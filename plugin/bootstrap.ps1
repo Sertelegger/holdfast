@@ -11,10 +11,126 @@
 Set-StrictMode -Version 2.0
 $ErrorActionPreference = 'Stop'
 
-$UrlManual = 'https://github.com/Sertelegger/holdfast/releases'
+$UrlReleases = 'https://github.com/Sertelegger/holdfast/releases'
 $UrlSource = 'https://github.com/Sertelegger/holdfast#build-and-try-it'
+$UrlOwnBin = 'https://github.com/Sertelegger/holdfast/tree/main/plugin#using-a-binary-you-built-yourself'
+$RepoGit = 'https://github.com/Sertelegger/holdfast'
 
-function Die([string]$msg) { Write-Error "holdfast bootstrap: $msg"; exit 1 }
+# Captured here because inside a function `$args` is that function's own.
+$HfArg1 = if ($args.Count -gt 0) { [string]$args[0] } else { '' }
+
+# --- how a failure reaches the person looking at Claude Code --------------
+# As in `bootstrap`, whose header has the measurement: a server that exits
+# before answering shows as `CONNECTION_CLOSED`, and one that answers
+# `initialize` with a JSON-RPC error shows the error's message. So under
+# `mcp`, a dying bootstrap reads the request the client has already sent and
+# answers it with the diagnosis. Nothing reads stdin on a success path, and
+# nothing does when stdin is a console.
+#
+# **The wait is bounded, and by the read itself** rather than by a signal,
+# which PowerShell has no portable way to send itself: the stream read runs
+# as a task, and a task not done in five seconds is abandoned. `exit` does
+# not wait for it.
+#
+# The reply is built by hand, not by ConvertTo-Json, whose escaping differs
+# between Windows PowerShell 5.1 and pwsh 7. Quote and backslash are escaped,
+# control characters become spaces as `bootstrap` makes them, and anything
+# outside printable ASCII becomes \uXXXX, so no console code page can alter
+# a byte of it.
+#
+# Exercised under pwsh on Linux by scripts/plugin-bootstrap-tests.sh (T14).
+# On Windows itself it is exactly as unverified as the entrypoint that would
+# reach it: see the header of this file.
+function JsonStr([string]$s) {
+    $b = New-Object System.Text.StringBuilder
+    [void]$b.Append('"')
+    foreach ($c in $s.ToCharArray()) {
+        $n = [int]$c
+        if ($n -eq 0x22) { [void]$b.Append('\"') }
+        elseif ($n -eq 0x5C) { [void]$b.Append('\\') }
+        elseif ($n -lt 0x20) { [void]$b.Append(' ') }
+        elseif ($n -gt 0x7E) { [void]$b.Append(('\u{0:x4}' -f $n)) }
+        else { [void]$b.Append($c) }
+    }
+    [void]$b.Append('"')
+    $b.ToString()
+}
+function Send-McpError([string]$msg) {
+    if ($HfArg1 -ne 'mcp') { return }
+    try { if (-not [Console]::IsInputRedirected) { return } } catch { return }
+    $line = $null
+    try {
+        $in = [Console]::OpenStandardInput()
+        $buf = New-Object byte[] 4096
+        $acc = New-Object System.IO.MemoryStream
+        $deadline = [DateTime]::UtcNow.AddSeconds(5)
+        $whole = $false
+        while ($true) {
+            $left = [int]($deadline - [DateTime]::UtcNow).TotalMilliseconds
+            if ($left -le 0) { break }
+            $task = $in.ReadAsync($buf, 0, $buf.Length)
+            if (-not $task.Wait($left)) { break }
+            $n = $task.Result
+            # End of input: a partial line still counts, as `read` counts it.
+            if ($n -le 0) { $whole = $acc.Length -gt 0; break }
+            $acc.Write($buf, 0, $n)
+            if ([Array]::IndexOf($buf, [byte]10, 0, $n) -ge 0) { $whole = $true; break }
+        }
+        if (-not $whole) { return }
+        $line = [Text.Encoding]::UTF8.GetString($acc.ToArray()).Split([char]10)[0]
+    } catch { return }
+    # The id is echoed back whatever its JSON type, as long as it is a string
+    # or an integer; anything else gets `null`, which is what JSON-RPC
+    # prescribes for an id it could not read.
+    $id = 'null'
+    try {
+        $o = $line | ConvertFrom-Json
+        $p = if ($null -ne $o) { $o.PSObject.Properties['id'] } else { $null }
+        if ($null -ne $p) {
+            if ($p.Value -is [string]) { $id = JsonStr $p.Value }
+            elseif ($p.Value -is [int] -or $p.Value -is [long]) { $id = [string]$p.Value }
+        }
+    } catch { }
+    [Console]::Out.Write('{"jsonrpc":"2.0","id":' + $id + ',"error":{"code":-32603,"message":' + (JsonStr $msg) + '}}' + [char]10)
+    [Console]::Out.Flush()
+}
+
+# One plain line on stderr, the same shape `bootstrap` writes. Not
+# Write-Error: under `$ErrorActionPreference = 'Stop'` that throws a
+# formatted error record instead, which pwsh 7 wraps at the console width and
+# decorates with ANSI colour, so the MCP log holds a word-wrapped box rather
+# than the sentence, and the `exit 1` after it never runs.
+function Die([string]$msg) {
+    $m = "holdfast bootstrap: $msg"
+    [Console]::Error.WriteLine($m)
+    Send-McpError $m
+    exit 1
+}
+
+# --- 0. an explicitly named binary ----------------------------------------
+# HOLDFAST_BOOTSTRAP_BIN, exactly as the Unix `bootstrap` treats it: exec that
+# file, no download, no version comparison, and a refusal rather than a
+# fallback when it is not usable. Above everything it makes irrelevant.
+# "Absolute" means drive-qualified or UNC on Windows -- `\foo` and `C:foo`
+# are rooted there but resolve against the current drive or directory, which
+# is whichever project Claude Code was started in. The `/` arm is pwsh on a
+# Unix host, which is where scripts/plugin-bootstrap-tests.sh runs this.
+if ($env:HOLDFAST_BOOTSTRAP_BIN) {
+    $Bin = $env:HOLDFAST_BOOTSTRAP_BIN
+    if ([System.IO.Path]::DirectorySeparatorChar -eq '/') {
+        $IsAbs = $Bin.StartsWith('/')
+    } else {
+        $IsAbs = $Bin -match '^([A-Za-z]:[\\/]|\\\\)'
+    }
+    if (-not $IsAbs) {
+        Die "HOLDFAST_BOOTSTRAP_BIN must be an absolute path, and '$Bin' is not -- this runs in whichever project Claude Code was started in, so a relative path names a different file in each one"
+    }
+    if (-not (Test-Path -LiteralPath $Bin -PathType Leaf)) {
+        Die "HOLDFAST_BOOTSTRAP_BIN is $Bin, which is not a file -- nothing was downloaded in its place, because the variable asks for exactly that binary"
+    }
+    & $Bin @args
+    exit $LASTEXITCODE
+}
 
 # $PSScriptRoot first, for the same reason `bootstrap` prefers $0: the cwd is
 # the user's, never the plugin root.
@@ -32,11 +148,13 @@ if ($Version -notmatch '^[0-9]+\.[0-9]+\.[0-9]+') { Die "version.txt does not ho
 $Arch = $env:PROCESSOR_ARCHITECTURE
 switch ($Arch) {
     'AMD64' { $Target = 'windows-x86_64' }
-    'ARM64' { Die "no prebuilt binary for windows-aarch64 -- build from source: $UrlSource" }
-    default { Die "no prebuilt binary for '$Arch' -- build from source: $UrlSource" }
+    'ARM64' { Die "no prebuilt binary for windows-aarch64 -- build holdfast from source ($UrlSource) and set HOLDFAST_BOOTSTRAP_BIN to its absolute path ($UrlOwnBin)" }
+    default { Die "no prebuilt binary for '$Arch' -- build holdfast from source ($UrlSource) and set HOLDFAST_BOOTSTRAP_BIN to its absolute path ($UrlOwnBin)" }
 }
 $Exe = 'holdfast.exe'
 $ArchiveName = "holdfast-$Target.zip"
+# Kept under the 500 characters `claude mcp list` shows; see `bootstrap`.
+$BuildIt = "build it -- cargo install --locked --git $RepoGit --tag v$Version holdfast -- and set HOLDFAST_BOOTSTRAP_BIN to its absolute path in the `"env`" block of Claude Code's settings.json, then restart. See $UrlOwnBin"
 
 # ${CLAUDE_PLUGIN_DATA} for the same reasons the Unix half prefers it:
 # uninstall-scoped, and not a well-known path a hostile local process can
@@ -46,7 +164,7 @@ if ($env:CLAUDE_PLUGIN_DATA) {
 } elseif ($env:LOCALAPPDATA) {
     $CacheRoot = Join-Path $env:LOCALAPPDATA 'holdfast'
 } else {
-    Die "neither CLAUDE_PLUGIN_DATA nor LOCALAPPDATA is set, so there is nowhere to cache the binary -- install holdfast manually from $UrlManual"
+    Die "neither CLAUDE_PLUGIN_DATA nor LOCALAPPDATA is set, so there is nowhere to cache the binary -- build holdfast from source and set HOLDFAST_BOOTSTRAP_BIN to its absolute path ($UrlOwnBin)"
 }
 $CacheDir = Join-Path $CacheRoot 'bin'
 $Cached = Join-Path $CacheDir "holdfast-v$Version-$Target.exe"
@@ -63,12 +181,23 @@ if ((Test-Path -LiteralPath $Cached) -and (Test-Path -LiteralPath $SumsCached)) 
 }
 
 # --- 2. download ----------------------------------------------------------
-New-Item -ItemType Directory -Force -Path $CacheDir | Out-Null
+# Each New-Item is caught and said with Die, like `bootstrap`'s: uncaught, it
+# is an error record on stderr and no answer to `initialize` (T14).
+try { New-Item -ItemType Directory -Force -Path $CacheDir | Out-Null } catch {
+    Die "cannot create $CacheDir (read-only or full filesystem?) -- or $BuildIt"
+}
 # Inside the cache directory, not $env:TEMP: a cross-volume Move-Item is a
 # copy-then-delete, and a concurrent bootstrap can then see a half-written
 # binary. Same rule as the Unix half.
+#
+# **Without -Force**, which hands back a directory that already exists as if
+# it had just been made -- and the `finally` below would then delete it. The
+# `try` whose `finally` removes $Tmp starts only once New-Item has created
+# it, so this only ever removes a directory it made, as `bootstrap` does.
 $Tmp = Join-Path $CacheDir (".dl." + [System.IO.Path]::GetRandomFileName())
-New-Item -ItemType Directory -Force -Path $Tmp | Out-Null
+try { New-Item -ItemType Directory -Path $Tmp | Out-Null } catch {
+    Die "cannot create a temp directory in $CacheDir -- make it writable, or $BuildIt"
+}
 try {
     if ($BaseUrl -notmatch '^https://' -and -not $env:HOLDFAST_BOOTSTRAP_INSECURE) {
         Die "refusing a non-TLS URL ($BaseUrl) -- TLS to GitHub is the whole of the v0.1.0 trust root (spec A-4)"
@@ -78,10 +207,21 @@ try {
     try { [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12 } catch { }
 
     $SumsTmp = Join-Path $Tmp 'SHA256SUMS.txt'
+    # Not published and not reachable need opposite advice; see the same
+    # block in `bootstrap`. A WebException (5.1) or HttpResponseException (7)
+    # carries the status when a server answered, and nothing when none did.
+    $SumsUrl = "$BaseUrl/v$Version/SHA256SUMS.txt"
     try {
-        Invoke-WebRequest -Uri "$BaseUrl/v$Version/SHA256SUMS.txt" -OutFile $SumsTmp -UseBasicParsing
+        Invoke-WebRequest -Uri $SumsUrl -OutFile $SumsTmp -UseBasicParsing
     } catch {
-        Die "cannot reach $BaseUrl/v$Version/SHA256SUMS.txt -- is the release published, and is this host online? On an air-gapped or firewalled host, download $ArchiveName and SHA256SUMS.txt from $UrlManual on a connected machine, verify the checksum yourself, and place the extracted binary at $Cached (see plugin/README.md)"
+        $Status = $null
+        try { $Status = [int]$_.Exception.Response.StatusCode } catch { }
+        if ($Status -eq 404) {
+            Die "no holdfast v$Version binary to download: the v$Version release answered 404 -- unpublished, a draft, or without binaries. To run Holdfast now, $BuildIt"
+        } elseif ($Status) {
+            Die "$SumsUrl answered HTTP $Status -- retry later, or $BuildIt"
+        }
+        Die "cannot reach $SumsUrl -- is this host online? On an air-gapped or firewalled host, fetch $ArchiveName and SHA256SUMS.txt from $UrlReleases/tag/v$Version on a connected machine, verify the checksum yourself, and place the extracted binary at $Cached with SHA256SUMS.txt beside it as $SumsCached -- both files, or it is a cache miss. Or $BuildIt"
     }
 
     # Whole-field equality against exactly one line, never a substring match:
@@ -103,7 +243,7 @@ try {
     try {
         Invoke-WebRequest -Uri "$BaseUrl/v$Version/$ArchiveName" -OutFile $ArcTmp -UseBasicParsing
     } catch {
-        Die "cannot download $ArchiveName from $BaseUrl/v$Version/ -- see $UrlManual for a manual install"
+        Die "cannot download $ArchiveName from $BaseUrl/v$Version/ although the manifest lists it -- retry, or $BuildIt"
     }
     $Got = (Get-FileHash -LiteralPath $ArcTmp -Algorithm SHA256).Hash.ToLowerInvariant()
     if ($Got -cne $Want) {

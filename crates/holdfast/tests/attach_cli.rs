@@ -1380,16 +1380,17 @@ async fn a_future_attention_frame_does_not_disturb_a_v0_1_0_client() {
 
 // ------------------- the way out of a secret prompt (§6.1, REQ-SEC-019)
 
-/// The prompt as the **client** draws it when `AwaitingSecret` arrives —
-/// `\r\n`, the text, `\r\n` — and never as a child draws it.
+/// The line the **client** draws when `AwaitingSecret` arrives, and never
+/// the child — since GH #236 a labelled `[holdfast]` line rather than the
+/// prompt text a second time.
 ///
 /// A row that merely waited for `Password: ` could not tell the client's
 /// render from the child's own bytes, and would then run its keystrokes
 /// through the *ordinary input* path: it would pass on a client that
 /// never received the frame at all, which is the one thing these rows
-/// have to rule out. `printf 'Password: '` emits no line terminator on
-/// either side, so this framing is the client's signature.
-const SECRET_PROMPT_DRAWN: &[u8] = b"\r\nPassword: \r\n";
+/// have to rule out. No child in this file prints this sentence, so it is
+/// the client's signature.
+const SECRET_PROMPT_DRAWN: &[u8] = b"goes only to the session";
 
 /// **GH #137, client side.** A submission the daemon declines must reach
 /// the person who typed it.
@@ -1430,6 +1431,7 @@ async fn a_declined_secret_is_reported_to_the_client_that_submitted_it() {
             enc(&ServerFrame::AwaitingSecret {
                 request_id: "req_sd99".into(),
                 prompt_text: "Password: ".into(),
+                raised_by: None,
             }),
         ],
         |f| matches!(f, ClientFrame::SecretInput { .. }),
@@ -1500,6 +1502,7 @@ async fn a_close_for_an_answered_request_does_not_unmask_a_new_prompt() {
     let mut second = enc(&ServerFrame::AwaitingSecret {
         request_id: "req_two".into(),
         prompt_text: "Password: ".into(),
+        raised_by: None,
     });
     second.extend_from_slice(&enc(&ServerFrame::SecretRequestClosed {
         request_id: "req_one".into(),
@@ -1522,6 +1525,7 @@ async fn a_close_for_an_answered_request_does_not_unmask_a_new_prompt() {
             enc(&ServerFrame::AwaitingSecret {
                 request_id: "req_one".into(),
                 prompt_text: "Password: ".into(),
+                raised_by: None,
             }),
         ],
         |f| matches!(f, ClientFrame::SecretInput { .. }),
@@ -1600,6 +1604,7 @@ async fn allow_echo_sets_the_flag_on_the_submitted_frame() {
             enc(&ServerFrame::AwaitingSecret {
                 request_id: "req_ae01".into(),
                 prompt_text: "Password: ".into(),
+                raised_by: None,
             }),
         ],
         Duration::from_secs(15),
@@ -1728,6 +1733,7 @@ async fn the_detach_key_works_while_a_secret_prompt_is_outstanding() {
             enc(&ServerFrame::AwaitingSecret {
                 request_id: "req_sd01".into(),
                 prompt_text: "Password: ".into(),
+                raised_by: None,
             }),
         ],
         Duration::from_secs(10),
@@ -1796,6 +1802,7 @@ async fn ctrl_c_at_a_secret_prompt_leaves_as_ordinary_input() {
             enc(&ServerFrame::AwaitingSecret {
                 request_id: "req_sc01".into(),
                 prompt_text: "Password: ".into(),
+                raised_by: None,
             }),
         ],
         Duration::from_secs(15),
@@ -1989,40 +1996,37 @@ async fn attach_says_it_attached_and_how_to_leave() {
         String::from_utf8_lossy(&seen)
     );
 
-    let pos = |needle: &[u8]| {
-        seen.windows(needle.len())
-            .position(|w| w == needle)
-            .unwrap_or(usize::MAX)
-    };
-
-    // **Ordering, because presence alone shipped a banner nobody could
-    // see.** The startup `Resize` raises `SIGWINCH`, the child repaints,
-    // and a prompt repaint erases from above the cursor to the end of the
-    // screen — so a banner written first lands in the erased region:
-    // present in the byte stream, absent from the terminal.
-    //
-    // Anchored on the child's prompt rather than on "the first escape
-    // sequence", which was the first version of this assertion and was
-    // useless the moment the banner itself gained colour: its own SGR
-    // codes then satisfied "an escape came first".
+    // **What the terminal shows, not what the byte stream contains,
+    // because presence alone shipped a banner nobody could see.** The
+    // first version printed it before the child's `SIGWINCH` repaint,
+    // which erased it; the second inserted it above the prompt, which —
+    // once the daemon sends the current screen (GH #235) — pushes a prompt
+    // on the last row off the bottom. It now rides the opening screen's
+    // top row, so the assertion is on the rendered screen after the
+    // repaint has had its chance: the notice on row 0, the prompt still
+    // on screen, and the cursor after the prompt, where the child's next
+    // write lands.
+    term.wait_for(b"bash-5.2$", 15);
+    std::thread::sleep(Duration::from_millis(500));
+    let mut screen = vt100::Parser::new(24, 80, 0);
+    screen.process(&term.snapshot());
+    let top = screen.screen().contents_between(0, 0, 0, 80);
     assert!(
-        pos(b"$") < pos(b"\x1b7"),
-        "the banner must follow the child's own output, not precede it:\n{}",
-        String::from_utf8_lossy(&seen)
+        top.contains("attached to") && top.contains("Ctrl-B d"),
+        "the notice is not on the top row once the child has repainted: {top:?}\n{}",
+        screen.screen().contents()
     );
-
-    // Cursor save/restore around it. `attach` is a pass-through and the
-    // child tracks its own cursor, so a banner that does not put it back
-    // leaves the child's next write starting mid-line.
+    let (row, col) = screen.screen().cursor_position();
+    let prompt = screen.screen().contents_between(row, 0, row, 80);
     assert!(
-        contains(&seen, b"\x1b7") && contains(&seen, b"\x1b8"),
-        "the banner must save and restore the cursor:\n{}",
-        String::from_utf8_lossy(&seen)
+        prompt.trim_end().ends_with("bash-5.2$"),
+        "the prompt is not on the cursor's row: {prompt:?}\n{}",
+        screen.screen().contents()
     );
-    assert!(
-        pos(b"\x1b7") < pos(b"attached to") && pos(b"attached to") < pos(b"\x1b8"),
-        "save must precede the text and restore must follow it:\n{}",
-        String::from_utf8_lossy(&seen)
+    assert_eq!(
+        col as usize,
+        prompt.trim_end().len() + 1,
+        "the cursor is not after the prompt, so the child's next write lands elsewhere"
     );
 
     term.type_keys(b"\x02d");
@@ -2437,8 +2441,13 @@ async fn a_truncated_attach_names_the_loss_and_does_not_exit_zero() {
             reason: "slow_consumer".into(),
         }),
     ];
-    let stub = StubDaemon::start("attachgap", replies, Duration::from_millis(900)).await;
+    let stub = StubDaemon::start("attachgap", replies, Duration::from_secs(15)).await;
     let mut term = Term::spawn(stub.paths.dir(), &["attach", "sess_a200"], 80, 24);
+    // Since GH #210 a `slow_consumer` holds the terminal and asks, rather
+    // than exiting — see `attach_holds_the_terminal_after_a_stall` — so
+    // the human's answer is what ends it here.
+    term.wait_for(b"press Enter to reattach", 15);
+    term.type_keys(&[0x02, b'd']);
     assert_eq!(
         term.wait_exit(15),
         3,
@@ -2461,9 +2470,9 @@ async fn a_truncated_attach_names_the_loss_and_does_not_exit_zero() {
     // on the code is green when only one of them works — which is what
     // reverting the ending's arm looks like.
     assert!(
-        contains(&seen, b"incomplete"),
-        "the ending must say the view is incomplete, not merely echo the \
-         reason token:\n{}",
+        contains(&seen, b"slow_consumer") && contains(&seen, b"left without reattaching"),
+        "the ending must say this client was detached and that the view missed \
+         output, not merely echo the reason token:\n{}",
         String::from_utf8_lossy(&seen)
     );
 }
@@ -2645,5 +2654,518 @@ async fn a_resize_flood_is_coalesced_for_watch_as_well() {
         notices[0].contains("104x55"),
         "watch must name where the drag landed, not where it started: {}",
         notices[0]
+    );
+}
+
+// --------------------------------------- GH #210: a stall is not an exit
+
+fn attached_stub(id: &str) -> Vec<u8> {
+    enc(&ServerFrame::Attached {
+        session_id: id.into(),
+        name: None,
+        cols: 80,
+        rows: 24,
+        state: "Running".into(),
+        exit_code: None,
+        protocol_major: PROTOCOL_MAJOR,
+        protocol_minor: PROTOCOL_MINOR,
+    })
+}
+
+/// **After a `slow_consumer` detach, `attach` holds the terminal and
+/// nothing typed goes anywhere until the human says so** (GH #210).
+///
+/// The dogfood pass: *"a detach mid-takeover sends the human's next
+/// keystrokes to their local shell"*. Three claims, each of which the old
+/// client failed or a plausible fix would:
+///
+/// * it does **not exit** on the frame, nor on ordinary typing —
+///   exiting is the defect, and a letter that left would be the defect
+///   one keystroke late;
+/// * what is typed while held is **not sent** to the session either —
+///   a client that quietly reconnected and forwarded would pass the
+///   first claim and put the keystrokes into a prompt the human has not
+///   seen;
+/// * `Ctrl-B d` leaves, with the status for a view that missed output.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn attach_holds_the_terminal_after_a_stall() {
+    let stub = StubDaemon::start(
+        "stallhold",
+        vec![
+            attached_stub("sess_hold"),
+            enc(&ServerFrame::Output {
+                session: "sess_hold".into(),
+                bytes: b"BEFORE-THE-STALL\r\n".to_vec(),
+            }),
+            enc(&ServerFrame::Detached {
+                reason: "slow_consumer".into(),
+            }),
+        ],
+        Duration::from_secs(15),
+    )
+    .await;
+    let mut term = Term::spawn(stub.paths.dir(), &["attach", "sess_hold"], 80, 24);
+    term.wait_for(b"press Enter to reattach, or Ctrl-B d", 15);
+
+    // Typed at a session the human can no longer see — every letter of
+    // it, including the ones a single-letter answer would have taken.
+    term.type_keys(b"rm -rf build; git squash");
+    std::thread::sleep(Duration::from_millis(500));
+    assert!(
+        matches!(term.child.try_wait(), Ok(None)),
+        "the client exited on keystrokes that were not an answer; the next ones go to \
+         the local shell"
+    );
+    assert!(
+        !stub
+            .frames()
+            .iter()
+            .any(|f| matches!(f, ClientFrame::Input { .. })),
+        "keystrokes typed while held reached the wire: {:?}",
+        stub.frames()
+    );
+
+    term.type_keys(&[0x02, b'd']);
+    assert_eq!(
+        term.wait_exit(10),
+        3,
+        "leaving after a stall is a view that missed output"
+    );
+}
+
+/// **A stopped `watch` is detached while it is still stopped, and says so
+/// when it resumes** (GH #210 — the brief's SIGSTOP proof).
+///
+/// The daemon side is the point: the detach happens with the client
+/// frozen, from the socket having accepted nothing for the stall bound,
+/// so nothing the client does is needed for it. The client side is the
+/// report — resumed inside the grace, it reads what was queued, then the
+/// reason, and exits with the truncated view's status.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_stopped_watch_is_detached_while_stopped_and_says_why_when_it_resumes() {
+    let d = TestDaemon::start("stopwatch").await;
+    d.daemon
+        .attach_hub()
+        .set_stall_timeout(Duration::from_secs(2));
+    let (s, pty) = d.session(None);
+    let mut term = Term::spawn(d.paths.dir(), &["watch", &s.id], 100, 30);
+    wait_until_attached(&term, &pty);
+
+    // SAFETY: a signal to our own child, by the pid we spawned it with.
+    assert_eq!(unsafe { libc::kill(term.pid(), libc::SIGSTOP) }, 0);
+    for _ in 0..200 {
+        pty.queue_output(&vec![b'z'; 16 * 1024]);
+        std::thread::sleep(Duration::from_millis(1));
+    }
+    let deadline = Instant::now() + Duration::from_secs(20);
+    while d.daemon.status().attach_clients != 0 && Instant::now() < deadline {
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    let still_stopped = matches!(term.child.try_wait(), Ok(None));
+    let detached = d.daemon.status().attach_clients == 0;
+    // SAFETY: as above.
+    assert_eq!(unsafe { libc::kill(term.pid(), libc::SIGCONT) }, 0);
+    assert!(
+        detached && still_stopped,
+        "a stopped watcher was not detached while stopped (detached={detached}, \
+         still stopped={still_stopped})"
+    );
+
+    assert_eq!(
+        term.wait_exit(20),
+        3,
+        "a stalled watch must exit with the truncated status"
+    );
+    let seen = term.snapshot();
+    assert!(
+        contains(&seen, b"slow_consumer") && contains(&seen, b"stopped reading"),
+        "the resumed watch did not say why its view ended:\n{}",
+        String::from_utf8_lossy(&seen[seen.len().saturating_sub(600)..])
+    );
+}
+
+/// **After a stall, `Enter` reattaches — the screen is repainted and
+/// typing reaches the session again** (GH #210, GH #235).
+///
+/// The real daemon and a real client frozen with `SIGSTOP`, so every link
+/// the reattach needs is the one that ships: the stall bound detaching a
+/// frozen client, the `Detached` arriving inside the grace, the hold, a
+/// fresh handshake, the new connection's opening screen.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_stalled_attach_reattaches_on_enter() {
+    let d = TestDaemon::start("reattach").await;
+    d.daemon
+        .attach_hub()
+        .set_stall_timeout(Duration::from_secs(2));
+    let (s, pty) = d.session(None);
+    let mut term = Term::spawn(d.paths.dir(), &["attach", &s.id], 100, 30);
+    wait_until_attached(&term, &pty);
+
+    // SAFETY: a signal to our own child, by the pid we spawned it with.
+    assert_eq!(unsafe { libc::kill(term.pid(), libc::SIGSTOP) }, 0);
+    for _ in 0..200 {
+        pty.queue_output(&vec![b'z'; 16 * 1024]);
+        std::thread::sleep(Duration::from_millis(1));
+    }
+    let deadline = Instant::now() + Duration::from_secs(20);
+    while d.daemon.status().attach_clients != 0 && Instant::now() < deadline {
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    assert_eq!(
+        d.daemon.status().attach_clients,
+        0,
+        "the frozen client was never detached"
+    );
+    // Printed after the detach, so the only way it reaches this terminal
+    // is the new connection's opening screen.
+    std::thread::sleep(Duration::from_millis(200));
+    pty.queue_output(b"\r\nSCREEN-AFTER-THE-STALL$ ");
+    // SAFETY: as above.
+    assert_eq!(unsafe { libc::kill(term.pid(), libc::SIGCONT) }, 0);
+
+    term.wait_for(b"press Enter to reattach", 20);
+    let before = pty.written().len();
+    term.type_keys(b"\r");
+    let deadline = Instant::now() + Duration::from_secs(15);
+    while d.daemon.status().attach_clients != 1 && Instant::now() < deadline {
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    assert_eq!(
+        d.daemon.status().attach_clients,
+        1,
+        "`Enter` did not reattach"
+    );
+
+    // The screen as it now stands, painted by the new connection.
+    term.wait_for(b"SCREEN-AFTER-THE-STALL$", 15);
+    assert_eq!(
+        pty.written().len(),
+        before,
+        "the key that answered the hold reached the session"
+    );
+
+    term.type_keys(b"echo back\r");
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while !contains(&pty.written(), b"echo back") && Instant::now() < deadline {
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    assert!(
+        contains(&pty.written(), b"echo back\r"),
+        "typing after the reattach did not reach the session"
+    );
+    term.type_keys(&[0x02, b'd']);
+    assert_eq!(
+        term.wait_exit(10),
+        3,
+        "a view that missed output during a stall exits with the truncated status, \
+         even after a clean detach"
+    );
+}
+
+// ------------------------------------------ GH #235: the opening screen
+
+/// **Attaching to an idle session shows its prompt without a keypress**
+/// (GH #235).
+///
+/// The dogfood pass: *"Only the banner … no prompt until you press
+/// Enter."* A `MockPty` does not answer `SIGWINCH`, so nothing here can
+/// repaint the prompt except the opening screen — which is exactly the
+/// case of a real shell attached at its own size, where no resize
+/// happens and nothing repaints either.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn attach_to_an_idle_session_shows_its_prompt_at_once() {
+    let d = TestDaemon::start("idleattach").await;
+    let (s, pty) = d.session(None);
+    // Enough output that the prompt sits at the bottom of the screen —
+    // the ordinary position for a shell that has done any work, and the
+    // one where a notice inserted above the prompt pushes it off.
+    let mut earlier = Vec::new();
+    for i in 0..60 {
+        earlier.extend_from_slice(format!("earlier output {i:02}\r\n").as_bytes());
+    }
+    earlier.extend_from_slice(b"IDLE-PROMPT$ ");
+    pty.queue_output(&earlier);
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while s.buffer_head() < earlier.len() as u64 && Instant::now() < deadline {
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    let mut term = Term::spawn(d.paths.dir(), &["attach", &s.id], 80, 24);
+    term.wait_for(b"IDLE-PROMPT$", 15);
+    // Past the older notice's fallback timer, so a client that still
+    // inserted it above the prompt would have done so by now.
+    std::thread::sleep(Duration::from_millis(800));
+
+    let mut screen = vt100::Parser::new(24, 80, 0);
+    screen.process(&term.snapshot());
+    let (row, col) = screen.screen().cursor_position();
+    let prompt = screen.screen().contents_between(row, 0, row, 80);
+    assert_eq!(
+        prompt.trim_end(),
+        "IDLE-PROMPT$",
+        "the prompt is not on screen at the cursor — a notice pushed it off, or the \
+         picture was never painted:\n{}",
+        screen.screen().contents()
+    );
+    assert_eq!(col, 13, "the cursor is not after the prompt");
+    assert!(
+        screen.screen().contents().contains("earlier output 59"),
+        "the screen above the prompt is missing:\n{}",
+        screen.screen().contents()
+    );
+    let top = screen.screen().contents_between(0, 0, 0, 80);
+    assert!(
+        top.contains("attached to"),
+        "the join notice is not on the top row: {top:?}"
+    );
+    term.type_keys(&[0x02, b'd']);
+    assert_eq!(term.wait_exit(10), 0);
+}
+
+/// **`watch` on a terminal opens with the screen and says it is
+/// watching**; **`watch` into a file captures only what the session
+/// prints from the join on** (GH #235).
+///
+/// Two surfaces, one frame: a terminal gets a picture and a notice, and a
+/// capture gets neither — a picture in a log file is bytes the session
+/// never printed, which is `Output`'s whole contract.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn watch_paints_the_screen_on_a_terminal_and_nothing_into_a_capture() {
+    let d = TestDaemon::start("watchsnap").await;
+    let (s, pty) = d.session(None);
+    pty.queue_output(b"PRE-JOIN-LINE\r\nWATCHED-PROMPT$ ");
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while s.buffer_head() == 0 && Instant::now() < deadline {
+        std::thread::sleep(Duration::from_millis(10));
+    }
+
+    let term = Term::spawn(d.paths.dir(), &["watch", &s.id], 80, 24);
+    let seen = term.wait_for(b"WATCHED-PROMPT$", 15);
+    assert!(contains(&seen, b"PRE-JOIN-LINE"));
+    term.wait_for(b"holdfast: watching", 10);
+    drop(term);
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while d.daemon.status().attach_clients != 0 && Instant::now() < deadline {
+        std::thread::sleep(Duration::from_millis(20));
+    }
+
+    // Into a pipe: the capture starts at the join.
+    let dir = d.paths.dir().to_path_buf();
+    let id = s.id.clone();
+    let capture = std::thread::spawn(move || run_plain(&dir, &["watch", &id]));
+    let deadline = Instant::now() + Duration::from_secs(15);
+    while d.daemon.status().attach_clients != 1 && Instant::now() < deadline {
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    pty.queue_output(b"LIVE-AFTER-JOIN\r\n");
+    std::thread::sleep(Duration::from_millis(300));
+    pty.exit(0);
+    let out = capture.join().expect("join");
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        stdout.contains("LIVE-AFTER-JOIN"),
+        "the capture missed live output: {stdout:?}"
+    );
+    assert!(
+        !stdout.contains("PRE-JOIN-LINE") && !stdout.contains('\x1b'),
+        "the opening screen was drawn into a capture: {stdout:?}"
+    );
+}
+
+// ---------------------------------- GH #236: whose words a prompt carries
+
+/// **A child's prompt is drawn once, and Holdfast's line says what it
+/// is** (GH #236) — against a real child that drops `ECHO`, so the
+/// provenance is the daemon's and not a stub's.
+///
+/// The dogfood pass saw `Password: \r\nPassword: \r\n`: the child's
+/// prompt, then the client printing the frame's `prompt_text`, which was
+/// the same line. The label is the fix, and the count is the assertion.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_childs_secret_prompt_is_drawn_once_and_labelled() {
+    let d = TestDaemon::start("promptonce").await;
+    let s = d.real_session(
+        "sh",
+        &[
+            "-c",
+            "stty -echo; printf 'Passphrase: '; read x; stty echo; printf 'len=%s\\n' \"${#x}\"",
+        ],
+    );
+    let mut term = Term::spawn(d.paths.dir(), &["attach", &s.id], 100, 30);
+    let seen = term.wait_for(SECRET_PROMPT_DRAWN, 20);
+    let count = seen
+        .windows(b"Passphrase:".len())
+        .filter(|w| *w == b"Passphrase:")
+        .count();
+    assert_eq!(
+        count,
+        1,
+        "the child's prompt was drawn {count} times:\n{}",
+        String::from_utf8_lossy(&seen)
+    );
+    assert!(
+        contains(
+            &seen,
+            b"[holdfast] the session is reading a secret at the prompt above"
+        ),
+        "the client's line does not say it is Holdfast's, or whose prompt it is:\n{}",
+        String::from_utf8_lossy(&seen)
+    );
+    term.type_keys(b"abc\r");
+    term.wait_for(b"len=3", 15);
+    let _ = s.signal(holdfast_core::pty::Signal::Kill);
+}
+
+/// **An agent's description is shown as the agent's** (GH #236).
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn an_agents_secret_description_is_attributed_to_the_agent() {
+    let stub = StubDaemon::start(
+        "agenttext",
+        vec![
+            attached_stub("sess_agent"),
+            enc(&ServerFrame::AwaitingSecret {
+                request_id: "req_ag01".into(),
+                prompt_text: "deploy key passphrase".into(),
+                raised_by: Some("tool_call".into()),
+            }),
+        ],
+        Duration::from_secs(15),
+    )
+    .await;
+    let mut term = Term::spawn(stub.paths.dir(), &["attach", "sess_agent"], 100, 30);
+    let seen = term.wait_for(SECRET_PROMPT_DRAWN, 15);
+    assert!(
+        contains(
+            &seen,
+            "the agent asks for a secret: “deploy key passphrase”".as_bytes()
+        ),
+        "the agent's words were not attributed to the agent:\n{}",
+        String::from_utf8_lossy(&seen)
+    );
+    term.type_keys(&[0x02, b'd']);
+    assert_eq!(term.wait_exit(10), 0);
+}
+
+/// The agent's request, as the daemon announces it — once for the tool
+/// call, and again when the child's echo drop finds it outstanding.
+fn agents_request(id: &str) -> Vec<u8> {
+    enc(&ServerFrame::AwaitingSecret {
+        request_id: id.into(),
+        prompt_text: "deploy key passphrase".into(),
+        raised_by: Some("tool_call".into()),
+    })
+}
+
+/// **The same request announced twice is one prompt, and what the human
+/// already typed survives the second announcement** (GH #236's review).
+///
+/// The order the dogfood repro did not try: the agent calls
+/// `request_secret_input` first, the human starts typing, and only then
+/// does the child reach `read -s`. The echo-drop edge finds the request
+/// outstanding and the daemon announces it again, with the same id — so
+/// `holdfast attach` drew the label a second time and **emptied the
+/// line**. Measured on a release build: `ab`, then the second frame, then
+/// `c` + Enter, and the child received `c` while the tool reported
+/// success.
+///
+/// The stub sends the second announcement **in answer to a resize**, so
+/// it arrives after the first keystrokes rather than racing them, and an
+/// `Output` behind it on the same socket says when the client has read
+/// it. Two assertions, and a client that ignored neither the label nor
+/// the line fails both: the label is drawn once, and the value submitted
+/// is everything typed.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn the_same_secret_request_announced_twice_keeps_what_was_typed() {
+    const SEEN_IT: &[u8] = b"SECOND-ANNOUNCEMENT-READ";
+    let mut again = agents_request("req_twice1");
+    again.extend(enc(&ServerFrame::Output {
+        session: "sess_twice".into(),
+        bytes: SEEN_IT.to_vec(),
+    }));
+    let stub = StubDaemon::start_reacting(
+        "secrettwice",
+        vec![attached_stub("sess_twice"), agents_request("req_twice1")],
+        |f| matches!(f, ClientFrame::Resize { cols: 101, .. }),
+        again,
+        Duration::from_secs(20),
+    )
+    .await;
+    let mut term = Term::spawn(stub.paths.dir(), &["attach", "sess_twice"], 100, 30);
+    term.wait_for(SECRET_PROMPT_DRAWN, 15);
+    term.type_keys(b"ab");
+    // Only so the two keystrokes are read before the second announcement
+    // is asked for. A correct client submits `abc` whichever it reads
+    // first; this is what lets the row also catch a client that empties
+    // the line, rather than only one that draws the label twice.
+    std::thread::sleep(Duration::from_millis(500));
+    term.resize(101, 30);
+    let seen = term.wait_for(SEEN_IT, 15);
+    let labels = seen
+        .windows(SECRET_PROMPT_DRAWN.len())
+        .filter(|w| *w == SECRET_PROMPT_DRAWN)
+        .count();
+    assert_eq!(
+        labels,
+        1,
+        "one request was drawn as {labels} prompts:\n{}",
+        String::from_utf8_lossy(&seen)
+    );
+    term.type_keys(b"c\r");
+    let sent = wait_frames(&stub, 10, |f| {
+        f.iter()
+            .any(|x| matches!(x, ClientFrame::SecretInput { .. }))
+    });
+    let submitted: Vec<&[u8]> = sent
+        .iter()
+        .filter_map(|f| match f {
+            ClientFrame::SecretInput {
+                request_id, bytes, ..
+            } if request_id == "req_twice1" => Some(bytes.as_slice()),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(
+        submitted,
+        vec![b"abc".as_slice()],
+        "the second announcement emptied the line: the child would have received the \
+         tail of what the human typed"
+    );
+    term.type_keys(&[0x02, b'd']);
+    assert_eq!(term.wait_exit(10), 0);
+}
+
+/// **`watch` reports a request once however many times it is announced,
+/// and a new request again** (GH #236's review). The second half is what
+/// keeps a watch that only ever reported the first request from passing.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn watch_reports_one_secret_request_once() {
+    const END: &[u8] = b"WATCH-READ-THEM-ALL";
+    let stub = StubDaemon::start(
+        "watchtwice",
+        vec![
+            attached_stub("sess_wtwice"),
+            agents_request("req_wtwice1"),
+            agents_request("req_wtwice1"),
+            enc(&ServerFrame::SecretRequestClosed {
+                request_id: "req_wtwice1".into(),
+                outcome: "fulfilled".into(),
+            }),
+            agents_request("req_wtwice2"),
+            enc(&ServerFrame::Output {
+                session: "sess_wtwice".into(),
+                bytes: END.to_vec(),
+            }),
+        ],
+        Duration::from_secs(15),
+    )
+    .await;
+    let term = Term::spawn(stub.paths.dir(), &["watch", "sess_wtwice"], 100, 30);
+    let seen = term.wait_for(END, 15);
+    let notice: &[u8] = b"only an attached client can answer it";
+    let reports = seen.windows(notice.len()).filter(|w| *w == notice).count();
+    assert_eq!(
+        reports,
+        2,
+        "two requests, one of them announced twice, were reported {reports} times:\n{}",
+        String::from_utf8_lossy(&seen)
     );
 }

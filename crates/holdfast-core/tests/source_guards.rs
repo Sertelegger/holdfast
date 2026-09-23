@@ -236,64 +236,64 @@ fn the_write_channel_carries_the_secret_as_itself() {
     );
 }
 
-/// **A gap's origin is read from the session, next to the subscribe**
-/// (GH #200).
+/// **A connection's stream starts at the session's floor, read between
+/// the subscribe and the screen capture** (GH #200, GH #235).
 ///
-/// **Here because no runtime test in this workspace can reach the line.**
-/// `run`'s `let baseline = session.buffer_head();` is what a
-/// `GapTracker` subtracts the first gap from, and the only way to
-/// exercise it end to end is a broadcast lag over a real socket — which
-/// `attach/conn.rs`'s own lag row records as unreachable from a client,
-/// because the per-connection queue fills and detaches long before the
-/// 256-frame broadcast can lag. Measured: replacing that call with `0`
-/// leaves **every** `attach::` unit row and **every** `attach_protocol`
-/// row green.
+/// **The runtime rows cover the value and cannot cover the order.** That
+/// the origin is the session's and not a constant is now reachable over
+/// a socket — `a_client_that_falls_behind_is_never_detached_and_loses_nothing_silently`
+/// joins a session that has already printed past its ring, and a zero
+/// origin breaks its shown-plus-lost identity by the whole pre-join
+/// history. What no runtime row can reach is the *ordering* the floor's
+/// guarantee rests on, because both of its failures are races a few
+/// instructions wide:
 ///
-/// And it is not a small wrong. The baseline is the origin, so a zero
-/// one makes the first gap on a connection report the session's entire
-/// byte count: attach to a session that has printed 10 MB, lag once
-/// before the first frame arrives, and the operator is told *"at least
-/// 10485760 bytes of output were dropped"* about a hole of a few
-/// hundred. The arithmetic itself is covered by
-/// `the_gap_origin_is_the_stream_start_and_not_zero`; what is covered
-/// here is that `run` hands it the session's head rather than a
-/// constant.
+/// * read **before** the subscribe, and bytes published in between are in
+///   neither the picture's past nor this receiver — the ring backfill
+///   still recovers them, so this one only costs a trip to the ring, and
+///   is asserted anyway because it is free;
+/// * read **after** the capture, and the floor can land past what the
+///   picture shows: the bytes in between are drawn nowhere, with no gap to
+///   say so. That is silent loss, and `Session::stream_floor`'s whole
+///   argument is that the read precedes the capture.
 ///
-/// **Adjacency is the assertion, not just presence.** The read has to
-/// happen right after `subscribe()`: earlier and it misses frames the
-/// receiver legitimately holds, later and frames published in between
-/// are counted as a hole that never existed. A scanner cannot check
-/// "right after" in general, so it checks that nothing but comments
-/// separates the two — which is the property the ordering argument
-/// actually rests on.
+/// So this checks the three statements appear in that order in `run`, and
+/// that the floor is what the forwarder is handed.
 #[test]
-fn the_gap_origin_is_read_from_the_session_beside_the_subscribe() {
+fn the_stream_floor_is_read_between_the_subscribe_and_the_capture() {
     let src = Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
     let text = read_src(src.join("attach/conn.rs"));
+    let (_, run) = text
+        .split_once("pub async fn run(")
+        .expect("`attach::conn::run` is gone");
+    let run = run.split_once("\n}\n").map_or(run, |(body, _)| body);
 
-    let (_, after) = text
-        .split_once("let output = session.subscribe();")
-        .expect("`run` no longer subscribes to the session's output at all");
-    let (between, _) = after
-        .split_once("let baseline =")
-        .expect("`run` no longer reads a baseline for the gap tracker (GH #200)");
-
+    let at = |needle: &str| {
+        run.find(needle)
+            .unwrap_or_else(|| panic!("`run` no longer contains `{needle}`"))
+    };
+    let subscribe = at("let output = session.subscribe();");
+    let floor = at("let floor = session.stream_floor();");
+    let capture = at("screen_snapshot(&session");
     assert!(
-        between
-            .lines()
-            .all(|l| l.trim().is_empty() || l.trim_start().starts_with("//")),
-        "something other than a comment now sits between the subscribe and the \
-         baseline read; the two are one operation and a statement between them \
-         is a window where frames are published and then counted as a gap:\n{between}"
+        subscribe < floor,
+        "the floor is read before the output subscription; bytes published in between \
+         reach this connection only by a trip to the ring"
+    );
+    assert!(
+        floor < capture,
+        "the floor is read after the screen capture, so the stream can resume past what \
+         the opening picture shows and lose the bytes between them silently"
     );
 
-    let (_, decl) = text.split_once("let baseline = ").expect("checked above");
-    let decl = decl.split_once(';').expect("the statement ends").0;
+    // And it is what the forwarder is given — not the buffer head, not 0.
+    let (_, spawn) = run
+        .split_once("tokio::spawn(forward_output(")
+        .expect("`run` no longer spawns the forwarder");
+    let args = spawn.split_once("));").expect("the spawn ends").0;
     assert!(
-        decl.contains("session.buffer_head()"),
-        "the gap's origin is no longer read from the session (it is `{decl}`). A \
-         constant here makes the first gap on every connection report the whole \
-         session, and no runtime test in this workspace can see it"
+        args.lines().any(|l| l.trim() == "floor,"),
+        "the forwarder is no longer handed the floor as its starting offset:\n{args}"
     );
 }
 

@@ -291,7 +291,26 @@ async fn send(s: &mut UnixStream, f: &ClientFrame) {
 /// The bug most of these rows guard against is a daemon that keeps the
 /// connection open, and as a bare `await` that is a hung CI job rather
 /// than a red row.
+/// The next frame, **skipping the one `ScreenSnapshot` a join sends**
+/// (GH #235).
+///
+/// Every connection now receives the session's screen right after
+/// `Attached`, and the rows in this file that predate it are about the
+/// stream, the handshake and the endings — not about the picture. The
+/// snapshot's own rows read it with [`recv_raw`] and assert where it
+/// sits; everything else reads past it here, so a row asking "what
+/// follows `Attached`" is still asking about the stream.
 async fn recv(s: &mut UnixStream) -> ServerFrame {
+    loop {
+        match recv_raw(s).await {
+            ServerFrame::ScreenSnapshot { .. } => continue,
+            other => return other,
+        }
+    }
+}
+
+/// The next frame, whatever it is.
+async fn recv_raw(s: &mut UnixStream) -> ServerFrame {
     let body = tokio::time::timeout(Duration::from_secs(5), frame::read_frame_body(s))
         .await
         .expect("no frame arrived within 5s")
@@ -302,12 +321,26 @@ async fn recv(s: &mut UnixStream) -> ServerFrame {
 /// Assert the peer closed. `Ok(Err(Eof))` only — a timeout is
 /// `Err(Elapsed)` and must **not** read as success, which is exactly
 /// what `matches!(x, Ok(Err(_)) | Err(_))` would have done.
+///
+/// A join's `ScreenSnapshot` still unread ahead of the close is read
+/// past, for [`recv`]'s reason; any other frame is a failure.
 async fn expect_eof(s: &mut UnixStream, what: &str) {
-    let r = tokio::time::timeout(Duration::from_secs(5), frame::read_frame_body(s)).await;
-    assert!(
-        matches!(r, Ok(Err(FrameError::Eof))),
-        "{what}: expected the daemon to close, got {r:?}"
-    );
+    loop {
+        let r = tokio::time::timeout(Duration::from_secs(5), frame::read_frame_body(&mut *s)).await;
+        if let Ok(Ok(body)) = &r {
+            if matches!(
+                decode_server_frame(body),
+                Ok(ServerFrame::ScreenSnapshot { .. })
+            ) {
+                continue;
+            }
+        }
+        assert!(
+            matches!(r, Ok(Err(FrameError::Eof))),
+            "{what}: expected the daemon to close, got {r:?}"
+        );
+        return;
+    }
 }
 
 /// Assert the peer closed, with only this session's still-unread output
@@ -351,6 +384,8 @@ async fn expect_eof_after_output(s: &mut UnixStream, session: &str, what: &str) 
             Ok(Err(FrameError::Eof)) => return,
             Ok(Ok(body)) => match decode_server_frame(&body).expect("a decodable server frame") {
                 ServerFrame::Output { session: id, .. } if id == session => {}
+                // The join's picture, if the row never read past it.
+                ServerFrame::ScreenSnapshot { session: id, .. } if id == session => {}
                 other => panic!(
                     "{what}: only this session's in-flight Output may follow a \
                      client-initiated Detach, and this is not that: {other:?}"
@@ -986,10 +1021,20 @@ async fn an_attach_client_receives_only_bytes_never_offsets() {
     assert!(matches!(recv(&mut c).await, ServerFrame::Attached { .. }));
 
     pty.queue_output(b"MARK");
-    let body = tokio::time::timeout(Duration::from_secs(5), frame::read_frame_body(&mut c))
-        .await
-        .expect("no Output within 5s")
-        .expect("a frame body");
+    // Past the join's picture (GH #235), which is not `Output` and has
+    // its own rows; the frame after it is the one this row is about.
+    let body = loop {
+        let body = tokio::time::timeout(Duration::from_secs(5), frame::read_frame_body(&mut c))
+            .await
+            .expect("no Output within 5s")
+            .expect("a frame body");
+        if !matches!(
+            decode_server_frame(&body),
+            Ok(ServerFrame::ScreenSnapshot { .. })
+        ) {
+            break body;
+        }
+    };
     let value: ciborium::value::Value =
         holdfast_core::protocol::frame::decode(&body).expect("decodable");
     let ciborium::value::Value::Map(entries) = value else {
@@ -1007,26 +1052,226 @@ async fn an_attach_client_receives_only_bytes_never_offsets() {
     );
 }
 
+/// A `MockPty` that hands the reader at most `.1` bytes per `read`, so a
+/// burst is published as many frames rather than one — the shape a
+/// line-at-a-time child produces through a real PTY, and the shape that
+/// filled a 64-frame queue in 64 lines (GH #210).
+#[derive(Debug)]
+struct ChunkedPty(Arc<MockPty>, usize);
+
+impl PtyBackend for ChunkedPty {
+    fn write(&self, data: &[u8]) -> holdfast_core::Result<()> {
+        self.0.write(data)
+    }
+    fn read(&self, buf: &mut [u8]) -> holdfast_core::Result<usize> {
+        let n = self.1.min(buf.len());
+        if n == 0 {
+            return Ok(0);
+        }
+        self.0.read(&mut buf[..n])
+    }
+    fn signal(&self, sig: Signal) -> holdfast_core::Result<()> {
+        self.0.signal(sig)
+    }
+    fn resize(&self, cols: u16, rows: u16) -> holdfast_core::Result<()> {
+        self.0.resize(cols, rows)
+    }
+    fn is_alive(&self) -> bool {
+        self.0.is_alive()
+    }
+    fn exit_code(&self) -> Option<i32> {
+        self.0.exit_code()
+    }
+    fn pid(&self) -> Option<u32> {
+        self.0.pid()
+    }
+}
+
+/// A registered session on `backend`, with a chosen ring and broadcast.
+fn session_with(
+    d: &TestDaemon,
+    backend: Arc<dyn PtyBackend>,
+    ring: usize,
+    broadcast: usize,
+) -> Arc<Session> {
+    let s = Session::new(
+        new_session_id(),
+        None,
+        "bash".into(),
+        vec![],
+        backend,
+        SessionConfig {
+            output_broadcast_capacity: broadcast,
+            ..SessionConfig::with_buffer_capacity(ring)
+        },
+    );
+    d.daemon
+        .server
+        .registry
+        .insert(Arc::clone(&s))
+        .expect("register");
+    s
+}
+
+/// What one draining client was shown: the `Output` bytes in order, every
+/// `OutputGap`, and every `Detached` reason.
+#[derive(Debug, Default)]
+struct Seen {
+    bytes: Vec<u8>,
+    gaps: Vec<u64>,
+    detached: Vec<String>,
+}
+
+/// Read a connection until `needle` has been rendered, or it ends, or
+/// `secs` pass — sleeping `per_64k` for every 64 KiB of output, so a row
+/// can be a reader of a chosen speed as well as a fast one. **Per byte
+/// and not per frame**, because the forwarder batches: a pause per frame
+/// reads faster the further behind the client falls.
+async fn drain_until(c: &mut UnixStream, needle: &[u8], secs: u64, per_64k: Duration) -> Seen {
+    let mut seen = Seen::default();
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(secs);
+    while tokio::time::Instant::now() < deadline {
+        let left = deadline - tokio::time::Instant::now();
+        let body = match tokio::time::timeout(left, frame::read_frame_body(&mut *c)).await {
+            Ok(Ok(b)) => b,
+            _ => break,
+        };
+        match decode_server_frame(&body).expect("a decodable server frame") {
+            ServerFrame::Output { bytes, .. } => {
+                seen.bytes.extend_from_slice(&bytes);
+                let tail = seen.bytes.len().saturating_sub(bytes.len() + needle.len());
+                if contains(&seen.bytes[tail..], needle) {
+                    return seen;
+                }
+                if !per_64k.is_zero() {
+                    tokio::time::sleep(per_64k.mul_f64(bytes.len() as f64 / 65536.0)).await;
+                }
+            }
+            ServerFrame::OutputGap { bytes, .. } => seen.gaps.push(bytes),
+            ServerFrame::Detached { reason } => {
+                seen.detached.push(reason);
+                break;
+            }
+            _ => {}
+        }
+    }
+    seen
+}
+
+/// Until `attach_clients` reads `want`, or `secs` pass. Returns how long
+/// it took, or `None`.
+async fn clients_reach(d: &TestDaemon, want: u64, secs: u64) -> Option<Duration> {
+    let started = tokio::time::Instant::now();
+    let deadline = started + Duration::from_secs(secs);
+    while tokio::time::Instant::now() < deadline {
+        if d.daemon.status().attach_clients == want {
+            return Some(started.elapsed());
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    None
+}
+
+/// **The dogfood repro, in process: a burst of ordinary test output
+/// reaches every draining client whole** (GH #210).
+///
+/// 1,500 lines of `cargo test`-shaped output detached `holdfast watch`
+/// four runs in four on the dogfood pass, having shown it between 4.5%
+/// and 32% of the lines. Two bounds in series did it: a 64-frame queue
+/// that a line-at-a-time child fills in 64 lines, and a 256-frame
+/// broadcast that a forwarder descheduled for a moment laps. The fix
+/// removes both as loss bounds, and this row holds both to it.
+///
+/// **The broadcast here is sixteen frames, deliberately**, so the ring
+/// path is exercised on every run rather than only on a loaded machine:
+/// a forwarder that treated a lag as a loss, or that re-sent what it had
+/// already sent, fails the equality below. And the child writes one line
+/// per `read`, which is the shape that made the frame count the binding
+/// constraint.
+///
+/// **Both roles, because they failed differently**: `observer` runs a
+/// redactor per frame and lost far more often than `interactive`, whose
+/// forwarder is a memcpy — 7 in 8 against 1 in 8 on the dogfood box.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_burst_of_short_lines_reaches_every_draining_client_whole() {
+    let d = TestDaemon::start("burst").await;
+    let pty = Arc::new(MockPty::new());
+    let s = session_with(
+        &d,
+        Arc::new(ChunkedPty(Arc::clone(&pty), 48)) as Arc<dyn PtyBackend>,
+        1024 * 1024,
+        16,
+    );
+
+    let mut clients = Vec::new();
+    for (mode, role) in [
+        (AttachMode::ReadWrite, AttachRole::Interactive),
+        (AttachMode::ReadOnly, AttachRole::Observer),
+    ] {
+        let mut c = d.dial().await;
+        send(&mut c, &attach_as(&s.id, mode, role)).await;
+        assert!(matches!(recv(&mut c).await, ServerFrame::Attached { .. }));
+        clients.push(tokio::spawn(async move {
+            drain_until(&mut c, b"case_1499 ... ok\r\n", 60, Duration::ZERO).await
+        }));
+    }
+
+    let mut expected = Vec::new();
+    for i in 0..1500 {
+        let line = format!("test module::tests::case_{i} ... ok\r\n");
+        pty.queue_output(line.as_bytes());
+        expected.extend_from_slice(line.as_bytes());
+    }
+
+    for (client, role) in clients.into_iter().zip(["interactive", "observer"]) {
+        let seen = client.await.expect("reader task");
+        assert_eq!(
+            seen.detached,
+            Vec::<String>::new(),
+            "{role}: detached mid-burst"
+        );
+        assert_eq!(
+            seen.gaps,
+            Vec::<u64>::new(),
+            "{role}: told it had lost output"
+        );
+        assert!(
+            seen.bytes == expected,
+            "{role}: the burst did not arrive whole, once, in order — {} of {} bytes",
+            seen.bytes.len(),
+            expected.len()
+        );
+    }
+}
+
+/// **A client that stops reading is detached in bounded time, and the
+/// session's reader and every other client are untouched** (§4.3,
+/// §11.2, GH #210).
+///
+/// This is the row #209's revert was about: with a large enough queue a
+/// client that drained nothing was never detached at all. The stall
+/// bound is the fix — the socket accepted nothing for that long, while
+/// the daemon had bytes for it — and it detaches however much or little
+/// the queue holds. Shortened through the hub's seam so the row does not
+/// sit out thirty seconds.
+///
+/// (b) and (c) are what make it able to fail in the other direction:
+/// detaching the whole *session*, or blocking the reader, both satisfy
+/// (a) on their own.
 #[tokio::test]
-async fn a_slow_consumer_is_detached_and_the_reader_keeps_running() {
-    // §4.3, §11.2. Four assertions, and (b) and (c) are what make this
-    // able to fail: detaching the whole *session*, or blocking the
-    // reader, both satisfy (a) on its own.
-    //
-    // **(d) is GH #200's and lives here rather than in a sibling row.**
-    // It needs the same 6.4 MB burst and the same non-draining client,
-    // and a second row building them is a second row whose timing can
-    // drift from this one's — measured: a standalone copy without this
-    // row's *draining* client went red under `nextest`'s own parallelism
-    // while this one passed beside it. One fixture, two questions: was
-    // the client detached, and was it told why.
-    let d = TestDaemon::start("slow").await;
+async fn a_client_that_stops_reading_is_detached_in_bounded_time() {
+    let d = TestDaemon::start("stall").await;
+    // Two seconds and not less: the *draining* client in this row shares
+    // the machine with the whole suite, and a bound it could be
+    // descheduled for would detach it too.
+    d.daemon
+        .attach_hub()
+        .set_stall_timeout(Duration::from_secs(2));
     let (s, pty) = d.session(None);
 
-    // The client that never reads.
+    // The client that never reads — not even its own `Attached`.
     let mut slow = d.dial().await;
     send(&mut slow, &attach_to(&s.id)).await;
-    // Deliberately does **not** read its own `Attached`.
 
     // A second client that drains everything.
     let mut fast = d.dial().await;
@@ -1035,26 +1280,14 @@ async fn a_slow_consumer_is_detached_and_the_reader_keeps_running() {
         recv(&mut fast).await,
         ServerFrame::Attached { .. }
     ));
-    let fast_reader = tokio::spawn(async move {
-        let mut seen = 0usize;
-        loop {
-            match tokio::time::timeout(Duration::from_secs(10), frame::read_frame_body(&mut fast))
-                .await
-            {
-                Ok(Ok(body)) => {
-                    if let Ok(ServerFrame::Output { bytes, .. }) = decode_server_frame(&body) {
-                        seen += bytes.len();
-                        if bytes.windows(4).any(|w| w == b"LAST") {
-                            return (seen, true);
-                        }
-                    }
-                }
-                _ => return (seen, false),
-            }
-        }
-    });
+    assert!(
+        clients_reach(&d, 2, 5).await.is_some(),
+        "both clients never registered"
+    );
+    let fast_reader =
+        tokio::spawn(async move { drain_until(&mut fast, b"LAST", 30, Duration::ZERO).await });
 
-    // Far more than 64 frames, and far more than any socket buffer.
+    // Far more than any socket buffer plus the per-connection budget.
     let head_before = s.buffer_head();
     for _ in 0..400 {
         pty.queue_output(&vec![b'z'; 16 * 1024]);
@@ -1062,10 +1295,72 @@ async fn a_slow_consumer_is_detached_and_the_reader_keeps_running() {
     }
     pty.queue_output(b"LAST");
 
-    // (a) the slow client is detached. It reads now, drains whatever the
-    // socket buffered, and must reach EOF — bounded, so a daemon that
-    // kept it attached is a red row rather than a hang. The frames are
-    // decoded on the way past so (d) can ask what it was told.
+    // (a) detached — **while it still has not read a byte**, which is the
+    // whole point: nothing the client does is needed for this.
+    let took = clients_reach(&d, 1, 20).await;
+    assert!(
+        took.is_some(),
+        "a client that stopped reading was never detached; the socket and two tasks \
+         are held for as long as it stays stopped"
+    );
+    let rows = audit_entries(&d, "attach_disconnect", 1).await;
+    assert_eq!(rows.len(), 1, "{rows:?}");
+    assert_eq!(rows[0]["reason"].as_str(), Some("slow_consumer"));
+
+    // (b) the draining client still receives every byte.
+    let seen = fast_reader.await.expect("reader task");
+    assert!(
+        contains(&seen.bytes, b"LAST"),
+        "the draining client stopped receiving when the stalled one was detached \
+         ({} bytes seen, {:?})",
+        seen.bytes.len(),
+        seen.detached
+    );
+    assert!(
+        seen.detached.is_empty(),
+        "the draining client was detached too"
+    );
+
+    // (c) the session's reader kept running.
+    assert!(
+        s.buffer_head() >= head_before + 400 * 16 * 1024,
+        "the PTY reader stalled behind a stalled attach client (head {} -> {})",
+        head_before,
+        s.buffer_head()
+    );
+    drop(slow);
+}
+
+/// **A stalled client that comes back inside the grace is told why, once**
+/// (§7.5, REQ-D-009, GH #200).
+///
+/// Detached for not reading, the client's `Detached` sits behind the
+/// socket it was not reading; the daemon keeps the connection one more
+/// stall bound so a client that resumes — a `watch` brought back from
+/// `Ctrl-Z` — reads everything queued and then the reason, rather than
+/// the bare EOF its own message calls *"the daemon closed the
+/// connection"*.
+#[tokio::test]
+async fn a_stalled_client_that_resumes_inside_the_grace_is_told_why_once() {
+    let d = TestDaemon::start("stallgrace").await;
+    d.daemon
+        .attach_hub()
+        .set_stall_timeout(Duration::from_secs(3));
+    let (s, pty) = d.session(None);
+    let mut slow = d.dial().await;
+    send(&mut slow, &attach_to(&s.id)).await;
+    assert!(clients_reach(&d, 1, 5).await.is_some());
+
+    for _ in 0..200 {
+        pty.queue_output(&vec![b'z'; 16 * 1024]);
+        tokio::time::sleep(Duration::from_millis(1)).await;
+    }
+    assert!(
+        clients_reach(&d, 0, 20).await.is_some(),
+        "the stalled client was never detached"
+    );
+
+    // Resume now — inside the second bound.
     let ending = tokio::time::timeout(Duration::from_secs(20), async {
         let mut endings: Vec<String> = Vec::new();
         loop {
@@ -1080,48 +1375,778 @@ async fn a_slow_consumer_is_detached_and_the_reader_keeps_running() {
             }
         }
     })
-    .await;
-    let ending = ending.expect("a client that stopped draining was never detached");
-    let ending = ending.expect("the connection failed rather than closing");
-
-    // (b) the draining client still receives every byte afterwards.
-    let (seen, saw_last) = fast_reader.await.expect("reader task");
-    assert!(
-        saw_last,
-        "the draining client stopped receiving when the slow one was detached ({seen} bytes seen)"
-    );
-
-    // (c) the session's reader kept running: the ring buffer advanced by
-    // everything that was queued.
-    assert!(
-        s.buffer_head() >= head_before + 400 * 16 * 1024,
-        "the PTY reader stalled behind a slow attach client (head {} -> {})",
-        head_before,
-        s.buffer_head()
-    );
-
-    // (d) **and it was told why** (GH #200). §7.5: after a successful
-    // handshake every close the daemon initiates is preceded by exactly
-    // one `Detached { reason }` unless a connection-level fault forced
-    // it, and it names this case on the attachment side — *"this client
-    // could not keep up"*. The frame was written with a `try_send` onto
-    // the very queue whose overflow caused the ending, so it was dropped
-    // in the one situation it exists to describe, and what a `holdfast
-    // watch` saw was a bare EOF that its own message calls *"the daemon
-    // closed the connection"* — the sentence for a daemon that went
-    // away.
-    //
-    // **Exactly one**, which is the half a `contains` would miss: a
-    // forwarder that queued the ending on every refused chunk would
-    // satisfy "it arrived" while putting a teardown frame in the middle
-    // of a live stream.
+    .await
+    .expect("the resumed client never reached the end of the connection")
+    .expect("the connection failed rather than closing");
+    // **Exactly one**, which is the half a `contains` would miss.
     assert_eq!(
         ending,
         vec!["slow_consumer".to_string()],
-        "a slow consumer must be told exactly once why its view ended; a bare \
-         EOF is indistinguishable from the daemon dying, which is what the \
-         client reports it as"
+        "a stalled client must be told exactly once why its view ended"
     );
+}
+
+/// **A stalled client that never comes back is closed on, not waited
+/// for** (GH #210).
+///
+/// The other half of the grace: two stall bounds after the socket
+/// filled, the daemon stops trying and closes, `Detached` unwritten. The
+/// witness is that `Detached` never arrives — a daemon that kept the
+/// socket open would still deliver it the moment the client read, which
+/// is exactly the unbounded hold #209's revert measured.
+#[tokio::test]
+async fn a_stalled_client_that_never_resumes_is_closed_on() {
+    let d = TestDaemon::start("stallgone").await;
+    d.daemon
+        .attach_hub()
+        .set_stall_timeout(Duration::from_millis(300));
+    let (s, pty) = d.session(None);
+    let mut slow = d.dial().await;
+    send(&mut slow, &attach_to(&s.id)).await;
+    assert!(clients_reach(&d, 1, 5).await.is_some());
+    for _ in 0..200 {
+        pty.queue_output(&vec![b'z'; 16 * 1024]);
+        tokio::time::sleep(Duration::from_millis(1)).await;
+    }
+    assert!(clients_reach(&d, 0, 20).await.is_some());
+    // Well past the grace.
+    tokio::time::sleep(Duration::from_secs(2)).await;
+
+    let outcome = tokio::time::timeout(Duration::from_secs(20), async {
+        let mut detached = 0usize;
+        loop {
+            match frame::read_frame_body(&mut slow).await {
+                Ok(body) => {
+                    if let Ok(ServerFrame::Detached { .. }) = decode_server_frame(&body) {
+                        detached += 1;
+                    }
+                }
+                Err(_) => return detached,
+            }
+        }
+    })
+    .await
+    .expect("the connection was held open for a client that never came back");
+    assert_eq!(
+        outcome, 0,
+        "Detached arrived, so the daemon was still holding the socket long after the \
+         grace — a client that never resumes would keep it forever"
+    );
+}
+
+/// **A client that falls behind is never detached, and every byte the
+/// session printed is either shown or counted** (GH #210).
+///
+/// The half of the requirement an occupancy bound could not meet: this
+/// client pauses while the session prints and then reads slowly, never
+/// stopped for as long as the stall bound, so it must never be detached
+/// however far behind it falls. It falls behind a 64 KiB ring, so it
+/// loses bytes — and each loss is an `OutputGap` naming exactly how many,
+/// which makes the accounting an identity: shown plus reported equals
+/// printed. `interactive`, so there is no redactor between the two
+/// numbers.
+///
+/// **The pause is waited out on the session, not on a clock.** The first
+/// version read at a fixed rate from the start and relied on the reader
+/// thread printing faster than that; under the full suite's load, with
+/// the join having switched VT100 tracking on for a debug build, the
+/// reader was the slower of the two and the row's own control fired —
+/// the client never fell a ring behind. The client now starts reading
+/// only once the ring's head says everything has been printed, so it is
+/// behind by construction.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_client_that_falls_behind_is_never_detached_and_loses_nothing_silently() {
+    let d = TestDaemon::start("slowreader").await;
+    // Longer than any pause below could plausibly take, so a detach here
+    // is the product's and not the scheduler's.
+    d.daemon
+        .attach_hub()
+        .set_stall_timeout(Duration::from_secs(20));
+    let pty = Arc::new(MockPty::new());
+    let s = session_with(&d, Arc::clone(&pty) as Arc<dyn PtyBackend>, 64 * 1024, 16);
+    // **Output from before the join, far past the ring.** It is the
+    // opening picture's business and not the stream's, so none of it may
+    // count as shown or as lost — which pins the stream's origin to where
+    // the join found the session: an origin of zero reports all of it as a
+    // gap and breaks the identity below by exactly this much.
+    let before = 200 * 1024;
+    pty.queue_output(&vec![b'p'; before]);
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+    while s.buffer_head() < before as u64 && tokio::time::Instant::now() < deadline {
+        tokio::time::sleep(Duration::from_millis(5)).await;
+    }
+    assert_eq!(
+        s.buffer_head(),
+        before as u64,
+        "the pre-join output never landed"
+    );
+
+    let mut c = d.dial().await;
+    send(&mut c, &attach_to(&s.id)).await;
+    assert!(matches!(recv(&mut c).await, ServerFrame::Attached { .. }));
+
+    let (go_tx, go_rx) = tokio::sync::oneshot::channel::<()>();
+    let reader = tokio::spawn(async move {
+        let _ = go_rx.await;
+        // Then slowly — a pause per 64 KiB of output, so the client stays
+        // behind for the whole drain as well as the burst.
+        drain_until(&mut c, b"LAST", 120, Duration::from_millis(50)).await
+    });
+    let mut printed = 0usize;
+    for _ in 0..64 {
+        pty.queue_output(&vec![b'z'; 16 * 1024]);
+        printed += 16 * 1024;
+    }
+    pty.queue_output(b"LAST");
+    printed += 4;
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
+    while s.buffer_head() < (before + printed) as u64 && tokio::time::Instant::now() < deadline {
+        tokio::time::sleep(Duration::from_millis(5)).await;
+    }
+    assert_eq!(
+        s.buffer_head(),
+        (before + printed) as u64,
+        "the burst never landed"
+    );
+    let _ = go_tx.send(());
+
+    let seen = reader.await.expect("reader task");
+    assert_eq!(
+        seen.detached,
+        Vec::<String>::new(),
+        "a client that paused for less than the stall bound was detached"
+    );
+    assert!(
+        contains(&seen.bytes, b"LAST"),
+        "the stream never reached its end"
+    );
+    // The fixture's own control: without a gap the identity below is
+    // `shown == printed`, which is the easy half.
+    assert!(
+        !seen.gaps.is_empty(),
+        "the reader never fell a whole ring behind, so nothing here tested a gap"
+    );
+    let reported: u64 = seen.gaps.iter().sum();
+    assert_eq!(
+        seen.bytes.len() as u64 + reported,
+        printed as u64,
+        "shown ({}) plus reported lost ({reported}, over {} gaps) is not what the session \
+         printed ({printed}) — bytes went missing without a gap, or a gap over-counted",
+        seen.bytes.len(),
+        seen.gaps.len()
+    );
+}
+
+/// **An operator's `output_broadcast_capacity` reaches the session**
+/// (GH #210, GH #128's family).
+///
+/// The key was accepted, validated and documented as a control while a
+/// hardcoded constant sized every channel. Driven through the tool an
+/// agent calls and the config a daemon loads, so the row fails if either
+/// end of the wiring is cut; `session::tests::the_output_broadcast_holds_the_configured_number_of_frames`
+/// is the half that says the number is the channel's, not only a field's.
+#[tokio::test]
+async fn the_operators_broadcast_capacity_reaches_the_session() {
+    use holdfast_core::mcp::tools::StartSessionArgs;
+    let mut config = holdfast_core::config::Config::default();
+    config.limits.output_broadcast_capacity = 7;
+    let dir = scratch_dir("bcast");
+    let daemon = Daemon::with_config(RuntimePaths::with_dir(dir.clone()), config);
+    let r = daemon
+        .server
+        .start_session(Parameters(StartSessionArgs {
+            command: Some("sh".into()),
+            ..Default::default()
+        }))
+        .await
+        .expect("start_session");
+    let body = r.structured_content.clone().expect("structured content");
+    let id = body["data"]["session_id"]
+        .as_str()
+        .expect("session_id")
+        .to_string();
+    let s = daemon.server.registry.get(&id).expect("the session");
+    assert_eq!(
+        s.output_broadcast_capacity(),
+        7,
+        "the configured capacity never reached the session's broadcast"
+    );
+    let _ = s.signal(Signal::Kill);
+    daemon.shutdown();
+    let _ = std::fs::remove_dir_all(dir);
+}
+
+// ------------------------------------------ GH #235: the opening screen
+
+/// Until the session's ring reaches `n`.
+async fn wait_for_head(s: &Session, n: u64) {
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+    while s.buffer_head() < n && tokio::time::Instant::now() < deadline {
+        tokio::time::sleep(Duration::from_millis(5)).await;
+    }
+    assert_eq!(s.buffer_head(), n, "the fixture's output never landed");
+}
+
+/// **A client joining an idle session is shown its screen, and the
+/// stream resumes exactly where the picture ends** (GH #235).
+///
+/// The dogfood pass: `holdfast attach` on a session idling at its prompt
+/// rendered its own banner and nothing else until somebody pressed
+/// Enter, and `holdfast watch` rendered nothing at all. Three claims, and
+/// each fails a plausible implementation:
+///
+/// * **the order** — `Attached`, then the picture, then output: a picture
+///   painted after the first `Output` overwrites it;
+/// * **the picture is the screen**, with the cursor where the child left
+///   it, which is where the child's next write lands;
+/// * **no byte is drawn twice or skipped at the seam**: the pre-join
+///   line must not come back as `Output` (a replay), and the first byte
+///   after the join must (a stream started from the wrong offset).
+#[tokio::test]
+async fn a_join_opens_with_the_screen_and_the_stream_resumes_where_it_ends() {
+    let d = TestDaemon::start("snapshot").await;
+    for (mode, role) in [
+        (AttachMode::ReadWrite, AttachRole::Interactive),
+        (AttachMode::ReadOnly, AttachRole::Observer),
+    ] {
+        // A session per role, so neither sees the other's marker.
+        let (s, pty) = d.session(None);
+        let before = b"before the join\r\nuser@box $ ";
+        pty.queue_output(before);
+        wait_for_head(&s, before.len() as u64).await;
+
+        let mut c = d.dial().await;
+        send(&mut c, &attach_as(&s.id, mode, role)).await;
+        assert!(
+            matches!(recv_raw(&mut c).await, ServerFrame::Attached { .. }),
+            "frame 1 must be Attached"
+        );
+        let ServerFrame::ScreenSnapshot {
+            session,
+            lines,
+            cursor_row,
+            cursor_col,
+            held_back,
+            ..
+        } = recv_raw(&mut c).await
+        else {
+            panic!("{role:?}: frame 2 must be the ScreenSnapshot");
+        };
+        assert_eq!(session, s.id);
+        assert_eq!(
+            lines[0].trim_end(),
+            "before the join",
+            "{role:?}: {lines:?}"
+        );
+        assert_eq!(lines[1].trim_end(), "user@box $", "{role:?}: {lines:?}");
+        assert_eq!(
+            (cursor_row, cursor_col),
+            (1, 11),
+            "{role:?}: the cursor must be where the child left it, after the prompt"
+        );
+        assert!(!held_back, "{role:?}: nothing is being withheld here");
+
+        let marker = format!("AFTER-{role:?}\r\n");
+        pty.queue_output(marker.as_bytes());
+        let seen = stream_until(&mut c, marker.as_bytes(), 10).await;
+        assert!(
+            !contains(&seen, b"before the join"),
+            "{role:?}: the pre-join line came back as Output — the stream started before \
+             the picture ended, which draws it twice"
+        );
+        assert!(
+            seen.starts_with(b"AFTER-"),
+            "{role:?}: the first byte after the join is not the first byte of the stream: {:?}",
+            String::from_utf8_lossy(&seen)
+        );
+    }
+}
+
+/// **The opening picture is masked by `get_screen_state`'s mask, for
+/// both roles** (GH #235, §9.2).
+///
+/// The snapshot is a re-rendering of history, not the live stream, so it
+/// takes the tool's grid and the tool's redaction — never a second
+/// renderer of the ring buffer, which would be a second masker. An
+/// `interactive` client is masked too: REQ-SEC-008's raw stream is the
+/// bytes that arrive while it is attached, and a picture is the one thing
+/// that could show it a credential it never saw arrive.
+#[tokio::test]
+async fn the_opening_screen_is_masked_like_get_screen_state() {
+    const TOKEN: &str = "ghp_0123456789abcdefghijABCDEFGHIJ012345";
+    let d = TestDaemon::start("snapmask").await;
+    let (s, pty) = d.session(None);
+    let line = format!("export GH_TOKEN={TOKEN}\r\n$ ");
+    pty.queue_output(line.as_bytes());
+    wait_for_head(&s, line.len() as u64).await;
+
+    // The tool's own grid, as the reference the frame must agree with.
+    let processor = holdfast_core::output::OutputProcessor::builtin().expect("processor");
+    let holdfast_core::screen::ScreenCapture::Full(tool) = s.screen_state(None, true, &processor)
+    else {
+        panic!("a capture with no diff_from is a full grid");
+    };
+    assert!(
+        !tool.lines.iter().any(|l| l.contains(TOKEN)),
+        "the fixture's reference grid is not masking the token at all"
+    );
+
+    for (mode, role) in [
+        (AttachMode::ReadWrite, AttachRole::Interactive),
+        (AttachMode::ReadOnly, AttachRole::Observer),
+    ] {
+        let mut c = d.dial().await;
+        send(&mut c, &attach_as(&s.id, mode, role)).await;
+        assert!(matches!(
+            recv_raw(&mut c).await,
+            ServerFrame::Attached { .. }
+        ));
+        let ServerFrame::ScreenSnapshot { lines, .. } = recv_raw(&mut c).await else {
+            panic!("frame 2 must be the ScreenSnapshot");
+        };
+        assert!(
+            !lines.iter().any(|l| l.contains(TOKEN)),
+            "{role:?}: the opening screen carried the token raw: {lines:?}"
+        );
+        assert_eq!(
+            lines, tool.lines,
+            "{role:?}: the opening screen is not get_screen_state's grid"
+        );
+    }
+}
+
+/// Distinct 64-column base64 lines, shaped like a key body.
+///
+/// Distinct so a row can be counted by which lines reached it, and
+/// generated rather than copied from a real key so no scanner reads the
+/// fixture as a leaked one. The alphabet and the width are RFC 7468's,
+/// which is all the grid's key judge asks of a body (GH #224).
+fn key_body(n: usize) -> Vec<String> {
+    const B64: &[u8] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    let mut x: u64 = 0x9e37_79b9_7f4a_7c15;
+    (0..n)
+        .map(|i| {
+            let mut line = if i == 0 {
+                String::from("MIIEowIBAAKCAQEA")
+            } else {
+                String::new()
+            };
+            while line.len() < 64 {
+                x ^= x << 13;
+                x ^= x >> 7;
+                x ^= x << 17;
+                line.push(B64[(x % 64) as usize] as char);
+            }
+            line
+        })
+        .collect()
+}
+
+/// **A client joining after a private key was printed is shown none of
+/// its body** — the case the live observer stream masks and the opening
+/// picture must not undo (GH #235's review, GH #224).
+///
+/// A `watch` attached while `cat key.pem` ran sees the body masked; one
+/// that joins a moment later was shown it raw by the first version of the
+/// picture, because the picture is `get_screen_state`'s grid and that
+/// grid's mask reached only the trailing 512 bytes. Measured on this
+/// branch's release build: 19 of 19 body lines for a key cut short
+/// (`head -n 20 key.pem`), 21 for a whole key whose header had scrolled
+/// off a 24-row screen — against 0 on the live observer in both. **Before
+/// this branch a late `watch` was shown nothing from before its join**, so
+/// the leak was new to the observer surface.
+///
+/// **What closes it is the grid's mask, not anything in `attach/`**, and
+/// that is deliberate: the picture has no renderer of its own to fix
+/// (`attach::conn::screen_snapshot`), so it is exactly as safe as
+/// `get_screen_state` and becomes safe when that does. This row is here
+/// so the two cannot drift apart — **it is red on a tree without GH
+/// #224's grid fix**, which is how it says the join must not ship
+/// without it.
+///
+/// **Both roles.** The picture is masked for `interactive` too (a
+/// re-rendering of history, not the raw live stream it is entitled to),
+/// so a row that checked only the observer would pass an implementation
+/// that unmasked the other.
+///
+/// The non-vacuity half is the unmasked grid: it must hold most of the
+/// body, or the fixture never put the key on the screen and "no raw body
+/// line" would be true of a blank picture.
+#[tokio::test]
+async fn a_client_joining_after_a_key_was_printed_is_shown_none_of_its_body() {
+    let d = TestDaemon::start("snapkey").await;
+    let processor = Arc::clone(&d.daemon.server.processor);
+    // (label, screen rows, body lines, closed with an END line)
+    for (case, rows, lines, closed) in [
+        // `head -n 20 key.pem`: a header and a body nobody will close,
+        // then the prompt.
+        ("cut short", 40u16, 19usize, false),
+        // `cat key.pem` on a screen shorter than the key: the header has
+        // scrolled off the top and only body, footer and prompt remain.
+        ("header scrolled off", 24, 30, true),
+    ] {
+        let body = key_body(lines);
+        let (s, pty) = d.session(None);
+        s.resize(80, rows).expect("resize the fixture's screen");
+        let mut out = b"$ cat key.pem\r\n-----BEGIN RSA PRIVATE KEY-----\r\n".to_vec();
+        for l in &body {
+            out.extend_from_slice(l.as_bytes());
+            out.extend_from_slice(b"\r\n");
+        }
+        if closed {
+            out.extend_from_slice(b"-----END RSA PRIVATE KEY-----\r\n");
+        }
+        out.extend_from_slice(b"$ ");
+        pty.queue_output(&out);
+        wait_for_head(&s, out.len() as u64).await;
+
+        let raw_in = |grid: &[String]| -> usize {
+            body.iter()
+                .filter(|b| grid.iter().any(|row| row.contains(b.as_str())))
+                .count()
+        };
+        let holdfast_core::screen::ScreenCapture::Full(unmasked) =
+            s.screen_state(None, false, &processor)
+        else {
+            panic!("a capture with no diff_from is a full grid");
+        };
+        let on_screen = raw_in(&unmasked.lines);
+        assert!(
+            on_screen >= lines.min(rows as usize) - 4,
+            "{case}: the fixture put only {on_screen} body lines on the screen — the row \
+             would pass on a picture that never showed the key: {:?}",
+            unmasked.lines
+        );
+
+        for (mode, role) in [
+            (AttachMode::ReadOnly, AttachRole::Observer),
+            (AttachMode::ReadWrite, AttachRole::Interactive),
+        ] {
+            let mut c = d.dial().await;
+            send(&mut c, &attach_as(&s.id, mode, role)).await;
+            assert!(matches!(
+                recv_raw(&mut c).await,
+                ServerFrame::Attached { .. }
+            ));
+            let ServerFrame::ScreenSnapshot { lines: picture, .. } = recv_raw(&mut c).await else {
+                panic!("{case}/{role:?}: frame 2 must be the ScreenSnapshot");
+            };
+            let leaked = raw_in(&picture);
+            assert_eq!(
+                leaked, 0,
+                "{case}/{role:?}: the opening screen carried {leaked} of the {on_screen} key-body \
+                 lines on screen raw. The picture is get_screen_state's grid, so this is that \
+                 grid's mask (GH #224) — a tree without its fix must not ship the join: {picture:?}"
+            );
+        }
+    }
+}
+
+/// **A `watch` that joins part way through a key is streamed none of
+/// the rest of it** — the stream's half of the join, where the row above
+/// is the picture's (the integration review of GH #235 × GH #242).
+///
+/// Two ways a human opens `holdfast watch` on an agent's session while a
+/// key is on its way:
+///
+/// * **between a pager's screens** — `less` has drawn the header and the
+///   first screen of body, and the agent pages on. Measured on the
+///   integrated release build: a watch joined there was sent 28 of a
+///   4096-bit key's 50 body lines raw over the next two screens, in 3 of
+///   3 trials, and one attached before `less` started was sent none;
+/// * **while the key is still printing** — measured the same way at a
+///   line every 0.25 s: 14 of 26 raw.
+///
+/// Both leaked because the observer's redactor started empty at the join:
+/// it had not seen the header, so the body after it was ordinary base64.
+/// It is now seeded from the ring behind the join
+/// (`StreamRedactor::resume_at`).
+///
+/// **The control is an interactive client that joins at the same
+/// moment**, whose stream is raw by design (REQ-SEC-008): it must carry
+/// most of the body, or the fixture never put the body on the stream
+/// after the join and "none leaked" would be true of an empty stream.
+#[tokio::test]
+async fn a_watch_joining_part_way_through_a_key_is_streamed_none_of_the_rest() {
+    let d = TestDaemon::start("latejoin").await;
+    let body = key_body(45);
+    let line = |l: &String| format!("{l}\r\n");
+    // (label, before the join, after the join)
+    let cases = [
+        (
+            "between a pager's screens",
+            format!(
+                "$ less -XM key.pem\r\n-----BEGIN RSA PRIVATE KEY-----\r\n{}\
+                 \x1b[7mkey.pem lines 1-23 51%\x1b[27m\x1b[K",
+                body[..22].iter().map(line).collect::<String>()
+            ),
+            format!(
+                "\r\x1b[K{}\x1b[7m:\x1b[27m\x1b[K\r\x1b[K$ echo done\r\ndone\r\n$ ",
+                body[22..].iter().map(line).collect::<String>()
+            ),
+        ),
+        (
+            "still printing",
+            format!(
+                "$ cat key.pem\r\n-----BEGIN RSA PRIVATE KEY-----\r\n{}",
+                body[..10].iter().map(line).collect::<String>()
+            ),
+            format!(
+                "{}-----END RSA PRIVATE KEY-----\r\n$ echo done\r\ndone\r\n$ ",
+                body[10..].iter().map(line).collect::<String>()
+            ),
+        ),
+    ];
+    for (case, before, after) in cases {
+        let (s, pty) = d.session(None);
+        s.resize(80, 24).expect("resize the fixture's screen");
+        pty.queue_output(before.as_bytes());
+        wait_for_head(&s, before.len() as u64).await;
+
+        let mut watch = d.dial().await;
+        send(
+            &mut watch,
+            &attach_as(&s.id, AttachMode::ReadOnly, AttachRole::Observer),
+        )
+        .await;
+        assert!(matches!(
+            recv_raw(&mut watch).await,
+            ServerFrame::Attached { .. }
+        ));
+        let mut raw = d.dial().await;
+        send(
+            &mut raw,
+            &attach_as(&s.id, AttachMode::ReadWrite, AttachRole::Interactive),
+        )
+        .await;
+        assert!(matches!(
+            recv_raw(&mut raw).await,
+            ServerFrame::Attached { .. }
+        ));
+
+        // A line at a time, each its own read: the rest of a key being
+        // printed does not arrive in one piece, and a redactor that held
+        // the header for one frame and lost it the next is caught only by
+        // the frames after the first.
+        let mut head = before.len() as u64;
+        for piece in after.split_inclusive('\n') {
+            pty.queue_output(piece.as_bytes());
+            head += piece.len() as u64;
+            wait_for_head(&s, head).await;
+        }
+        let done = b"done\r\n$ ";
+        let in_stream = |seen: &[u8]| body.iter().filter(|l| contains(seen, l.as_bytes())).count();
+        let control = in_stream(&stream_until(&mut raw, done, 10).await);
+        assert!(
+            control >= 20,
+            "{case}: control — the interactive client was streamed only {control} body \
+             lines, so the fixture never put the rest of the key on the stream"
+        );
+        let watched = stream_until(&mut watch, done, 10).await;
+        assert_eq!(
+            in_stream(&watched),
+            0,
+            "{case}: the watch that joined part way through was streamed key body raw — \
+             its redactor had not seen the header: {:?}",
+            String::from_utf8_lossy(&watched)
+        );
+        assert!(
+            contains(&watched, b"[REDACTED:"),
+            "{case}: the rest of the key was dropped without a marker: {:?}",
+            String::from_utf8_lossy(&watched)
+        );
+    }
+}
+
+/// **The picture goes before a replayed secret prompt**, or it paints
+/// over it (GH #235, §7.5's replay).
+#[tokio::test]
+async fn the_opening_screen_precedes_a_replayed_secret_prompt() {
+    let d = TestDaemon::start("snapreplay").await;
+    let (s, pty) = d.session(None);
+    pty.set_echo(Some(false));
+    pty.queue_output(b"Passphrase: ");
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+    while !s.is_awaiting_secret() && tokio::time::Instant::now() < deadline {
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    assert!(s.is_awaiting_secret(), "the fixture never dropped echo");
+
+    let mut c = d.dial().await;
+    send(&mut c, &attach_to(&s.id)).await;
+    assert!(matches!(
+        recv_raw(&mut c).await,
+        ServerFrame::Attached { .. }
+    ));
+    let ServerFrame::ScreenSnapshot { lines, .. } = recv_raw(&mut c).await else {
+        panic!("frame 2 must be the ScreenSnapshot, ahead of the replayed prompt");
+    };
+    assert_eq!(lines[0].trim_end(), "Passphrase:");
+    match recv_raw(&mut c).await {
+        ServerFrame::AwaitingSecret {
+            prompt_text,
+            raised_by,
+            ..
+        } => {
+            assert_eq!(prompt_text.trim_end(), "Passphrase:");
+            // GH #236: the text is the child's own line, and the frame
+            // says so, so a client need not print it a second time.
+            assert_eq!(raised_by.as_deref(), Some("echo_drop"));
+        }
+        other => panic!("frame 3 must be the replayed AwaitingSecret, got {other:?}"),
+    }
+}
+
+/// **A replayed request says who raised it: the agent, when the agent
+/// did** (GH #236, §7.5's replay; GH #235's review).
+///
+/// The order a human taking over is most likely to meet: the child is
+/// already reading a password with nobody attached — so no edge raised
+/// anything — the agent calls `request_secret_input`, which raises the
+/// request itself, and the human attaches to answer it. The replay is
+/// then the only `AwaitingSecret` that client will ever get, and it must
+/// carry the agent's words **as the agent's**. The review found the
+/// replay's provenance untested: a replay that always said `echo_drop`
+/// passed every row, because the only other replay row raises from the
+/// echo drop, and would have told this human *"the session is reading a
+/// secret at the prompt above"* instead of what the agent asked for.
+///
+/// Through the tool itself, not the slot, so the raise is the one an
+/// agent makes.
+#[tokio::test]
+async fn a_replayed_request_the_agent_raised_says_it_is_the_agents() {
+    let d = TestDaemon::start("replayagent").await;
+    let (s, pty) = d.session(None);
+    pty.set_echo(Some(false));
+    pty.queue_output(b"Password: ");
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+    while !s.is_awaiting_secret() && tokio::time::Instant::now() < deadline {
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    assert!(s.is_awaiting_secret(), "the fixture never dropped echo");
+    assert!(
+        d.daemon.attach_hub().outstanding_secret(&s.id).is_none(),
+        "something raised on the edge with nobody attached, so the agent's call below \
+         would adopt rather than raise — the row would be the echo-drop replay again"
+    );
+
+    let server = d.daemon.server.clone();
+    let session = s.id.clone();
+    let call = tokio::spawn(async move {
+        server
+            .request_secret_input(Parameters(RequestSecretInputArgs {
+                session,
+                prompt_text: "deploy key passphrase".into(),
+                timeout_secs: Some(20),
+                ..Default::default()
+            }))
+            .await
+            .expect("request_secret_input")
+    });
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+    while !d.daemon.attach_hub().secrets().has_waiter(&s.id) {
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "the call never registered a waiter"
+        );
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+
+    let mut c = d.dial().await;
+    send(&mut c, &attach_to(&s.id)).await;
+    let request_id = match recv(&mut c).await {
+        ServerFrame::Attached { .. } => match recv(&mut c).await {
+            ServerFrame::AwaitingSecret {
+                request_id,
+                prompt_text,
+                raised_by,
+            } => {
+                assert_eq!(
+                    raised_by.as_deref(),
+                    Some("tool_call"),
+                    "the replay of a request the agent raised did not say so"
+                );
+                assert_eq!(prompt_text, "deploy key passphrase");
+                request_id
+            }
+            other => panic!("expected the replayed AwaitingSecret, got {other:?}"),
+        },
+        other => panic!("expected Attached, got {other:?}"),
+    };
+
+    // Answer it, so the call ends on the path it was waiting for rather
+    // than on its deadline.
+    send(
+        &mut c,
+        &ClientFrame::SecretInput {
+            request_id,
+            bytes: b"hunter2\r".to_vec(),
+            allow_echo: false,
+        },
+    )
+    .await;
+    let r = tokio::time::timeout(Duration::from_secs(15), call)
+        .await
+        .expect("the call returned")
+        .expect("the call's task");
+    let body = r.structured_content.expect("structured content");
+    assert_eq!(body["status"], "secret_provided", "{body}");
+}
+
+/// **An agent's words are labelled as the agent's** (GH #236).
+///
+/// A request raised by `request_secret_input` on a vacant slot carries
+/// the agent's `prompt_text`; one raised by the child dropping echo
+/// carries the child's own line. The frame says which, so the person
+/// about to type a credential knows whether they are reading the
+/// program's prompt or a description of it. The fan-out reads the
+/// provenance off the slot rather than taking it as an argument, so
+/// neither raise path can pass one that disagrees with the request.
+#[tokio::test]
+async fn a_tool_calls_prompt_is_marked_as_the_agents_and_an_echo_drops_as_the_childs() {
+    let d = TestDaemon::start("provenance").await;
+    let (s, pty) = d.session(None);
+    let mut c = attach_ok(&d, &s.id, AttachMode::ReadWrite).await;
+
+    // The agent raises first, on a vacant slot.
+    let hub = d.daemon.attach_hub();
+    let adopted = hub
+        .secrets()
+        .raise_or_adopt(&s.id, "deploy key passphrase", None, true)
+        .expect("a vacant slot is raised, not collided");
+    assert!(adopted.raised_here);
+    hub.broadcast_awaiting_secret(&s.id, &adopted.request_id, &adopted.prompt_text);
+    match recv(&mut c).await {
+        ServerFrame::AwaitingSecret {
+            prompt_text,
+            raised_by,
+            ..
+        } => {
+            assert_eq!(prompt_text, "deploy key passphrase");
+            assert_eq!(raised_by.as_deref(), Some("tool_call"));
+        }
+        other => panic!("expected the agent's AwaitingSecret, got {other:?}"),
+    }
+    let _ = hub.close_secret(&s.id, None);
+
+    // Then the child, on a second session so the slot is fresh.
+    let (s2, pty2) = d.session(None);
+    let mut c2 = attach_ok(&d, &s2.id, AttachMode::ReadWrite).await;
+    pty2.set_echo(Some(false));
+    pty2.queue_output(b"Password: ");
+    match recv(&mut c2).await {
+        ServerFrame::AwaitingSecret { raised_by, .. } => {
+            assert_eq!(raised_by.as_deref(), Some("echo_drop"));
+        }
+        ServerFrame::Output { .. } => match recv(&mut c2).await {
+            ServerFrame::AwaitingSecret { raised_by, .. } => {
+                assert_eq!(raised_by.as_deref(), Some("echo_drop"));
+            }
+            other => panic!("expected the child's AwaitingSecret, got {other:?}"),
+        },
+        other => panic!("expected the child's AwaitingSecret, got {other:?}"),
+    }
+    drop(pty);
 }
 
 #[tokio::test]
@@ -1191,6 +2216,9 @@ async fn stream_until(c: &mut UnixStream, needle: &[u8], secs: u64) -> Vec<u8> {
             // `Resize` or a `ProtocolError` arriving mid-stream is a
             // defect in whatever row is running.
             ServerFrame::AwaitingSecret { .. } | ServerFrame::SecretRequestClosed { .. } => {}
+            // The join's picture (GH #235) is not the stream; the rows
+            // about it read it with `recv_raw`.
+            ServerFrame::ScreenSnapshot { .. } => {}
             other => panic!("expected Output, got {other:?}"),
         }
         if acc.windows(needle.len()).any(|w| w == needle) {
@@ -2442,6 +3470,7 @@ async fn next_awaiting_secret(c: &mut UnixStream, secs: u64) -> (String, String)
             ServerFrame::AwaitingSecret {
                 request_id,
                 prompt_text,
+                ..
             } => return (request_id, prompt_text),
             ServerFrame::Output { .. } | ServerFrame::Resize { .. } => {}
             other => panic!("expected AwaitingSecret, got {other:?}"),
@@ -3220,9 +4249,13 @@ async fn each_disconnect_reason_is_recorded_once() {
     }
 
     // 4. slow_consumer — Task 6's teardown, which had no audit row at
-    // all until this task.
+    // all until this task. A stall since GH #210, so the bound is
+    // shortened through the hub's seam rather than sat out.
     {
         let d = TestDaemon::start("reasonslow").await;
+        d.daemon
+            .attach_hub()
+            .set_stall_timeout(Duration::from_millis(300));
         let (_s, pty) = d.session(None);
         let mut slow = d.dial().await;
         send(&mut slow, &attach_to(&_s.id)).await;
@@ -3629,10 +4662,10 @@ fn the_attach_protocol_carries_no_confirmation_frame() {
     // this the loop above passes against an empty array. 6 → 7 and 9 → 10
     // are 0.0.7's two additive variants (§23.3, Global Constraint 13);
     // 10 → 11 is `OutputGap`, GH #200's, and §7.5 now carries it as its
-    // twelfth row — eleven of twelve ship, TransferProgress (0.0.9) does
-    // not.
+    // twelfth row; 11 → 12 is `ScreenSnapshot`, GH #235's thirteenth —
+    // twelve of thirteen ship, TransferProgress (0.0.9) does not.
     assert_eq!(ClientFrameKind::ALL.len(), 7);
-    assert_eq!(KNOWN_SERVER_TYPES.len(), 11);
+    assert_eq!(KNOWN_SERVER_TYPES.len(), 12);
 }
 
 // ------------------------- GH #24: the slot a dead session leaves behind

@@ -18,8 +18,19 @@
 
 use std::sync::Arc;
 
+use crate::output::pem::RegionEnd;
 use crate::output::redact::marker;
-use crate::output::{OutputProcessor, ProcessingLimits};
+use crate::output::{OutputProcessor, ProcessingLimits, UNVOUCHED_CARRY_BYTES};
+
+/// What [`StreamRedactor::judge`] decided about the bytes it holds.
+struct Judged {
+    spans: Vec<crate::output::redact::Span>,
+    /// A last line that may still turn out to be key body starts here.
+    hold_from: Option<u64>,
+    /// The earliest anchor the lookbehind must keep; see
+    /// [`StreamRedactor::retire`].
+    keep_from: Option<u64>,
+}
 
 /// The pseudo-kind emitted for a match the window could not judge:
 /// `[REDACTED:unresolved]` (§9.2, REQ-O-011a). **Reserved — no redaction
@@ -80,6 +91,22 @@ pub const STREAM_CARRY_BYTES: usize = 8192;
 /// the session on `-----BEGIN CERTIFICATE-----`, which matches the
 /// prefix and can never match the pattern.
 const WITHHOLD_WINDOW_BYTES: usize = 2 * STREAM_CARRY_BYTES;
+
+/// How much of the stream behind a join point a joining observer's
+/// redactor is seeded with — [`StreamRedactor::resume_at`].
+///
+/// **Derived, and the two terms are the two things a redactor carries
+/// forward.** A key header whose body lines are still being followed is
+/// kept until it is `UNVOUCHED_CARRY_BYTES` behind the stream's end
+/// (`keep_from`), and a partial that overflowed the carry is withheld
+/// over a window of [`WITHHOLD_WINDOW_BYTES`]. Seeded with the larger of
+/// the two, a joiner holds every anchor and every open partial a redactor
+/// fed from the start of the session would still hold at the join.
+pub const RESUME_CONTEXT_BYTES: usize = if UNVOUCHED_CARRY_BYTES > WITHHOLD_WINDOW_BYTES {
+    UNVOUCHED_CARRY_BYTES
+} else {
+    WITHHOLD_WINDOW_BYTES
+};
 
 /// Redacts a live byte stream for the `observer` role (§9.2).
 ///
@@ -173,6 +200,19 @@ pub struct StreamRedactor {
     /// state incoming bytes are dropped — not emitted, and not
     /// accumulated past [`STREAM_CARRY_BYTES`].
     withholding: bool,
+    /// Where the span the last marker was emitted for began — so a span
+    /// the reader has seen a marker for is continued silently across
+    /// feeds, and one it has not is marked (see `render`).
+    marked_from: Option<u64>,
+    /// Absolute offset below which nothing is ever emitted: the stream
+    /// before it reached this reader another way — a joining client's
+    /// opening picture (GH #235) — and is held here as context only. `0`
+    /// for a redactor that has seen the stream from its start.
+    shown_until: u64,
+    /// A reader that joined while the stream was being withheld has not
+    /// been told so; its next output starts with the marker the others
+    /// got when the withholding began.
+    owes_marker: bool,
 }
 
 impl std::fmt::Debug for StreamRedactor {
@@ -197,7 +237,50 @@ impl StreamRedactor {
             split: 0,
             base: 0,
             withholding: false,
+            marked_from: None,
+            shown_until: 0,
+            owes_marker: false,
         }
+    }
+
+    /// A redactor for a reader that joins the stream at `floor`, seeded
+    /// with `behind` — the bytes that end at `floor`; only the last
+    /// [`RESUME_CONTEXT_BYTES`] of them are read — as context it never
+    /// emits.
+    ///
+    /// **Why a joiner cannot start empty.** What this type masks is
+    /// decided partly by bytes it has already seen: a key header whose
+    /// body lines are still arriving, a partial still open in the carry.
+    /// A redactor that starts at the join has seen neither, so the next
+    /// screenful of `less` over a key, or the rest of a key still being
+    /// printed, reaches it as ordinary base64 and goes out raw — to the
+    /// reader who joined late, while every reader attached earlier sees
+    /// markers. Measured through `holdfast watch` on `less` of a 4096-bit
+    /// key, paged twice after the watch joined: 28 of the 50 body lines
+    /// raw, against none for a watch attached before `less` started.
+    ///
+    /// **Seeded by feeding, not by copying state in**, so the joiner's
+    /// state is the one `feed` builds and the two cannot disagree about
+    /// what a key is. What the seed emits is discarded, and nothing before
+    /// `floor` is emitted afterwards either: the opening picture already
+    /// showed the reader those bytes, masked by the grid. A marker the
+    /// seed emitted is forgotten for the same reason — this reader never
+    /// saw it — so a run of key body still arriving at the join is marked
+    /// once for this reader rather than continued in silence.
+    pub fn resume_at(processor: Arc<OutputProcessor>, behind: &[u8], floor: u64) -> Self {
+        let mut r = Self::new(processor);
+        let behind = &behind[behind.len().saturating_sub(RESUME_CONTEXT_BYTES)..];
+        r.base = floor.saturating_sub(behind.len() as u64);
+        // Reader-sized pieces, the regime `feed` is built against —
+        // `attach::conn`'s `BACKFILL_CHUNK_BYTES` is this size for the
+        // same reason.
+        for piece in behind.chunks(STREAM_CARRY_BYTES) {
+            let _ = r.feed(piece);
+        }
+        r.shown_until = r.base + r.buf.len() as u64;
+        r.marked_from = None;
+        r.owes_marker = r.withholding;
+        r
     }
 
     /// Feed a chunk; return the bytes that may be emitted now, redacted.
@@ -205,6 +288,22 @@ impl StreamRedactor {
         if chunk.is_empty() {
             return Vec::new();
         }
+        let mut out = self.owed_marker();
+        out.extend(self.judge_chunk(chunk));
+        out
+    }
+
+    /// The marker a reader that joined during a withholding is owed, once.
+    fn owed_marker(&mut self) -> Vec<u8> {
+        if std::mem::take(&mut self.owes_marker) {
+            marker(UNRESOLVED_KIND).into_bytes()
+        } else {
+            Vec::new()
+        }
+    }
+
+    /// [`Self::feed`] without the owed marker.
+    fn judge_chunk(&mut self, chunk: &[u8]) -> Vec<u8> {
         if self.withholding {
             return self.feed_while_withholding(chunk);
         }
@@ -219,15 +318,11 @@ impl StreamRedactor {
         // still contains the prefix can see the token in flight.
         let stream_end = self.base + self.buf.len() as u64;
         let carry_start = self.base + self.split as u64;
-        let stop = self
+        let partial = self
             .processor
             .index
             .earliest_partial(&self.processor.rules, &self.buf, self.base)
             .unwrap_or(stream_end);
-        // Clamped below by `carry_start`: a partial that opened inside
-        // the already-emitted lookbehind cannot be un-emitted, and the
-        // best that is left is to withhold its value bytes.
-        let emit_end = stop.clamp(carry_start, stream_end);
 
         // **The union of views, not the raw bytes alone (GH #135).** An
         // escape planted inside a credential breaks the rule's anchor in
@@ -238,9 +333,18 @@ impl StreamRedactor {
         // one written here for the reason this file's header already
         // gives: two rule sets cannot be kept from drifting, so there is
         // one.
-        let spans = self.processor.all_spans(&self.buf, self.base);
-        let mut out = self.render(&spans, emit_end);
-        self.retire(emit_end);
+        let judged = self.judge(RegionEnd::Arriving);
+        // A key-body line still arriving after a candidate that stopped
+        // short is held like a partial: half of it may be masked once the
+        // rest arrives, and half a line of key body is not a thing to
+        // emit and then regret.
+        let stop = judged.hold_from.map_or(partial, |h| partial.min(h));
+        // Clamped below by `carry_start`: a partial that opened inside
+        // the already-emitted lookbehind cannot be un-emitted, and the
+        // best that is left is to withhold its value bytes.
+        let emit_end = stop.clamp(carry_start, stream_end);
+        let mut out = self.render(&judged.spans, emit_end);
+        self.retire(emit_end, judged.keep_from);
 
         if self.buf.len() - self.split > STREAM_CARRY_BYTES {
             // §9.2's terminating rule: the marker **once**, the carried
@@ -267,16 +371,21 @@ impl StreamRedactor {
     /// that never overflowed the carry is emitted raw, because at end of
     /// stream it will never be judged and `ghp_abc` — a prefix that is
     /// not a secret — is the common case. What bounds it is
-    /// [`STREAM_CARRY_BYTES`].
+    /// [`STREAM_CARRY_BYTES`]. **Except a PEM candidate carrying key
+    /// material**, which since GH #242 is masked here: it is a key cut
+    /// short, not a prefix that might be nothing.
     pub fn flush(&mut self) -> Vec<u8> {
+        let mut out = self.owed_marker();
         if self.withholding {
             self.reset();
-            return Vec::new();
+            return out;
         }
         let stream_end = self.base + self.buf.len() as u64;
-        let spans = self.processor.all_spans(&self.buf, self.base);
-        let out = self.render(&spans, stream_end);
-        self.retire(stream_end);
+        // `Final`: nothing more will arrive, so a last line held because it
+        // might have been key body is judged now as the line it is.
+        let judged = self.judge(RegionEnd::Final);
+        out.extend(self.render(&judged.spans, stream_end));
+        self.retire(stream_end, None);
         out
     }
 
@@ -313,16 +422,113 @@ impl StreamRedactor {
             // The withheld bytes become lookbehind rather than output, so
             // a rule spanning the boundary can still match what comes
             // next. They are never emitted: `render` only ever emits from
-            // `split` onwards.
+            // `split` onwards. A key that stopped short inside them keeps
+            // its anchor, for the reason `retire` gives.
+            let keep_from = self.keep_from(
+                &self
+                    .processor
+                    .index
+                    .candidate_scan(
+                        &self.processor.rules,
+                        &self.buf,
+                        self.base,
+                        RegionEnd::Arriving,
+                    )
+                    .stopped_short,
+            );
             self.split = self.buf.len();
-            self.trim_lookbehind();
+            self.trim_lookbehind(keep_from);
         }
         Vec::new()
     }
 
+    /// What `render` substitutes a marker for, where a last line that may
+    /// be key body starts, and which anchor the lookbehind must keep.
+    ///
+    /// **The spans** are every match over the emitted views, plus every
+    /// `-----BEGIN` candidate that **died** in the carry with key material
+    /// behind it (GH #242), plus the key-body lines after one that stopped
+    /// short of its closing boundary (`pem::body_lines`). The second half
+    /// is what makes GH #242's narrowing safe on this surface. A candidate
+    /// the stream is holding used to leave the carry only by completing
+    /// (and being matched here) or by overflowing it (and being withheld).
+    /// Since a candidate can now stop at the first byte that is not PEM
+    /// text, it has a third exit — `head -n 15 id_rsa` and then a prompt —
+    /// on which `earliest_partial` answers `None`, nothing has matched,
+    /// and the held body would go out raw. The third half is the same
+    /// argument one step later: the next screenful of a pager, or every
+    /// line of a key printed with a timestamp in front of it, is key body
+    /// arriving after the candidate stopped. All three are the
+    /// `PrefixIndex::unterminated_candidates` answer
+    /// `OutputProcessor::process` masks, so the stream and the read agree
+    /// about which bytes are a key.
+    ///
+    /// **With `Final`**, a key body still arriving when the stream ends is
+    /// masked rather than flushed: nothing will close it, and a PEM
+    /// candidate with key material behind it is a key cut short — the case
+    /// the dead-candidate arm masks when a prompt follows it, reached with
+    /// nothing following it. A candidate without material (`ghp_abc`, a
+    /// bare header) is still flushed, which is the residual `flush`
+    /// states.
+    fn judge(&self, end: RegionEnd) -> Judged {
+        use crate::output::redact::{merge_spans, Span};
+        // Matched over the lookbehind and the carry — not over an anchor
+        // `retire` kept further back, which is there for the candidate
+        // scan below and would otherwise make every feed re-match up to
+        // `UNVOUCHED_CARRY_BYTES` it has already judged. A complete key
+        // whose header only the kept anchor holds is not matched whole
+        // here; its body lines in the carry are masked by the scan, and
+        // its `-----END` line is emitted, which carries nothing.
+        let lb = self.split.saturating_sub(self.limits.lookbehind_bytes);
+        let mut spans = self
+            .processor
+            .all_spans(&self.buf[lb..], self.base + lb as u64);
+        let scan =
+            self.processor
+                .index
+                .candidate_scan(&self.processor.rules, &self.buf, self.base, end);
+        let masked: Vec<Span> = scan
+            .found
+            .iter()
+            .filter(|c| !c.in_flight || (end == RegionEnd::Final && c.material && !c.resumed))
+            .filter(|c| {
+                !spans
+                    .iter()
+                    .any(|s| !s.is_unresolved() && s.start <= c.start && s.end > c.start)
+            })
+            .map(|c| Span::unresolved(c.start, c.end))
+            .collect();
+        if !masked.is_empty() {
+            spans.extend(masked);
+            spans = merge_spans(spans);
+        }
+        Judged {
+            spans,
+            hold_from: scan
+                .found
+                .iter()
+                .filter(|c| c.resumed && c.in_flight)
+                .map(|c| c.start)
+                .min(),
+            keep_from: self.keep_from(&scan.stopped_short),
+        }
+    }
+
+    /// The earliest anchor in `stopped_short` whose body lines are still
+    /// being followed at the end of the stream so far — the one `retire`
+    /// must not trim away.
+    fn keep_from(&self, stopped_short: &[u64]) -> Option<u64> {
+        let stream_end = self.base + self.buf.len() as u64;
+        stopped_short
+            .iter()
+            .copied()
+            .filter(|a| a + UNVOUCHED_CARRY_BYTES as u64 > stream_end)
+            .min()
+    }
+
     /// Copy `buf[split..emit_end]` out, substituting a marker for every
     /// span that overlaps it.
-    fn render(&self, spans: &[crate::output::redact::Span], emit_end: u64) -> Vec<u8> {
+    fn render(&mut self, spans: &[crate::output::redact::Span], emit_end: u64) -> Vec<u8> {
         let region_start = self.base + self.split as u64;
         if emit_end <= region_start {
             return Vec::new();
@@ -330,6 +536,9 @@ impl StreamRedactor {
         let at = |off: u64| (off - self.base) as usize;
         let mut out = Vec::with_capacity(at(emit_end) - at(region_start));
         let mut pos = region_start;
+        // Bytes before `shown_until` went to this reader in its opening
+        // picture, so they are never copied (`resume_at`).
+        let shown = self.shown_until;
         // `merge_spans` hands these back sorted and non-overlapping, so
         // one forward pass suffices.
         for span in spans {
@@ -337,36 +546,78 @@ impl StreamRedactor {
                 continue;
             }
             let start = span.start.max(region_start);
-            if start > pos {
-                out.extend_from_slice(&self.buf[at(pos)..at(start)]);
+            let from = pos.max(shown);
+            if start > from {
+                out.extend_from_slice(&self.buf[at(from)..at(start)]);
             }
             // A span that opened inside the already-emitted lookbehind
             // gets **no** marker and still loses its bytes: the marker
             // would claim a substitution the reader never saw begin, and
             // emitting the tail raw would hand over the value half of a
             // token whose prefix already went out.
-            if span.start >= region_start {
-                let kind = &self.processor.rules.rules[span.rule].kind;
+            //
+            // **Except an `unresolved` span no marker has been emitted for
+            // yet.** A run of key-body lines after a stopped candidate
+            // (`pem::body_lines`) starts at its first line, and what went
+            // out of that line before it could be judged is what a pager
+            // repaints first — `\r\x1b[K`. When the rest arrived in later
+            // feeds the whole screenful was dropped with no marker at all,
+            // measured through `holdfast watch` on `less` and a space; the
+            // reader was never told anything was withheld. Once one marker
+            // for the run has gone out, its continuation stays silent.
+            //
+            // **And any span that began before this reader joined**
+            // (`resume_at`). The reader was not sent the part before the
+            // join as a stream at all — the opening picture showed it,
+            // masked — so "a substitution the reader never saw begin" is
+            // not what a marker here would claim; without one, the rest of
+            // a key being printed when `holdfast watch` opened simply
+            // stopped arriving, and nothing said why.
+            let unmarked = (span.is_unresolved() || span.start < shown)
+                && self.marked_from.is_none_or(|m| m < span.start);
+            if span.start >= region_start || unmarked {
+                // `span_kind`, not `rules[span.rule]`: a span may be the
+                // synthetic `unresolved` one, which names no rule.
+                let kind = crate::output::redact::span_kind(&self.processor.rules, span);
                 out.extend_from_slice(marker(kind).as_bytes());
+                self.marked_from = Some(span.start);
             }
             pos = pos.max(span.end.min(emit_end));
         }
-        if pos < emit_end {
-            out.extend_from_slice(&self.buf[at(pos)..at(emit_end)]);
+        let from = pos.max(shown);
+        if from < emit_end {
+            out.extend_from_slice(&self.buf[at(from)..at(emit_end)]);
         }
         out
     }
 
     /// Move the split forward to `emit_end` and drop everything that has
-    /// fallen out of the lookbehind window.
-    fn retire(&mut self, emit_end: u64) {
+    /// fallen out of the lookbehind window — except, from `keep_from` on,
+    /// a private-key anchor whose body lines are still being followed.
+    ///
+    /// **Why the anchor is kept rather than a flag about it.** Every
+    /// other surface finds the key-body lines after a stopped candidate by
+    /// asking about bytes that still include its header: a read's carry
+    /// region reaches `UNVOUCHED_CARRY_BYTES` back, and the grid scans as
+    /// far. This one keeps `lookbehind_bytes` — 512 — and a pager's next
+    /// screenful arrives kilobytes after the header, so the stream would
+    /// judge it with no candidate in sight and emit it raw. Keeping the
+    /// anchor makes the stream ask the same question of the same bytes as
+    /// `read_output`, which is what this file's header says it is for;
+    /// the cost is that the lookbehind is up to `UNVOUCHED_CARRY_BYTES`
+    /// long, and re-judged per feed, for the carry behind such a header
+    /// and no longer.
+    fn retire(&mut self, emit_end: u64, keep_from: Option<u64>) {
         self.split = ((emit_end - self.base) as usize).min(self.buf.len());
-        self.trim_lookbehind();
+        self.trim_lookbehind(keep_from);
     }
 
-    fn trim_lookbehind(&mut self) {
+    fn trim_lookbehind(&mut self, keep_from: Option<u64>) {
         if self.split > self.limits.lookbehind_bytes {
-            let cut = self.split - self.limits.lookbehind_bytes;
+            let mut cut = self.split - self.limits.lookbehind_bytes;
+            if let Some(keep) = keep_from {
+                cut = cut.min(keep.saturating_sub(self.base) as usize);
+            }
             self.buf.drain(..cut);
             self.base += cut as u64;
             self.split -= cut;
@@ -404,14 +655,18 @@ mod tests {
     use crate::audit::AuditLog;
     use crate::output::rules::{builtin_shared, RuleSet};
 
-    fn redactor() -> StreamRedactor {
+    fn processor() -> Arc<OutputProcessor> {
         let rules = builtin_shared();
         let audit = Arc::new(AuditLog::disabled(Arc::clone(&rules)));
-        StreamRedactor::new(Arc::new(OutputProcessor::new(
+        Arc::new(OutputProcessor::new(
             rules,
             audit,
             ProcessingLimits::default(),
-        )))
+        ))
+    }
+
+    fn redactor() -> StreamRedactor {
+        StreamRedactor::new(processor())
     }
 
     const GH: &str = "ghp_0123456789abcdefghijABCDEFGHIJ012345";
@@ -735,5 +990,448 @@ mod tests {
             1
         );
         assert!(!out.windows(64).any(|w| w.iter().all(|b| *b == b'K')));
+    }
+
+    /// **Every key format stays off the stream, whole or cut short, at
+    /// every chunk size** (GH #242's safety half, on the `watch` surface).
+    ///
+    /// The cut-short shapes are the ones GH #242 could have broken: the
+    /// key is held while it arrives, and the prompt that follows `head -n
+    /// 9` ends the candidate. Before that change nothing ended it except
+    /// the carry; now something does, and ending it must mask the held
+    /// body rather than release it. The independent review of GH #242
+    /// found the next step: key body that arrives *after* the candidate
+    /// ended — a pager's next screenful, the middle of a key `sed` prints
+    /// in chunks, every line of a key a pager cut off under a decoration
+    /// — arrived on this stream raw, because the anchor had long left the
+    /// 512-byte lookbehind. So the stream keeps the anchor while its body
+    /// lines are followed (`retire`), and holds a line still arriving that
+    /// may be one.
+    ///
+    /// **Paired** with what must still arrive: the commands around every
+    /// shape.
+    #[test]
+    fn every_key_format_stays_off_the_stream_whole_or_cut_short() {
+        every_shape_stays_off_the_stream(|shape| matches!(shape, "complete" | "head -n 9"));
+    }
+
+    /// The rest of `Key::shapes`, split out so the two halves run in
+    /// parallel: each shape costs the same few seconds of a debug build
+    /// at the small chunk sizes, and eleven of them in one row is a row
+    /// that reaches nextest's slow threshold on a loaded runner.
+    /// Nine shapes at every chunk size would be the slow row that note
+    /// is about, so the small chunks rotate through the keys: every key
+    /// meets a chunk that splits its lines mid-run (97, co-prime with
+    /// every line length here), and every third key the thirteen-byte
+    /// one as well.
+    #[test]
+    fn every_key_arriving_after_its_candidate_stopped_stays_off_the_stream() {
+        every_shape_stays_off_the_stream(|shape| !matches!(shape, "complete" | "head -n 9"));
+    }
+
+    fn every_shape_stays_off_the_stream(which: impl Fn(&str) -> bool) {
+        use crate::output::pem::fixtures::KEYS;
+        let mut shapes = 0usize;
+        for (k, key) in KEYS.iter().enumerate() {
+            for shape in key.shapes().into_iter().filter(|s| which(s.name)) {
+                shapes += 1;
+                let original = matches!(shape.name, "complete" | "head -n 9");
+                // Thirteen rather than one: every feed re-judges the whole
+                // carry, so a one-byte chunk costs the square of the key
+                // and buys no boundary thirteen does not also reach.
+                let chunks: &[usize] = if original {
+                    &[13, 64, 1000, 8192]
+                } else if k % 3 == 0 {
+                    &[13, 97, 8192]
+                } else {
+                    &[97, 8192]
+                };
+                for &chunk in chunks {
+                    let mut r = redactor();
+                    let mut out = Vec::new();
+                    for piece in shape.text.as_bytes().chunks(chunk) {
+                        out.extend(r.feed(piece));
+                    }
+                    out.extend(r.flush());
+                    let out = String::from_utf8_lossy(&out).into_owned();
+                    assert_eq!(
+                        key.leaked_in(&out),
+                        None,
+                        "{} {} at chunk {chunk}: {out:?}",
+                        key.name,
+                        shape.name
+                    );
+                    for kept in &shape.kept {
+                        assert!(
+                            out.contains(kept.as_str()),
+                            "{} {} at chunk {chunk}: {kept:?} must still arrive: {out:?}",
+                            key.name,
+                            shape.name
+                        );
+                    }
+                    assert!(
+                        out.ends_with("echo done\r\ndone\r\n$ "),
+                        "{} {} at chunk {chunk}: what follows the key must \
+                         still arrive: {out:?}",
+                        key.name,
+                        shape.name
+                    );
+                }
+            }
+        }
+        assert!(shapes >= KEYS.len() * 2, "the sweep lost its shapes");
+    }
+
+    /// **A pager's next screenful of a key reaches `watch` as a marker, not
+    /// as nothing** — whatever the pty's chunking.
+    ///
+    /// `less` repaints with `\r\x1b[K` and then the lines. When the
+    /// `\r\x1b[K` went out in one feed and the lines arrived in later
+    /// ones, each line was held until it was whole, then masked as part of
+    /// a run of body lines that *began* in the already-emitted bytes — and
+    /// a span opening there got no marker. Measured through `holdfast
+    /// watch` on `less` and a space: no key material, and no marker, just
+    /// the prompt again. Replayed here at one and three bytes per feed
+    /// from the end of the first screenful.
+    #[test]
+    fn a_pagers_next_screenful_is_marked_whatever_the_chunking() {
+        use crate::output::pem::fixtures::KEYS;
+        let key = &KEYS[0];
+        let shape = key
+            .shapes()
+            .into_iter()
+            .find(|s| s.name == "less, next screenful")
+            .unwrap();
+        let text = shape.text.as_bytes();
+        let screenful = shape.text.find("\x1b[27m\x1b[K").unwrap() + 8;
+        for size in [1usize, 3] {
+            let mut r = redactor();
+            let mut out = r.feed(&text[..screenful]);
+            for piece in text[screenful..].chunks(size) {
+                out.extend(r.feed(piece));
+            }
+            out.extend(r.flush());
+            let out = String::from_utf8_lossy(&out).into_owned();
+            assert_eq!(key.leaked_in(&out), None, "at {size}: {out:?}");
+            let after = &out[out.find("id_key lines 1-").unwrap()..];
+            assert!(
+                after.contains("[REDACTED:unresolved]"),
+                "at {size}: the next screenful was dropped without a marker: {after:?}"
+            );
+            assert_eq!(
+                after.matches("[REDACTED:").count(),
+                1,
+                "at {size}: one run, one marker: {after:?}"
+            );
+        }
+    }
+
+    /// **A key cut short by the end of the stream is masked, not flushed**
+    /// (GH #242). Nothing follows it to end the candidate, so it is still
+    /// held when the session ends — and `flush` used to emit whatever was
+    /// held, which for a key is its body. Paired with the prefix that is
+    /// not a secret, which the same flush still releases.
+    #[test]
+    fn a_key_cut_short_by_the_end_of_the_stream_is_masked_not_flushed() {
+        use crate::output::pem::fixtures::KEYS;
+        for key in KEYS {
+            // Four lines: the header and three of body, which is the
+            // whole body of the smallest fixture and leaves it unclosed.
+            let cut: String = key.pem().split_inclusive('\n').take(4).collect();
+            assert!(!cut.contains("-----END"), "{}", key.name);
+            let mut r = redactor();
+            let mut out = r.feed(format!("$ head -n 4 k\n{cut}").as_bytes());
+            assert!(
+                !r.is_withholding(),
+                "{}: the fixture must end in the carry, not in the withhold",
+                key.name
+            );
+            out.extend(r.flush());
+            let out = String::from_utf8_lossy(&out).into_owned();
+            assert_eq!(key.leaked_in(&out), None, "{}: {out:?}", key.name);
+            assert!(
+                out.contains("[REDACTED:unresolved]"),
+                "{}: {out:?}",
+                key.name
+            );
+        }
+        let mut r = redactor();
+        assert!(r.feed(b"ghp_abc").is_empty());
+        assert_eq!(r.flush(), b"ghp_abc");
+        // …and so does a header with no body behind it, which carries no
+        // key material either: masking it would put a marker where the
+        // session printed only a boundary line.
+        let mut r = redactor();
+        let mut out = r.feed(b"-----BEGIN RSA PRIVATE KEY-----\n");
+        out.extend(r.flush());
+        assert_eq!(out, b"-----BEGIN RSA PRIVATE KEY-----\n");
+    }
+
+    /// **The stream and the read agree about prose** (GH #242). A
+    /// `-----BEGIN` in running text used to cost an observer a marker and
+    /// up to `2 × STREAM_CARRY_BYTES` of dropped output; measured on
+    /// `main` at `a81b02d`, about three lines in ten of this repository's
+    /// `CHANGELOG.md` never reached `holdfast watch`. The candidate now
+    /// dies on the text that follows the header, so nothing is held and
+    /// nothing is masked on its account.
+    ///
+    /// The file is read from disk for the reason
+    /// `the_documented_read_loop_drains_this_repositorys_own_changelog`
+    /// gives, and the corpus carries `[REDACTED:unresolved]` as prose too,
+    /// so the assertion is that the stream adds none.
+    #[test]
+    fn the_stream_masks_no_prose_anchor_in_this_repositorys_changelog() {
+        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../CHANGELOG.md");
+        let text = std::fs::read(path).expect("the repository's own changelog");
+        let anchors = |t: &[u8]| {
+            t.windows(31)
+                .filter(|w| *w == b"-----BEGIN RSA PRIVATE KEY-----")
+                .count()
+        };
+        let markers = |t: &[u8]| {
+            t.windows(21)
+                .filter(|w| *w == b"[REDACTED:unresolved]")
+                .count()
+        };
+        assert!(anchors(&text) > 0, "the corpus no longer carries the shape");
+
+        let mut r = redactor();
+        let mut out = Vec::new();
+        for piece in text.chunks(8192) {
+            out.extend(r.feed(piece));
+            assert!(!r.is_withholding(), "the stream withheld prose");
+        }
+        out.extend(r.flush());
+        assert_eq!(
+            markers(&out),
+            markers(&text),
+            "the stream added an unresolved marker"
+        );
+        assert_eq!(
+            anchors(&out),
+            anchors(&text),
+            "a prose anchor did not arrive"
+        );
+    }
+
+    /// What a reader joining at `join` is sent of `text`: the redactor
+    /// resumed there from the bytes behind it, fed the rest in `chunk`s,
+    /// then flushed.
+    fn joined_at(p: &Arc<OutputProcessor>, text: &[u8], join: usize, chunk: usize) -> String {
+        let mut r = StreamRedactor::resume_at(Arc::clone(p), &text[..join], join as u64);
+        let mut out = Vec::new();
+        for piece in text[join..].chunks(chunk) {
+            out.extend(r.feed(piece));
+        }
+        out.extend(r.flush());
+        String::from_utf8_lossy(&out).into_owned()
+    }
+
+    /// **A reader that joins late is sent none of a key the readers
+    /// attached before it are not sent** (the integration review of
+    /// GH #235 × GH #242).
+    ///
+    /// Every key in every shape, joined at three points: just after the
+    /// key's first line — the header, or for a decorated key its first
+    /// decorated line — and at the start and in the middle of the line at
+    /// the middle of the text. Measured through `holdfast watch` before
+    /// this: a watch joined after `less` drew the first screen of a
+    /// 4096-bit key was sent 28 of its 50 body lines raw over the next two
+    /// screens, and one joined while a key was still printing a line every
+    /// 0.25 s was sent 14 of 26; a watch attached before either command
+    /// was sent none. Those are this sweep's `less` and `complete` shapes,
+    /// joined past the header.
+    ///
+    /// Four claims per join: no material; a marker wherever material
+    /// followed the join; whatever follows the key still arrives; and
+    /// nothing before the join comes back — the opening picture drew it,
+    /// and a stream that re-sent it would draw the command line twice.
+    ///
+    /// **The control is the defect itself.** A redactor started empty at
+    /// the middle join must leak somewhere in each half, or the half never
+    /// reaches a join that needs the context and is green for a redactor
+    /// that ignores it.
+    ///
+    /// Three joins rather than every line: each join judges the key about
+    /// four times, and at every line the sweep ran past nextest's kill in
+    /// a debug build.
+    #[test]
+    fn a_late_reader_is_sent_none_of_a_key_whole_or_cut_short() {
+        every_join_stays_off_the_stream(|shape| matches!(shape, "complete" | "head -n 9"));
+    }
+
+    /// The rest of `Key::shapes`, split out so the two halves run in
+    /// parallel, for the reason `every_key_arriving_after_its_candidate_stopped_stays_off_the_stream`
+    /// gives.
+    #[test]
+    fn a_late_reader_is_sent_none_of_a_key_arriving_after_its_candidate_stopped() {
+        every_join_stays_off_the_stream(|shape| !matches!(shape, "complete" | "head -n 9"));
+    }
+
+    fn every_join_stays_off_the_stream(which: impl Fn(&str) -> bool) {
+        use crate::output::pem::fixtures::KEYS;
+        const DONE: &str = "$ echo done\r\ndone\r\n$ ";
+        let p = processor();
+        let (mut joins, mut control_leaks) = (0usize, 0usize);
+        for key in KEYS {
+            for shape in key.shapes().into_iter().filter(|s| which(s.name)) {
+                let text = shape.text.as_bytes();
+                let line_after =
+                    |at: usize| at + 1 + text[at..].iter().position(|b| *b == b'\n').unwrap();
+                let command_end = line_after(0);
+                let middle = line_after(text.len() / 2);
+                // Clamped to the command after the key, which is the last
+                // join that is about the key at all.
+                let last = text.len() - DONE.len();
+                let points = [line_after(command_end), middle, middle + 33].map(|j| j.min(last));
+                for join in points {
+                    joins += 1;
+                    // The rest of a key still printing arrives a line or so
+                    // at a time, and a redactor that held the key's header
+                    // for one feed and dropped it the next passes at 8192.
+                    let chunk = if shape.name == "complete" && join == middle {
+                        97
+                    } else {
+                        8192
+                    };
+                    let out = joined_at(&p, text, join, chunk);
+                    assert_eq!(
+                        key.leaked_in(&out),
+                        None,
+                        "{} {} joined at {join}: {out:?}",
+                        key.name,
+                        shape.name
+                    );
+                    assert!(
+                        out.ends_with(DONE),
+                        "{} {} joined at {join}: what follows the key must still \
+                         arrive: {out:?}",
+                        key.name,
+                        shape.name
+                    );
+                    // Told, not only spared: a run of key body still arriving
+                    // at the join is marked for this reader too, even when
+                    // the seed already marked it for nobody.
+                    if key
+                        .leaked_in(&String::from_utf8_lossy(&text[join..]))
+                        .is_some()
+                    {
+                        assert!(
+                            out.contains("[REDACTED:"),
+                            "{} {} joined at {join}: key body after the join was dropped \
+                             without a marker: {out:?}",
+                            key.name,
+                            shape.name
+                        );
+                    }
+                    assert!(
+                        !out.contains(&shape.text[..command_end]),
+                        "{} {} joined at {join}: the command before the join came back \
+                         — the picture drew it: {out:?}",
+                        key.name,
+                        shape.name
+                    );
+                }
+                let mut fresh = redactor();
+                let mut control = fresh.feed(&text[middle..]);
+                control.extend(fresh.flush());
+                if key.leaked_in(&String::from_utf8_lossy(&control)).is_some() {
+                    control_leaks += 1;
+                }
+            }
+        }
+        assert!(
+            joins >= KEYS.len() * 3 * 2,
+            "the sweep lost its joins: {joins}"
+        );
+        assert!(
+            control_leaks > 0,
+            "control: a redactor started empty at the join leaked in none of the shapes, \
+             so no join here needs the context the row is about"
+        );
+    }
+
+    /// **The next screenful of a pager reaches a reader that joined on
+    /// the first one as one marker**, whatever the pty's chunking — the
+    /// late-joiner twin of `a_pagers_next_screenful_is_marked_whatever_the_chunking`.
+    ///
+    /// Joined on `less`'s prompt, where `holdfast watch` joins when a
+    /// human opens it on an agent paging through a file. A joiner owes
+    /// the reader a marker the seed emitted and threw away, so this also
+    /// pins that the marker is sent and sent once.
+    #[test]
+    fn a_pagers_next_screenful_reaches_a_late_joiner_as_one_marker() {
+        use crate::output::pem::fixtures::KEYS;
+        let p = processor();
+        for key in KEYS {
+            let shape = key
+                .shapes()
+                .into_iter()
+                .find(|s| s.name == "less, next screenful")
+                .unwrap();
+            let text = shape.text.as_bytes();
+            let join = shape.text.find("\x1b[27m\x1b[K").unwrap() + 8;
+            for chunk in [1usize, 3, 8192] {
+                let out = joined_at(&p, text, join, chunk);
+                assert_eq!(
+                    key.leaked_in(&out),
+                    None,
+                    "{} at {chunk}: {out:?}",
+                    key.name
+                );
+                assert_eq!(
+                    out.matches("[REDACTED:").count(),
+                    1,
+                    "{} at {chunk}: one run, one marker: {out:?}",
+                    key.name
+                );
+                assert!(
+                    !out.contains("id_key lines 1-"),
+                    "{} at {chunk}: the first screen's prompt was drawn before the \
+                     join and came back: {out:?}",
+                    key.name
+                );
+            }
+        }
+    }
+
+    /// **A reader that joins while the stream is withheld is told so**,
+    /// once, and is sent none of what is withheld.
+    ///
+    /// The readers attached before were sent `[REDACTED:unresolved]` when
+    /// the carry overflowed; one that joins afterwards would otherwise
+    /// see a screen that stops changing and nothing to say why. Paired
+    /// with a join on ordinary output, which owes nothing.
+    #[test]
+    fn a_reader_joining_during_a_withholding_is_owed_its_marker() {
+        let p = processor();
+        // Longer than the carry and shorter than the withholding window,
+        // as a 16384-bit RSA key is: the carry overflows part way through
+        // and the key completes inside the window.
+        let key = pem(STREAM_CARRY_BYTES + 4096);
+        let join = STREAM_CARRY_BYTES + 2048;
+        let mut r = StreamRedactor::resume_at(Arc::clone(&p), &key[..join], join as u64);
+        assert!(
+            r.is_withholding(),
+            "the fixture must join inside the withhold"
+        );
+        let mut out = r.feed(&key[join..]);
+        out.extend(r.feed(b"$ "));
+        out.extend(r.flush());
+        let out = String::from_utf8_lossy(&out).into_owned();
+        assert_eq!(out.matches("[REDACTED:").count(), 1, "{out:?}");
+        assert!(
+            out.starts_with("[REDACTED:unresolved]"),
+            "the joiner was not told the stream is withheld: {out:?}"
+        );
+        assert!(!out.contains("MIIE"), "withheld bytes were sent: {out:?}");
+        assert!(out.ends_with("$ "), "the stream never resumed: {out:?}");
+
+        let mut r = StreamRedactor::resume_at(p, b"$ make\r\nok\r\n$ ", 14);
+        assert_eq!(
+            r.feed(b"ls\r\n"),
+            b"ls\r\n",
+            "a join on ordinary output owes nothing"
+        );
     }
 }

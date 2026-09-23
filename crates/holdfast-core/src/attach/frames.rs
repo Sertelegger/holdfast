@@ -314,14 +314,91 @@ pub enum ServerFrame {
         reason: String,
         message: String,
     },
+    /// **The session's screen as it stands when this client joins** —
+    /// sent once, after `Attached` and before any `Output` (GH #235).
+    ///
+    /// Without it a client attaching to a session idling at a prompt
+    /// rendered nothing at all until the child next printed, and one
+    /// joining mid-command saw the command's output start partway down
+    /// an otherwise empty terminal. §4.3 still forbids *replay* — nothing
+    /// here re-sends bytes the session printed before the client arrived
+    /// — and a picture of the screen is not that: it is what a person
+    /// walking up to the terminal would see.
+    ///
+    /// **The grid `get_screen_state` returns, through the same capture
+    /// and the same mask**, never a second rendering of the ring buffer.
+    /// Cells §4.1 is withholding read `[REDACTED:unresolved]`, and
+    /// `held_back` says whether any did, exactly as the tool's own field
+    /// does. It is masked for every `role`: this is a re-rendering of
+    /// history, not the live stream `interactive` is entitled to raw
+    /// (REQ-SEC-008), and a picture of a secret already on screen is the
+    /// one thing a snapshot could add that the live stream never sent.
+    ///
+    /// **So it is exactly as safe as that grid, and no safer.** A late
+    /// `watch` was shown a private key's body raw — one cut short, or one
+    /// whose header had scrolled off — which an observer attached during
+    /// the print never saw, because the grid's mask reached only the
+    /// trailing 512 bytes. Before this frame a late observer was shown
+    /// nothing from before its join, so the leak was new to that surface,
+    /// and GH #224's key mask on the grid is what closes it:
+    /// `a_client_joining_after_a_key_was_printed_is_shown_none_of_its_body`
+    /// is red on any tree without it.
+    ///
+    /// **Out of band rather than as `Output`**, for `OutputGap`'s reason:
+    /// `Output` is the child's own bytes and `interactive` is a
+    /// byte-exact surface, so a daemon-drawn screen inside it would
+    /// corrupt every capture taken through one. A frame lets the
+    /// renderer decide — `holdfast watch > log` draws nothing, because a
+    /// log file has no screen to paint.
+    ///
+    /// **The stream resumes where the picture ends, or a few bytes before
+    /// it — never after.** The capture is the screen tracker's, which
+    /// lags the ring buffer by at most the chunk the reader is feeding
+    /// it; the stream starts at an offset read *before* the capture, so
+    /// the error is a handful of bytes drawn twice rather than a handful
+    /// never drawn (`Session::stream_floor`). For a session at rest the
+    /// two are the same offset.
+    ///
+    /// Plain text per row and no attributes: the grid is the tool's, and
+    /// the tool's grid is text. A renderer paints the rows, puts the
+    /// cursor at `cursor_row`/`cursor_col` (zero-based), and lets the
+    /// live stream repaint colour as the child redraws.
+    ScreenSnapshot {
+        session: String,
+        cols: u16,
+        rows: u16,
+        cursor_row: u16,
+        cursor_col: u16,
+        cursor_visible: bool,
+        /// Whether the child is on the alternate screen (a full-screen
+        /// program). For a renderer that owns its terminal — the web UI's —
+        /// which can enter it too and have the child's own exit from it
+        /// land where the child expects. `holdfast attach` and `watch`
+        /// deliberately do not: a pass-through that switched a mode on at
+        /// the join would leave it on after `Ctrl-B d`.
+        alt_screen: bool,
+        lines: Vec<String>,
+        /// Some cells were masked because §4.1 is withholding the bytes
+        /// that drew them — `ScreenGrid::held_back`, verbatim.
+        held_back: bool,
+    },
     Output {
         session: String,
         #[serde(with = "serde_bytes")]
         bytes: Vec<u8>,
     },
-    /// **The stream skipped `bytes` bytes here** — §4.3's bounded output
-    /// broadcast dropped frames this connection had not read yet, and
-    /// they are gone (GH #200).
+    /// **The stream skipped `bytes` bytes here** — the session's ring
+    /// buffer evicted them before this connection read them, and they are
+    /// gone (GH #200, GH #210).
+    ///
+    /// **Since GH #210 a gap means the ring, not the broadcast.** It was
+    /// introduced for §4.3's bounded output broadcast dropping frames a
+    /// connection had not read, with the bytes still in the ring; a
+    /// connection now resumes from the ring whenever the broadcast laps it
+    /// (`conn::forward_output`), so the only hole left is one the ring
+    /// could not fill either — the connection fell a whole ring behind.
+    /// The count is the distance from where this connection's stream had
+    /// reached to the ring's tail, and it is still exact.
     ///
     /// The count is **exact and in bytes**, not the frame count
     /// `RecvError::Lagged(n)` reports. The internal `OutputFrame` carries
@@ -346,7 +423,7 @@ pub enum ServerFrame {
     ///
     /// **It counts the *raw* stream, which for an `observer` is not the
     /// stream that client renders — so it is a floor, not a total.** The
-    /// number is exactly §4.3's broadcast hole and nothing else; an
+    /// number is exactly the raw stream's hole and nothing else; an
     /// observer's `StreamRedactor` withholds on its own account, and
     /// those bytes are announced separately and in band, by
     /// `[REDACTED:unresolved]` where the value was (REQ-O-011a). Two
@@ -377,6 +454,27 @@ pub enum ServerFrame {
     AwaitingSecret {
         request_id: String,
         prompt_text: String,
+        /// **Who wrote `prompt_text`**: `"echo_drop"` when the request was
+        /// raised by the child dropping `ECHO` and the text is the line
+        /// the child itself drew, `"tool_call"` when an agent's
+        /// `request_secret_input` raised it and the text is the agent's
+        /// (GH #236). §9.4's `raised_by` spelling, carried to the one
+        /// surface where a human reads the text.
+        ///
+        /// **The human needs this and not only the audit log.** A child's
+        /// prompt is already on the screen, so a client that prints it
+        /// again shows it twice — which is what `holdfast attach` did —
+        /// while an agent's text is a *claim about* what is being asked
+        /// for, and a person about to type a credential should know
+        /// which of the two they are reading. §5.2 keeps an adopting
+        /// call's text off the wire for the same reason: it would let an
+        /// agent relabel a prompt a human may already be typing into.
+        ///
+        /// Optional, and absent means unknown: a daemon older than 1.5
+        /// sends no key, and a client renders the text neutrally rather
+        /// than guessing.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        raised_by: Option<String>,
     },
     SecretRequestClosed {
         request_id: String,
@@ -720,6 +818,7 @@ impl ServerFrame {
         match self {
             Self::Attached { .. } => Some("Attached"),
             Self::AttachReject { .. } => Some("AttachReject"),
+            Self::ScreenSnapshot { .. } => Some("ScreenSnapshot"),
             Self::Output { .. } => Some("Output"),
             Self::OutputGap { .. } => Some("OutputGap"),
             Self::SessionExited { .. } => Some("SessionExited"),
@@ -742,6 +841,11 @@ impl ServerFrame {
 /// server list — restricted to the variants 0.0.7 implements, plus the
 /// one that is not a §7.5 row at all.
 ///
+/// **`ScreenSnapshot` sits between the handshake and `Output`** (GH
+/// #235), because that is where it is sent: the one server frame that
+/// belongs to joining rather than to the stream, and it arrives after
+/// `Attached` and before the first byte of live output.
+///
 /// **`OutputGap` sits directly after `Output`, which is where §7.5 now
 /// carries it** (GH #200). It was placed here first, by the rule the
 /// rest of this order follows rather than by transcription — it is a
@@ -760,6 +864,7 @@ impl ServerFrame {
 pub const KNOWN_SERVER_TYPES: &[&str] = &[
     "Attached",
     "AttachReject",
+    "ScreenSnapshot",
     "Output",
     "OutputGap",
     "SessionExited",
@@ -1247,6 +1352,17 @@ mod tests {
                 reason: "session_not_found".into(),
                 message: "m".into(),
             },
+            ServerFrame::ScreenSnapshot {
+                session: "s".into(),
+                cols: 80,
+                rows: 24,
+                cursor_row: 0,
+                cursor_col: 0,
+                cursor_visible: true,
+                alt_screen: false,
+                lines: vec![],
+                held_back: false,
+            },
             ServerFrame::Output {
                 session: "s".into(),
                 bytes: vec![],
@@ -1260,6 +1376,7 @@ mod tests {
             ServerFrame::AwaitingSecret {
                 request_id: "r".into(),
                 prompt_text: String::new(),
+                raised_by: None,
             },
             ServerFrame::SecretRequestClosed {
                 request_id: "r".into(),
@@ -1289,9 +1406,10 @@ mod tests {
         assert_eq!(tags.as_slice(), KNOWN_SERVER_TYPES);
         assert_eq!(
             KNOWN_SERVER_TYPES.len(),
-            11,
-            "eleven of §7.5's twelve; only TransferProgress (0.0.9) is deferred. \
-             OutputGap is the twelfth row, added to §7.5 by GH #200"
+            12,
+            "twelve of §7.5's thirteen; only TransferProgress (0.0.9) is deferred. \
+             OutputGap is the twelfth row, added to §7.5 by GH #200, and \
+             ScreenSnapshot the thirteenth, added by GH #235"
         );
         // The negative: Unknown is decode-only and must not be in the
         // list, or decode_server_frame would refuse to produce it.

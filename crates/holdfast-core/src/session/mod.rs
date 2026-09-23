@@ -1,5 +1,6 @@
 //! A single PTY-backed session.
 
+pub mod launch;
 pub mod reaper;
 pub mod registry;
 pub mod wait;
@@ -32,12 +33,194 @@ use tokio::sync::broadcast;
 
 pub type SessionId = String;
 
+/// Whether `command args` is an **interactive** shell — the kind that
+/// ignores `SIGTERM` and ends on `SIGHUP` (GH #234). Asked of the session
+/// leader's argv as it is now, not as it was spawned; see
+/// `Session::hang_up_idle_shell`.
+///
+/// Its own list rather than `detect_shell`'s, which answers a different
+/// question (can Holdfast type an OSC 133 snippet into it?) for three
+/// shells. POSIX has every interactive shell ignore `SIGTERM`, so `sh`,
+/// `dash` and `ksh` sat out `terminate`'s grace exactly as `bash` did.
+///
+/// Refuses `-c` and a **script operand**: the first argument that is not
+/// an option — and not the value of one of the options listed, which take
+/// one — is a script, and a shell running a script is not interactive; it
+/// may be handling `SIGTERM` itself, and a hangup would cut that short.
+/// Wrong in the conservative direction, this costs the old behaviour: the
+/// escalation to `SIGKILL` after the grace.
+fn is_interactive_shell(command: &str, args: &[String]) -> bool {
+    const SHELLS: [&str; 9] = [
+        "bash", "zsh", "fish", "sh", "dash", "ksh", "mksh", "tcsh", "csh",
+    ];
+    const TAKES_A_VALUE: [&str; 8] = [
+        "-o",
+        "+o",
+        "-O",
+        "+O",
+        "--rcfile",
+        "--init-file",
+        "-C",
+        "--init-command",
+    ];
+    let base = command.rsplit('/').next().unwrap_or(command);
+    if !SHELLS.contains(&base) {
+        return false;
+    }
+    let mut expects_value = false;
+    for arg in args {
+        if expects_value {
+            expects_value = false;
+            continue;
+        }
+        if arg == "-c" || arg == "--" {
+            return false;
+        }
+        if arg.starts_with('-') || arg.starts_with('+') {
+            expects_value = TAKES_A_VALUE.contains(&arg.as_str());
+            continue;
+        }
+        return false;
+    }
+    true
+}
+
+#[cfg(test)]
+mod interactive_shell_tests {
+    use super::is_interactive_shell;
+
+    fn args(a: &[&str]) -> Vec<String> {
+        a.iter().map(|s| (*s).to_string()).collect()
+    }
+
+    /// Each refusal is a program that *handles* `SIGTERM` or may, where a
+    /// hangup would cut its cleanup short — so each is a row an
+    /// over-eager classifier fails, and each acceptance is a shell the
+    /// hangup exists for, which an over-cautious one fails.
+    #[test]
+    fn only_a_shell_with_no_script_is_interactive() {
+        for (command, a) in [
+            ("bash", &[][..]),
+            ("/bin/bash", &["--norc", "--noprofile"][..]),
+            ("zsh", &["-f"][..]),
+            ("fish", &["--no-config"][..]),
+            ("bash", &["-o", "vi"][..]),
+            ("bash", &["--rcfile", "my.rc", "-i"][..]),
+            ("sh", &[][..]),
+            ("/bin/dash", &["-i"][..]),
+        ] {
+            assert!(is_interactive_shell(command, &args(a)), "{command} {a:?}");
+        }
+        for (command, a) in [
+            ("bash", &["-c", "trap 'exit 77' TERM; sleep 9"][..]),
+            ("bash", &["script.sh"][..]),
+            ("bash", &["--norc", "script.sh"][..]),
+            ("bash", &["--", "script.sh"][..]),
+            ("python3", &[][..]),
+            ("bash", &["-lc", "make"][..]),
+            ("/usr/bin/env", &[][..]),
+        ] {
+            assert!(!is_interactive_shell(command, &args(a)), "{command} {a:?}");
+        }
+    }
+
+    /// **GH #234's gate, as `Session::hang_up_idle_shell` applies it.**
+    /// Every refusal is a case where the hangup would reach something
+    /// other than an idle shell: a job still cleaning up (not alone), a
+    /// program the shell `exec`ed into (not a shell now), a leader that
+    /// cannot be read. Every acceptance is a shell the hangup exists for,
+    /// including a login shell's `-bash`.
+    ///
+    /// Spawned as `env bash`, so the rule is visibly about the leader
+    /// **now**: a gate that consulted the spawn-time command would refuse
+    /// every row here, and fail the acceptances.
+    #[test]
+    fn only_a_lone_interactive_shell_is_hung_up() {
+        use super::{new_session_id, Session, SessionConfig};
+        use crate::pty::{MockPty, PtyBackend};
+        use std::sync::Arc;
+
+        let cases: [(Option<&[&str]>, bool, bool); 9] = [
+            (Some(&["bash", "--norc"]), true, true),
+            (Some(&["-bash"]), true, true),
+            (Some(&["/bin/zsh"]), true, true),
+            (Some(&["bash", "--norc"]), false, false),
+            (Some(&["python3", "app.py"]), true, false),
+            (Some(&["bash", "server.sh"]), true, false),
+            (
+                Some(&["sh", "-c", "trap '' TERM; exec sleep 9"]),
+                true,
+                false,
+            ),
+            (Some(&[]), true, false),
+            (None, true, false),
+        ];
+        for (argv, alone, expect) in cases {
+            let pty = Arc::new(MockPty::new());
+            pty.set_leader(argv, alone);
+            let session = Session::new(
+                new_session_id(),
+                None,
+                "env".into(),
+                vec!["bash".into()],
+                Arc::clone(&pty) as Arc<dyn PtyBackend>,
+                SessionConfig::with_buffer_capacity(4096),
+            );
+            assert_eq!(
+                session.hang_up_idle_shell(),
+                expect,
+                "leader {argv:?}, alone {alone}"
+            );
+            assert_eq!(pty.hang_ups(), usize::from(expect), "{argv:?}");
+            // Once: a hung-up shell is gone, and a second ask sends
+            // nothing to whatever holds its pid next.
+            assert!(!session.hang_up_idle_shell(), "{argv:?}");
+            assert_eq!(pty.hang_ups(), usize::from(expect), "{argv:?}");
+        }
+    }
+}
+
 /// How many frames the per-session output broadcast holds before a slow
-/// consumer starts losing them (§4.3's default). A consumer that lags gets
-/// `RecvError::Lagged` and resyncs from the ring buffer rather than from
-/// the frame it happened to be holding (REQ-C-006); the reader is never
-/// blocked, which is the property the bound exists to guarantee.
+/// consumer starts losing them — §4.2's `output_broadcast_capacity`
+/// default. A consumer that lags gets `RecvError::Lagged` and resyncs
+/// from the ring buffer rather than from the frame it happened to be
+/// holding (REQ-C-006); the reader is never blocked, which is the
+/// property the bound exists to guarantee.
+///
+/// **The default, not the value** (GH #210). [`SessionConfig`] carries
+/// the capacity, and `start_session` fills it from the operator's
+/// `[limits] output_broadcast_capacity` — a key that was accepted,
+/// validated and documented as a control for five releases while this
+/// constant sized every channel. It is also no longer a loss bound for
+/// attach clients: `attach::conn::forward_output` resyncs a lag from the
+/// ring buffer like every other offset-aware consumer, so for them the
+/// capacity decides only how often they take that path.
 pub const OUTPUT_BROADCAST_FRAMES: usize = 256;
+
+/// The most frames an operator may give the output broadcast: sixteen
+/// times [`OUTPUT_BROADCAST_FRAMES`] (GH #210's review).
+///
+/// **A ceiling because the key became live, and a live key with none is
+/// an allocation an operator can make by accident.** `tokio`'s broadcast
+/// allocates every slot when it is built — per session, rounded up to a
+/// power of two. The review measured a key of 4,194,304, the knob GH #210
+/// itself pointed operators at, costing about 230 MB of daemon RSS per
+/// `start_session`; 1,000,000,000 asked for 60 GB and aborted the daemon
+/// with every session in it. While the key was inert the same
+/// `config.toml` was harmless.
+///
+/// **Past this the memory grows and nothing is bought.** Since GH #210 a
+/// lagging consumer resyncs from the ring buffer, so the capacity decides
+/// how often that path is taken, not what anybody is shown — while a
+/// subscriber that stops reading (a paused attach forwarder whose client
+/// the stall bound has not yet detached) keeps alive every frame it has
+/// not read, each up to one reader `read`. That is already a multiple of
+/// the default ring at this ceiling.
+///
+/// `Config::validate` **refuses** a larger value, for the reason that file
+/// refuses rather than clamps everywhere else; `Session::new` clamps to
+/// it too, for the callers that build a `SessionConfig` by hand.
+pub const MAX_OUTPUT_BROADCAST_FRAMES: usize = 16 * OUTPUT_BROADCAST_FRAMES;
 
 /// One chunk the reader appended, with the absolute span it occupies.
 ///
@@ -169,6 +352,17 @@ pub struct SessionConfig {
     /// `Session::new` call sites that predate this keep their
     /// `..Default::default()` and the behaviour they assert.
     pub rules: Option<Arc<RuleSet>>,
+    /// §4.2 `output_broadcast_capacity`: how many frames the live output
+    /// broadcast holds for a subscriber that has not read them.
+    /// [`OUTPUT_BROADCAST_FRAMES`] by default (GH #210).
+    ///
+    /// **Clamped to `1..=`[`MAX_OUTPUT_BROADCAST_FRAMES`]** rather than
+    /// trusted: `tokio::sync::broadcast::channel(0)` panics, a huge one
+    /// allocates every slot up front and can abort the daemon, and either
+    /// happens inside `start_session`. `Config::validate` already refuses
+    /// both from the file; the clamp is for the callers that build a
+    /// `SessionConfig` by hand.
+    pub output_broadcast_capacity: usize,
 }
 
 impl Default for SessionConfig {
@@ -190,6 +384,7 @@ impl Default for SessionConfig {
             // session with no operator config to honour, and the safe
             // default is every rule.
             rules: None,
+            output_broadcast_capacity: OUTPUT_BROADCAST_FRAMES,
         }
     }
 }
@@ -297,6 +492,9 @@ pub struct Session {
     /// it snapshots the buffer, which is the ordering that stops a fast
     /// command's output from landing in the gap between the two.
     output_tx: broadcast::Sender<OutputFrame>,
+    /// What `output_tx` was sized to — [`SessionConfig::output_broadcast_capacity`],
+    /// clamped (GH #210). Kept because the channel does not report it.
+    output_broadcast_capacity: usize,
     /// §7.5's non-output edges, on the same shape as `output_tx` and for
     /// the same reason: a connection converts them into frames, and the
     /// session never names one.
@@ -333,6 +531,10 @@ pub struct Session {
     /// provider call and comparing it in the writer thread is how that is
     /// refused; see [`WriteRequest::SecretIfUnread`].
     writes_performed: Arc<AtomicU64>,
+    /// `buffer.head` as sampled just before the most recent write the
+    /// backend took — [`WriteAck::pre_write_head`] of the latest write —
+    /// or 0 before any. See [`Session::output_since_last_write`].
+    last_write_head: AtomicU64,
     /// §4.3's write queue — the *push* half of the same fan-out
     /// `output_tx` is the pull half of.
     ///
@@ -806,7 +1008,10 @@ impl Session {
         // "effectively never" rather than a wrapped deadline in the past.
         let idle_timeout_ms = (config.idle_timeout_secs as i64).saturating_mul(1000);
         let idle_deadline_ms = Arc::new(AtomicI64::new(deadline_from(started_ms, idle_timeout_ms)));
-        let (output_tx, _) = broadcast::channel(OUTPUT_BROADCAST_FRAMES);
+        let output_broadcast_capacity = config
+            .output_broadcast_capacity
+            .clamp(1, MAX_OUTPUT_BROADCAST_FRAMES);
+        let (output_tx, _) = broadcast::channel(output_broadcast_capacity);
         let (events_tx, _) = broadcast::channel(SESSION_EVENT_FRAMES);
         let (write_tx, mut write_rx) = tokio::sync::mpsc::channel(WRITE_QUEUE_FRAMES);
         let awaiting_secret = Arc::new(std::sync::atomic::AtomicBool::new(false));
@@ -857,11 +1062,13 @@ impl Session {
             redaction_stats: Mutex::new(BTreeMap::new()),
             binding_uses: Mutex::new(BTreeMap::new()),
             output_tx: output_tx.clone(),
+            output_broadcast_capacity,
             events_tx: events_tx.clone(),
             awaiting_secret: Arc::clone(&awaiting_secret),
             secret_episode: Arc::clone(&secret_episode),
             reader_finished: Arc::clone(&reader_finished),
             writes_performed: Arc::clone(&writes_performed),
+            last_write_head: AtomicU64::new(0),
             write_tx: Mutex::new(write_tx),
             writer: std::sync::OnceLock::new(),
             last_activity_ms: Arc::clone(&last_activity_ms),
@@ -1743,6 +1950,25 @@ impl Session {
         self.writes_performed.load(Ordering::Relaxed)
     }
 
+    /// Whether the child has written anything since the most recent input
+    /// reached it — and `true` for a session no input has reached, where no
+    /// mode can predate a write.
+    ///
+    /// **Evidence that the child reacted to its last input, and no more
+    /// than evidence** (GH #248): a program that was still drawing when the
+    /// key went in makes this `true` before it has read the key. What it
+    /// does establish is the negative, and that is what it is for — `false`
+    /// means nothing has come back since the write, so a mode read now is
+    /// the mode from *before* it. `session::wait::CarriedMode` consumes it.
+    ///
+    /// Compared against the head sampled *before* the write, so output the
+    /// reader pushes in between counts as after it: the error is on the
+    /// side of "reacted", the side the pre-fix behaviour was on always.
+    pub fn output_since_last_write(&self) -> bool {
+        self.writes_performed() == 0
+            || self.buffer_head() > self.last_write_head.load(Ordering::Relaxed)
+    }
+
     /// The prompt line the child has drawn, redacted (§9.2).
     ///
     /// Used by the replay path, which needs the text at *attach* time
@@ -1865,6 +2091,49 @@ impl Session {
     /// requires.
     pub fn subscribe(&self) -> broadcast::Receiver<OutputFrame> {
         self.output_tx.subscribe()
+    }
+
+    /// How many frames the live output broadcast holds for a subscriber
+    /// that has not read them — §4.2's `output_broadcast_capacity` as this
+    /// session was built with it (GH #210).
+    pub fn output_broadcast_capacity(&self) -> usize {
+        self.output_broadcast_capacity
+    }
+
+    /// An offset **at or before** the one any [`screen_state`] capture
+    /// started after this call returns will reflect (GH #235).
+    ///
+    /// `holdfast attach` and `holdfast watch` now open with the current
+    /// screen, and the live stream has to resume where that picture
+    /// ends. The picture is the screen tracker's, and the tracker lags
+    /// the ring buffer by whatever chunk the reader thread has pushed and
+    /// not yet fed it — so the buffer's head is *not* a safe place to
+    /// resume: a chunk in that window is in neither the picture nor a
+    /// stream that starts after it, and it vanishes without a gap to say
+    /// so.
+    ///
+    /// **A lower bound, deliberately, and the error it permits is the
+    /// visible one.** A stream started here may repeat the few bytes that
+    /// reached the tracker between this call and the capture; it can
+    /// never skip one. Both halves of the argument are monotonicity: the
+    /// tracker's consumed offset only moves forward (a re-seed restarts
+    /// it at the buffer's head, which is ahead of it), and a tracker that
+    /// is not running when this is read will be seeded, by the capture,
+    /// from a buffer whose head has not moved backwards. The screen lock
+    /// is held across both reads so the tracker cannot be switched on
+    /// between them — the order is `screen → buffer`, the one the
+    /// tracker documents.
+    ///
+    /// For an idle session — the case GH #235 is about — the two numbers
+    /// are equal and the resume is exact.
+    ///
+    /// [`screen_state`]: Self::screen_state
+    pub fn stream_floor(&self) -> u64 {
+        let screen = self.screen.lock();
+        match screen.tracked_head() {
+            Some(head) => head,
+            None => self.buffer.lock().head(),
+        }
     }
 
     /// A handle on §4.3's write queue.
@@ -2173,7 +2442,23 @@ impl Session {
                 let clipped = head
                     .saturating_sub(req.max_bytes as u64)
                     .max(requested_start);
-                (clipped, clipped > requested_start)
+                // **A tail read starts on a character, not inside one
+                // (GH #241).** `tail_bytes` and a front clip are both
+                // byte counts back from `head`, so either can land on the
+                // second byte of a character and open the page with
+                // U+FFFD. The continuation bytes of a character whose
+                // lead is behind the start are not text the caller can
+                // use; skipping at most three of them is. A cursor read
+                // is not snapped: its start is the caller's, and the
+                // paging loop no longer produces one inside a character.
+                let snapped = (0..3u64)
+                    .map(|k| clipped + k)
+                    .find(|off| {
+                        *off >= head || !(0x80..=0xbfu8).contains(&buffer.slice(*off, *off + 1)[0])
+                    })
+                    .unwrap_or(clipped + 3)
+                    .min(head);
+                (snapped, clipped > requested_start)
             } else {
                 (requested_start, false)
             };
@@ -2229,7 +2514,9 @@ impl Session {
             front_clipped,
             truncated_at_tail,
         };
-        let read = processor.process(&snapshot, &req.options);
+        // The width is the session's now: GH #247's collapse drops a
+        // redraw only when the line in front of it cannot have wrapped.
+        let read = processor.process_at_width(&snapshot, &req.options, Some(self.size().0));
 
         // Fold this response's counts into the session tally that
         // `status.redaction_stats` reports (§5.2, REQ-O-012). It is fed
@@ -2395,9 +2682,16 @@ impl Session {
         // surface may take this value; see
         // [`Session::open_unvouched_holdback`].
         let holdback = self.open_unvouched_holdback(processor);
-        self.screen
-            .lock()
-            .capture(diff_from, redact, Instant::now(), &*self.buffer, holdback)
+        // `capture_judged` and not `capture`: the processor is also what
+        // judges which bytes behind the screen are a private key (GH #224).
+        self.screen.lock().capture_judged(
+            diff_from,
+            redact,
+            Instant::now(),
+            &*self.buffer,
+            holdback,
+            Some(processor),
+        )
     }
 
     /// The §8.6 T3c cursor sub-signal, or `None` when Tier B is off.
@@ -2443,6 +2737,8 @@ impl Session {
         // autofill refuses a credential when this changed under it, and a
         // write that never reached the PTY satisfied no read.
         self.writes_performed.fetch_add(1, Ordering::Relaxed);
+        self.last_write_head
+            .fetch_max(pre_write_head, Ordering::Relaxed);
         self.touch();
         Ok(WriteAck {
             bytes_written: data.len(),
@@ -2482,6 +2778,67 @@ impl Session {
         self.backend.signal_tree(sig)?;
         self.touch();
         Ok(())
+    }
+
+    /// Hang up an interactive shell that has nothing left in front of it
+    /// — what closing its terminal would do — and say whether a hangup
+    /// went out (GH #234).
+    ///
+    /// **Why this exists: an interactive shell ignores `SIGTERM`** (§4.4),
+    /// so `terminate`'s sweep reached every job and left the shell, and
+    /// every `terminate` of a `bash` session waited out its whole grace
+    /// before `SIGKILL` retired it; `daemon stop` paid the same for each
+    /// shell. `SIGHUP` is the signal a shell is *built* to end on: a
+    /// terminal closing sends it, and an interactive shell answers by
+    /// passing it to its jobs and exiting.
+    ///
+    /// **That second half is also the hazard**, and each condition below
+    /// is a case a hangup would break:
+    ///
+    /// - **The leader, as it is now, is an interactive shell**
+    ///   (`PtyBackend::leader_argv`, then `is_interactive_shell`). Not the
+    ///   spawn-time `command`: after `exec python3 app.py` the session
+    ///   has the shell's pid and group and a program in it that may be in
+    ///   its own `SIGTERM` handler — or, for a server that reads `SIGHUP`
+    ///   as "reload", about to reload mid-shutdown. `bash script.sh` is a
+    ///   shell by name and a program by behaviour, and fails here too.
+    /// - **Nothing else in the session is alive**
+    ///   (`PtyBackend::leader_alone`). A job that caught the `SIGTERM` —
+    ///   in the foreground or the background — is still running its
+    ///   cleanup, and a hangup to the shell would be passed on to it. Once
+    ///   it has finished, the shell is alone and the next poll qualifies.
+    /// - **The leader has not been reaped**, so its pid still names it —
+    ///   the guard `PtyBackend::signal` states, kept by each of the three
+    ///   backend calls.
+    ///
+    /// Every "cannot tell" — an unreadable argv, a platform that cannot
+    /// enumerate a session — answers `false` and sends nothing, which is
+    /// the escalation to `SIGKILL` that every shell got before this.
+    ///
+    /// The shell's exit status is then "killed by `SIGHUP`", which REQ-P-007
+    /// reports as `exit_code: 1`, exactly as the `SIGKILL` it replaces did.
+    pub fn hang_up_idle_shell(&self) -> bool {
+        // The argv first: one read, where `leader_alone` walks every
+        // process on the machine — and every session that is not a shell
+        // is asked on every poll of a `daemon stop`.
+        let Some(argv) = self.backend.leader_argv() else {
+            return false;
+        };
+        let Some((program, args)) = argv.split_first() else {
+            return false;
+        };
+        // A login shell spells its own name with a leading `-`.
+        let program = program.strip_prefix('-').unwrap_or(program);
+        if !is_interactive_shell(program, args) || !self.backend.leader_alone() {
+            return false;
+        }
+        // The backend delivers, under its own reaped-leader guard; one
+        // that cannot answers `false` and the caller escalates as before.
+        let sent = self.backend.hang_up();
+        if sent {
+            self.touch();
+        }
+        sent
     }
 
     /// Stamp activity for an event that mutated the session without
@@ -2551,6 +2908,118 @@ mod tests {
     use crate::pty::{MockPty, MAX_COLS, MAX_ROWS, MIN_COLS, MIN_ROWS};
     use crate::screen::{ScreenCapture, ScreenGrid, ScreenTracking};
     use std::time::Instant;
+
+    /// **A join resumes the stream from what the screen shows, not from
+    /// the buffer's head** (GH #235).
+    ///
+    /// The two differ whenever bytes reached the ring without reaching
+    /// the screen tracker yet — ordinarily the one chunk the reader is
+    /// between pushing and feeding, a window no test can hold open. §9.5's
+    /// buffer notice is the deterministic case: `inject_notice` pushes to
+    /// the ring and publishes, and never feeds the tracker. A floor at the
+    /// buffer's head would put the notice in neither the opening picture
+    /// nor the stream; at the tracker's offset it is streamed after the
+    /// picture, which is where it belongs.
+    ///
+    /// The negative: with no tracker running, the floor is the buffer's
+    /// head, because the capture that follows will seed from there.
+    #[test]
+    fn the_stream_floor_is_the_screens_offset_not_the_buffers() {
+        let (s, pty) = mock_session();
+        pty.queue_output(b"a prompt$ ");
+        wait_for_bytes(&s, 10);
+        assert_eq!(
+            s.stream_floor(),
+            s.buffer_head(),
+            "with no tracker running the floor is the head the capture will seed from"
+        );
+
+        // Switch the tracker on the way a join does, then put bytes in the
+        // ring that it has not parsed.
+        let _ = s.screen_state(None, true, &OutputProcessor::builtin().unwrap());
+        let shown = s.buffer_head();
+        s.inject_notice(b"[holdfast] a notice\r\n");
+        assert!(
+            s.buffer_head() > shown,
+            "the fixture's notice never reached the ring"
+        );
+        assert_eq!(
+            s.stream_floor(),
+            shown,
+            "the floor ran ahead of what the screen shows; the bytes in between would be \
+             in neither the opening picture nor the stream"
+        );
+    }
+
+    /// **A hand-built capacity is clamped into `1..=`the ceiling** (GH
+    /// #210's review). `Config::validate` refuses a file's value past
+    /// [`MAX_OUTPUT_BROADCAST_FRAMES`]; this is the half for a caller that
+    /// builds a `SessionConfig` itself. The values past the ceiling are
+    /// kept small enough that an unclamped build allocates them without
+    /// incident, so a removed clamp fails the assertion instead of taking
+    /// the test process with it.
+    #[test]
+    fn a_capacity_outside_the_bounds_is_clamped_into_them() {
+        for (asked, held) in [
+            (0, 1),
+            (MAX_OUTPUT_BROADCAST_FRAMES, MAX_OUTPUT_BROADCAST_FRAMES),
+            (MAX_OUTPUT_BROADCAST_FRAMES + 1, MAX_OUTPUT_BROADCAST_FRAMES),
+            (4 * MAX_OUTPUT_BROADCAST_FRAMES, MAX_OUTPUT_BROADCAST_FRAMES),
+        ] {
+            let s = Session::new(
+                new_session_id(),
+                None,
+                "bash".into(),
+                vec![],
+                Arc::new(MockPty::new()) as Arc<dyn PtyBackend>,
+                SessionConfig {
+                    output_broadcast_capacity: asked,
+                    ..SessionConfig::with_buffer_capacity(4096)
+                },
+            );
+            assert_eq!(
+                s.output_broadcast_capacity(),
+                held,
+                "a hand-built capacity of {asked} was not clamped to {held}"
+            );
+        }
+    }
+
+    /// **The broadcast holds what the config says, not a constant** (GH
+    /// #210). Measured by the lag a subscriber that reads nothing is told
+    /// about: `frames - capacity`, for two capacities, so neither the
+    /// config value nor the old constant can pass for the other.
+    #[test]
+    fn the_output_broadcast_holds_the_configured_number_of_frames() {
+        for capacity in [4usize, 32] {
+            let pty = Arc::new(MockPty::new());
+            let s = Session::new(
+                new_session_id(),
+                None,
+                "bash".into(),
+                vec![],
+                Arc::clone(&pty) as Arc<dyn PtyBackend>,
+                SessionConfig {
+                    output_broadcast_capacity: capacity,
+                    ..SessionConfig::with_buffer_capacity(64 * 1024)
+                },
+            );
+            assert_eq!(s.output_broadcast_capacity(), capacity);
+            let mut rx = s.subscribe();
+            let frames = capacity + 9;
+            for i in 0..frames {
+                pty.queue_output(b"x");
+                wait_for_bytes(&s, i as u64 + 1);
+            }
+            match rx.try_recv() {
+                Err(broadcast::error::TryRecvError::Lagged(n)) => assert_eq!(
+                    n, 9,
+                    "a broadcast of {capacity} frames dropped {n} of {frames}"
+                ),
+                other => panic!("expected a lag of 9 frames, got {other:?}"),
+            }
+        }
+    }
 
     fn mock_session() -> (Arc<Session>, Arc<MockPty>) {
         let pty = Arc::new(MockPty::new());
@@ -2926,6 +3395,63 @@ mod tests {
         assert_eq!(r.output, "export TOKEN=[REDACTED:github]\nnext\n");
         assert_eq!(r.cursor, line.len() as u64);
         assert!(!r.held_back);
+    }
+
+    /// **A tail read opens on a character, never inside one (GH #241).**
+    ///
+    /// `tail_bytes` and a front-clipped tail are byte counts back from
+    /// `head`, so either lands on a continuation byte as readily as on a
+    /// lead, and the page then opens with U+FFFD. Every `tail_bytes` from
+    /// one to the whole buffer is asked here, so every alignment against
+    /// the three- and four-byte characters is reached; the front-clipped
+    /// arm goes through `max_bytes` instead, which is the other road to
+    /// the same arithmetic.
+    #[test]
+    fn a_tail_read_never_opens_inside_a_utf8_character() {
+        let (s, pty) = mock_session();
+        let p = OutputProcessor::builtin().unwrap();
+        let text = "日本語 🦀 é\n".repeat(20);
+        pty.queue_output(text.as_bytes());
+        wait_for_bytes(&s, text.len() as u64);
+
+        let mut snapped = 0usize;
+        for n in 1..=text.len() {
+            let req = ReadRequest {
+                start: ReadStart::TailBytes(n),
+                holdback: Holdback::BypassedByCallerOptIn,
+                ..ReadRequest::since(0, 32 * 1024)
+            };
+            let r = s.read_processed(&req, &p);
+            assert!(
+                !r.output.contains('\u{fffd}'),
+                "tail_bytes {n} opened inside a character: {:?}",
+                &r.output[..r.output.len().min(16)]
+            );
+            assert!(text.ends_with(&r.output), "tail_bytes {n} is not a suffix");
+            snapped += (r.output.len() < n) as usize;
+        }
+        assert!(snapped > 0, "no tail_bytes value landed inside a character");
+
+        // Front-clipped by `max_bytes` rather than by the argument.
+        for max_bytes in 1..=16usize {
+            let req = ReadRequest {
+                start: ReadStart::TailBytes(text.len()),
+                holdback: Holdback::BypassedByCallerOptIn,
+                ..ReadRequest::since(0, max_bytes)
+            };
+            let r = s.read_processed(&req, &p);
+            assert!(r.truncated_for_size, "max_bytes {max_bytes}: front clip");
+            assert!(
+                !r.output.contains('\u{fffd}'),
+                "max_bytes {max_bytes}: {:?}",
+                r.output
+            );
+            assert_eq!(
+                r.cursor,
+                text.len() as u64,
+                "a tail read still ends at head"
+            );
+        }
     }
 
     /// C-1 on the real read path (§4.1: *"a secret that was partially in
@@ -4085,6 +4611,10 @@ mod tests {
                 // The built-in §9.2 table, which is what a session with
                 // no server behind it gets.
                 rules: None,
+                // §4.2's default; this row is about the history and
+                // detection knobs, and a usize beside two usizes above is
+                // named rather than defaulted for the same reason.
+                output_broadcast_capacity: OUTPUT_BROADCAST_FRAMES,
             },
         );
         pty.queue_output(&bytes);
@@ -4665,6 +5195,317 @@ mod tests {
         let g = grid(s.screen_state(None, true, &OutputProcessor::builtin().unwrap()));
         assert_eq!(g.lines[0].trim_end(), "ONCE");
         assert_eq!((g.cursor_row, g.cursor_col), (0, 4));
+    }
+
+    // ---------------------------------------- GH #224: keys on the grid
+
+    /// A session with a ring large enough for any fixture key, Tier B on,
+    /// at `rows × cols`.
+    fn key_session(rows: u16, cols: u16) -> (Arc<Session>, Arc<MockPty>) {
+        let pty = Arc::new(MockPty::new());
+        let s = Session::new(
+            new_session_id(),
+            None,
+            "bash".into(),
+            vec![],
+            Arc::clone(&pty) as Arc<dyn PtyBackend>,
+            SessionConfig::with_buffer_capacity(1 << 20),
+        );
+        s.set_screen_config(ScreenConfig {
+            mode: ScreenTracking::On,
+            rows,
+            cols,
+            ..ScreenConfig::default()
+        });
+        (s, pty)
+    }
+
+    /// Queue `text` and return the grid once the *parser* has caught up
+    /// with it — the reader publishes to the buffer first and to the
+    /// screen after, so waiting on the buffer alone races that gap.
+    fn painted_grid(s: &Session, pty: &MockPty, text: &str, p: &OutputProcessor) -> ScreenGrid {
+        pty.queue_output(text.as_bytes());
+        wait_for_bytes(s, text.len() as u64);
+        let mut g = grid(s.screen_state(None, true, p));
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while !g.lines.iter().any(|l| l.starts_with("done")) && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(5));
+            g = grid(s.screen_state(None, true, p));
+        }
+        assert!(
+            g.lines.iter().any(|l| l.starts_with("done")),
+            "the parser never reached the end of the fixture: {:?}",
+            g.lines
+        );
+        g
+    }
+
+    /// **`get_screen_state` masks a private key on the grid wherever
+    /// `read_output` masks it** (GH #224, GH #243).
+    ///
+    /// Two shapes, and each was a leak on `main` at `a81b02d` measured on
+    /// the real wire:
+    ///
+    /// * **complete, with its header scrolled off the top.** The render
+    ///   never sees `-----BEGIN`, so its own redactor matches nothing and
+    ///   the holdback mask reaches 512 bytes back: 36 of a 4096-bit key's
+    ///   body lines came back raw. The two larger keys here are taller
+    ///   than a 24-row screen, and every key is taller than the 10-row
+    ///   one, so every fixture reaches this arm at some geometry.
+    /// * **cut short** (`head -n 15`), with a prompt after it. Nothing
+    ///   closes the key, so the render matches nothing whether or not the
+    ///   header is on screen; `read_output` masked the body and the grid
+    ///   returned all of it.
+    ///
+    /// **Paired** with what must survive: the command after the key comes
+    /// back verbatim, on every arm. A grid that masked everything below a
+    /// `-----BEGIN` would pass the rest of this row.
+    ///
+    /// **And every other shape in `Key::shapes`**, at one geometry: the
+    /// independent review of GH #242 found the grid showing a pager's
+    /// next screenful of a key raw — 23 body lines under `less` at 24
+    /// rows — on this branch and on `a81b02d` alike, and the same for a
+    /// decorated key a pager cut off.
+    #[test]
+    fn the_grid_masks_a_private_key_that_read_output_masks() {
+        use crate::output::pem::fixtures::KEYS;
+        let p = OutputProcessor::builtin().unwrap();
+        let mut scrolled_off = 0usize;
+        for key in KEYS {
+            let pem = key.pem().replace('\n', "\r\n");
+            let cut: String = pem.split_inclusive('\n').take(15).collect();
+            // A shape, its text, and the geometries it is painted at.
+            type Arm<'a> = (&'a str, String, &'a [(u16, u16)]);
+            let mut shapes: Vec<Arm> = vec![
+                (
+                    "complete",
+                    format!("$ cat k\r\n{pem}$ echo done\r\ndone\r\n$ "),
+                    &[(40, 120), (24, 80), (10, 100)],
+                ),
+                (
+                    "head -n 15",
+                    format!("$ cat k\r\n{cut}$ echo done\r\ndone\r\n$ "),
+                    &[(40, 120), (24, 80), (10, 100)],
+                ),
+            ];
+            for shape in key.shapes() {
+                if !matches!(shape.name, "complete" | "head -n 9") {
+                    shapes.push((shape.name, shape.text, &[(24, 100)]));
+                }
+            }
+            for (shape, text, geometries) in &shapes {
+                for &(rows, cols) in *geometries {
+                    let (s, pty) = key_session(rows, cols);
+                    let g = painted_grid(&s, &pty, text, &p);
+                    let screen = g.lines.join("\n");
+                    scrolled_off += (!screen.contains("-----BEGIN")
+                        && !screen.contains("[REDACTED:private-key]"))
+                        as usize;
+                    assert_eq!(
+                        key.leaked_in(&screen),
+                        None,
+                        "{} {shape} at {rows}x{cols}: {screen}",
+                        key.name
+                    );
+                    assert!(
+                        g.lines.iter().any(|l| l.trim_end() == "$ echo done"),
+                        "{} {shape} at {rows}x{cols}: the next command was masked: {screen}",
+                        key.name
+                    );
+                    // One marker per masked row at most: the two judges
+                    // overlap on a header that is on screen, and a render
+                    // that painted both would print two markers there.
+                    // Except across `bat`'s gutter glyph, which the key
+                    // render does not swap (it swaps printable ASCII, one
+                    // byte for one) and which therefore splits a row's
+                    // mask in two, around a glyph that carries nothing.
+                    assert!(
+                        text.contains('\u{2502}')
+                            || g.lines.iter().all(|l| l.matches("[REDACTED:").count() <= 1),
+                        "{} {shape} at {rows}x{cols}: {screen}",
+                        key.name
+                    );
+                    // The read path agrees, in the same moment.
+                    let r = s.read_processed(&ReadRequest::since(0, 1 << 20), &p);
+                    assert_eq!(key.leaked_in(&r.output), None, "{} {shape}", key.name);
+                    // The key session's own ring is the only reason this
+                    // is not a leak on a fixture shaped differently: the
+                    // row's premise is that the screen really is showing
+                    // part of the key.
+                    assert!(
+                        screen.contains("[REDACTED:"),
+                        "{} {shape} at {rows}x{cols}: nothing of the key is on \
+                         screen, so this arm tests nothing: {screen}",
+                        key.name
+                    );
+                }
+            }
+        }
+        assert!(
+            scrolled_off > 0,
+            "no arm scrolled a header off the screen, which is the case GH #224 reports"
+        );
+    }
+
+    /// **A read collapses a redraw only where the session's own width says
+    /// the line did not wrap** (GH #247, the independent review).
+    ///
+    /// The review's repro, at the session: 150 `W`s and a tail in an
+    /// 80-column session, then `\r\x1b[K`. The line wrapped over two rows
+    /// and the erase cleared only the last, so the grid still shows the
+    /// first 80 `W`s — and the read, which dropped the whole line, showed
+    /// none. At 200 columns the same bytes never wrapped and are dropped,
+    /// which is the half that proves the width reaches the processor at
+    /// all: a read path that passed no width would keep both.
+    #[test]
+    fn a_read_collapses_a_redraw_only_where_the_session_width_says_it_did_not_wrap() {
+        let p = OutputProcessor::builtin().unwrap();
+        let text = format!("{}IMPORTANT-TAIL\r\x1b[Kdone-51\r\n", "W".repeat(150));
+        for (cols, collapsed) in [(80u16, false), (200, true)] {
+            let (s, pty) = key_session(24, cols);
+            pty.queue_output(text.as_bytes());
+            wait_for_bytes(&s, text.len() as u64);
+            let r = s.read_processed(&ReadRequest::since(0, 1 << 20), &p);
+            if collapsed {
+                assert_eq!(r.output, "done-51\r\n", "at {cols} columns");
+            } else {
+                assert_eq!(r.output.matches('W').count(), 150, "at {cols} columns");
+                assert!(r.output.contains("IMPORTANT-TAIL"), "at {cols} columns");
+            }
+        }
+    }
+
+    /// **A key still arriving, with its header scrolled off, is masked on
+    /// the grid** — the in-flight arm of `OutputProcessor::key_regions`,
+    /// which no row reached (the independent review of GH #242: deleting
+    /// that arm left every test green and put 23 body lines on a 24-row
+    /// grid).
+    ///
+    /// `head -n 45 k; sleep 8` of a 4096-bit key: forty-four body lines
+    /// with nothing after them yet. The header has scrolled off, so the
+    /// grid's own candidate walk sees no anchor; the candidate is alive,
+    /// so it is neither a dead one nor followed by body lines. Only the
+    /// in-flight arm names these bytes. The last line is left half
+    /// written, as a key still streaming is, which is also what gives the
+    /// row a cursor position to wait on — the parser is fed after the
+    /// buffer, and a fixture with no sentinel after it has no other.
+    #[test]
+    fn the_grid_masks_a_key_still_arriving_with_its_header_scrolled_off() {
+        use crate::output::pem::fixtures::KEYS;
+        let p = OutputProcessor::builtin().unwrap();
+        for key in KEYS.iter().filter(|k| k.material_lines().len() > 30) {
+            let (rows, cols) = (24u16, 100u16);
+            let pem = key.pem().replace('\n', "\r\n");
+            let lines: Vec<&str> = pem.split_inclusive('\n').collect();
+            // Up to the forty-fifth line, and never the closing boundary.
+            let cut = (lines.len() - 2).min(44);
+            let last = lines[cut].trim_end();
+            let text = format!(
+                "$ head -n 45 k; sleep 8\r\n{}{}",
+                lines[..cut].concat(),
+                &last[..last.len() / 2]
+            );
+            assert!(!text.contains("-----END"), "{}", key.name);
+            let expect = {
+                let mut t = vt100::Parser::new(rows, cols, 0);
+                t.process(text.as_bytes());
+                t.screen().cursor_position()
+            };
+            let (s, pty) = key_session(rows, cols);
+            pty.queue_output(text.as_bytes());
+            wait_for_bytes(&s, text.len() as u64);
+            let deadline = Instant::now() + Duration::from_secs(5);
+            let mut g = grid(s.screen_state(None, true, &p));
+            while (g.cursor_row, g.cursor_col) != expect && Instant::now() < deadline {
+                std::thread::sleep(Duration::from_millis(5));
+                g = grid(s.screen_state(None, true, &p));
+            }
+            assert_eq!(
+                (g.cursor_row, g.cursor_col),
+                expect,
+                "{}: the parser never reached the end of the fixture",
+                key.name
+            );
+            let screen = g.lines.join("\n");
+            // The premise: the header is off the screen, so this is the
+            // byte stream's judge and not the grid's own.
+            assert!(!screen.contains("-----BEGIN"), "{}: {screen}", key.name);
+            assert_eq!(key.leaked_in(&screen), None, "{}: {screen}", key.name);
+            assert!(g.held_back, "{}: {screen}", key.name);
+        }
+    }
+
+    /// **The grid judges the key it shows, not only the bytes behind it**
+    /// (GH #224's second judge).
+    ///
+    /// A render is a reconstruction: here a line of junk follows the
+    /// header and is then overwritten by a carriage return, so the screen
+    /// shows the header and the key body contiguous, and every body line
+    /// is painted in two halves with a carriage return and a cursor move
+    /// between them, so the screen shows whole lines. The byte stream
+    /// does not — it carries the junk between header and body, and since
+    /// GH #242 a `-----BEGIN` candidate ends at the first byte that cannot
+    /// be PEM text; and the body lines after it, which `pem::body_lines`
+    /// masks when a line carries a key-body run, carry only half-line runs
+    /// in any stream a read emits. So the stream's judge sees prose after
+    /// a header and nothing to mask — the read path's residual for this
+    /// shape, which takes a program that writes junk into its own key and
+    /// then paints each line of it in pieces. (With the junk alone, and
+    /// whole lines, the stream's judge masks it too, since the review of
+    /// GH #242.) The grid is not left to the stream's answer on it,
+    /// because the grid emits what it renders.
+    #[test]
+    fn the_grid_masks_a_key_whose_stream_was_overwritten_on_screen() {
+        use crate::output::pem::fixtures::KEYS;
+        let p = OutputProcessor::builtin().unwrap();
+        let key = &KEYS[0];
+        let pem = key.pem().replace('\n', "\r\n");
+        let mut lines = pem.split_inclusive('\n');
+        let header = lines.next().unwrap();
+        let body: String = lines
+            .take(12)
+            .map(|l| {
+                let l = l.trim_end();
+                let half = l.len() / 2;
+                format!("{}\r\x1b[{half}C{}\r\n", &l[..half], &l[half..])
+            })
+            .collect();
+        let (s, pty) = key_session(40, 120);
+        let text = format!("$ cat k\r\n{header}JUNK.\r{body}user@host:~$ echo done\r\ndone\r\n$ ");
+        // The premise: the stream judges this candidate dead with nothing
+        // to mask, so the byte-stream judge cannot be what masks it.
+        assert!(
+            p.key_regions(text.as_bytes(), 0).is_empty(),
+            "the stream's judge must see nothing here, or this row tests the other judge"
+        );
+        let g = painted_grid(&s, &pty, &text, &p);
+        let screen = g.lines.join("\n");
+        assert!(
+            !screen.contains("JUNK"),
+            "the fixture must overwrite its junk: {screen}"
+        );
+        assert_eq!(key.leaked_in(&screen), None, "{screen}");
+        assert!(g.held_back, "{screen}");
+        assert!(screen.contains("$ echo done"), "{screen}");
+    }
+
+    /// The negative the row above cannot give: prose that *names* a key
+    /// header costs the grid nothing (GH #242), and a grid with no key on
+    /// it reports `held_back: false`.
+    #[test]
+    fn the_grid_does_not_mask_prose_that_mentions_a_key_header() {
+        let p = OutputProcessor::builtin().unwrap();
+        let (s, pty) = key_session(24, 80);
+        let text = "$ git grep -n BEGIN CHANGELOG.md\r\n\
+            CHANGELOG.md:12: contains `-----BEGIN RSA PRIVATE KEY-----` as prose\r\n\
+            $ printf -- '-----BEGIN RSA PRIVATE KEY-----\\n'\r\n\
+            -----BEGIN RSA PRIVATE KEY-----\r\n\
+            user@host:~$ echo done\r\ndone\r\n$ ";
+        let g = painted_grid(&s, &pty, text, &p);
+        let screen = g.lines.join("\n");
+        assert!(!g.held_back, "{screen}");
+        assert!(!screen.contains("[REDACTED"), "{screen}");
+        assert!(screen.contains("as prose"), "{screen}");
     }
 
     // ---------------------------------------------- geometry bounds (C3)

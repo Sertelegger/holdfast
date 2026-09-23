@@ -184,6 +184,14 @@ const HOST_DEPENDENT_ROWS: &[(&str, &[Need])] = &[
         &[Need::Program("zsh")],
     ),
     (
+        "a_zsh_precmd_that_regenerates_its_prompt_keeps_the_marker_stream_and_the_history",
+        &[Need::Program("zsh")],
+    ),
+    (
+        "a_confirmation_prompt_from_an_external_program_answers_at_prompt",
+        &[Need::Program("python3")],
+    ),
+    (
         "fish_integration_emits_the_measured_marker_stream_and_exact_exit_codes",
         &[Need::Program("fish")],
     ),
@@ -2617,4 +2625,850 @@ async fn a_program_that_fakes_bracketed_paste_fools_tier_2() {
     );
     assert_eq!(s["prompt"]["last_line"], "");
     kill(&server, &id).await;
+}
+
+// ---------------------------------------------------------------------
+// GH #220 — a prompt regenerated at every prompt
+// ---------------------------------------------------------------------
+
+/// A stock bash whose `PROMPT_COMMAND` assigns `PS1` at every prompt —
+/// starship's shape (`starship_precmd` runs `PS1="$(starship prompt …)"`),
+/// with no starship, so CI needs nothing installed.
+///
+/// Through the environment rather than an rc file, which bash reads
+/// before it draws its first prompt (measured, and relied on by
+/// `already_marking_bash` too); `--norc` keeps the rest of the host's
+/// configuration out of it.
+fn regenerating_bash(ps1: &str) -> StartSessionArgs {
+    bash_with_prompt_command(&format!("PS1={ps1:?}"))
+}
+
+/// `bash --norc --noprofile` with `PROMPT_COMMAND` inherited verbatim.
+fn bash_with_prompt_command(prompt_command: &str) -> StartSessionArgs {
+    let mut env = term().expect("TERM");
+    env.insert("PROMPT_COMMAND".into(), prompt_command.into());
+    StartSessionArgs {
+        command: Some("bash".into()),
+        args: vec!["--norc".into(), "--noprofile".into()],
+        env: Some(env),
+        ..Default::default()
+    }
+}
+
+/// GH #220's reproduction, minus starship: every entry of
+/// `get_command_history` came back `command: ""`, the session's first
+/// command was missing outright, and `osc133_source` still said
+/// `holdfast`. Measured on this row's shape before the fix: three entries
+/// for four commands, all empty, at `terminal_mode`.
+///
+/// `assert_marker_stream_and_exit_codes` is the whole assertion, and
+/// that is the point: a regenerated prompt must produce **the identical
+/// stream and history** a static one does — `D;0`, `A`, `B`, then `C`,
+/// `D;<code>`, `A`, `B` per command, three entries with text and codes,
+/// source `holdfast`.
+///
+/// Two arms. The scalar `PROMPT_COMMAND` is starship's own shape. The
+/// array arm puts the regenerator at **index 1**, which runs after
+/// anything composed into index 0, so the re-wrap has to be its own last
+/// element there. bash < 5.1 runs only index 0 of an array, so on such a
+/// host the array arm's regenerator never fires and the arm passes without
+/// testing anything; it is exercised wherever bash ≥ 5.1 is — which
+/// includes `ubuntu-24.04`'s 5.2.
+#[tokio::test]
+async fn a_prompt_regenerated_at_every_prompt_keeps_the_marker_stream_and_the_history() {
+    let rc = std::env::temp_dir().join(format!(
+        "holdfast-detection-array-pc-{}.bashrc",
+        std::process::id()
+    ));
+    std::fs::write(&rc, "PROMPT_COMMAND=(':' 'PS1=\"regen\\$ \"')\n").expect("write rc");
+    let array = StartSessionArgs {
+        command: Some("bash".into()),
+        args: vec![
+            "--noprofile".into(),
+            "--rcfile".into(),
+            rc.to_string_lossy().into_owned(),
+        ],
+        env: term(),
+        ..Default::default()
+    };
+    // The third arm regenerates `PS0` as well, which no framework measured
+    // does today (starship sets it once): without `__holdfast_p`'s `PS0`
+    // check every `C` after the first prompt is lost, and with it
+    // `Executing`, the command count and the history's entries.
+    let ps0 = bash_with_prompt_command(r#"PS1="regen\$ "; PS0="""#);
+    for (arm, args) in [
+        ("scalar", regenerating_bash("regen$ ")),
+        ("array", array),
+        ("ps0", ps0),
+    ] {
+        let server = HoldfastServer::new();
+        let id = start(&server, args).await;
+        assert_marker_stream_and_exit_codes(&server, &id, "bash").await;
+        // Without this the row could pass against a shell that never
+        // regenerated anything: only a live regenerator prints this prompt.
+        assert!(
+            raw(&server, &id).await.contains("regen$ "),
+            "{arm}: the regenerating PROMPT_COMMAND never ran"
+        );
+        kill(&server, &id).await;
+    }
+    let _ = std::fs::remove_file(&rc);
+}
+
+/// The re-wrap is appended to the user's `PROMPT_COMMAND`, so it has to
+/// survive whatever that text ends in — and the first form of it did not
+/// (review of GH #220). It was joined with `; `, which turned a trailing
+/// `;` into `;;`, a trailing `; ` or newline into a line that starts with
+/// `;`, and a trailing comment into one that swallowed the call. Every one
+/// of those is a working `PROMPT_COMMAND` on its own; the common
+/// history-sharing idiom `PROMPT_COMMAND="history -a; $PROMPT_COMMAND"`
+/// leaves the `; ` whenever it started empty. The first three made bash
+/// print `syntax error near unexpected token` at every prompt and run none
+/// of the line — no `D`, so every entry stayed open with `exit_code: null`,
+/// and the user's own hooks stopped — and the fourth silently disabled the
+/// re-wrap.
+///
+/// Each arm's hook regenerates the prompt, so the re-wrap has to have run
+/// *after* it at every prompt for the marker stream to come out whole, and
+/// `regen$ ` shows that the user's hook still ran.
+#[tokio::test]
+async fn a_prompt_command_that_ends_in_a_separator_or_a_comment_keeps_working() {
+    for (arm, prompt_command) in [
+        ("trailing `; `", "PS1=\"regen\\$ \"; "),
+        ("trailing `;`", "PS1=\"regen\\$ \";"),
+        ("trailing newline", "PS1=\"regen\\$ \"\n"),
+        ("trailing comment", "PS1=\"regen\\$ \" # the prompt"),
+    ] {
+        let server = HoldfastServer::new();
+        let id = start(&server, bash_with_prompt_command(prompt_command)).await;
+        assert_marker_stream_and_exit_codes(&server, &id, "bash").await;
+        let all = raw(&server, &id).await;
+        assert!(
+            !all.contains("syntax error"),
+            "{arm}: the snippet broke the user's PROMPT_COMMAND: {all:?}"
+        );
+        assert!(
+            all.contains("regen$ "),
+            "{arm}: the user's own hook stopped running"
+        );
+        kill(&server, &id).await;
+    }
+}
+
+/// bash-preexec's contract, which the re-wrap must not break (review of
+/// GH #220). bash-preexec — what atuin, iTerm2's integration and starship
+/// (when it finds it loaded) hook through — needs `__bp_interactive_mode`
+/// to be the **last** thing `PROMPT_COMMAND` runs: that call arms its
+/// `DEBUG` trap, and the next simple command bash runs is taken to be the
+/// user's. The re-wrap first went in *after* it, so the trap fired for
+/// `__holdfast_p`, recognised a `PROMPT_COMMAND` member, disarmed, and the
+/// user's real command then ran with no `preexec` at all. Measured with the
+/// real bash-preexec 0.5.0, 0.6.0 and master: no `preexec` for any command
+/// on the first two, and every one but the first on master, which moves
+/// its own call back to the end at each prompt; starship's `took 2s` under
+/// bash-preexec went with them.
+///
+/// **This is a model of bash-preexec, not bash-preexec**, which nothing in
+/// CI installs. It keeps the two properties the defect turns on, in
+/// bash-preexec's own names: `__bp_interactive_mode` arms the trap, and the
+/// first command the trap sees after that disarms it and is reported only
+/// if it is not a `PROMPT_COMMAND` member. Its `precmd` regenerates the
+/// prompt, as starship's does when it runs as a bash-preexec hook, so the
+/// marker stream also shows the re-wrap still runs after it.
+///
+/// Two arms, bash-preexec's two installed shapes: 0.5.0 always writes a
+/// newline-separated scalar; 0.6.0 and later write an array on bash ≥ 5.1
+/// and the scalar below that, which the rc decides exactly as 0.6.0 does.
+#[tokio::test]
+async fn bash_preexec_still_sees_every_command_after_the_snippet_joins_prompt_command() {
+    let scalar = r#"PROMPT_COMMAND=$'__bp_precmd_invoke_cmd\n__bp_interactive_mode'"#;
+    let versioned = r#"if (( BASH_VERSINFO[0] > 5 || (BASH_VERSINFO[0] == 5 && BASH_VERSINFO[1] >= 1) )); then PROMPT_COMMAND=(__bp_precmd_invoke_cmd __bp_interactive_mode); else PROMPT_COMMAND=$'__bp_precmd_invoke_cmd\n__bp_interactive_mode'; fi"#;
+    for (arm, install) in [("0.5.0", scalar), ("0.6.0", versioned)] {
+        let dir = std::env::temp_dir().join(format!(
+            "holdfast-detection-bp-{}-{}",
+            arm.replace('.', "_"),
+            std::process::id()
+        ));
+        std::fs::create_dir_all(&dir).expect("mkdir");
+        let log = dir.join("preexec.log");
+        let rc = dir.join("bashrc");
+        std::fs::write(
+            &rc,
+            format!(
+                "PS1='$ '\n\
+                 __bp_precmd_invoke_cmd() {{ PS1='regen\\$ '; }}\n\
+                 __bp_interactive_mode() {{ __bp_armed=on; }}\n\
+                 __bp_debug() {{\n\
+                 \x20   [[ -n ${{__bp_armed-}} ]] || return 0\n\
+                 \x20   __bp_armed=\n\
+                 \x20   case $BASH_COMMAND in __bp_*|__holdfast_*) return 0 ;; esac\n\
+                 \x20   printf '%s\\n' \"$BASH_COMMAND\" >> '{log}'\n\
+                 }}\n\
+                 trap '__bp_debug' DEBUG\n\
+                 {install}\n",
+                log = log.display(),
+            ),
+        )
+        .expect("write rc");
+        let server = HoldfastServer::new();
+        let id = start(
+            &server,
+            StartSessionArgs {
+                command: Some("bash".into()),
+                args: vec![
+                    "--noprofile".into(),
+                    "--rcfile".into(),
+                    rc.to_string_lossy().into_owned(),
+                ],
+                env: term(),
+                ..Default::default()
+            },
+        )
+        .await;
+        assert_marker_stream_and_exit_codes(&server, &id, "bash").await;
+        assert!(
+            raw(&server, &id).await.contains("regen$ "),
+            "{arm}: the model's precmd never ran"
+        );
+        let seen = std::fs::read_to_string(&log).unwrap_or_default();
+        let seen: Vec<&str> = seen.lines().collect();
+        for command in ["echo hello", "false", EXITS_42] {
+            assert!(
+                seen.contains(&command),
+                "{arm}: preexec never fired for `{command}`; it saw {seen:?}"
+            );
+        }
+        kill(&server, &id).await;
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+}
+
+/// The **human** half of GH #220: what a person types during an `attach`
+/// takeover goes into the same PTY by the same write path, key by key, and
+/// was lost the same way. It adds one thing the agent's whole-line writes
+/// never exercise — a line edit — and at the owner's prompt that was lost
+/// a second time: starship's last row there is `⬢ [Docker] ❯ `, whose
+/// glyphs are three bytes each, and the repaint after a Ctrl-U stepped past
+/// it in *columns* while the scanner measured it in *bytes*. A complete
+/// command came back `[REDACTED:unresolved]`.
+///
+/// `LC_ALL=C.UTF-8` is what makes readline measure the prompt in columns.
+/// On a host without that locale readline falls back to bytes, the two
+/// counts agree, and the width half of this row passes without testing
+/// anything — the regeneration half still runs.
+#[tokio::test]
+async fn a_line_typed_and_edited_key_by_key_at_a_regenerated_prompt_is_recorded() {
+    let mut args = regenerating_bash("⬢ [x] ❯ ");
+    let env = args.env.as_mut().expect("env");
+    env.insert("LC_ALL".into(), "C.UTF-8".into());
+    let server = HoldfastServer::new();
+    let id = start(&server, args).await;
+    await_markers(&server, &id, 3).await;
+
+    // One key per write, as a terminal sends them, and each edit waits for
+    // the line editor to have drawn the last: readline skips a redisplay
+    // while input is pending, and a repaint it never drew tests nothing.
+    for key in "echo this is a long command".chars() {
+        keypress(&server, &id, &key.to_string()).await;
+    }
+    await_status(&server, &id, "the long line drawn", |s| {
+        s["prompt"]["last_line"]
+            .as_str()
+            .is_some_and(|l| l.ends_with("long command"))
+    })
+    .await;
+    keypress(&server, &id, "\u{15}").await; // Ctrl-U
+    await_status(&server, &id, "the line killed", |s| {
+        s["prompt"]["last_line"]
+            .as_str()
+            .is_some_and(|l| !l.contains("long command"))
+    })
+    .await;
+    for key in "echo HOLDFAST''_TYPED".chars() {
+        keypress(&server, &id, &key.to_string()).await;
+    }
+    keypress(&server, &id, "\r").await;
+
+    let h = await_closed_history(&server, &id, 1).await;
+    let entries = h["data"]["entries"].as_array().expect("entries");
+    assert_eq!(entries.len(), 1, "{h}");
+    assert_eq!(
+        entries[0]["command"], "echo HOLDFAST''_TYPED",
+        "the typed, edited line did not reach the history: {h}"
+    );
+    assert_eq!(entries[0]["exit_code"], 0, "{h}");
+    kill(&server, &id).await;
+}
+
+/// zsh's arm of GH #220. starship's own zsh integration sets `PROMPT` once
+/// with `promptsubst` and was never affected (measured); a configuration
+/// that assigns `PS1` from `precmd` was, exactly as bash was.
+///
+/// `ZDOTDIR` points at a directory holding only that `.zshrc`, and
+/// `--no-globalrcs` keeps the host's `/etc/zsh*` out of it — macOS ships
+/// an `/etc/zshrc` that sets its own prompt.
+#[tokio::test]
+async fn a_zsh_precmd_that_regenerates_its_prompt_keeps_the_marker_stream_and_the_history() {
+    if !have(Need::Program("zsh")) {
+        eprintln!("skipping: zsh not installed");
+        return;
+    }
+    let dir = std::env::temp_dir().join(format!("holdfast-detection-zdot-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).expect("mkdir");
+    std::fs::write(dir.join(".zshrc"), "precmd() { PS1='regen%# ' }\n").expect("write .zshrc");
+    let mut env = term().expect("TERM");
+    env.insert("ZDOTDIR".into(), dir.to_string_lossy().into_owned());
+    let server = HoldfastServer::new();
+    let id = start(
+        &server,
+        StartSessionArgs {
+            command: Some("zsh".into()),
+            args: vec!["--no-globalrcs".into()],
+            env: Some(env),
+            ..Default::default()
+        },
+    )
+    .await;
+    assert_marker_stream_and_exit_codes(&server, &id, "zsh").await;
+    assert!(
+        raw(&server, &id).await.contains("regen% "),
+        "the regenerating precmd never ran"
+    );
+    kill(&server, &id).await;
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// The regenerator Holdfast cannot outrun, and the wire saying so.
+///
+/// A hook appended to `PROMPT_COMMAND` *after* the snippet ran — what
+/// `eval "$(starship init bash)"` typed into a live session does — runs
+/// after the re-wrap, so the prompt markers stop for good. Exit codes
+/// still arrive, command text cannot, and until GH #220 `osc133_source`
+/// went on saying `holdfast`: the one field a caller checks before
+/// trusting that history.
+#[tokio::test]
+async fn a_prompt_regenerated_after_the_snippet_is_reported_as_degraded() {
+    let server = HoldfastServer::new();
+    let id = start(&server, bash()).await;
+    await_markers(&server, &id, 3).await;
+    send(
+        &server,
+        &id,
+        r#"PROMPT_COMMAND="$PROMPT_COMMAND"'; PS1="late\$ "'"#,
+    )
+    .await;
+    // `C` and `D;0` for that line, and then no `A`/`B` ever again.
+    //
+    // **Synchronised on the history, not the buffer** (review of GH #220).
+    // `osc133_source` is the detector's, and the reader feeds the buffer
+    // first and the detector after it, so a read taken once the markers
+    // reach the buffer can see the detector's *earlier* `holdfast` — and a
+    // regression that degraded on that `D` would pass whenever the detector
+    // lagged. The history is fed after the detector, so a closed entry for
+    // this line means the detector has seen its `D`.
+    await_markers(&server, &id, 5).await;
+    await_closed_history(&server, &id, 1).await;
+    let s = status(&server, &id).await;
+    assert_eq!(
+        s["osc133_source"], "holdfast",
+        "nothing is known to be missing until a command is submitted: {s}"
+    );
+    send(&server, &id, "(exit 7)").await;
+    await_markers(&server, &id, 7).await;
+
+    let h = await_closed_history(&server, &id, 2).await;
+    let entries = h["data"]["entries"].as_array().expect("entries");
+    assert_eq!(entries.len(), 2, "{h}");
+    // The exit code survives the lost prompt; the text cannot, since no
+    // `B` ever armed the capture.
+    assert_eq!(entries[1]["exit_code"], 7, "{h}");
+    assert_eq!(entries[1]["command"], "", "{h}");
+    let s = status(&server, &id).await;
+    assert_eq!(
+        s["osc133_source"], "holdfast_degraded",
+        "a session whose history has lost its command text still claims \
+         Holdfast's integration is whole: {s}"
+    );
+    kill(&server, &id).await;
+}
+
+// ---------------------------------------------------------------------
+// GH #240 — whose is the submit
+// ---------------------------------------------------------------------
+
+/// GH #240 through the whole reader, deterministically.
+///
+/// The real-shell row below cannot make the race happen on demand — it is
+/// the scheduler's choice whether the reader scans bash's submit before or
+/// after the child takes the terminal. A mock can: the prompt is scanned
+/// with bash (group 100) holding the terminal, then the foreground moves to
+/// the child (200) **before** the submit chunk is queued, so the reader's
+/// per-chunk sample is the child's — the losing interleaving, every run.
+///
+/// Measured against the unfixed scanner: `Executing` / `semantic` / 0.00
+/// with the child's `[Y/n] ` as the last line, for as long as anyone asks.
+#[tokio::test]
+async fn a_submit_scanned_after_the_fork_does_not_hold_a_confirmation_prompt_at_executing() {
+    use holdfast_core::pty::{MockPty, PtyBackend};
+    use holdfast_core::session::{new_session_id, Session, SessionConfig};
+    use std::sync::Arc;
+
+    let server = HoldfastServer::new();
+    let pty = Arc::new(MockPty::new());
+    pty.set_foreground_group(Some(100));
+    // `input()` reads a canonical, echoing line.
+    pty.set_echo(Some(true));
+    pty.set_canonical(Some(true));
+    let session = Session::new(
+        new_session_id(),
+        None,
+        "bash".into(),
+        vec![],
+        Arc::clone(&pty) as Arc<dyn PtyBackend>,
+        SessionConfig::default(),
+    );
+    let id = session.id.clone();
+    server.registry.insert(session).expect("registry insert");
+
+    pty.queue_output(b"\x1b[?2004h\x1b]133;A;holdfast=1\x07$ \x1b]133;B;holdfast=1\x07");
+    await_status(&server, &id, "bash's own prompt", |s| {
+        s["interaction_mode"] == "AtPrompt" && s["detection_tier"] == "semantic"
+    })
+    .await;
+
+    pty.set_foreground_group(Some(200));
+    pty.queue_output(
+        b"python3 confirm.py\r\n\x1b[?2004l\r\x1b]133;C;holdfast=1\x07\
+          Do you want to continue? [Y/n] ",
+    );
+    let s = await_settled(&server, &id, "Do you want to continue? [Y/n] ").await;
+    assert_classified(&s, "AtPrompt", "heuristic", 0.9);
+}
+
+/// GH #240's reproduction on a real shell and a real child: a program
+/// stopped at a `[Y/n] ` confirmation. The dogfood pass measured 2 trials
+/// in 8 answering `Executing` / `semantic` for the whole 12 s wait.
+///
+/// **This row cannot force the losing interleaving** — see the mock row
+/// above, which does. It pins the behaviour end to end, and it would have
+/// failed intermittently rather than every time against the unfixed
+/// scanner.
+///
+/// **It waits for the *detector* to have seen the prompt, not the buffer,
+/// and that is the fix's one precondition rather than tidiness.** The
+/// submit's owner is inherited from the prompt's, which is only right if
+/// the prompt was scanned while bash still sat at it. A 50 ms delay put in
+/// front of the reader's detector feed (the documented `buffer -> detector`
+/// probe) turned this row red when it synchronised on `await_markers`:
+/// the markers were in the buffer, the command was typed, and the prompt
+/// chunk was scanned after python already held the terminal. An agent
+/// that waits for `AtPrompt` before typing — which is what the tool
+/// descriptions tell it to do — is on the safe side of that by
+/// construction; see `ModeScanner::osc133`'s residual.
+#[tokio::test]
+async fn a_confirmation_prompt_from_an_external_program_answers_at_prompt() {
+    if !have(Need::Program("python3")) {
+        eprintln!("skipping: python3 not installed");
+        return;
+    }
+    let server = HoldfastServer::new();
+    let id = start(&server, bash()).await;
+    await_status(&server, &id, "bash's prompt, as the detector saw it", |s| {
+        s["interaction_mode"] == "AtPrompt" && s["detection_tier"] == "semantic"
+    })
+    .await;
+    send(
+        &server,
+        &id,
+        r#"python3 -c "x=input('Do you want to continue? [Y/n] '); print('got', x)""#,
+    )
+    .await;
+    let s = await_settled(&server, &id, "Do you want to continue? [Y/n] ").await;
+    assert_classified(&s, "AtPrompt", "heuristic", 0.9);
+
+    send(&server, &id, "y").await;
+    let h = await_closed_history(&server, &id, 1).await;
+    assert_eq!(h["data"]["entries"][0]["exit_code"], 0, "{h}");
+    kill(&server, &id).await;
+}
+
+// ---------------------------------------------------------------------
+// GH #238 — a pattern written from the text an agent reads
+// ---------------------------------------------------------------------
+
+/// GH #238's reproduction at a real shell. cargo, pytest, grep and ls all
+/// colour their key words on a TTY, so the text an agent reads as
+/// `test result: ok` is written as `test result: \x1b[32mok\x1b[m`, and
+/// `send_input{wait_for: "test result: ok"}` used its whole deadline and
+/// answered `timeout` for a run that had succeeded.
+///
+/// The command line's echo cannot satisfy the pattern: it carries
+/// `\033[32m` as eight literal characters between `: ` and `ok`, so only
+/// the *printed* line can match.
+#[tokio::test]
+async fn a_wait_for_written_from_the_text_matches_coloured_output() {
+    let server = HoldfastServer::new();
+    let id = start(&server, bash()).await;
+    await_markers(&server, &id, 3).await;
+
+    let started = Instant::now();
+    let r = body(
+        &server
+            .send_input(Parameters(SendInputArgs {
+                session: id.clone(),
+                data: r"printf 'test result: \033[32mok\033[m. 3 passed\n'".into(),
+                wait_for: Some("test result: ok".into()),
+                timeout_secs: Some(20),
+                ..Default::default()
+            }))
+            .await
+            .expect("send_input must not be a protocol error"),
+    );
+    assert_eq!(r["status"], "ok", "the colour escape hid the match: {r}");
+    assert_eq!(r["data"]["matched"], true, "{r}");
+    assert!(
+        started.elapsed() < Duration::from_secs(10),
+        "matched only at the deadline: {:?}",
+        started.elapsed()
+    );
+    // What the agent reads is the text it wrote the pattern from …
+    assert_eq!(r["data"]["match"]["text"], "test result: ok", "{r}");
+    // … and `match.offset` is still a raw byte offset (§5.2): the bytes
+    // there are the coloured ones the program wrote.
+    let offset = r["data"]["match"]["offset"].as_u64().expect("offset") as usize;
+    let all = raw(&server, &id).await;
+    assert!(
+        all.as_bytes()[offset..].starts_with(b"test result: \x1b[32mok"),
+        "match.offset does not address the raw bytes: {:?}",
+        &all[offset..(offset + 24).min(all.len())]
+    );
+    kill(&server, &id).await;
+}
+
+// ---------------------------------------------------------------------
+// GH #248 — a pattern-less wait right after a key to a full-screen program
+// ---------------------------------------------------------------------
+
+/// GH #248: `send_input{data: "q", append_newline: false}` to `less`, then
+/// a pattern-less wait, answered `Fullscreen` in 0.0 s two times in five —
+/// the mode from **before** the key, because `less` had not read it yet —
+/// and `status` said `AtPrompt` half a second later. An agent acting on
+/// that answer presses `q` again and leaves a stray `q` at the shell.
+///
+/// The mock reacts to the key the way `less` does, only *after* it
+/// arrives: the write hook starts a thread that leaves the alternate
+/// screen 100 ms later. That makes the losing interleaving the only one —
+/// the wait's first sample is always the stale `Fullscreen` — where the
+/// real program only loses it sometimes.
+///
+/// The settle window is widened to 2 s so what is asserted is *which*
+/// sample was answered, not how promptly the reacting thread was
+/// scheduled: the stale answer came back in well under a millisecond, and
+/// a carried-over mode nothing has answered since the key is held for at
+/// least the settle window. The next row is the same claim
+/// at the default window, with a program slower than it.
+///
+/// **And the hold must not become a tax on the right answer.** The shell
+/// integration here is live, so the prompt that follows `less` is
+/// `AtPrompt` / `semantic`, and a wait that watched `Fullscreen` give way
+/// to it has watched the program finish — it answers then, not a settle
+/// window later. The 1.5 s bound is that half, with the 2 s window as its
+/// margin: measured on a real `less` before this bound existed, the fixed
+/// wait answered in ~300 ms where the unfixed one's correct answers took
+/// ~50 ms, and the difference was exactly one default settle window.
+#[tokio::test]
+async fn a_pattern_less_wait_right_after_a_key_to_a_full_screen_program_waits_for_the_key() {
+    use holdfast_core::detect::DetectionConfig;
+    use holdfast_core::mcp::tools::WaitForPatternArgs;
+    use holdfast_core::pty::{MockPty, PtyBackend};
+    use holdfast_core::session::{new_session_id, Session, SessionConfig};
+    use std::sync::Arc;
+
+    let server = HoldfastServer::new();
+    let pty = Arc::new(MockPty::new());
+    let session = Session::new(
+        new_session_id(),
+        None,
+        "bash".into(),
+        vec![],
+        Arc::clone(&pty) as Arc<dyn PtyBackend>,
+        SessionConfig {
+            detection: DetectionConfig {
+                settle_threshold_ms: 2_000,
+                ..DetectionConfig::default()
+            },
+            ..SessionConfig::default()
+        },
+    );
+    let id = session.id.clone();
+    server.registry.insert(session).expect("registry insert");
+
+    pty.queue_output(
+        b"\x1b]133;A;holdfast=1\x07$ \x1b]133;B;holdfast=1\x07less README.md\r\n\
+          \x1b]133;C;holdfast=1\x07\x1b[?1049h\x1b[H\x1b[2JREADME.md\r\n",
+    );
+    await_mode(&server, &id, "Fullscreen").await;
+
+    let weak = Arc::downgrade(&pty);
+    pty.on_write(move || {
+        let weak = weak.clone();
+        std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(100));
+            if let Some(pty) = weak.upgrade() {
+                pty.queue_output(
+                    b"\x1b[?1049l\x1b]133;D;0;holdfast=1\x07\
+                      \x1b]133;A;holdfast=1\x07$ \x1b]133;B;holdfast=1\x07",
+                );
+            }
+        });
+    });
+    keypress(&server, &id, "q").await;
+
+    let started = Instant::now();
+    let r = body(
+        &server
+            .wait_for_pattern(Parameters(WaitForPatternArgs {
+                session: id.clone(),
+                pattern: None,
+                timeout_secs: Some(20),
+                since_cursor: None,
+                max_bytes: None,
+            }))
+            .await
+            .expect("wait_for_pattern must not be a protocol error"),
+    );
+    assert_ne!(
+        r["data"]["interaction_mode"], "Fullscreen",
+        "answered from the sample before the key was read: {r}"
+    );
+    assert_eq!(r["status"], "ok", "{r}");
+    assert_eq!(r["data"]["interaction_mode"], "AtPrompt", "{r}");
+    assert_eq!(r["data"]["detection_tier"], "semantic", "{r}");
+    assert!(
+        started.elapsed() < Duration::from_millis(1_500),
+        "the wait watched the program leave and still sat out the settle \
+         window: {:?}",
+        started.elapsed()
+    );
+}
+
+/// A mock session showing a `less`-shaped full-screen program at a
+/// shell-integrated prompt, with `settle_threshold_ms` as given.
+async fn mock_less(
+    settle_threshold_ms: u64,
+) -> (
+    HoldfastServer,
+    std::sync::Arc<holdfast_core::pty::MockPty>,
+    String,
+) {
+    use holdfast_core::detect::DetectionConfig;
+    use holdfast_core::pty::{MockPty, PtyBackend};
+    use holdfast_core::session::{new_session_id, Session, SessionConfig};
+    use std::sync::Arc;
+
+    let server = HoldfastServer::new();
+    let pty = Arc::new(MockPty::new());
+    let session = Session::new(
+        new_session_id(),
+        None,
+        "bash".into(),
+        vec![],
+        Arc::clone(&pty) as Arc<dyn PtyBackend>,
+        SessionConfig {
+            detection: DetectionConfig {
+                settle_threshold_ms,
+                ..DetectionConfig::default()
+            },
+            ..SessionConfig::default()
+        },
+    );
+    let id = session.id.clone();
+    server.registry.insert(session).expect("registry insert");
+    pty.queue_output(
+        b"\x1b]133;A;holdfast=1\x07$ \x1b]133;B;holdfast=1\x07less README.md\r\n\
+          \x1b]133;C;holdfast=1\x07\x1b[?1049h\x1b[H\x1b[2JREADME.md\r\n",
+    );
+    await_mode(&server, &id, "Fullscreen").await;
+    (server, pty, id)
+}
+
+/// One pattern-less `wait_for_pattern`, and how long it took.
+async fn pattern_less_wait(server: &HoldfastServer, id: &str) -> (Value, Duration) {
+    pattern_less_wait_for(server, id, 20).await
+}
+
+async fn pattern_less_wait_for(
+    server: &HoldfastServer,
+    id: &str,
+    timeout_secs: u64,
+) -> (Value, Duration) {
+    use holdfast_core::mcp::tools::WaitForPatternArgs;
+    let started = Instant::now();
+    let r = body(
+        &server
+            .wait_for_pattern(Parameters(WaitForPatternArgs {
+                session: id.into(),
+                pattern: None,
+                timeout_secs: Some(timeout_secs),
+                since_cursor: None,
+                max_bytes: None,
+            }))
+            .await
+            .expect("wait_for_pattern must not be a protocol error"),
+    );
+    (r, started.elapsed())
+}
+
+/// The review's reproduction of GH #248, and the reason the first fix
+/// was not one. That fix held a carried-over `Fullscreen` for the settle
+/// window and then answered it; under the load the dogfood pass ran at,
+/// a `less` still starting took longer than that to read its `q`, and the
+/// wait answered `Fullscreen` at ~260 ms, 7 times in 42 — the issue's
+/// exact signature, moved later.
+///
+/// Here the program reads the key 700 ms after it arrives, with the
+/// default settle window, so the settle window runs out while nothing has
+/// come back from the key. The pre-write mode is not the answer then; the
+/// prompt that follows the program's exit is.
+#[tokio::test]
+async fn a_pattern_less_wait_does_not_answer_from_before_a_key_a_slow_program_has_not_read() {
+    use holdfast_core::detect::DEFAULT_SETTLE_THRESHOLD_MS;
+    use std::sync::Arc;
+
+    let (server, pty, id) = mock_less(DEFAULT_SETTLE_THRESHOLD_MS).await;
+    let weak = Arc::downgrade(&pty);
+    pty.on_write(move || {
+        let weak = weak.clone();
+        std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(700));
+            if let Some(pty) = weak.upgrade() {
+                pty.queue_output(
+                    b"\x1b[?1049l\x1b]133;D;0;holdfast=1\x07\
+                      \x1b]133;A;holdfast=1\x07$ \x1b]133;B;holdfast=1\x07",
+                );
+            }
+        });
+    });
+    keypress(&server, &id, "q").await;
+    let (r, _) = pattern_less_wait(&server, &id).await;
+    assert_ne!(
+        r["data"]["interaction_mode"], "Fullscreen",
+        "answered from the sample before the key was read: {r}"
+    );
+    assert_eq!(r["status"], "ok", "{r}");
+    assert_eq!(r["data"]["interaction_mode"], "AtPrompt", "{r}");
+    assert_eq!(r["data"]["detection_tier"], "semantic", "{r}");
+}
+
+/// The price of the row above, bounded: a key that makes the program print
+/// nothing at all leaves the pre-write mode as the only answer there is,
+/// and it is given once `CARRIED_WITHOUT_OUTPUT_HOLD` has passed — not
+/// before it, and not at the deadline.
+///
+/// Two more arms bound that hold from either side. An operator who raised
+/// the settle window past it gets the settle window, since a key that
+/// produced nothing is weaker evidence than one that produced a redraw and
+/// must not be answered sooner. A deadline shorter than the hold gets an
+/// answer inside the deadline, as the settle window's clamp already does,
+/// rather than `reached: false` beside a mode that was showing throughout.
+#[tokio::test]
+async fn a_key_a_full_screen_program_answers_with_nothing_is_answered_after_the_longer_hold() {
+    use holdfast_core::detect::DEFAULT_SETTLE_THRESHOLD_MS;
+    use holdfast_core::session::wait::CARRIED_WITHOUT_OUTPUT_HOLD;
+
+    let raised = CARRIED_WITHOUT_OUTPUT_HOLD + Duration::from_secs(1);
+    for (arm, settle, timeout_secs, at_least) in [
+        (
+            "default",
+            DEFAULT_SETTLE_THRESHOLD_MS,
+            20,
+            CARRIED_WITHOUT_OUTPUT_HOLD,
+        ),
+        ("raised settle", raised.as_millis() as u64, 20, raised),
+        (
+            "short deadline",
+            DEFAULT_SETTLE_THRESHOLD_MS,
+            1,
+            Duration::ZERO,
+        ),
+    ] {
+        let (server, _pty, id) = mock_less(settle).await;
+        keypress(&server, &id, "x").await;
+        let (r, elapsed) = pattern_less_wait_for(&server, &id, timeout_secs).await;
+        assert_eq!(r["status"], "ok", "{arm}: {r}");
+        assert_eq!(r["data"]["reached"], true, "{arm}: {r}");
+        assert_eq!(r["data"]["interaction_mode"], "Fullscreen", "{arm}: {r}");
+        assert!(
+            elapsed >= at_least,
+            "{arm}: answered a mode nothing had confirmed since the key after \
+             {elapsed:?}"
+        );
+        assert!(
+            elapsed < Duration::from_secs(10),
+            "{arm}: a silent key ran the wait toward its deadline: {elapsed:?}"
+        );
+    }
+}
+
+/// And the common case keeps its latency: a key the program answers
+/// without leaving the screen (`less` scrolling) is evidence the mode is
+/// current, so the settle window — 50 ms here — is the whole cost, not the
+/// silent-key hold.
+#[tokio::test]
+async fn a_key_a_full_screen_program_redraws_for_is_answered_after_the_settle_window() {
+    use holdfast_core::session::wait::CARRIED_WITHOUT_OUTPUT_HOLD;
+    use std::sync::Arc;
+
+    let (server, pty, id) = mock_less(50).await;
+    let weak = Arc::downgrade(&pty);
+    pty.on_write(move || {
+        if let Some(pty) = weak.upgrade() {
+            pty.queue_output(b"\x1b[H\x1b[2Jline two\r\n");
+        }
+    });
+    keypress(&server, &id, "j").await;
+    let (r, elapsed) = pattern_less_wait(&server, &id).await;
+    assert_eq!(r["status"], "ok", "{r}");
+    assert_eq!(r["data"]["interaction_mode"], "Fullscreen", "{r}");
+    assert!(
+        elapsed < CARRIED_WITHOUT_OUTPUT_HOLD,
+        "the program redrew for the key and the wait still sat out the \
+         silent-key hold: {elapsed:?}"
+    );
+}
+
+/// A carried mode with **no write behind it** cannot be the mode from
+/// before one, so it needs only the settle window: a session nothing was
+/// ever typed at, sitting at an echo-off read that printed no prompt.
+/// Without that case the silent-key hold would apply to it, since nothing
+/// has come back since a write that never happened.
+#[tokio::test]
+async fn a_carried_mode_with_no_write_behind_it_is_answered_after_the_settle_window() {
+    use holdfast_core::pty::{MockPty, PtyBackend};
+    use holdfast_core::session::wait::CARRIED_WITHOUT_OUTPUT_HOLD;
+    use holdfast_core::session::{new_session_id, Session, SessionConfig};
+    use std::sync::Arc;
+
+    let server = HoldfastServer::new();
+    let pty = Arc::new(MockPty::new());
+    pty.set_echo(Some(false));
+    let session = Session::new(
+        new_session_id(),
+        None,
+        "mock".into(),
+        vec![],
+        Arc::clone(&pty) as Arc<dyn PtyBackend>,
+        SessionConfig::default(),
+    );
+    let id = session.id.clone();
+    server.registry.insert(session).expect("registry insert");
+    await_mode(&server, &id, "AwaitingSecret").await;
+
+    let (r, elapsed) = pattern_less_wait(&server, &id).await;
+    assert_eq!(r["data"]["interaction_mode"], "AwaitingSecret", "{r}");
+    assert!(
+        elapsed < CARRIED_WITHOUT_OUTPUT_HOLD,
+        "no write was ever made, and the wait still held for a key's \
+         answer: {elapsed:?}"
+    );
 }

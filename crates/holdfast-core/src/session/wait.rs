@@ -16,6 +16,27 @@
 //! buys throughput this milestone has no measurement calling for, and
 //! costs the ability to report the match's *text*, which §5.2 requires.
 //!
+//! **The window is kept twice, and a pattern is matched against both**
+//! (GH #238). An agent writes its regex from the text it reads, and what
+//! it reads — `read_output`'s default, `output_since_start`, `match.text`
+//! — has had its ANSI escapes removed. The bytes the program wrote have
+//! not: cargo prints `test result: \x1b[32mok\x1b[m`, so
+//! `wait_for: "test result: ok"` timed out after its whole deadline on a
+//! run that succeeded, with the matching text sitting in the same
+//! response's `output_since_start`. So the window carries an escape-free
+//! view beside the raw bytes, built by the read path's own
+//! [`AnsiStripper`] with a map from every text byte back to its raw
+//! offset, and the pattern is searched in both. The earlier match wins,
+//! by raw offset; a tie goes to the raw one, whose span is exact.
+//!
+//! Both, rather than the text alone, because a pattern that spells an
+//! escape (`\x1b\[32mok`) is a thing callers were told they could write —
+//! the tool's own documentation said "raw output bytes" — and it must keep
+//! matching. **`match.offset` stays a raw byte offset** (§5.2): a text
+//! match starts at the raw offset of its first byte and ends just past its
+//! last, so escapes *inside* the match are inside the span and escapes
+//! around it are not.
+//!
 //! On broadcast lag the window is rebuilt from
 //! `max(clamp_since_cursor, buffer.tail)` — **not** from the frame
 //! boundary the receiver happened to reach (REQ-C-006). The difference
@@ -24,6 +45,8 @@
 //! silently.
 
 use super::{OutputFrame, Session};
+use crate::detect::InteractionMode;
+use crate::output::ansi::AnsiStripper;
 use regex::bytes::Regex;
 use std::time::{Duration, Instant};
 use tokio::sync::broadcast::error::RecvError;
@@ -79,6 +102,96 @@ pub struct WaitOutcome {
     pub truncated_at_tail: bool,
 }
 
+/// Whether a **pattern-less** wait may answer with `Fullscreen` or
+/// `AwaitingSecret` yet (GH #248).
+///
+/// Those two answer at once rather than at the deadline, and the reason
+/// stands: a TUI never returns to a prompt, and a secret prompt wants
+/// `request_secret_input`, not patience. What was wrong is *which* sample
+/// they answer from. An agent sends `q` to `less` and waits; the key is in
+/// the pty but `less` has not read it yet, so the wait's first sample is
+/// the `Fullscreen` from **before** the write — and it was returned in
+/// 0.0 s, 2 times in 5, with `AtPrompt` half a second later. An agent
+/// acting on that presses `q` again and leaves a stray `q` at the shell.
+/// `AwaitingSecret` has the same shape one step later: a secret handed in
+/// by `request_secret_input` and not yet read still shows echo off.
+///
+/// So a mode **already showing at the first sample** is not the answer
+/// until there is evidence it is not the pre-write one:
+///
+/// - **The wait watched it arrive** — any change since the first sample —
+///   and it answers at once, as before.
+/// - **The child has written something since the last input reached it**
+///   ([`Session::output_since_last_write`]) and the mode has held for
+///   `hold`, the detector's own settle window: the program reacted and is
+///   still in this mode — `less` scrolled.
+/// - **Nothing has come back since the write**, and the mode has held for
+///   [`CARRIED_WITHOUT_OUTPUT_HOLD`]: the key produced no output at all.
+///
+/// **The first form of this fix held every carried mode for the settle
+/// window alone, and that only moved the stale answer** (review of GH
+/// #248). `less` takes longer than 250 ms to read a key it was sent while
+/// starting, under the load the dogfood pass ran at; the wait then
+/// answered `Fullscreen` at ~260 ms, 7 times in 42, and `status` said
+/// `AtPrompt` a moment later. A wait cannot see a key being read, but it
+/// can see that nothing has answered it yet, and while nothing has, a
+/// longer hold costs nothing but the rare key a program ignores silently.
+/// Measured with a raw-mode program that reads its key 600 ms after it
+/// arrives: the settle-only hold answered `Fullscreen` 10 times in 10,
+/// this one `AtPrompt` 10 times in 10, in ~0.6 s.
+///
+/// **Residuals, all three on the side of the old behaviour.** The longer
+/// hold is a bound, not a proof: a program slower than it and still silent
+/// is answered from the stale sample. Output that is not an answer to the
+/// key counts as one — the tail of a draw still in flight when the key
+/// went in, or the line discipline's own echo of the key, which happens at
+/// the write whenever `ECHO` is on. `less` sets raw mode before it enters
+/// the alternate screen (measured), so neither applies to it once it shows.
+#[derive(Debug, Default)]
+pub struct CarriedMode {
+    first: Option<(InteractionMode, Instant)>,
+    moved: bool,
+}
+
+/// How long a mode carried into a pattern-less wait is held when nothing
+/// has come back since the last write — see [`CarriedMode`].
+///
+/// Long against the delays that produced GH #248's stale answers (a
+/// `less` still starting took ~1 s to read its `q` at load 18–36) and
+/// short against a deadline, because it is only ever paid by a key that
+/// makes a full-screen program print nothing. Never shorter than the
+/// settle window, which an operator can raise past it.
+pub const CARRIED_WITHOUT_OUTPUT_HOLD: Duration = Duration::from_secs(2);
+
+impl CarriedMode {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Record one sample and say whether `mode` may be the answer now.
+    /// Call it for **every** sample, whatever the mode, or a change the
+    /// wait did watch goes unrecorded and the mode it produced waits out a
+    /// window it should not.
+    ///
+    /// `reacted` is [`Session::output_since_last_write`] at this sample;
+    /// `hold` applies when it is true, and `silent_hold` when it is not.
+    pub fn answerable(
+        &mut self,
+        mode: InteractionMode,
+        now: Instant,
+        reacted: bool,
+        hold: Duration,
+        silent_hold: Duration,
+    ) -> bool {
+        let (first, since) = *self.first.get_or_insert((mode, now));
+        if mode != first {
+            self.moved = true;
+        }
+        let held = now.saturating_duration_since(since);
+        self.moved || held >= if reacted { hold } else { silent_hold }
+    }
+}
+
 /// Run the two-phase scan. Cancel-safe only at the granularity of the
 /// caller's own timeout: the loop owns its deadline.
 pub async fn for_pattern(session: &Session, pattern: &Regex, spec: WaitSpec) -> WaitOutcome {
@@ -89,14 +202,14 @@ pub async fn for_pattern(session: &Session, pattern: &Regex, spec: WaitSpec) -> 
     let mut rx = session.subscribe();
 
     // 2. Snapshot under the buffer lock; scan outside it.
-    let (mut window, mut window_start, snapshot_head, truncated_at_tail) = {
+    let (mut window, snapshot_head, truncated_at_tail) = {
         let (tail, head) = session.buffer_extent();
         let requested = spec.since_cursor.unwrap_or(head);
         let clamped = requested.clamp(tail, head);
         let bytes = session.buffer_slice(clamped, head);
-        (bytes, clamped, head, clamped > requested)
+        (Window::new(clamped, &bytes), head, clamped > requested)
     };
-    let scan_start = window_start;
+    let scan_start = window.start;
     let mut scan_cursor = snapshot_head;
 
     let mut outcome = WaitOutcome {
@@ -107,7 +220,7 @@ pub async fn for_pattern(session: &Session, pattern: &Regex, spec: WaitSpec) -> 
     };
 
     // 3. History.
-    if let Some(found) = search(pattern, &window, window_start) {
+    if let Some(found) = window.search(pattern) {
         outcome.end = WaitEnd::Matched;
         outcome.found = Some(found);
         return outcome;
@@ -136,8 +249,8 @@ pub async fn for_pattern(session: &Session, pattern: &Regex, spec: WaitSpec) -> 
         let slice = LIVENESS_POLL.min(deadline - now);
         match tokio::time::timeout(slice, rx.recv()).await {
             Ok(Ok(frame)) => {
-                if feed(&mut window, &mut window_start, &mut scan_cursor, &frame) {
-                    if let Some(found) = search(pattern, &window, window_start) {
+                if window.feed(&mut scan_cursor, &frame) {
+                    if let Some(found) = window.search(pattern) {
                         outcome.end = WaitEnd::Matched;
                         outcome.found = Some(found);
                         return outcome;
@@ -149,9 +262,8 @@ pub async fn for_pattern(session: &Session, pattern: &Regex, spec: WaitSpec) -> 
                 // search start, not from where the receiver resumed.
                 let rebuilt = resync(session, scan_start, &mut outcome);
                 window = rebuilt.window;
-                window_start = rebuilt.window_start;
                 scan_cursor = rebuilt.scan_cursor;
-                if let Some(found) = search(pattern, &window, window_start) {
+                if let Some(found) = window.search(pattern) {
                     outcome.end = WaitEnd::Matched;
                     outcome.found = Some(found);
                     return outcome;
@@ -221,8 +333,8 @@ fn final_rescan(
 ) -> WaitOutcome {
     let (tail, head) = session.buffer_extent();
     let start = scan_start.max(tail);
-    let final_window = session.buffer_slice(start, head);
-    if let Some(found) = search(pattern, &final_window, start) {
+    let final_window = Window::new(start, &session.buffer_slice(start, head));
+    if let Some(found) = final_window.search(pattern) {
         outcome.end = WaitEnd::Matched;
         outcome.found = Some(found);
     } else {
@@ -233,8 +345,7 @@ fn final_rescan(
 
 /// The window a lagged waiter starts again from.
 struct Resync {
-    window: Vec<u8>,
-    window_start: u64,
+    window: Window,
     scan_cursor: u64,
 }
 
@@ -253,54 +364,173 @@ fn resync(session: &Session, scan_start: u64, outcome: &mut WaitOutcome) -> Resy
     if resync_start > scan_start {
         outcome.truncated_at_tail = true;
     }
-    let mut window = session.buffer_slice(resync_start, head);
-    let mut window_start = resync_start;
-    trim(&mut window, &mut window_start);
+    let mut window = Window::new(resync_start, &session.buffer_slice(resync_start, head));
+    window.trim();
     Resync {
         window,
-        window_start,
         scan_cursor: head,
     }
 }
 
-/// Append a frame's unscanned suffix. Returns whether anything was added.
-fn feed(
-    window: &mut Vec<u8>,
-    window_start: &mut u64,
-    scan_cursor: &mut u64,
-    frame: &OutputFrame,
-) -> bool {
-    // The historical scan already covered everything below `scan_cursor`,
-    // so a frame that straddles the cutover contributes only its suffix —
-    // which is what the frame's absolute span is carried for.
-    let from = frame.start.max(*scan_cursor);
-    if from >= frame.end {
-        return false;
-    }
-    // A frame that begins past the window's end would leave a hole; that
-    // can only happen after a lag, which resyncs instead.
-    if from > *window_start + window.len() as u64 {
-        return false;
-    }
-    window.extend_from_slice(&frame.bytes[(from - frame.start) as usize..]);
-    *scan_cursor = frame.end;
-    trim(window, window_start);
-    true
+/// The coalesced scan window (§5.2's second option), kept in two views.
+///
+/// `raw` is the stream exactly as the program wrote it. `text` is the same
+/// stream with its escape sequences removed by the read path's own
+/// [`AnsiStripper`], and `runs` maps `text` back to raw offsets — which is
+/// what lets a match found in `text` be reported in raw offsets, as §5.2
+/// requires of `match.offset`. See the module doc for why both are
+/// searched.
+///
+/// **The map is one entry per escape, not one per byte**, and that is a
+/// budget rather than a nicety. The historical and final-rescan windows are
+/// not trimmed: they run from the requested cursor to the head of a ring
+/// an operator can configure to any size, so a per-byte `u64` table was
+/// eight bytes of bookkeeping for every byte a `since_cursor: 0` wait
+/// covered — 8 MiB beside the default 1 MiB ring, and proportionally more
+/// beside a larger one. Runs cost what the output's escapes cost.
+///
+/// The stripper is resumable, so an escape split across two frames is
+/// removed exactly as one inside a frame is. A window rebuilt from the
+/// ring (`new`, after a lag or at the final rescan) starts its stripper
+/// at `Ground`; if the rebuild point falls inside a sequence, that
+/// sequence's tail reads as text until the next escape — the same
+/// best-effort `read_output` gives a cursor that lands mid-sequence.
+struct Window {
+    raw: Vec<u8>,
+    /// Absolute offset of `raw[0]`.
+    start: u64,
+    text: Vec<u8>,
+    /// Maximal runs of `text` that were contiguous in the raw stream, as
+    /// `(index in text of the run's first byte, its raw offset)`, in order.
+    /// A new run starts wherever the stripper removed something.
+    runs: Vec<(usize, u64)>,
+    stripper: AnsiStripper,
 }
 
-fn trim(window: &mut Vec<u8>, window_start: &mut u64) {
-    if window.len() > SCAN_WINDOW_BYTES {
-        let drop = window.len() - SCAN_WINDOW_BYTES;
-        window.drain(..drop);
-        *window_start += drop as u64;
+impl Window {
+    fn new(start: u64, bytes: &[u8]) -> Self {
+        let mut w = Self {
+            raw: Vec::with_capacity(bytes.len()),
+            start,
+            text: Vec::with_capacity(bytes.len()),
+            runs: Vec::new(),
+            stripper: AnsiStripper::new(),
+        };
+        w.push(bytes);
+        w
     }
-}
 
-fn search(pattern: &Regex, window: &[u8], window_start: u64) -> Option<MatchSpan> {
-    pattern.find(window).map(|m| MatchSpan {
-        start: window_start + m.start() as u64,
-        end: window_start + m.end() as u64,
-    })
+    /// Absolute offset just past the last raw byte.
+    fn end(&self) -> u64 {
+        self.start + self.raw.len() as u64
+    }
+
+    fn push(&mut self, bytes: &[u8]) {
+        let from = self.end();
+        self.raw.extend_from_slice(bytes);
+        for (at, &b) in (from..).zip(bytes) {
+            if let Some(t) = self.stripper.feed(at, b) {
+                let continues = matches!(
+                    self.runs.last(),
+                    Some(&(first, raw)) if raw + (self.text.len() - first) as u64 == at
+                );
+                if !continues {
+                    self.runs.push((self.text.len(), at));
+                }
+                self.text.push(t);
+            }
+        }
+    }
+
+    /// Append a frame's unscanned suffix. Returns whether anything was
+    /// added.
+    fn feed(&mut self, scan_cursor: &mut u64, frame: &OutputFrame) -> bool {
+        // The historical scan already covered everything below
+        // `scan_cursor`, so a frame that straddles the cutover contributes
+        // only its suffix — which is what the frame's absolute span is
+        // carried for.
+        let from = frame.start.max(*scan_cursor);
+        if from >= frame.end {
+            return false;
+        }
+        // A frame that begins past the window's end would leave a hole;
+        // that can only happen after a lag, which resyncs instead.
+        if from > self.end() {
+            return false;
+        }
+        self.push(&frame.bytes[(from - frame.start) as usize..]);
+        *scan_cursor = frame.end;
+        self.trim();
+        true
+    }
+
+    /// Drop from the front past `SCAN_WINDOW_BYTES` of raw stream, and the
+    /// text that came from what was dropped.
+    fn trim(&mut self) {
+        if self.raw.len() > SCAN_WINDOW_BYTES {
+            let drop = self.raw.len() - SCAN_WINDOW_BYTES;
+            self.raw.drain(..drop);
+            self.start += drop as u64;
+            // The first text byte still inside the window: text offsets
+            // rise with their index, so this is a binary search.
+            let (mut lo, mut hi) = (0, self.text.len());
+            while lo < hi {
+                let mid = (lo + hi) / 2;
+                if self.raw_offset(mid) < self.start {
+                    lo = mid + 1;
+                } else {
+                    hi = mid;
+                }
+            }
+            if lo > 0 {
+                let first = (lo < self.text.len()).then(|| self.raw_offset(lo));
+                self.text.drain(..lo);
+                let kept = self.runs.partition_point(|&(i, _)| i <= lo);
+                let mut runs: Vec<(usize, u64)> = first.map(|o| (0, o)).into_iter().collect();
+                runs.extend(self.runs[kept..].iter().map(|&(i, o)| (i - lo, o)));
+                self.runs = runs;
+            }
+        }
+    }
+
+    /// The raw offset `text[i]` came from. `i` must be a text index.
+    fn raw_offset(&self, i: usize) -> u64 {
+        let run = self.runs.partition_point(|&(first, _)| first <= i) - 1;
+        let (first, raw) = self.runs[run];
+        raw + (i - first) as u64
+    }
+
+    /// The earlier of the raw match and the text match, in raw offsets.
+    fn search(&self, pattern: &Regex) -> Option<MatchSpan> {
+        let raw = pattern.find(&self.raw).map(|m| MatchSpan {
+            start: self.start + m.start() as u64,
+            end: self.start + m.end() as u64,
+        });
+        let text = pattern.find(&self.text).map(|m| {
+            // A text position maps to the raw offset of the byte there, or
+            // to the window's end when it is one past the last text byte —
+            // which only an empty match can be.
+            let at = |i: usize| {
+                if i < self.text.len() {
+                    self.raw_offset(i)
+                } else {
+                    self.end()
+                }
+            };
+            let start = at(m.start());
+            let end = if m.end() > m.start() {
+                self.raw_offset(m.end() - 1) + 1
+            } else {
+                start
+            };
+            MatchSpan { start, end }
+        });
+        match (raw, text) {
+            (Some(r), Some(t)) if t.start < r.start => Some(t),
+            (Some(r), _) => Some(r),
+            (None, t) => t,
+        }
+    }
 }
 
 #[cfg(test)]
@@ -642,13 +872,13 @@ mod tests {
         };
         let rebuilt = resync(&s, 0, &mut outcome);
         assert_eq!(
-            rebuilt.window_start, 0,
+            rebuilt.window.start, 0,
             "the scan start is still buffered, so recovery begins there — \
              not at the frame boundary the receiver resumed at"
         );
         assert_eq!(rebuilt.scan_cursor, 11);
         assert_eq!(
-            search(&re(r"LAGx+GED"), &rebuilt.window, rebuilt.window_start),
+            rebuilt.window.search(&re(r"LAGx+GED")),
             Some(MatchSpan { start: 0, end: 10 }),
             "a match whose start preceded the lag is recovered whole"
         );
@@ -662,8 +892,8 @@ mod tests {
         // above, `max(scan_start, tail)` and a bare `tail` are the same
         // expression; here they are not.
         let rebuilt = resync(&s, 4, &mut outcome);
-        assert_eq!(rebuilt.window_start, 4);
-        assert_eq!(rebuilt.window, b"xxxGED\n");
+        assert_eq!(rebuilt.window.start, 4);
+        assert_eq!(rebuilt.window.raw, b"xxxGED\n");
     }
 
     /// The other arm of the same rule: once the tail has moved past the
@@ -692,8 +922,8 @@ mod tests {
             truncated_at_tail: false,
         };
         let rebuilt = resync(&s, 0, &mut outcome);
-        assert_eq!(rebuilt.window_start, 8, "clamped up to the live tail");
-        assert_eq!(rebuilt.window, b"89abcdef");
+        assert_eq!(rebuilt.window.start, 8, "clamped up to the live tail");
+        assert_eq!(rebuilt.window.raw, b"89abcdef");
         assert!(
             outcome.truncated_at_tail,
             "the requested start rolled out of the ring; the agent is told"
@@ -727,5 +957,328 @@ mod tests {
         let out = for_pattern(&s, &re(r"LAGx+GED"), spec(None, 10_000)).await;
         assert_eq!(out.end, WaitEnd::Matched);
         assert_eq!(out.found.expect("a match").start, 0);
+    }
+
+    /// GH #238's reproduction, byte for byte: cargo colours the verdict, so
+    /// the text an agent reads as `test result: ok` is written as
+    /// `test result: \x1b[32mok\x1b[m`. A pattern copied from the text
+    /// never matched the bytes, and the wait timed out after its whole
+    /// deadline on a run that had succeeded.
+    ///
+    /// The offsets are the contract half: `match.offset` is a **raw** byte
+    /// offset (§5.2), so the span starts at the `t` and ends just past the
+    /// `k`, with the colour escape between them inside it and the reset
+    /// after it outside.
+    #[tokio::test]
+    async fn a_pattern_written_from_the_text_matches_coloured_output() {
+        let (s, pty) = mock();
+        let out = b"running 3 tests\r\ntest result: \x1b[32mok\x1b[m. 3 passed\r\n";
+        pty.queue_output(out);
+        while s.buffer_head() < out.len() as u64 {
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        let o = for_pattern(&s, &re("test result: ok"), spec(Some(0), 2000)).await;
+        assert_eq!(
+            o.end,
+            WaitEnd::Matched,
+            "the escape inside the verdict hid it"
+        );
+        let start = out.windows(11).position(|w| w == b"test result").unwrap() as u64;
+        let k = out.windows(2).position(|w| w == b"ok").unwrap() as u64 + 1;
+        assert_eq!(o.found, Some(MatchSpan { start, end: k + 1 }));
+    }
+
+    /// The two windows rebuilt from the ring search the text view too
+    /// (review of GH #238): the final rescan, which is what answers for
+    /// output that lands in the liveness gap just before a death —
+    /// `cargo test; exit` — and the lag resync. Each is asserted directly,
+    /// because neither path can be steered into from `for_pattern` on
+    /// demand (see `a_lag_resync_rebuilds_from_the_earliest_still_buffered_byte`),
+    /// and a raw-only search in either passed every other row here.
+    #[tokio::test]
+    async fn the_final_rescan_and_the_lag_resync_match_coloured_output() {
+        let (s, pty) = mock();
+        let out = b"running 3 tests\r\ntest result: \x1b[32mok\x1b[m. 3 passed\r\n";
+        pty.queue_output(out);
+        while s.buffer_head() < out.len() as u64 {
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        let start = out.windows(11).position(|w| w == b"test result").unwrap() as u64;
+        let k = out.windows(2).position(|w| w == b"ok").unwrap() as u64 + 1;
+        let want = Some(MatchSpan { start, end: k + 1 });
+        let fresh = || WaitOutcome {
+            end: WaitEnd::TimedOut,
+            found: None,
+            scan_start: 0,
+            truncated_at_tail: false,
+        };
+
+        let o = final_rescan(&s, &re("test result: ok"), 0, fresh());
+        assert_eq!(
+            o.end,
+            WaitEnd::Matched,
+            "the final rescan searched raw bytes only"
+        );
+        assert_eq!(o.found, want);
+
+        let rebuilt = resync(&s, 0, &mut fresh());
+        assert_eq!(
+            rebuilt.window.search(&re("test result: ok")),
+            want,
+            "the resync window lost its text view"
+        );
+    }
+
+    /// The same, arriving live and split mid-escape across two frames —
+    /// the stripper is resumable, so the second frame's `2mok` is not
+    /// taken for text.
+    #[tokio::test]
+    async fn a_coloured_match_split_inside_its_escape_across_frames_is_found() {
+        let (s, pty) = mock();
+        let writer = Arc::clone(&pty);
+        std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(40));
+            writer.queue_output(b"error\x1b[0m: could not compile\r\ntest result: \x1b[3");
+            std::thread::sleep(Duration::from_millis(60));
+            writer.queue_output(b"2mok\x1b[m.\r\n");
+        });
+        let o = for_pattern(&s, &re("test result: ok\\."), spec(None, 5000)).await;
+        assert_eq!(o.end, WaitEnd::Matched);
+        let found = o.found.expect("a match");
+        assert_eq!(
+            s.buffer_slice(found.start, found.end),
+            b"test result: \x1b[32mok\x1b[m.".to_vec(),
+            "the span is the raw bytes the text match came from"
+        );
+    }
+
+    /// The other view keeps working: a pattern that spells an escape was a
+    /// thing callers were told they could write ("raw output bytes"), and
+    /// it matches nothing in the text view.
+    #[tokio::test]
+    async fn a_pattern_that_spells_an_escape_still_matches_the_raw_bytes() {
+        let (s, pty) = mock();
+        let out = b"test result: \x1b[32mok\x1b[m.\r\n";
+        pty.queue_output(out);
+        while s.buffer_head() < out.len() as u64 {
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        let o = for_pattern(&s, &re(r"\x1b\[32mok"), spec(Some(0), 2000)).await;
+        assert_eq!(o.end, WaitEnd::Matched);
+        assert_eq!(o.found, Some(MatchSpan { start: 13, end: 20 }));
+    }
+
+    /// The tie-break and the ordering rule, over the window directly: the
+    /// earlier match wins **by raw offset** whichever view found it, and a
+    /// tie goes to the raw view, whose span is exact.
+    #[test]
+    fn the_earlier_match_wins_by_raw_offset_whichever_view_found_it() {
+        // `ok` appears first coloured (text view only sees it whole) and
+        // later plain (both views).
+        let w = Window::new(100, b"a \x1b[1mo\x1b[0mk b ok");
+        assert_eq!(
+            w.search(&re("ok")),
+            Some(MatchSpan {
+                start: 106,
+                end: 112
+            }),
+            "the coloured `ok` is earlier and the raw view cannot see it"
+        );
+        // Plain text: both views find the same `ok` and agree exactly.
+        let w = Window::new(100, b"say ok");
+        assert_eq!(
+            w.search(&re("ok")),
+            Some(MatchSpan {
+                start: 104,
+                end: 106
+            })
+        );
+        // An escape before and after the match is not part of it.
+        let w = Window::new(0, b"\x1b[32mok\x1b[m");
+        assert_eq!(w.search(&re("o.")), Some(MatchSpan { start: 5, end: 7 }));
+        // An empty match at the very end maps to the window's end rather
+        // than past its offset table.
+        // A tie at the same start goes to the raw view: here the raw match
+        // runs through the reset escape and the text match stops at `k`.
+        let w = Window::new(0, b"ok\x1b[m tail");
+        assert_eq!(
+            w.search(&re(r"ok\S*")),
+            Some(MatchSpan { start: 0, end: 5 })
+        );
+        let w = Window::new(10, b"ab\x1b[m");
+        assert_eq!(w.search(&re("$")), Some(MatchSpan { start: 15, end: 15 }));
+    }
+
+    /// Trimming drops the text that came from the trimmed bytes and no
+    /// more, so a text match never reports an offset below the window.
+    #[test]
+    fn trimming_keeps_the_two_views_aligned() {
+        let mut w = Window::new(0, &[]);
+        let mut cursor = 0;
+        let mut body = vec![b'x'; SCAN_WINDOW_BYTES];
+        body.extend_from_slice(b"\x1b[31mRED\x1b[0m");
+        let frame = OutputFrame {
+            start: 0,
+            end: body.len() as u64,
+            bytes: Arc::from(&body[..]),
+        };
+        assert!(w.feed(&mut cursor, &frame));
+        assert_eq!(w.raw.len(), SCAN_WINDOW_BYTES);
+        assert_eq!(w.raw_offset(0), w.start, "the first text byte left behind");
+        assert_eq!(w.runs.first().map(|r| r.0), Some(0));
+        let found = w.search(&re("RED")).expect("found");
+        assert_eq!(found.start, SCAN_WINDOW_BYTES as u64 + 5);
+    }
+
+    /// The run map's one invariant, checked exhaustively rather than at
+    /// the two offsets the rows above happen to look at: every text byte
+    /// maps back to the raw byte it came from, across frames that split
+    /// escapes and across trims that cut through runs, escapes and the
+    /// boundary between them.
+    #[test]
+    fn every_text_byte_maps_back_to_the_raw_byte_it_came_from() {
+        // A deterministic mixture: plain text, SGR, OSC 133 with both
+        // terminators, a charset designator, and bare text between them.
+        let pieces: [&[u8]; 7] = [
+            b"plain text ",
+            b"\x1b[1;32m",
+            b"GREEN",
+            b"\x1b]133;D;0;holdfast=1\x07",
+            b"\x1b]0;title\x1b\\",
+            b"\x1b(B",
+            b"tail\r\n",
+        ];
+        let mut stream = Vec::new();
+        let mut i = 0usize;
+        while stream.len() < SCAN_WINDOW_BYTES * 2 + 4096 {
+            stream.extend_from_slice(pieces[i % pieces.len()]);
+            i = i.wrapping_mul(31).wrapping_add(7);
+        }
+        let mut w = Window::new(0, &[]);
+        let mut cursor = 0u64;
+        // Frames of an awkward size, so escapes straddle them. The whole
+        // map is checked every eighth frame and after the last — every
+        // frame is quadratic and costs seconds in a debug build.
+        let chunks: Vec<&[u8]> = stream.chunks(997).collect();
+        for (n, chunk) in chunks.iter().enumerate() {
+            let frame = OutputFrame {
+                start: cursor,
+                end: cursor + chunk.len() as u64,
+                bytes: Arc::from(*chunk),
+            };
+            assert!(w.feed(&mut cursor, &frame));
+            if n % 8 != 0 && n + 1 != chunks.len() {
+                continue;
+            }
+            for (k, &t) in w.text.iter().enumerate() {
+                let raw = w.raw_offset(k);
+                assert!(raw >= w.start && raw < w.end(), "text {k} maps outside");
+                assert_eq!(
+                    stream[raw as usize], t,
+                    "text byte {k} maps to raw {raw}, which holds another byte"
+                );
+            }
+        }
+        assert!(w.start > 0, "the fixture must have trimmed");
+    }
+
+    /// GH #248: a mode already showing at the wait's first sample may be
+    /// the one from **before** the write the wait follows. Once the child
+    /// has answered the write, the settle window is enough.
+    #[test]
+    fn a_carried_mode_the_child_has_answered_since_is_answered_once_it_has_held() {
+        use crate::detect::InteractionMode::*;
+        let (hold, silent) = (Duration::from_millis(250), Duration::from_secs(2));
+        let t0 = Instant::now();
+        let mut c = CarriedMode::new();
+        assert!(
+            !c.answerable(Fullscreen, t0, true, hold, silent),
+            "the first sample"
+        );
+        assert!(!c.answerable(
+            Fullscreen,
+            t0 + Duration::from_millis(200),
+            true,
+            hold,
+            silent
+        ));
+        assert!(
+            c.answerable(Fullscreen, t0 + hold, true, hold, silent),
+            "a mode that held for the window after the child answered is the answer"
+        );
+    }
+
+    /// The review's case: **nothing has come back since the write**, so the
+    /// mode is the pre-write one however long it has held — `less` still
+    /// starting when its `q` went in, answered from at 260 ms 7 times in
+    /// 42 when the settle window was the only hold. Only the longer hold
+    /// makes it the answer, and output arriving makes it the answer at once
+    /// if the settle window has already passed.
+    #[test]
+    fn a_carried_mode_nothing_has_answered_since_the_write_waits_the_longer_hold() {
+        use crate::detect::InteractionMode::*;
+        let (hold, silent) = (Duration::from_millis(250), Duration::from_secs(2));
+        let t0 = Instant::now();
+        let mut c = CarriedMode::new();
+        assert!(!c.answerable(Fullscreen, t0, false, hold, silent));
+        assert!(
+            !c.answerable(Fullscreen, t0 + Duration::from_secs(1), false, hold, silent),
+            "held past the settle window with nothing back since the write: \
+             this is the sample from before the key"
+        );
+        assert!(
+            c.answerable(Fullscreen, t0 + silent, false, hold, silent),
+            "a key that makes the program print nothing is answered, eventually"
+        );
+
+        let mut c = CarriedMode::new();
+        assert!(!c.answerable(AwaitingSecret, t0, false, hold, silent));
+        assert!(!c.answerable(AwaitingSecret, t0 + hold, false, hold, silent));
+        assert!(
+            c.answerable(
+                AwaitingSecret,
+                t0 + Duration::from_millis(600),
+                true,
+                hold,
+                silent
+            ),
+            "the child answered the write and the settle window has passed"
+        );
+    }
+
+    /// The other half: a mode the wait watched arrive is fresh by
+    /// construction and answers at once — including the first mode coming
+    /// back after something else was seen, and whatever `reacted` says.
+    #[test]
+    fn a_mode_the_wait_watched_arrive_is_answered_at_once() {
+        use crate::detect::InteractionMode::*;
+        let (hold, silent) = (Duration::from_millis(250), Duration::from_secs(2));
+        let t0 = Instant::now();
+        let mut c = CarriedMode::new();
+        assert!(!c.answerable(AwaitingSecret, t0, false, hold, silent));
+        c.answerable(
+            Executing,
+            t0 + Duration::from_millis(1),
+            false,
+            hold,
+            silent,
+        );
+        assert!(c.answerable(
+            AwaitingSecret,
+            t0 + Duration::from_millis(2),
+            false,
+            hold,
+            silent
+        ));
+
+        let mut c = CarriedMode::new();
+        c.answerable(AtPrompt, t0, false, hold, silent);
+        assert!(c.answerable(
+            Fullscreen,
+            t0 + Duration::from_millis(1),
+            false,
+            hold,
+            silent
+        ));
     }
 }

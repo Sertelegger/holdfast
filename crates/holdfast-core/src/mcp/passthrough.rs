@@ -9,19 +9,19 @@
 //! transports — only where it runs.
 
 use super::envelope;
-// **Ten names, one per arg-taking arm of `call_tool` below.** Six of
-// them are 0.0.2's, 0.0.3's and 0.0.4's — Step 3's table names which —
-// and `rustfmt` sorts the braces alphabetically, so the milestones are
-// interleaved rather than trailing. Count these against the match: a
-// list that is short by one is `E0412 cannot find type ... in this
-// scope`, which is what an earlier revision of this block shipped.
+// **One name per arm of `call_tool` below** — every arm takes one now,
+// `list_sessions` included (GH #219). `rustfmt` sorts the braces
+// alphabetically, so the milestones are interleaved rather than trailing.
+// Count these against the match: a list that is short by one is `E0412
+// cannot find type ... in this scope`, which is what an earlier revision
+// of this block shipped.
 //
-// All ten exist by the time this milestone runs; if one does not, stop
+// All of them exist by the time this milestone runs; if one does not, stop
 // and check the milestone order rather than inventing a stand-in —
 // `every_router_tool_is_dispatchable` names whichever tool is
 // unreachable.
 use super::tools::{
-    GetCommandHistoryArgs, GetScreenStateArgs, InterruptArgs, ReadOutputArgs,
+    GetCommandHistoryArgs, GetScreenStateArgs, InterruptArgs, ListSessionsArgs, ReadOutputArgs,
     RequestSecretInputArgs, ResizeArgs, SendInputArgs, StartSessionArgs, StatusArgs, TerminateArgs,
     WaitForPatternArgs,
 };
@@ -117,9 +117,9 @@ pub async fn call_tool(
         // the shape that works — but the shim's read side must not impose
         // a deadline shorter than the tool's.
         "request_secret_input" => run!(request_secret_input, RequestSecretInputArgs),
-        // No arguments: the router still passes an (empty) object, and
-        // the macro above is arg-shaped, so this arm is written out.
-        "list_sessions" => Some(server.list_sessions().await),
+        // No arguments, and an empty struct that says so: a key here is
+        // refused like any other tool's unknown argument (GH #219).
+        "list_sessions" => run!(list_sessions_tool, ListSessionsArgs),
         _ => None,
     }
 }

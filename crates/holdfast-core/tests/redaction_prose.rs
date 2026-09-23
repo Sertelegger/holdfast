@@ -25,20 +25,26 @@
 //!    [`NAMESPACE_PROSE`] is its corpus and [`PRE_FIX_RULES`] its
 //!    control.
 //! 2. **The value half.** Both rules carry `value_must_not_match`, which
-//!    refuses a value with **no digit in it that also carries a
-//!    structural byte** — one of `_ . : ( < > [ ] { } | \` or a
-//!    backtick, the punctuation that makes an identifier, a path, a call
-//!    or markup. `` the token: `get_screen_state` `` has no second colon
-//!    and so survived step 1; it is refused here.
-//!    [`VALUE_SIDE_PROSE`] is its corpus and [`COLON_ONLY_RULES`] — the
-//!    rules exactly as `main` carried them between the two — its
-//!    control.
+//!    refuses a value with **no digit in it that also carries one of
+//!    `( < > [ ] { } | \` or a backtick** — the bracket and quote bytes no
+//!    credential alphabet uses (`_`, `.` and `:` were in the first draft
+//!    and came back out; see [`REAL_SHAPED_CREDENTIALS`]).
+//!    `` the token: `get_screen_state` `` has no second colon and so
+//!    survived step 1; it is refused here. [`VALUE_SIDE_PROSE`] is its
+//!    corpus and [`COLON_ONLY_RULES`] — the rules exactly as `main`
+//!    carried them between the two — its control.
+//! 3. **GH #245, Part 6 below.** Two more digit-free code shapes are
+//!    refused — a `::` path, and a lower-case field access carrying an
+//!    `_` — and a label no longer owns the next line's first word.
+//!    [`CODE_SHAPES`] and [`CROSS_LINE`] are its corpora and
+//!    [`BEFORE_245`] — the four rules it touched, as `a81b02d` shipped
+//!    them — its control.
 //!
 //! The disjunction is what makes step 2 cost nothing. A bare "must
 //! contain a digit" drops every digit-free passphrase; a bare value
 //! character class drops a bcrypt hash and a password carrying `!` or
 //! `@`; refusing only their *conjunction* drops neither, and
-//! [`REAL_SHAPED_CREDENTIALS`] asserts that over thirty-four rows.
+//! [`REAL_SHAPED_CREDENTIALS`] asserts that over every row it has.
 //!
 //! **Why the assertions here are not vacuous.** Every arm that asserts an
 //! *absence* is paired with the same input run through the rule set that
@@ -262,6 +268,23 @@ const REAL_SHAPED_CREDENTIALS: &[&str] = &[
     // refused. `secrets.token_urlsafe()` is the standard Flask
     // `SECRET_KEY` recipe.
     "api_key=abcd_efgh_ijkl_mnopqrst",
+    // **GH #245's rows: one on each side of every branch it added**, so a
+    // branch that grew one byte too wide reds here rather than leaking.
+    // The `::` branch is letters only: a digit, or a `!` that is not
+    // opening a macro, takes a value out of it.
+    "password=P::ssw0rd!",
+    "password=Hunter::Two::2",
+    // The field-access branch is lower-case only: a dotted vendor token
+    // whose config name carries an `_` -- Doppler's default
+    // `dev_personal` -- has an upper-case base62 body and stays redacted,
+    // and so does a mixed-case or digit-bearing value of the same shape.
+    "DOPPLER_TOKEN=dp.st.dev_personal.AbCdEfGhIjKlMnOpQrStUvWxYzAbCd",
+    "SECRET_KEY=Correct.Horse_Battery",
+    "api_key=abcd_efgh.ijkl2345",
+    // The separator: an assignment a formatter wrapped onto the next,
+    // indented line is still reached.
+    "let password =\n    \"hunter2hunter2\";",
+    "api_key =\r\n    's3cr3t-value'",
 ];
 
 /// **The guard that keeps the two corpus-driven arms from passing on an
@@ -436,7 +459,7 @@ fn the_value_side_table_reaches_both_rules_of_the_pair() {
 /// only thing that catches, and every row must still come back redacted.
 #[test]
 fn every_credential_shape_the_label_only_rules_catch_is_still_caught() {
-    not_vacuous(REAL_SHAPED_CREDENTIALS, 41, "REAL_SHAPED_CREDENTIALS");
+    not_vacuous(REAL_SHAPED_CREDENTIALS, 48, "REAL_SHAPED_CREDENTIALS");
     let rules = builtin();
     let mut lost = Vec::new();
     for row in REAL_SHAPED_CREDENTIALS {
@@ -460,7 +483,7 @@ fn every_credential_shape_the_label_only_rules_catch_is_still_caught() {
 /// it loses nothing.
 #[test]
 fn the_fix_moved_the_credential_set_in_neither_direction() {
-    not_vacuous(REAL_SHAPED_CREDENTIALS, 41, "REAL_SHAPED_CREDENTIALS");
+    not_vacuous(REAL_SHAPED_CREDENTIALS, 48, "REAL_SHAPED_CREDENTIALS");
     let (after, before) = (builtin(), pre_fix());
     let mut differing = Vec::new();
     for row in REAL_SHAPED_CREDENTIALS {
@@ -1119,5 +1142,557 @@ fn read_output_returns_value_side_source_unaltered_and_reports_nothing() {
         VALUE_SIDE_PROSE.len(),
         "the colon-only read must report one `generic` redaction per row: {:?}",
         r.redactions
+    );
+}
+
+// ------------------------------------------------ Part 6: GH #245
+
+/// **The label-keyed rules and `bearer-authorization` exactly as
+/// `a81b02d` shipped them** — `\s*` after the separator, `\s+` after
+/// `bearer`, and #202's one-branch refusal — and `openai-api-key` with no
+/// refusal at all. Spelled out, never derived, so the control cannot move
+/// with the thing it controls. Every pattern is `a81b02d`'s verbatim, and
+/// so is every example beside it.
+const BEFORE_245: &str = r#"
+[[rule]]
+name = "openai-api-key"
+kind = "openai"
+pattern = '''\bsk-(?:proj-|svcacct-|admin-)?[A-Za-z0-9_-]{24,}'''
+prefixes = ["sk-", "sk-proj-", "sk-svcacct-", "sk-admin-"]
+positive = ["sk-AAAABBBBCCCCDDDDEEEEFFFFGGGG"]
+negative = ["sk-tiny"]
+
+[[rule]]
+name = "bearer-authorization"
+kind = "bearer"
+pattern = '''(?i)bearer\s+(?P<value>[A-Za-z0-9._~+/-]{20,}=*)'''
+positive = ["Authorization: Bearer abcdefghijklmnopqrstuvwxyz"]
+negative = ["Bearer short"]
+
+[[rule]]
+name = "secret-key-assignment"
+kind = "generic"
+pattern = '''(?i)\b[a-z0-9_.-]{0,32}(?:secret|private|encryption|signing|master|session)[_-]key\b["'\s]*[:=]\s*["']?(?P<value>[^:\s"';,)][^\s"';,)]{7,})'''
+prefixes = ["secret_key", "secret-key", "private_key", "private-key", "encryption_key", "encryption-key", "signing_key", "signing-key", "master_key", "master-key", "session_key", "session-key"]
+value_must_not_match = '''[^0-9]*[(<>\[\]{}|\\`][^0-9]*'''
+positive = ["CLERK_SECRET_KEY=sk_test_0123456789abcdef01234567"]
+negative = ["SECRET_KEY_FILE=/run/secrets/app"]
+
+[[rule]]
+name = "generic-secret-assignment"
+kind = "generic"
+pattern = '''(?i)\b[a-z0-9_.-]{0,32}(?:password|passwd|secret|api[_-]?key|access[_-]?token|auth[_-]?token|token)\b["'\s]*[:=]\s*["']?(?P<value>[^:\s"';,)][^\s"';,)]{7,})'''
+prefixes = ["password", "passwd", "secret", "apikey", "api_key", "api-key", "accesstoken", "access_token", "access-token", "authtoken", "auth_token", "auth-token"]
+value_must_not_match = '''[^0-9]*[(<>\[\]{}|\\`][^0-9]*'''
+positive = ["export DB_PASSWORD=hunter2hunter2"]
+negative = ["password: short"]
+
+[[rule]]
+name = "aws-secret-access-key"
+kind = "aws"
+pattern = '''(?i)aws_secret_access_key["'\s]*[:=]\s*["']?(?P<value>[A-Za-z0-9/+=]{40})'''
+positive = ["AWS_SECRET_ACCESS_KEY=wJalrXUtnFEMIK7MDENGbPxRfiCYEXAMPLEKEY01"]
+negative = ["AWS_SECRET_ACCESS_KEY=short"]
+
+[[rule]]
+name = "cloudflare-api-token"
+kind = "cloudflare"
+pattern = '''(?i)\bcloudflare[a-z0-9_.-]{0,24}(?:token|key|secret)\b["'\s]*[:=]\s*["']?(?P<value>[A-Za-z0-9_.-]{20,})'''
+positive = ["CLOUDFLARE_API_TOKEN=0123456789abcdefghij0123456789abcdefghij"]
+negative = ["CLOUDFLARE_ACCOUNT_ID=0123"]
+
+[[rule]]
+name = "railway-token"
+kind = "railway"
+pattern = '''(?i)\brailway[a-z0-9_.-]{0,24}(?:token|key|secret)\b["'\s]*[:=]\s*["']?(?P<value>[A-Za-z0-9_.-]{16,})'''
+positive = ["RAILWAY_TOKEN=0123abcd-4567-89ef-0123-456789abcdef"]
+negative = ["RAILWAY_TOKEN="]
+
+[[rule]]
+name = "powersync-token"
+kind = "powersync"
+pattern = '''(?i)\bpowersync[a-z0-9_.-]{0,24}(?:token|key|secret|password)\b["'\s]*[:=]\s*["']?(?P<value>[^\s"';,)]{8,})'''
+positive = ["export POWERSYNC_DEV_TOKEN='abcdef0123456789'"]
+negative = ["POWERSYNC_TOKEN="]
+
+[[rule]]
+name = "datadog-api-key"
+kind = "datadog"
+pattern = '''(?i)dd_api_key["'\s]*[:=]\s*["']?(?P<value>[a-f0-9]{32})'''
+positive = ["DD_API_KEY=0123456789abcdef0123456789abcdef"]
+negative = ["DD_API_KEY=nothex"]
+"#;
+
+/// `a81b02d` for the rules GH #245 touched — see [`BEFORE_245`]. The five
+/// vendor-keyed label rules are in it because GH #245 changed their
+/// separator too, and without them in the control a revert of any one of
+/// those separators went unnoticed (found by review).
+fn before_245() -> RuleSet {
+    RuleSet::builtin_with_extra(BEFORE_245).expect("the a81b02d control compiles")
+}
+
+/// **A label at the end of a line, and whatever the next line happens to
+/// start with.** The dogfood pass's own shapes: the first three are
+/// `rg -n` hits under a line of prose, the next three are interactive
+/// transcripts — ssh's retry prompt among them, which is every failed
+/// password attempt — and the last is `bearer-authorization`'s, whose
+/// `\s+` crossed a line the same way. On `a81b02d` every one came back
+/// with the next line's first word replaced by a marker.
+const CROSS_LINE: &[&str] = &[
+    "L1 the window reassembled a mid-token:\ncrates/holdfast-core/src/output/redact.rs:207:    let spans = find_spans(rules, window, 0);",
+    "Set your API token:\nREADME.md:11:export FOO=bar",
+    "Set your API token:\n\nREADME.md:11:export FOO=bar",
+    "dev@build-01's password: \r\nPermission denied, please try again.\r\n",
+    "Vault token:\r\nSuccessfully authenticated! You are now logged in.",
+    "Enter your GitHub personal access token:\r\nAuthentication succeeded",
+    "the header is Authorization: Bearer\ncrates/holdfast-core/src/output/redact.rs:207:",
+    // A Python block under a label, verbatim from the CPython stdlib: the
+    // indented line is a statement, not the label's value.
+    "            if not have_password:\n                password = None",
+    // `env | sort` with an empty variable: an `=` may cross only into an
+    // *indented* line, and the next variable is not one.
+    "API_TOKEN=\nHOME=/home/dev\nLANG=C.UTF-8",
+];
+
+/// The fix: none of those rows is altered.
+#[test]
+fn a_label_at_the_end_of_a_line_does_not_own_the_next_line() {
+    not_vacuous(CROSS_LINE, 9, "CROSS_LINE");
+    let rules = builtin();
+    let mut mangled = Vec::new();
+    for row in CROSS_LINE {
+        let out = redact_str(&rules, row);
+        if out != *row {
+            mangled.push(format!("{row:?}\n  -> {out:?} by {:?}", hits(&rules, row)));
+        }
+    }
+    assert!(
+        mangled.is_empty(),
+        "{} of {} cross-line rows came back altered:\n{}",
+        mangled.len(),
+        CROSS_LINE.len(),
+        mangled.join("\n")
+    );
+}
+
+/// **Control: `a81b02d` mangled every one of those rows**, and did it by
+/// replacing a word that sits on the *second* line.
+#[test]
+fn before_gh_245_every_cross_line_row_lost_a_word_on_its_second_line() {
+    not_vacuous(CROSS_LINE, 9, "CROSS_LINE");
+    let rules = before_245();
+    for row in CROSS_LINE {
+        let spans = find_spans(&rules, row.as_bytes(), 0);
+        let first_break = row.find('\n').expect("every row spans a line break");
+        assert!(
+            spans.iter().any(|s| s.start as usize > first_break),
+            "the control must redact something past the line break in {row:?}, or \
+             the row proves nothing about the separator: {spans:?}"
+        );
+    }
+}
+
+/// **Every label-keyed rule carries the separator, one row apiece.** The
+/// rows above reach only `generic-secret-assignment` and
+/// `bearer-authorization`, and the separator is spelled out in each rule
+/// separately — so a review of GH #245 reverted it on `aws`, `datadog`,
+/// `cloudflare`, `railway` and `powersync` and nothing went red. Each row
+/// here is a label ending one line and a next line that happens to fit that
+/// rule's value class — once after a `:`, once after an `=` into a line
+/// that is not indented — and each must be left alone, where the control
+/// redacted it by the rule the row names.
+#[test]
+fn every_vendor_label_rule_stops_at_the_end_of_its_line() {
+    let (rules, before) = (builtin(), before_245());
+    for (row, rule) in [
+        (
+            "aws_secret_access_key:\n3f1c2a9b8d7e6f5a4b3c2d1e0f9a8b7c6d5e4f3a refs/heads/main",
+            "aws-secret-access-key",
+        ),
+        (
+            "AWS_SECRET_ACCESS_KEY=\n3f1c2a9b8d7e6f5a4b3c2d1e0f9a8b7c6d5e4f3a refs/heads/main",
+            "aws-secret-access-key",
+        ),
+        (
+            "DD_API_KEY:\nd41d8cd98f00b204e9800998ecf8427e  empty.txt",
+            "datadog-api-key",
+        ),
+        (
+            "DD_API_KEY=\nd41d8cd98f00b204e9800998ecf8427e  empty.txt",
+            "datadog-api-key",
+        ),
+        (
+            "cloudflare_api_token:\nholdfast-core.redaction_default.toml",
+            "cloudflare-api-token",
+        ),
+        (
+            "CLOUDFLARE_API_TOKEN=\nholdfast-core.redaction_default.toml",
+            "cloudflare-api-token",
+        ),
+        (
+            "railway_token:\nholdfast-core.redaction_default.toml",
+            "railway-token",
+        ),
+        (
+            "RAILWAY_TOKEN=\nholdfast-core.redaction_default.toml",
+            "railway-token",
+        ),
+        (
+            "powersync_token:\nPermission denied, please try again.",
+            "powersync-token",
+        ),
+        (
+            "POWERSYNC_TOKEN=\nPermission denied, please try again.",
+            "powersync-token",
+        ),
+    ] {
+        assert_eq!(
+            redact_str(&rules, row),
+            row,
+            "`{rule}` took the next line's first word in {row:?}: {:?}",
+            hits(&rules, row)
+        );
+        assert!(
+            hits(&before, row).iter().any(|n| n == rule),
+            "the control must redact {row:?} by `{rule}`, or the row does not pin \
+             that rule's separator: {:?}",
+            hits(&before, row)
+        );
+    }
+}
+
+/// The same rows through `read_output`, the surface the issue reported —
+/// and the pipeline's normalised views (GH #135) judge them too.
+#[test]
+fn read_output_hands_the_cross_line_rows_back_whole() {
+    let processor = OutputProcessor::builtin().unwrap();
+    let source = format!("{}{TAIL}", CROSS_LINE.join("\n"));
+    let r = read(&processor, source.as_bytes());
+    assert_eq!(r.output, source, "read_output altered a cross-line row");
+    assert!(r.redactions.is_empty(), "{:?}", r.redactions);
+}
+
+/// **What the separator keeps: an assignment wrapped onto the next line.**
+/// rustfmt and prettier both break `let token = "<long literal>";` after
+/// the `=` and indent the literal, and a secret written into source is
+/// that long. Every label-keyed rule still reaches it — one row per rule,
+/// because the separator is spelled out in each of them and each could be
+/// reverted alone.
+#[test]
+fn an_assignment_wrapped_onto_an_indented_line_is_still_redacted() {
+    let rules = builtin();
+    for (row, rule) in [
+        (
+            "let password =\n    \"hunter2hunter2\";",
+            "generic-secret-assignment",
+        ),
+        (
+            "api_key =\r\n    's3cr3t-value'",
+            "generic-secret-assignment",
+        ),
+        (
+            "SECRET_KEY =\n    'django-insecure-0123456789'",
+            "secret-key-assignment",
+        ),
+        (
+            "const aws_secret_access_key =\n  \"wJalrXUtnFEMIK7MDENGbPxRfiCYEXAMPLEKEY01\";",
+            "aws-secret-access-key",
+        ),
+        (
+            "cloudflare_api_token =\n  \"0123456789abcdefghij0123456789abcdefghij\"",
+            "cloudflare-api-token",
+        ),
+        (
+            "railway_token =\n  \"0123abcd-4567-89ef-0123-456789abcdef\"",
+            "railway-token",
+        ),
+        (
+            "powersync_token =\n  \"abcdef0123456789\"",
+            "powersync-token",
+        ),
+        (
+            "dd_api_key =\n  \"0123456789abcdef0123456789abcdef\"",
+            "datadog-api-key",
+        ),
+    ] {
+        let got = hits(&rules, row);
+        assert!(
+            got.iter().any(|n| n == rule),
+            "`{rule}` must still reach a wrapped assignment in {row:?}: {got:?}"
+        );
+    }
+}
+
+/// **REQ-TST-006: what the separator gives up, stated.** A `:` never
+/// crosses a line any more, so two spellings that put a real value on the
+/// line after its label are no longer reached by a label-keyed rule:
+///
+/// * YAML's plain scalar on the line after its key, indented under it —
+///   legal, and rare next to `key: value`;
+/// * a credential a prompt echoes on the line after it — the same bytes
+///   as ssh's retry prompt with a credential where `Permission` was, so
+///   nothing in the value tells the two apart, and ssh's shape happens on
+///   every failed attempt.
+///
+/// Each is paired with the control, under which it was redacted, and the
+/// pair is closed by the `=` spelling of the same value, which still is —
+/// so no arm here is satisfied by a rule set that matches nothing.
+#[test]
+fn a_value_on_the_line_after_a_colon_is_the_documented_limitation() {
+    let (rules, before) = (builtin(), before_245());
+    for missed in [
+        "password:\n  hunter2hunter2hunter2",
+        "Paste your token:\nhunter2hunter2hunter2",
+    ] {
+        assert_eq!(
+            redact_str(&rules, missed),
+            missed,
+            "the next-line residual closed for {missed:?} — rewrite this row \
+             rather than deleting it"
+        );
+        assert_ne!(
+            redact_str(&before, missed),
+            missed,
+            "a81b02d must have redacted {missed:?}, or this is not a residual"
+        );
+    }
+    let caught = "password =\n  hunter2hunter2hunter2";
+    assert_ne!(redact_str(&rules, caught), caught);
+}
+
+/// **REQ-TST-006: the two `=` spellings the separator does not reach.**
+/// The `=` crosses exactly one line break, into an indented line, and
+/// only when the `=` ends the label's own line — rustfmt's and prettier's
+/// wrap. `a81b02d`'s `\s*` on both sides of the `=` also reached a label
+/// with its `=` on the next line, and an `=` with a blank line before
+/// the value; neither is a formatter's output, and both were found by
+/// review rather than by any corpus. Paired with the control, which
+/// redacted both, and with the rustfmt spelling of the same value.
+#[test]
+fn an_assignment_split_any_other_way_is_the_documented_limitation() {
+    let (rules, before) = (builtin(), before_245());
+    for missed in [
+        "password\n    = \"Tr0ub4dor&3xyz\"",
+        "password =\n\n    \"Tr0ub4dor&3xyz\"",
+    ] {
+        assert_eq!(
+            redact_str(&rules, missed),
+            missed,
+            "the split-assignment residual closed for {missed:?} — rewrite this row \
+             rather than deleting it"
+        );
+        assert_ne!(
+            redact_str(&before, missed),
+            missed,
+            "a81b02d must have redacted {missed:?}, or this is not a residual"
+        );
+    }
+    let caught = "password =\n    \"Tr0ub4dor&3xyz\"";
+    assert!(!redact_str(&rules, caught).contains("Tr0ub4dor"));
+}
+
+/// **The two code shapes, verbatim from the corpora GH #245 measured**
+/// (`syn`, `mio`, CPython, `rustls`). On `a81b02d` every row was redacted;
+/// none carries a digit, so none is a shape #202's digit rule vouches for.
+const CODE_SHAPES: &[&str] = &[
+    // A `::` path.
+    "pub paren_token: token::Paren,",
+    "pub brace_token: token::Brace,",
+    "pub bracket_token: token::Bracket,",
+    "_token: mio::Token,",
+    "private_key: &crate::SecretKey,",
+    // A lower-case field access carrying an `_`.
+    "semi_token: node.semi_token,",
+    "colon_token: node.colon_token,",
+    "self.add_password = self.passwd.add_password",
+    "handshake_client_traffic_secret: self.client_handshake_traffic_secret,",
+    // Each branch with the `&` or `*` that may lead it — constructed, the
+    // shape of `&notification.progress_token` in `rmcp` and of a deref of
+    // a static path.
+    "token: &notification.progress_token,",
+    "let secret = *config::DEFAULT_SECRET;",
+];
+
+#[test]
+fn the_two_code_shapes_are_not_credentials() {
+    not_vacuous(CODE_SHAPES, 9, "CODE_SHAPES");
+    let rules = builtin();
+    let mut mangled = Vec::new();
+    for row in CODE_SHAPES {
+        let out = redact_str(&rules, row);
+        if out != *row {
+            mangled.push(format!("{row:?}\n  -> {out:?} by {:?}", hits(&rules, row)));
+        }
+    }
+    assert!(mangled.is_empty(), "{}", mangled.join("\n"));
+}
+
+/// Control, and reach: `a81b02d` redacted every row, and the table reaches
+/// both label-keyed rules, so neither's copy of the refusal can be
+/// reverted without a row going red.
+#[test]
+fn before_gh_245_every_code_shape_was_redacted_by_both_rules_of_the_pair() {
+    let before = before_245();
+    let mut by_rule: std::collections::BTreeMap<String, usize> = Default::default();
+    for row in CODE_SHAPES {
+        let names = hits(&before, row);
+        assert!(
+            !names.is_empty(),
+            "a81b02d left {row:?} alone, so it proves nothing"
+        );
+        for name in names {
+            *by_rule.entry(name).or_default() += 1;
+        }
+    }
+    for name in ["generic-secret-assignment", "secret-key-assignment"] {
+        assert!(
+            by_rule.get(name).copied().unwrap_or_default() > 0,
+            "no row of CODE_SHAPES reaches `{name}`: {by_rule:?}"
+        );
+    }
+}
+
+/// **Each new branch on each rule of the pair, one row apiece.** The
+/// corpora exercised the `::` branch on both rules but the field-access
+/// branch only on `generic-secret-assignment`, so these four rows are
+/// constructed — each is the shape of a verbatim row above, on the other
+/// label — and each must be refused by exactly the rule it names. Without
+/// them `secret-key-assignment`'s copy of the field-access branch could be
+/// deleted and only a documented-limitation row would notice.
+#[test]
+fn each_new_branch_is_carried_by_both_rules_of_the_pair() {
+    let (rules, before) = (builtin(), before_245());
+    for (row, rule) in [
+        (
+            "pub brace_token: token::Brace,",
+            "generic-secret-assignment",
+        ),
+        ("semi_token: node.semi_token,", "generic-secret-assignment"),
+        ("signing_key: &crypto::SigningKey,", "secret-key-assignment"),
+        (
+            "signing_key: self.signing_key_pair,",
+            "secret-key-assignment",
+        ),
+    ] {
+        assert_eq!(redact_str(&rules, row), row, "{row:?} was altered");
+        assert_eq!(
+            hits(&before, row),
+            vec![rule.to_string()],
+            "the control must redact {row:?} by `{rule}` alone, or the row does not \
+             pin that rule's branch"
+        );
+    }
+}
+
+/// **REQ-TST-006: what the two new branches give up.** A digit-free value
+/// that is nothing but letters joined by `::`, and a digit-free lower-case
+/// value that mixes `.` and `_`, are refused wherever they are — a human
+/// could choose either. Each is paired with the same value carrying one
+/// digit, which is redacted, and with the control, which redacted both.
+#[test]
+fn the_two_code_shapes_cost_a_digit_free_credential_of_the_same_shape() {
+    let (rules, before) = (builtin(), before_245());
+    for (missed, caught) in [
+        ("password=Hello::World", "password=Hello::World1"),
+        (
+            "SECRET_KEY=correct.horse_battery",
+            "SECRET_KEY=correct.horse_battery9",
+        ),
+    ] {
+        assert_eq!(
+            redact_str(&rules, missed),
+            missed,
+            "GH #245's residual closed for {missed:?} — rewrite this row"
+        );
+        assert_ne!(
+            redact_str(&before, missed),
+            missed,
+            "not a residual: {missed:?}"
+        );
+        assert_ne!(
+            redact_str(&rules, caught),
+            caught,
+            "one digit must bring {caught:?} back"
+        );
+    }
+}
+
+/// **The OpenSSH algorithm name is not an OpenAI key** — `ssh -G`'s own
+/// lines, which list it under three keywords. The control reported each
+/// as `[REDACTED:openai]`; the paired arm plants a real-shaped key on the
+/// same line, which is still redacted.
+#[test]
+fn an_openssh_algorithm_name_is_not_an_openai_key() {
+    let (rules, before) = (builtin(), before_245());
+    let lines = [
+        "hostkeyalgorithms sk-ecdsa-sha2-nistp256-cert-v01@openssh.com,sk-ssh-ed25519-cert-v01@openssh.com",
+        "pubkeyacceptedalgorithms sk-ecdsa-sha2-nistp256-cert-v01@openssh.com,sk-ssh-ed25519@openssh.com",
+        "casignaturealgorithms sk-ecdsa-sha2-nistp256@openssh.com,sk-ssh-ed25519@openssh.com",
+        "HostKeyAlgorithms +sk-ecdsa-sha2-nistp256-cert-v01@openssh.com",
+    ];
+    let mut before_marked = 0usize;
+    for line in lines {
+        assert_eq!(redact_str(&rules, line), line, "{line:?} was altered");
+        if redact_str(&before, line) != line {
+            before_marked += 1;
+        }
+    }
+    assert!(
+        before_marked >= 3,
+        "the control must mark the `-cert-v01` lines, or this proves nothing"
+    );
+    let planted = format!("{} sk-proj-AbCdEf0123456789GhIjKlMnOpQr", lines[0]);
+    let out = redact_str(&rules, &planted);
+    assert!(
+        out.contains("[REDACTED:openai]") && !out.contains("AbCdEf0123456789"),
+        "a real key beside the algorithm name must still be redacted: {out:?}"
+    );
+}
+
+/// **The refusal holds at the buffer head too** (§4.1): the algorithm name
+/// still arriving is withheld until the `@` that kills the rule, and is
+/// then released whole and unmarked — rather than being released on the
+/// ground that a marker covers it, which the refusal makes untrue.
+#[test]
+fn an_openssh_algorithm_name_at_the_buffer_head_is_released_whole() {
+    let processor = OutputProcessor::builtin().unwrap();
+    let line = "hostkeyalgorithms sk-ecdsa-sha2-nistp256-cert-v01@openssh.com\n";
+    let r = read(&processor, line.as_bytes());
+    assert!(
+        !r.held_back && r.output == line && r.redactions.is_empty(),
+        "held_back={} output={:?} redactions={:?}",
+        r.held_back,
+        r.output,
+        r.redactions
+    );
+    let head = "hostkeyalgorithms sk-ecdsa-sha2-nistp256-cert-v01";
+    let r = read(&processor, head.as_bytes());
+    assert!(
+        r.redactions.is_empty() && !r.output.contains("[REDACTED"),
+        "a refused whole match must never be marked: {:?}",
+        r.output
+    );
+
+    // **The arm that separates holding from releasing.** A refused whole
+    // match is not the end of the question while bytes are still
+    // arriving: one upper-case byte more and the same run is outside the
+    // refused family and is a key. So a refused match at the head is
+    // *held*, and the byte that makes it a key finds it still withheld —
+    // where releasing it on the ground that it "matched" would already
+    // have handed out every byte but the last.
+    let growing = "export KEY=sk-ssh-abcdefghijklmnopqrstuvw";
+    let r = read(&processor, growing.as_bytes());
+    assert!(
+        r.held_back && !r.output.contains("abcdefghijklmnop"),
+        "a refused match still arriving must be held: held_back={} output={:?}",
+        r.held_back,
+        r.output
+    );
+    let grown = format!("{growing}X\n");
+    let r = read(&processor, grown.as_bytes());
+    assert!(
+        r.output.contains("[REDACTED:openai]") && !r.output.contains("abcdefghijklmnop"),
+        "one byte later it is a key and must come back as one marker: {:?}",
+        r.output
     );
 }

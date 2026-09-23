@@ -22,6 +22,7 @@
 pub mod ansi;
 pub mod encoding;
 pub mod normalise;
+pub mod pem;
 pub mod prefix_index;
 pub mod redact;
 pub mod rules;
@@ -86,6 +87,16 @@ use std::sync::Arc;
 /// it *falls*, because a wider window resolves more candidates outright —
 /// where masking `[u, window_end)` uncapped costs 3.91% and **38.65%**.
 /// Uncapped, the damage scales with a number the caller chooses.
+///
+/// **Those shares were measured before GH #242, and GH #242 is why they
+/// no longer describe this repository.** Every candidate they counted was
+/// a `-----BEGIN` in prose or test source, believed for the whole carry
+/// because `private-key-block`'s `[\s\S]*?` never dies. A `-----BEGIN`
+/// candidate is now believed only while what follows can be PEM text
+/// (`pem.rs`), so a prose mention costs nothing:
+/// `the_documented_read_loop_drains_this_repositorys_own_changelog`
+/// asserts the CHANGELOG's share is zero. The cap still bounds what a
+/// candidate that *is* PEM text can cost, which is what it is for.
 pub const UNVOUCHED_CARRY_BYTES: usize = 16 * 1024;
 
 /// The second half of [`UNVOUCHED_CARRY_BYTES`]'s derivation, asserted at
@@ -312,12 +323,15 @@ pub struct ReadRequest {
     /// Raw-byte budget (§5.1): caps bytes read *from the ring buffer*,
     /// not the size of the encoded payload.
     ///
-    /// It has exactly one documented overshoot: when the cap would fall
-    /// inside a secret, the read consumes to the end of that secret so the
+    /// It has two documented overshoots. When the cap would fall inside a
+    /// secret, the read consumes to the end of that secret so the
     /// continuation cursor lands past it and not inside it (see
-    /// [`OutputProcessor::process`]). Those extra raw bytes are wholly
+    /// [`OutputProcessor::process`]); those extra raw bytes are wholly
     /// inside the one marker the response already carries, so the returned
-    /// payload is unchanged — only `bytes_returned` and `cursor` move.
+    /// payload is unchanged — only `bytes_returned` and `cursor` move. And
+    /// when a page smaller than one UTF-8 character would otherwise end
+    /// inside it, the read finishes the character — at most three bytes,
+    /// and only where stopping short would return nothing (GH #241).
     pub max_bytes: usize,
     pub options: ReadOptions,
     /// Which mechanism is reading — `read_output` or, from 0.0.5,
@@ -424,7 +438,9 @@ pub struct ProcessedRead {
     /// **Raw** bytes consumed, so it stays consistent with the cursor
     /// arithmetic; the encoded `output` may be longer or shorter (§5.1).
     /// It may also exceed the request's `max_bytes` — by the tail of a
-    /// secret the cap landed inside, and only then.
+    /// secret the cap landed inside, or by the at most three remaining
+    /// bytes of a character a page smaller than it would otherwise split
+    /// (GH #241), and only then.
     pub bytes_returned: usize,
     /// Absolute offset just past the bytes consumed.
     pub cursor: u64,
@@ -664,6 +680,175 @@ impl OutputProcessor {
         redact::merge_spans(spans)
     }
 
+    /// Every complete `binary`-rule match in `region`, over each stream a
+    /// read of it could emit — [`Self::all_spans`] restricted to the rules
+    /// whose one match can outrun a lookbehind.
+    pub(crate) fn binary_spans(&self, region: &[u8], region_start: u64) -> Vec<Span> {
+        let mut spans = redact::find_binary_spans(&self.rules, region, region_start);
+        for view in normalise::emitted_views(region, region_start) {
+            spans.extend(
+                redact::find_binary_spans(&self.rules, view.bytes(), 0)
+                    .into_iter()
+                    .map(|s| view.map_span(s)),
+            );
+        }
+        redact::merge_spans(spans)
+    }
+
+    /// Redact one string a surface reports whole — a window title — as
+    /// [`redact::redact_str`] does, and also mask a private-key candidate
+    /// in it that nothing closes (GH #224).
+    ///
+    /// `redact_str` replaces complete matches and nothing else, so
+    /// `printf '\033]0;%s\007' "$(head -n 8 id_rsa)"` put eight lines of
+    /// key into `get_screen_state`'s `title` and `status`'s, joined by the
+    /// emulator into one line, while `read_output` masked the same bytes.
+    /// The candidate walk is the one every other surface runs, over the
+    /// string as the surface reports it; a title is final rather than
+    /// arriving, so a candidate still believed at its end is masked too.
+    pub fn redact_standalone(&self, text: &str) -> String {
+        let redacted = redact::redact_str(&self.rules, text);
+        let spans: Vec<Span> = self
+            .index
+            .unterminated_candidates(&self.rules, redacted.as_bytes(), 0, pem::RegionEnd::Final)
+            .into_iter()
+            .map(|c| Span::unresolved(c.start, c.end))
+            .collect();
+        if spans.is_empty() {
+            return redacted;
+        }
+        let bytes = redacted.as_bytes();
+        let mut out = Vec::with_capacity(bytes.len());
+        let mut at = 0usize;
+        for span in redact::merge_spans(spans) {
+            out.extend_from_slice(&bytes[at..span.start as usize]);
+            out.extend_from_slice(redact::marker(redact::UNRESOLVED_KIND).as_bytes());
+            at = span.end as usize;
+        }
+        out.extend_from_slice(&bytes[at..]);
+        String::from_utf8_lossy(&out).into_owned()
+    }
+
+    /// The byte ranges of `region` that are a private key as far as this
+    /// processor can tell — for a surface that masks by *what bytes wrote
+    /// a cell* rather than by a read range (GH #224, `get_screen_state`).
+    ///
+    /// Four kinds, and they are the four `process` masks: a complete
+    /// `binary` match; a `-----BEGIN` candidate still believed at the
+    /// region's end; one that died with key material behind it; and the
+    /// key-body lines after one that stopped short (`pem::body_lines`) —
+    /// the next screenful of a pager is the case the grid shows most. The
+    /// last three are capped at [`UNVOUCHED_CARRY_BYTES`] past their
+    /// anchor, as a read caps them, and a candidate a complete match
+    /// covers is that match's. Sorted and disjoint.
+    ///
+    /// The region ends at `buffer.head`, so a last line still arriving is
+    /// masked as far as a read masks it; a line only a live stream would
+    /// hold is not, because a grid has nothing to hold it for.
+    pub fn key_regions(&self, region: &[u8], region_start: u64) -> Vec<(u64, u64)> {
+        let mut spans = self.binary_spans(region, region_start);
+        let complete = spans.clone();
+        for c in self.index.unterminated_candidates(
+            &self.rules,
+            region,
+            region_start,
+            pem::RegionEnd::Arriving,
+        ) {
+            if c.resumed && c.in_flight {
+                continue;
+            }
+            if !complete
+                .iter()
+                .any(|s| s.start <= c.start && s.end > c.start)
+            {
+                let end = c.end.min(c.start + UNVOUCHED_CARRY_BYTES as u64);
+                spans.push(Span::unresolved(c.start, end));
+            }
+        }
+        redact::merge_spans(spans)
+            .into_iter()
+            .map(|s| (s.start, s.end))
+            .collect()
+    }
+
+    /// The complete `binary` matches that open **behind** the window and
+    /// reach the page (GH #243) — the ones `all_spans` over the window
+    /// cannot see, because their anchor is not in it.
+    ///
+    /// Over `carry_region` rather than a wider window, and for the
+    /// `binary` rules alone, for one reason: every other rule's match fits
+    /// inside `lookbehind_bytes` and is already found from the window, so
+    /// asking them again about sixteen more kilobytes costs a scan and
+    /// finds nothing. A match wholly behind `req_start` is dropped, since
+    /// the caller receives none of it; one that starts inside the window
+    /// is `all_spans`'s already.
+    ///
+    /// **Scanned to `window_start + UNVOUCHED_CARRY_BYTES` and no
+    /// further**, which bounds the cost on a read of any size — without
+    /// it a 256 KiB read would re-judge its whole window for one rule, and
+    /// the views over it are most of what a read costs on colourised
+    /// output. A match found this way is therefore at most
+    /// `UNVOUCHED_CARRY_BYTES` long, the same bound a candidate is
+    /// believed over and the one `_RSA_16384_PEM_FITS_INSIDE_THE_CARRY`
+    /// holds against the largest key the rule can match. A key painted
+    /// with a colour change on every character can exceed it in raw
+    /// bytes; that is outside this reach — and the likeliest way to paint
+    /// one is not `lolcat` but `grep -n . id_rsa` under the common
+    /// `grep --color=auto` alias, which wraps every matched character in
+    /// its own colour change and makes a 3 KB key about 64 KB. Its header
+    /// is not in the raw bytes either, so no candidate is found for it
+    /// and nothing follows its body lines.
+    fn carry_spans(&self, w: &WindowSnapshot<'_>) -> Vec<Span> {
+        if w.carry_region_start >= w.window_start || w.carry_region.is_empty() {
+            return Vec::new();
+        }
+        let region_end = w.carry_region_start + w.carry_region.len() as u64;
+        let scan_end = (w.window_start + UNVOUCHED_CARRY_BYTES as u64).min(region_end);
+        let region = &w.carry_region[..(scan_end - w.carry_region_start) as usize];
+        self.binary_spans(region, w.carry_region_start)
+            .into_iter()
+            .filter(|s| s.start < w.window_start && s.end > w.req_start)
+            .collect()
+    }
+
+    /// The unterminated candidates in `carry_region` that died with key
+    /// material behind them, and the key-body lines after one that stopped
+    /// short (`pem::body_lines`), that no span in `spans` covers — each one
+    /// capped at [`UNVOUCHED_CARRY_BYTES`] past its anchor and the window's
+    /// end. See [`PrefixIndex::unterminated_candidates`].
+    ///
+    /// [`PrefixIndex::unterminated_candidates`]: prefix_index::PrefixIndex::unterminated_candidates
+    fn dead_candidates(
+        &self,
+        w: &WindowSnapshot<'_>,
+        spans: &[Span],
+    ) -> Vec<prefix_index::Unterminated> {
+        let window_end = w.window_start + w.window.len() as u64;
+        self.index
+            .unterminated_candidates(
+                &self.rules,
+                w.carry_region,
+                w.carry_region_start,
+                pem::RegionEnd::Arriving,
+            )
+            .into_iter()
+            .filter(|c| !c.in_flight)
+            .filter(|c| {
+                !spans
+                    .iter()
+                    .any(|s| !s.is_unresolved() && s.start <= c.start && s.end > c.start)
+            })
+            .map(|c| prefix_index::Unterminated {
+                end: c
+                    .end
+                    .min(c.start + UNVOUCHED_CARRY_BYTES as u64)
+                    .min(window_end),
+                ..c
+            })
+            .filter(|c| c.end > w.req_start && c.start < c.end)
+            .collect()
+    }
+
     /// The earliest anchor in `[head − `[`UNVOUCHED_CARRY_BYTES`]`, head −
     /// partial_secret_scan_bytes)` that is still alive at the end of the
     /// window — the at-`buffer.head` half of GH #14, which no window size
@@ -745,7 +930,24 @@ impl OutputProcessor {
     }
 
     /// Run the pipeline over a snapshot. Pure: no locks, no I/O.
+    ///
+    /// With no terminal width, so a redraw is never collapsed (GH #247):
+    /// whether a line wrapped is a question about the width, and a caller
+    /// that cannot answer it gets every byte. `Session::read_processed`
+    /// knows the session's width and calls [`Self::process_at_width`].
     pub fn process(&self, w: &WindowSnapshot<'_>, opts: &ReadOptions) -> ProcessedRead {
+        self.process_at_width(w, opts, None)
+    }
+
+    /// [`Self::process`] for a session `cols` wide, which is what lets
+    /// `ansi: "strip"` drop a redraw a terminal erased (GH #247) — only a
+    /// line that cannot have wrapped at that width; see `erased_redraws`.
+    pub fn process_at_width(
+        &self,
+        w: &WindowSnapshot<'_>,
+        opts: &ReadOptions,
+        cols: Option<u16>,
+    ) -> ProcessedRead {
         let window_end = w.window_start + w.window.len() as u64;
         let holdback = self.holdback_boundary(w, opts);
         // The size cap and the holdback both bound the read; whichever
@@ -807,7 +1009,19 @@ impl OutputProcessor {
         }
 
         let mut spans = if opts.redact {
-            self.all_spans(w.window, w.window_start)
+            let mut spans = self.all_spans(w.window, w.window_start);
+            // **A match that opened behind the window still covers the
+            // page (GH #243).** The window reaches `lookbehind_bytes` —
+            // 512 — behind `req_start`, and a private key is kilobytes, so
+            // a read that starts inside a *complete* key never saw its
+            // `-----BEGIN` and `find_spans` matched nothing: `tail_lines`,
+            // `tail_bytes` and a cursor partway in all returned the rest
+            // of the body raw with `redactions: {}`. The carry region
+            // reaches `UNVOUCHED_CARRY_BYTES` back, which covers the
+            // largest key the rule can match, and only the `binary` rules
+            // can need it — every other rule's match fits the lookbehind.
+            spans.extend(self.carry_spans(w));
+            redact::merge_spans(spans)
         } else {
             Vec::new()
         };
@@ -864,17 +1078,14 @@ impl OutputProcessor {
         // the one a bounded window emits for *"a match the window cannot
         // judge"*; this is a bounded window.
         //
-        // **`get_screen_state` is not a third example, and an earlier
-        // draft of this comment listed it as one.** It masks the cells
-        // where the live render differs from the render at
-        // `holdback_boundary`, which is driven by `unvouched_boundary`
-        // over the trailing `partial_secret_scan_bytes` — so it masks an
-        // in-flight *prefix* and has no handling at all for a candidate
-        // anchored further back. Measured on one buffer in one moment,
-        // `read_output` returns one marker and the grid returns 39 raw
-        // body lines. That is pre-existing and outside this change, but
-        // it is the gap this change opens *between* the two surfaces and
-        // it should not be described as prior art for it.
+        // **`get_screen_state` was not a third example until GH #224,
+        // and an earlier draft of this comment listed it as one.** Its
+        // mask covered the trailing `partial_secret_scan_bytes` only, so
+        // `read_output` returned one marker where the grid returned 39 raw
+        // body lines. It now asks this processor which bytes behind the
+        // screen are a key (`key_regions`) and masks the cells those
+        // bytes wrote — the same regions this read masks, by a different
+        // unit — which is `ScreenTracker::capture_judged`'s business.
         //
         // **A mask is legal here where a view-driven *withhold* is not.**
         // `holdback_boundary` explains the asymmetry: a shortened read
@@ -988,9 +1199,40 @@ impl OutputProcessor {
                 spans.push(redact::Span::unresolved(u, end));
                 spans = redact::merge_spans(spans);
             }
+
+            // **A candidate that died with key material behind it is
+            // masked, not released (GH #242).** The two detectors above
+            // own the candidates still believed at the window's edge.
+            // Since a `-----BEGIN` candidate can stop at the first byte
+            // that is not PEM text, there is a second kind — `head -n 15
+            // id_rsa` and then a prompt — that is neither believed nor
+            // matched, and nothing above sees it. Its extent is where
+            // `pem::extent` stopped believing it, capped at the same
+            // `UNVOUCHED_CARRY_BYTES` for the same reason, and one that a
+            // complete match covers is left to that match's own marker.
+            //
+            // **And the key body that goes on after it** (the independent
+            // review of GH #242): the next screenful of `less`, the middle
+            // of a key `sed` prints in chunks, every line of a key printed
+            // under a timestamp or a gutter that a pager cut off. Each was
+            // masked while `[\s\S]*?` kept the candidate believed, and
+            // each was released raw by the narrowing — `less` and a space
+            // returned 23 body lines with `redactions: {}`. The lines that
+            // carry key body are masked for the same carry past the
+            // anchor, and the prompt and command between them are not.
+            for c in self.dead_candidates(w, &spans) {
+                spans.push(redact::Span::unresolved(c.start, c.end));
+            }
+            spans = redact::merge_spans(spans);
         }
 
         let mut read_end = safety_end.max(w.req_start).min(w.cap_end);
+        // **A read never ends inside a UTF-8 character (GH #241).** The
+        // cap is a raw byte count, and `encode` decodes each page on its
+        // own, so a character split across two pages came back as two
+        // U+FFFD — on both sides, silently, in text an agent then quotes
+        // back into a `sed`. See `utf8_read_end` for the three arms.
+        read_end = utf8_read_end(w, read_end);
         let held_back = safety_end < w.cap_end;
         let truncated_for_size = w.front_clipped || (w.cap_end < w.head && w.cap_end <= safety_end);
         // `held_back` and its cause answer the same question and must
@@ -1105,7 +1347,17 @@ impl OutputProcessor {
             }
         }
 
-        let (bytes, redactions) = self.render(w, &spans, read_end, opts);
+        // **A redraw a terminal erased is not text the caller is shown
+        // (GH #247).** See `erased_redraws`; the ranges it returns are
+        // skipped by `render` exactly as a span is, minus the marker.
+        let erased = match (opts.ansi, cols) {
+            (AnsiMode::Strip, Some(cols)) => erased_redraws(w, &spans, read_end, cols),
+            _ => Vec::new(),
+        };
+        let (mut bytes, mut redactions) = self.render(w, &spans, &erased, read_end, opts);
+        if !erased.is_empty() {
+            self.judge_collapsed(&mut bytes, &mut redactions);
+        }
 
         ProcessedRead {
             output: encoding::encode(&bytes, opts.text_encoding),
@@ -1127,10 +1379,14 @@ impl OutputProcessor {
     /// the lookbehind portion — that is what makes a secret split across
     /// two reads redact from both sides (§4.1). Its bytes are still fed to
     /// the stripper so escape state stays accurate.
+    ///
+    /// Bytes inside an `erased` range are fed to the stripper and emitted
+    /// nowhere (GH #247).
     fn render(
         &self,
         w: &WindowSnapshot<'_>,
         spans: &[Span],
+        erased: &[(u64, u64)],
         read_end: u64,
         opts: &ReadOptions,
     ) -> (Vec<u8>, BTreeMap<String, usize>) {
@@ -1140,6 +1396,7 @@ impl OutputProcessor {
         let mut stripper = AnsiStripper::new();
         let mut off = w.window_start;
         let mut next_span = 0usize;
+        let mut next_erased = 0usize;
 
         while off < read_end {
             while next_span < spans.len() && spans[next_span].end <= off {
@@ -1168,7 +1425,11 @@ impl OutputProcessor {
                 AnsiMode::Strip => stripper.feed(off, byte),
                 AnsiMode::Raw => Some(byte),
             };
-            if off >= w.req_start {
+            while next_erased < erased.len() && erased[next_erased].1 <= off {
+                next_erased += 1;
+            }
+            let is_erased = erased.get(next_erased).is_some_and(|e| e.0 <= off);
+            if off >= w.req_start && !is_erased {
                 if let Some(b) = emitted {
                     out.push(b);
                 }
@@ -1177,6 +1438,384 @@ impl OutputProcessor {
         }
         (out, redactions)
     }
+
+    /// Judge a page `erased_redraws` shortened, **as the caller receives
+    /// it**, and marker whatever it newly carries (GH #247).
+    ///
+    /// Dropping a redraw joins the text in front of its line to the text
+    /// that replaced it — a stream no view in `normalise` enumerates,
+    /// because none of them deletes a range. A rule that reaches across a
+    /// line break (`\s` in a label rule's separator does) can match there
+    /// and nowhere else: `PASSWORD:\n` then an erased ` x` then the value
+    /// matches only once ` x` is gone. So the payload itself is matched —
+    /// by `all_spans`, whose views are what `encode`'s filters can derive
+    /// from it — and a match is replaced exactly as `render` replaces one.
+    /// A match over a marker's own text replaces it with another marker,
+    /// which shows nothing either did not.
+    ///
+    /// Only reached when something was erased, so an ordinary page pays
+    /// nothing for it.
+    fn judge_collapsed(&self, out: &mut Vec<u8>, redactions: &mut BTreeMap<String, usize>) {
+        let spans = self.all_spans(out, 0);
+        if spans.is_empty() {
+            return;
+        }
+        let mut judged = Vec::with_capacity(out.len());
+        let mut at = 0usize;
+        for span in spans {
+            let kind = redact::span_kind(&self.rules, &span);
+            judged.extend_from_slice(&out[at..span.start as usize]);
+            judged.extend_from_slice(redact::marker(kind).as_bytes());
+            *redactions.entry(kind.to_string()).or_insert(0) += 1;
+            at = span.end as usize;
+        }
+        judged.extend_from_slice(&out[at..]);
+        *out = judged;
+    }
+}
+
+/// The length a UTF-8 sequence opening with `lead` claims, or `None` for
+/// a byte that opens nothing — ASCII, a continuation byte, or one of the
+/// bytes no well-formed sequence starts with (`0xc0`, `0xc1`, `0xf5..`).
+fn utf8_sequence_len(lead: u8) -> Option<u64> {
+    match lead {
+        0xc2..=0xdf => Some(2),
+        0xe0..=0xef => Some(3),
+        0xf0..=0xf4 => Some(4),
+        _ => None,
+    }
+}
+
+/// Where a read that would end at `read_end` may end without splitting a
+/// UTF-8 character (GH #241). Returns `read_end` unchanged unless the
+/// bytes in front of it are the first part of a sequence whose remaining
+/// bytes lie at or past it.
+///
+/// **Three arms, and the reason there are three is that the obvious one
+/// wedges.**
+///
+/// * *Pull back to the lead byte* when that still returns the caller
+///   something (`lead > req_start`). The rest of the character is the
+///   first thing the next read returns, so both pages decode whole. At
+///   most three bytes, and only ever of a character the page could not
+///   finish — the same move REQ-O-008 makes for an unfinished escape.
+/// * *Push forward to the character's end* when pulling back would return
+///   nothing — a `max_bytes` smaller than one character, or a read whose
+///   whole page is the front of one. Pulling back there hands the caller
+///   its own cursor on every retry, which is GH #195's wedge through a
+///   third rule; the overshoot is at most three bytes past `max_bytes`,
+///   and only when the character's remaining bytes are already in the
+///   window. `ProcessedRead::bytes_returned` documents it beside the
+///   secret overshoot, which is the only other one.
+/// * *Leave it* at `buffer.head` when the child has exited, or when the
+///   remaining bytes have not arrived and pulling back would return
+///   nothing. A dead child will never finish the character, so holding it
+///   back would strand it; and a read that is *only* an unfinished
+///   character is exactly the case the escape rule already declines to
+///   withhold. What is left is at most three bytes that decode as
+///   U+FFFD, which is what they are.
+///
+/// **Not a holdback.** It sets no flag and names no cause: it moves the
+/// read end by less than one character and costs the caller no byte it
+/// is not handed on the next read, which is why `held_back_cause`'s
+/// closed vocabulary does not grow for it. A read cut short of `head` by
+/// it still reports `cursor` at the lead byte, which is where the next
+/// read must start, and a read that was already truncated for size hands
+/// back that same offset as `next_cursor`.
+fn utf8_read_end(w: &WindowSnapshot<'_>, read_end: u64) -> u64 {
+    let window_end = w.window_start + w.window.len() as u64;
+    if read_end <= w.req_start || read_end > window_end {
+        return read_end;
+    }
+    let byte = |off: u64| w.window[(off - w.window_start) as usize];
+    // Walk back to the byte that opened the character `read_end` might be
+    // inside. At most three of a character's bytes can sit in front of a
+    // split — a four-byte one cut after its third — so at most two of
+    // them are continuation bytes, and the lead is at most three back.
+    let floor = w.req_start.max(w.window_start);
+    let mut lead = read_end - 1;
+    while lead > floor && read_end - lead < 3 && (0x80..=0xbf).contains(&byte(lead)) {
+        lead -= 1;
+    }
+    let Some(len) = utf8_sequence_len(byte(lead)) else {
+        return read_end;
+    };
+    let char_end = lead + len;
+    if char_end <= read_end {
+        // The character closes at or before the read end: no split.
+        return read_end;
+    }
+    if lead > w.req_start && (read_end < w.head || w.child_alive) {
+        return lead;
+    }
+    // Pulling back would return nothing. Finish the character instead,
+    // if the whole of it is here and really is one.
+    if char_end <= window_end && (read_end..char_end).all(|off| (0x80..=0xbf).contains(&byte(off)))
+    {
+        return char_end;
+    }
+    read_end
+}
+
+/// The ranges of `[req_start, read_end)` holding a redraw a terminal has
+/// already erased (GH #247) — what a progress bar leaves behind in the
+/// byte stream: every frame of `Building [==>  ] 12/400`, each one
+/// returned to column 0 by `\r` and wiped by the next.
+///
+/// **Only a line the stream itself erases, and only in two spellings a
+/// terminal cannot read any other way.** Both start at a `\r` that is not
+/// the first half of `\r\n`, and both drop everything on that line in
+/// front of it:
+///
+/// * `\r`, then SGR only, then **erase-in-line** —
+///   `\x1b[K`, `\x1b[0K` or `\x1b[2K`. From column 0 all three clear the
+///   whole row, so nothing written on it before survives. This is how
+///   cargo clears its bar before printing a `Compiling` line, and how
+///   most progress bars redraw.
+/// * `\r`, then a redraw of printable text and SGR only, **ending in
+///   `\x1b[K`** before the next `\r` or `\n`. It overwrote the row from
+///   column 0 and erased the rest, so again nothing older survives —
+///   whatever the widths, wide characters included.
+///
+/// Anything else is left exactly as it was: a `\r` followed by a shorter
+/// line with no erase (the old tail is still on screen), a redraw with a
+/// tab, a backspace or a cursor movement in it, a redraw that has not
+/// finished inside this page, and every byte under `ansi: raw`, which
+/// promises the bytes.
+///
+/// **And a line that may have wrapped** (the independent review of
+/// GH #247). `\r` returns to column 0 of the row the cursor is on, and an
+/// erase clears that row — so a line wider than the terminal leaves every
+/// row above its last one on screen, and dropping the whole line dropped
+/// text a terminal still shows: 150 `W`s and a `\r\x1b[K` in an 80-column
+/// session read back as nothing where the grid showed two rows of them.
+/// So the line is dropped only if its start column is known and it never
+/// reached past `cols`, counted the conservative way: every character
+/// that is not ASCII as two columns, a column that is unknown after any
+/// escape that can move the cursor, and a page whose first line began
+/// before anything this window can see as unknown too. `cols` is the
+/// session's width when the read is taken; a session widened *after* a
+/// wrapped line was painted is the residual, since the rows it wrapped
+/// onto are still on screen and this counts against the wider width.
+/// **Nothing that a terminal still shows is dropped.**
+///
+/// **It never touches what redaction sees.** Spans are found on the whole
+/// window before this runs and a range overlapping any of them is not
+/// dropped, so no marker disappears; the cursor, `bytes_returned` and
+/// every flag are unchanged, because the bytes were read — they are only
+/// not shown. And a line with nothing printable in front of its `\r` —
+/// bash's `\x1b[?2004l\r` before every command's output — is not
+/// "collapsed" into a page that differs only by that `\r`.
+fn erased_redraws(
+    w: &WindowSnapshot<'_>,
+    spans: &[Span],
+    read_end: u64,
+    cols: u16,
+) -> Vec<(u64, u64)> {
+    let window_end = w.window_start + w.window.len() as u64;
+    let end = read_end.min(window_end);
+    if end <= w.req_start {
+        return Vec::new();
+    }
+    let cols = u32::from(cols);
+    let at = |off: u64| w.window[(off - w.window_start) as usize];
+    // A CSI sequence at `off`: where it ends and its final byte.
+    let csi = |off: u64| -> Option<(u64, u8)> {
+        if off + 1 >= end || at(off) != 0x1b || at(off + 1) != b'[' {
+            return None;
+        }
+        let mut i = off + 2;
+        while i < end {
+            match at(i) {
+                0x20..=0x3f => i += 1,
+                f @ 0x40..=0x7e => return Some((i + 1, f)),
+                _ => return None,
+            }
+        }
+        None
+    };
+    // Where a non-CSI escape at `off` ends: a string sequence (OSC, DCS,
+    // SOS, PM, APC) at its BEL or ST, anything else after its
+    // intermediates and one final byte — the grammar `AnsiStripper`
+    // consumes, so no byte of the sequence is mistaken for text.
+    let escape_end = |off: u64| -> u64 {
+        let mut i = off + 1;
+        if i >= end {
+            return end;
+        }
+        if matches!(at(i), b']' | b'P' | b'X' | b'^' | b'_') {
+            i += 1;
+            while i < end {
+                match at(i) {
+                    0x07 => return i + 1,
+                    0x1b if i + 1 < end && at(i + 1) == b'\\' => return i + 2,
+                    _ => i += 1,
+                }
+            }
+            return end;
+        }
+        while i < end && (0x20..=0x2f).contains(&at(i)) {
+            i += 1;
+        }
+        (i + 1).min(end)
+    };
+    // Erase-in-line from the cursor or of the whole line: `\x1b[K`,
+    // `\x1b[0K`, `\x1b[2K`. Returns the byte after it and whether it was
+    // the whole-line form.
+    let erase = |off: u64| -> Option<(u64, bool)> {
+        let (next, fin) = csi(off)?;
+        let params =
+            &w.window[(off + 2 - w.window_start) as usize..(next - 1 - w.window_start) as usize];
+        (fin == b'K' && matches!(params, b"" | b"0" | b"2")).then_some((next, params == b"2"))
+    };
+    let mut out: Vec<(u64, u64)> = Vec::new();
+    // The walk starts at the window, not the page, so the column the
+    // page's first line began at can be known: from the stream's first
+    // byte, or from the first `\r` the lookbehind holds. Before either it
+    // is unknown, and so is every line that began then.
+    let mut col: Option<u32> = (w.window_start == 0).then_some(0);
+    let mut line_start = w.window_start;
+    let mut printable = false;
+    // The current line began at a known column and has not wrapped.
+    let mut fits = col.is_some();
+    let mut off = w.window_start;
+    while off < end {
+        let b = at(off);
+        // A line feed — or the two other bytes that move the cursor down,
+        // VT and FF — starts a new line, at the column it left.
+        if matches!(b, b'\n' | 0x0b | 0x0c) {
+            line_start = off + 1;
+            printable = false;
+            fits = col.is_some();
+            off += 1;
+            continue;
+        }
+        if b == 0x1b {
+            // SGR changes no position. Every other sequence might: a
+            // cursor move, a screen switch, a save and restore, a scroll —
+            // after which a `\r` and an erase may land on a different row
+            // or a different screen from the text written before it. So
+            // anything but SGR ends the line as far as this rule is
+            // concerned, and the text in front of it is never dropped.
+            // Found by an independent review, on `\x1b[?1049h`. An erase
+            // moves no cursor either, so the column survives it; after
+            // anything else it is unknown until the next `\r`.
+            match csi(off) {
+                Some((next, b'm')) => off = next,
+                Some((next, fin)) => {
+                    off = next;
+                    line_start = off;
+                    printable = false;
+                    if !matches!(fin, b'K' | b'J') {
+                        col = None;
+                    }
+                    fits = col.is_some();
+                }
+                None => {
+                    off = escape_end(off);
+                    line_start = off;
+                    printable = false;
+                    col = None;
+                    fits = false;
+                }
+            }
+            continue;
+        }
+        if b != b'\r' {
+            printable |= b >= 0x20 && b != 0x7f;
+            // Where the cursor goes, counted so that a line that might
+            // have wrapped is taken to have. A character is written at the
+            // column after a full row only by wrapping to the next one.
+            if let Some(c) = col.as_mut() {
+                let width = match b {
+                    0x20..=0x7e => 1,
+                    0xc0..=0xff => 2,
+                    _ => 0,
+                };
+                match b {
+                    b'\t' => *c = ((*c / 8 + 1) * 8).min(cols.saturating_sub(1)),
+                    0x08 => *c = c.saturating_sub(1),
+                    _ if width > 0 => {
+                        if *c + width > cols {
+                            fits = false;
+                            *c = 0;
+                        }
+                        *c += width;
+                    }
+                    _ => {}
+                }
+            }
+            off += 1;
+            continue;
+        }
+        // The first half of `\r\n` needs no arm of its own: the `\n` after
+        // it is neither an erase nor a redraw ending in one, so both
+        // spellings below decline it.
+        let cr = off;
+        // Spelling 1: SGR only, then an erase. **Not mode changes**, and
+        // an earlier draft allowed them: `\x1b[?1049h` switches to the
+        // alternate screen, so an erase after it clears *that* screen and
+        // the line in front of the `\r` is still on the main one, shown
+        // again the moment the program leaves — dropping it would drop
+        // text a terminal still shows. Found by an independent review.
+        let mut i = cr + 1;
+        let mut erased = false;
+        while let Some((next, fin)) = csi(i) {
+            if erase(i).is_some() {
+                erased = true;
+                break;
+            }
+            if fin != b'm' {
+                break;
+            }
+            i = next;
+        }
+        // Spelling 2: a redraw of text and SGR from column 0, ending in an
+        // erase-to-end before the next `\r` or `\n` — both inside this
+        // page, or it has not finished and nothing is decided.
+        if !erased {
+            let mut j = cr + 1;
+            let mut last_was_erase = false;
+            while j < end {
+                let c = at(j);
+                if c == b'\r' || c == b'\n' {
+                    erased = last_was_erase;
+                    break;
+                }
+                if c == 0x1b {
+                    match (csi(j), erase(j)) {
+                        (_, Some((next, false))) => {
+                            last_was_erase = true;
+                            j = next;
+                        }
+                        (Some((next, b'm')), _) => j = next,
+                        _ => break,
+                    }
+                    continue;
+                }
+                if c < 0x20 || c == 0x7f {
+                    break;
+                }
+                last_was_erase = false;
+                j += 1;
+            }
+        }
+        let drop = (line_start, cr + 1);
+        let overlaps_span = spans.iter().any(|s| s.start < drop.1 && drop.0 < s.end);
+        if erased && printable && fits && !overlaps_span && drop.1 > w.req_start {
+            out.push(drop);
+        }
+        if erased {
+            line_start = cr + 1;
+            printable = false;
+        }
+        // `\r` is column 0 on whatever row the cursor is, and a line that
+        // did not end here goes on from there without having wrapped.
+        col = Some(0);
+        fits |= erased;
+        off = cr + 1;
+    }
+    out
 }
 
 /// Move `read_end` past any span it would otherwise end *inside*, so the
@@ -1956,6 +2595,17 @@ mod tests {
     /// one goes red if the corpus stops containing the shape *or* if the
     /// shape stops being handled, and the first assertion tells the two
     /// apart.
+    ///
+    /// **Since GH #242 the prose anchors are not masked at all**, and the
+    /// row asserts that as well as the drain. #195's fix made the loop
+    /// progress by masking each unterminated anchor for
+    /// `UNVOUCHED_CARRY_BYTES`; on this corpus that was a quarter of the
+    /// text. A `-----BEGIN` candidate is now believed only while what
+    /// follows can be PEM text, and a closing backtick is not, so every
+    /// prose mention comes back verbatim with no marker. The paired half
+    /// — that the check was *narrowed* and not deleted — is the same
+    /// corpus with a truncated key planted in it, which must come back
+    /// masked on the same loop.
     #[test]
     fn the_documented_read_loop_drains_this_repositorys_own_changelog() {
         let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
@@ -1979,28 +2629,40 @@ mod tests {
 
         let p = processor();
         let o = ReadOptions::default();
-        let mut cursor = 0u64;
-        let mut reads = 0usize;
-        let mut saw_marker = false;
-        while cursor < buf.len() as u64 {
-            reads += 1;
-            assert!(reads <= 32, "the read loop did not terminate");
-            let w = snapshot(&p, &buf, cursor, 32 * 1024, true, false);
-            let r = p.process(&w, &o);
-            assert!(
-                r.cursor > cursor,
-                "read {reads} returned {} bytes and left the cursor at \
-                 {cursor}: that is GH #195",
-                r.bytes_returned
+        // One pass of the documented loop, returning the joined payload,
+        // the read count and the `unresolved` markers it reported.
+        let drain = |buf: &[u8]| {
+            let mut cursor = 0u64;
+            let mut reads = 0usize;
+            let mut unresolved = 0usize;
+            let mut joined = String::new();
+            while cursor < buf.len() as u64 {
+                reads += 1;
+                assert!(reads <= 32, "the read loop did not terminate");
+                let w = snapshot(&p, buf, cursor, 32 * 1024, true, false);
+                let r = p.process(&w, &o);
+                assert!(
+                    r.cursor > cursor,
+                    "read {reads} returned {} bytes and left the cursor at \
+                     {cursor}: that is GH #195",
+                    r.bytes_returned
+                );
+                unresolved += r
+                    .redactions
+                    .get(redact::UNRESOLVED_KIND)
+                    .copied()
+                    .unwrap_or(0);
+                joined.push_str(&r.output);
+                cursor = r.cursor;
+            }
+            assert_eq!(
+                cursor,
+                buf.len() as u64,
+                "the loop must consume the corpus, not merely terminate"
             );
-            saw_marker |= r.redactions.contains_key(redact::UNRESOLVED_KIND);
-            cursor = r.cursor;
-        }
-        assert_eq!(
-            cursor,
-            buf.len() as u64,
-            "the loop must consume the corpus, not merely terminate"
-        );
+            (joined, reads, unresolved)
+        };
+        let (joined, reads, unresolved) = drain(&buf);
         // **Relative to the corpus, not an absolute.** These three files
         // grow, and an absolute bound goes red from documentation growth
         // alone — which would be misdiagnosed as the wedge returning. The
@@ -2014,12 +2676,42 @@ mod tests {
              degrees",
             buf.len()
         );
-        assert!(
-            saw_marker,
-            "the prose anchor must be reported as unresolved rather than \
-             silently released — without this the row passes against a \
-             fix that simply deleted the check"
+        // GH #242: every prose anchor comes back verbatim, and nothing is
+        // masked on their account.
+        let anchors = |t: &[u8]| {
+            t.windows(31)
+                .filter(|w| *w == b"-----BEGIN RSA PRIVATE KEY-----")
+                .count()
+        };
+        assert_eq!(
+            unresolved, 0,
+            "a prose `-----BEGIN` is not a candidate past its closing \
+             backtick, so nothing in this corpus is unresolved"
         );
+        assert_eq!(
+            anchors(joined.as_bytes()),
+            anchors(&buf),
+            "every prose anchor must reach the caller"
+        );
+
+        // The paired half: the check was narrowed, not deleted. A key cut
+        // short in the middle of the same corpus is still masked, whole.
+        let key = pem::fixtures::KEYS[0].pem();
+        let truncated: String = key.lines().take(12).map(|l| format!("{l}\n")).collect();
+        let mid = buf.len() / 2;
+        let mut planted = buf[..mid].to_vec();
+        planted.extend_from_slice(b"\n$ head -n 12 id_rsa\n");
+        planted.extend_from_slice(truncated.as_bytes());
+        planted.extend_from_slice(b"$ ");
+        planted.extend_from_slice(&buf[mid..]);
+        let (joined, _, unresolved) = drain(&planted);
+        assert!(unresolved >= 1, "the planted key must be masked");
+        for line in truncated.lines().skip(1) {
+            assert!(
+                !joined.contains(line),
+                "a line of the planted key reached the caller: {line}"
+            );
+        }
     }
 
     /// **The gap between surfaces, closed and asserted in both
@@ -2369,11 +3061,21 @@ mod tests {
         let p = processor();
 
         // ---- arm 1: the mask starts first and swallows the real match.
+        //
+        // **The real match is an AWS key id, and it was a GitHub token
+        // until GH #242.** A `-----BEGIN` candidate is now believed only
+        // while what follows can be PEM text, and `ghp_`'s underscore is
+        // not — the candidate ended in front of the token, and the row was
+        // no longer about a mask meeting a match. `AKIA…` is sixteen
+        // base64 characters behind a base64 prefix, so it sits inside text
+        // the candidate still believes, which is the arrangement this row
+        // needs.
+        const AWS: &str = "AKIAIOSFODNN7EXAMPLE";
         let prologue = "$ cat bundle\n";
         let mut buf = format!("{prologue}-----BEGIN RSA PRIVATE KEY-----\n").into_bytes();
         buf.extend(std::iter::repeat_n(b'A', 1024));
         buf.extend_from_slice(b"\ntoken ");
-        buf.extend_from_slice(GITHUB.as_bytes());
+        buf.extend_from_slice(AWS.as_bytes());
         buf.extend_from_slice(b"\n");
         buf.extend(std::iter::repeat_n(b'B', 1024));
         buf.extend_from_slice(b"\n");
@@ -3892,5 +4594,869 @@ mod tests {
         );
         assert!(!r.output.contains(GITHUB), "leaked: {}", r.output);
         assert_eq!(r.output, "\u{1b}]0;deploy [REDACTED:github]\u{7}$ ");
+    }
+
+    // ------------------------------------------ GH #241: UTF-8 boundaries
+
+    /// Mixed-width text in which every page boundary a small `max_bytes`
+    /// produces lands inside a character sooner or later: two-, three-
+    /// and four-byte sequences, ASCII between them, and newlines.
+    fn multibyte_corpus(lines: usize) -> String {
+        "한ü日語 — “quoted” 🦀 é 🎉 abc\n".repeat(lines)
+    }
+
+    /// **The documented paging loop returns the text it was given, at
+    /// every `max_bytes`, including the ones smaller than a character**
+    /// (GH #241).
+    ///
+    /// The window end was a raw byte count and `encode` decodes each page
+    /// on its own, so a character split across two pages came back as
+    /// U+FFFD on both sides. Measured on `main` at `a81b02d` with this
+    /// corpus: every `max_bytes` below swaps characters for U+FFFD, and
+    /// `max_bytes: 1` returns nothing *but* U+FFFD for the non-ASCII part.
+    ///
+    /// Two properties, and each one catches a different wrong fix:
+    /// *byte-identical concatenation* catches the split, and *every read
+    /// makes progress* catches the pull-back that returns nothing — which
+    /// at `max_bytes` 1, 2 and 3 is every read that starts on a lead
+    /// byte, and would be GH #195's wedge through a third rule.
+    #[test]
+    fn paging_never_splits_a_utf8_character_at_any_max_bytes() {
+        let p = processor();
+        for max_bytes in [1usize, 2, 3, 5, 7, 64, 1000, 4096] {
+            // Every read of a tiny page re-judges a whole lookahead
+            // window, so the corpus is sized to the page: enough pages to
+            // meet every alignment, few enough to stay fast.
+            let text = multibyte_corpus(if max_bytes < 64 { 3 } else { 200 });
+            let buf = text.as_bytes();
+            // The fixture has to contain the shapes this is about, or it
+            // proves nothing about them.
+            assert!(text.chars().any(|c| c.len_utf8() == 2));
+            assert!(text.chars().any(|c| c.len_utf8() == 3));
+            assert!(text.chars().any(|c| c.len_utf8() == 4));
+            let mut joined = String::new();
+            let mut cursor = 0u64;
+            let mut reads = 0usize;
+            let mut split_seen = false;
+            while cursor < buf.len() as u64 {
+                reads += 1;
+                assert!(
+                    reads <= buf.len() + 1,
+                    "max_bytes {max_bytes}: no termination"
+                );
+                let w = snapshot(&p, buf, cursor, max_bytes, true, false);
+                // The fixture really does put a raw page end inside a
+                // character at this size, or the row is vacuous for it.
+                let cap = w.cap_end;
+                if cap < buf.len() as u64 && (0x80..=0xbf).contains(&buf[cap as usize]) {
+                    split_seen = true;
+                }
+                let r = p.process(&w, &ReadOptions::default());
+                assert!(
+                    r.cursor > cursor,
+                    "max_bytes {max_bytes}: read {reads} from {cursor} made no progress"
+                );
+                assert!(
+                    !r.output.contains('\u{fffd}'),
+                    "max_bytes {max_bytes}: read {reads} from {cursor} split a character: {:?}",
+                    r.output
+                );
+                joined.push_str(&r.output);
+                cursor = r.cursor;
+            }
+            assert!(
+                split_seen,
+                "max_bytes {max_bytes}: no page end fell inside a character"
+            );
+            assert_eq!(
+                joined, text,
+                "max_bytes {max_bytes}: the pages do not rejoin"
+            );
+        }
+    }
+
+    /// The three arms of `utf8_read_end`, each pinned on its own, because
+    /// the paging row above is satisfied by more than one of them at a
+    /// time and a mutant that deletes one arm can hide behind another.
+    #[test]
+    fn a_split_character_is_pulled_back_pushed_forward_or_left_by_rule() {
+        let p = processor();
+        // "ab" then 日 (e6 97 a5), then "c".
+        let buf = "ab日c".as_bytes();
+
+        // Pulled back: a page ending one byte into the character stops
+        // before it and returns what it can.
+        let w = snapshot(&p, buf, 0, 3, true, false);
+        let r = p.process(&w, &ReadOptions::default());
+        assert_eq!(r.output, "ab");
+        assert_eq!(r.cursor, 2, "the next read starts on the lead byte");
+        assert_eq!(r.next_cursor, Some(2));
+        assert!(r.truncated_for_size && !r.held_back);
+
+        // Pushed forward: a page that *is* the front of the character
+        // would return nothing if pulled back, so it finishes it.
+        let w = snapshot(&p, buf, 2, 1, true, false);
+        let r = p.process(&w, &ReadOptions::default());
+        assert_eq!(r.output, "日");
+        assert_eq!(r.bytes_returned, 3, "at most three bytes past max_bytes");
+        assert_eq!(r.cursor, 5);
+
+        // At `head`, with the child alive: the rest has not arrived, so
+        // the page stops before it and `cursor` says where to resume.
+        let partial = &buf[..4];
+        let w = snapshot(&p, partial, 0, 4096, true, false);
+        let r = p.process(&w, &ReadOptions::default());
+        assert_eq!(r.output, "ab");
+        assert_eq!(r.cursor, 2);
+        assert!(!r.held_back, "less than one character is not a holdback");
+
+        // …and with the child gone it never will arrive, so the bytes go
+        // out as what they are rather than being stranded.
+        let w = snapshot(&p, partial, 0, 4096, false, false);
+        let r = p.process(&w, &ReadOptions::default());
+        assert_eq!(r.cursor, 4, "a dead child's partial character is not held");
+        assert!(r.output.starts_with("ab") && r.output.contains('\u{fffd}'));
+
+        // A read that is *only* an unfinished character at `head` is left
+        // alone even while the child lives, for the reason the escape
+        // rule gives: withholding it would return the caller nothing.
+        let w = snapshot(&p, partial, 2, 4096, true, false);
+        let r = p.process(&w, &ReadOptions::default());
+        assert_eq!(r.cursor, 4, "no zero-byte read at head");
+    }
+
+    // ------------------------------------ GH #243 / #242: every read shape
+
+    /// A PTY's rendering of `cat <key>` in the middle of a session: the
+    /// command, the key with `\r\n` line ends, and a later command.
+    fn catted(pem: &str) -> String {
+        format!(
+            "$ cat id_key\r\n{}$ echo done\r\ndone\r\n$ ",
+            pem.replace('\n', "\r\n")
+        )
+    }
+
+    /// The offsets a `tail_lines` read of each size would start at — the
+    /// byte after each `\n`, newest first — plus the buffer's start.
+    fn line_starts(buf: &[u8]) -> Vec<u64> {
+        let mut starts: Vec<u64> = std::iter::once(0)
+            .chain(
+                buf.iter()
+                    .enumerate()
+                    .filter(|(_, b)| **b == b'\n')
+                    .map(|(i, _)| i as u64 + 1),
+            )
+            .filter(|s| (*s as usize) < buf.len())
+            .collect();
+        starts.reverse();
+        starts
+    }
+
+    /// **No read shape returns key material, for any key format, whether
+    /// the key is complete or cut short** (GH #243, GH #242).
+    ///
+    /// #223 masked a key for a read that starts *before* its header. A
+    /// read that starts *inside* it never saw the header, so nothing
+    /// marked the body: on `main` at `a81b02d` a `tail_lines` read of a
+    /// complete 4096-bit key returned most of its body raw with
+    /// `redactions: {}`, and so did `tail_bytes` and a cursor partway in.
+    /// Every such shape is driven here, at every line and at a spread of
+    /// byte offsets, against every fixture format:
+    ///
+    /// * `tail_lines` of every size, which is a read starting after each
+    ///   `\n`;
+    /// * `tail_bytes` at every size up to the whole buffer, in steps;
+    /// * a cursor read starting at every such offset, at the default
+    ///   `max_bytes` and at a small one, so both the at-`head` branch and
+    ///   the truncated one run.
+    ///
+    /// The shapes are `pem::fixtures::Key::shapes`. `head -n 9` followed
+    /// by a prompt is the case that is neither closed nor in flight, and
+    /// that GH #242's narrowing would release if dying released. The five
+    /// after it are the independent review's: key body arriving *after*
+    /// the candidate stopped — a pager's next screenful, `sed` in chunks,
+    /// and three decorated keys a pager cut off — each of which the
+    /// narrowing released raw and `a81b02d` masked.
+    ///
+    /// **Paired** with what must survive, on the whole-buffer read: the
+    /// commands around every shape, which is what GH #242 was for.
+    #[test]
+    fn no_read_shape_returns_key_material_for_any_key_format() {
+        let p = processor();
+        let o = ReadOptions::default();
+        let mut reads = 0usize;
+        for key in pem::fixtures::KEYS {
+            for shape in key.shapes() {
+                let (name, buf) = (shape.name, shape.text.as_bytes());
+                let head = buf.len() as u64;
+                // Control: the whole-buffer read masks it, so a leak below
+                // is the read shape's and not the fixture's.
+                let whole = p.process(&snapshot(&p, buf, 0, 1 << 20, true, false), &o);
+                assert_eq!(key.leaked_in(&whole.output), None, "{} {name}", key.name);
+                for kept in &shape.kept {
+                    assert!(
+                        whole.output.contains(kept.as_str()),
+                        "{} {name}: {kept:?} was masked with the key: {:?}",
+                        key.name,
+                        whole.output
+                    );
+                }
+
+                let mut starts = line_starts(buf);
+                starts.extend((0..head).step_by(53));
+                for start in starts {
+                    for (max_bytes, bypass) in [(32 * 1024, true), (32 * 1024, false), (256, false)]
+                    {
+                        reads += 1;
+                        let w = snapshot(&p, buf, start, max_bytes, true, bypass);
+                        let r = p.process(&w, &o);
+                        assert_eq!(
+                            key.leaked_in(&r.output),
+                            None,
+                            "{} ({name}): a read from {start} of {head} at max_bytes \
+                             {max_bytes} returned key material: {:?} redactions {:?}",
+                            key.name,
+                            r.output,
+                            r.redactions
+                        );
+                        // A complete key the rule matched keeps the rule's
+                        // name from inside it too — `unresolved` is for a
+                        // region nothing matched, and this one did.
+                        if shape.complete && r.output.contains("[REDACTED:") {
+                            assert!(
+                                r.redactions.contains_key("private-key"),
+                                "{} ({name}) from {start}: {:?}",
+                                key.name,
+                                r.redactions
+                            );
+                        }
+                    }
+                }
+            }
+        }
+        assert!(reads > 1000, "the sweep shrank to {reads} reads");
+    }
+
+    /// **A PEM block that is not a private key is never masked**, from
+    /// any read position — a certificate, a public key, EC parameters, a
+    /// CSR. Each opens `-----BEGIN` and carries a base64 body the PEM walk
+    /// believes; what keeps them out is the rule's own automaton dying on
+    /// the label, and without that the walk would mask every certificate
+    /// chain a TLS tool prints as "a key that died with material".
+    #[test]
+    fn a_pem_block_that_is_not_a_private_key_is_never_masked() {
+        let p = processor();
+        let o = ReadOptions::default();
+        let body: String = pem::fixtures::KEYS[1]
+            .material_lines()
+            .iter()
+            .map(|l| format!("{l}\r\n"))
+            .collect();
+        for label in [
+            "CERTIFICATE",
+            "PUBLIC KEY",
+            "RSA PUBLIC KEY",
+            "EC PARAMETERS",
+            "CERTIFICATE REQUEST",
+        ] {
+            let text = format!(
+                "$ cat f.pem\r\n-----BEGIN {label}-----\r\n{body}-----END {label}-----\r\n$ "
+            );
+            let cut = format!(
+                "$ head f.pem\r\n-----BEGIN {label}-----\r\n{}$ ",
+                &body[..700]
+            );
+            for text in [text, cut] {
+                let buf = text.as_bytes();
+                for start in (0..buf.len() as u64).step_by(97) {
+                    let r = p.process(&snapshot(&p, buf, start, 32 * 1024, true, false), &o);
+                    assert!(
+                        r.redactions.is_empty(),
+                        "{label} from {start}: {:?}",
+                        r.redactions
+                    );
+                    assert_eq!(
+                        r.output.as_bytes(),
+                        &buf[start as usize..],
+                        "{label} from {start}"
+                    );
+                }
+            }
+        }
+    }
+
+    /// **A candidate that died is believed over the carry and no further**,
+    /// the same bound a candidate still arriving gets (GH #242). Without
+    /// the cap a PEM-shaped blob of any length followed by a prompt would
+    /// be masked whole by a read that starts before it, while a read that
+    /// starts past the carry — which cannot see the anchor — releases the
+    /// same bytes; the two reads would disagree about one region by a
+    /// distance the child chooses. The residual is asserted, as the
+    /// in-flight one is in
+    /// `a_private_key_longer_than_the_lookahead_window_is_never_emitted_raw`.
+    #[test]
+    fn a_dead_candidate_is_believed_for_the_carry_and_no_further() {
+        let carry = UNVOUCHED_CARRY_BYTES as u64;
+        let (pem, _) = pem_longer_than(40 * 1024);
+        let prologue = "$ cat blob\n";
+        let buf = format!("{prologue}{}\n$ echo done\n", &pem[..pem.len() - 30]).into_bytes();
+        let anchor = prologue.len() as u64;
+        let line_at = |i: usize| anchor + 32 + 65 * i as u64;
+        let r = read(&buf, 0, 256 * 1024);
+        for i in (0..600).take_while(|i| line_at(*i) + 65 <= anchor + carry) {
+            assert!(
+                !r.output.contains(&format!("KEYBODY{i:06}")),
+                "line {i} is inside the carry"
+            );
+        }
+        let past = (0..600).find(|i| line_at(*i) > anchor + carry).unwrap();
+        assert!(
+            r.output.contains(&format!("KEYBODY{past:06}")),
+            "the residual moved: a dead candidate past {carry} bytes is not believed"
+        );
+        assert!(r.output.ends_with("$ echo done\n"));
+    }
+
+    /// The paired direction for the row above: the reads that must *not*
+    /// be masked still are not. Without this the sweep passes against a
+    /// processor that masks every read carrying a `-----BEGIN` in its
+    /// carry region, which would be GH #242 back at full size.
+    #[test]
+    fn output_after_a_key_is_not_masked_on_its_account() {
+        let p = processor();
+        let o = ReadOptions::default();
+        for key in pem::fixtures::KEYS {
+            let pem = key.pem();
+            let cut: String = pem.lines().take(9).map(|l| format!("{l}\n")).collect();
+            for (shape, text) in [("complete", catted(&pem)), ("head -n 9", catted(&cut))] {
+                let buf = text.as_bytes();
+                let done = text.rfind("$ echo done").unwrap() as u64;
+                // A read that starts at the next command sees it verbatim,
+                // though the key is well inside its carry region.
+                let r = p.process(&snapshot(&p, buf, done, 32 * 1024, true, false), &o);
+                assert_eq!(
+                    r.output, "$ echo done\r\ndone\r\n$ ",
+                    "{} {shape}",
+                    key.name
+                );
+                assert!(
+                    r.redactions.is_empty(),
+                    "{} {shape}: {:?}",
+                    key.name,
+                    r.redactions
+                );
+                // And the whole-buffer read masks the key and nothing else.
+                let r = p.process(&snapshot(&p, buf, 0, 1 << 20, true, false), &o);
+                assert!(
+                    r.output.starts_with("$ cat id_key\r\n[REDACTED:"),
+                    "{}",
+                    r.output
+                );
+                assert!(
+                    r.output.ends_with("$ echo done\r\ndone\r\n$ "),
+                    "{} {shape}: {:?}",
+                    key.name,
+                    r.output
+                );
+            }
+        }
+    }
+
+    /// **After a key header, what is masked is key body and nothing else**
+    /// — the cost side of following a stopped candidate's body lines
+    /// (`pem::body_lines`), measured on the lines likeliest to follow one.
+    ///
+    /// * After a **complete** key nothing is followed: its candidate
+    ///   closed, and the rule's own match is the whole of its mask. A
+    ///   SHA-256 digest on the next line comes back.
+    /// * After a key **cut short**, or a header in **prose**, a git object
+    ///   id (40 hex) and ordinary output come back; a line carrying a run
+    ///   of [`pem::KEY_LINE_RUN`] — here a SHA-256 digest — is masked,
+    ///   which is the stated cost; and past `UNVOUCHED_CARRY_BYTES` from
+    ///   the header even that comes back.
+    #[test]
+    fn after_a_key_header_only_key_body_lines_are_masked() {
+        let p = processor();
+        let o = ReadOptions::default();
+        let key = &pem::fixtures::KEYS[0];
+        let pem = key.pem();
+        let cut: String = pem.lines().take(9).map(|l| format!("{l}\n")).collect();
+        let sha1 = "a81b02d3c4e5f60718293a4b5c6d7e8f90a1b2c3";
+        let sha256 = "66786b9abe23920d022a182d1416b1bbc8130dd4872a9553d76985a1708dcd1e";
+        let after =
+            format!("$ git log -1 --format=%H\r\n{sha1}\r\n$ sha256sum f\r\n{sha256}  f\r\n$ ");
+        for (shape, text, digest_masked) in [
+            ("complete", catted(&pem), false),
+            ("head -n 9", catted(&cut), true),
+            (
+                "prose",
+                "$ grep -n BEGIN CHANGELOG.md\r\n12: `-----BEGIN RSA PRIVATE KEY-----` as prose\r\n$ "
+                    .to_string(),
+                true,
+            ),
+        ] {
+            let buf = format!("{text}{after}");
+            let r = p.process(&snapshot(&p, buf.as_bytes(), 0, 1 << 20, true, false), &o);
+            assert_eq!(key.leaked_in(&r.output), None, "{shape}");
+            assert!(r.output.contains(sha1), "{shape}: {:?}", r.output);
+            assert!(r.output.contains("$ sha256sum f"), "{shape}: {:?}", r.output);
+            assert_eq!(
+                !r.output.contains(sha256),
+                digest_masked,
+                "{shape}: {:?}",
+                r.output
+            );
+        }
+
+        // Past the carry, the prose header's reach has ended.
+        let pad: String = (0..UNVOUCHED_CARRY_BYTES / 40)
+            .map(|i| format!("ordinary line {i:024}\r\n"))
+            .collect();
+        let buf = format!("12: `-----BEGIN RSA PRIVATE KEY-----` as prose\r\n{pad}{after}");
+        let r = p.process(&snapshot(&p, buf.as_bytes(), 0, 1 << 20, true, false), &o);
+        assert!(r.output.contains(sha256), "the reach is the carry");
+        assert!(r.redactions.is_empty(), "{:?}", r.redactions);
+    }
+
+    // ---------------------------------------- GH #247: erased redraws
+
+    /// A terminal wide enough for every fixture line below: the width the
+    /// dogfood pass's cargo measurement was taken at.
+    const WIDE: u16 = 120;
+
+    /// The bytes `cargo build` writes through a pty, in the shape measured
+    /// on cargo 1.97 at 120 columns: each `Building` frame padded to the
+    /// width and ended by `\r`, followed either by the next frame or by
+    /// `\r\x1b[K` and a `Compiling` line, and the last frame erased before
+    /// `Finished`.
+    fn cargo_progress(crates: &[&str]) -> (String, Vec<String>) {
+        const BOLD_GREEN: &str = "\x1b[1m\x1b[92m";
+        const BOLD_CYAN: &str = "\x1b[1m\x1b[96m";
+        const RESET: &str = "\x1b[0m";
+        let total = crates.len() * 2;
+        let frame = |n: usize, what: &str| {
+            let bar = format!("[{:<28}]", "=".repeat(n * 28 / total) + ">");
+            let text = format!(" {bar} {n}/{total}: {what}");
+            format!("{BOLD_CYAN}    Building{RESET}{text:<100}\r")
+        };
+        let mut out = String::new();
+        let mut shown = Vec::new();
+        for (i, name) in crates.iter().enumerate() {
+            let line = format!("   Compiling {name} v1.0.{i}");
+            out.push_str(&format!(
+                "{BOLD_GREEN}   Compiling{RESET} {name} v1.0.{i}\r\n"
+            ));
+            shown.push(line);
+            out.push_str(&frame(2 * i, name));
+            out.push_str(&frame(2 * i + 1, name));
+            out.push_str("\x1b[K");
+        }
+        out.push_str(&frame(total - 1, "demo(bin)"));
+        out.push_str(&format!(
+            "\x1b[K{BOLD_GREEN}    Finished{RESET} `dev` profile in 8.47s\r\n"
+        ));
+        shown.push("    Finished `dev` profile in 8.47s".to_string());
+        (out, shown)
+    }
+
+    /// **A build's progress bar costs the caller its last frame, not
+    /// every frame** (GH #247).
+    ///
+    /// Measured on `main` at `a81b02d`: a nine-second `cargo build` read
+    /// back as mostly `Building [...]` redraws, and a synthetic 400-step
+    /// bar returned 32 KB of progress to a `tail_lines: 3` read because
+    /// the redraws are one "line". A terminal shows none of those frames
+    /// — each is returned to column 0 and wiped — so the stripped page
+    /// now carries exactly what a terminal shows: every `Compiling` line,
+    /// `Finished`, and nothing of the bar.
+    ///
+    /// **The cursor does not move for it.** The frames were read; they
+    /// are only not shown. So `bytes_returned` and `cursor` are asserted
+    /// to be the whole buffer, exactly as before.
+    #[test]
+    fn a_build_progress_bar_reads_back_as_what_a_terminal_shows() {
+        let p = processor();
+        let (text, shown) = cargo_progress(&["proc-macro2", "quote", "syn", "serde", "regex"]);
+        let buf = text.as_bytes();
+        let r = p.process_at_width(
+            &snapshot(&p, buf, 0, 1 << 20, true, false),
+            &ReadOptions::default(),
+            Some(WIDE),
+        );
+        let expected: String = shown.iter().map(|l| format!("{l}\r\n")).collect();
+        assert_eq!(r.output, expected);
+        assert_eq!(r.cursor, buf.len() as u64);
+        assert_eq!(r.bytes_returned, buf.len());
+        assert!(!r.output.contains("Building"));
+
+        // The synthetic one from the issue: 400 frames of `\r\x1b[K`
+        // then text, and nothing after the last.
+        let mut bar = String::new();
+        for n in 1..=400 {
+            bar.push_str(&format!(
+                "\r\x1b[K Building [{}] {n}/400",
+                "#".repeat(n / 10)
+            ));
+        }
+        let r = p.process_at_width(
+            &snapshot(&p, bar.as_bytes(), 0, 1 << 20, true, false),
+            &ReadOptions::default(),
+            Some(WIDE),
+        );
+        // The first `\r` stays: nothing printable is in front of it, so it
+        // erased nothing, and the rule drops only what was erased.
+        assert_eq!(
+            r.output,
+            format!("\r Building [{}] 400/400", "#".repeat(40))
+        );
+
+        // The second spelling: a redraw from column 0 that ends in an
+        // erase-to-end, with no erase in front of it.
+        let r = p.process_at_width(
+            &snapshot(
+                &p,
+                b"a much longer old line\rnew\x1b[K\r\n",
+                0,
+                4096,
+                true,
+                false,
+            ),
+            &ReadOptions::default(),
+            Some(WIDE),
+        );
+        assert_eq!(r.output, "new\r\n");
+
+        // `ansi: raw` promises the bytes, and gets them.
+        let raw = p.process_at_width(
+            &snapshot(&p, buf, 0, 1 << 20, true, false),
+            &ReadOptions {
+                ansi: AnsiMode::Raw,
+                ..ReadOptions::default()
+            },
+            Some(WIDE),
+        );
+        assert_eq!(raw.output, text);
+    }
+
+    /// **Nothing a terminal still shows is dropped** — the half that makes
+    /// the row above safe to have. Each case is a `\r` that does *not*
+    /// erase its line, and each comes back byte for byte.
+    #[test]
+    fn a_redraw_that_leaves_text_on_screen_is_not_collapsed() {
+        let p = processor();
+        for text in [
+            // Shorter, no erase: the old tail is still visible.
+            "downloading 100%\rdone\n",
+            // A tab moves the cursor without writing; the old text under
+            // the gap survives.
+            "old text here\r\tnew\x1b[K\n",
+            // Cursor movement inside the redraw.
+            "0123456789\rab\x1b[3Ccd\x1b[K\n",
+            // A screen switch between the `\r` and the erase: the erase
+            // clears the alternate screen, and the main one keeps its line.
+            "main screen text\r\x1b[?1049h\x1b[K\x1b[?1049l\n",
+            // …or in front of the `\r`, which is the same thing earlier.
+            "main screen text\x1b[?1049h\r\x1b[K\x1b[?1049l\n",
+            // A cursor move in front of the `\r`: the erase clears the row
+            // above, and this one keeps its text.
+            "this row stays\x1b[A\r\x1b[Kthe row above\n",
+            // Save and restore are escapes too.
+            "kept\x1b7\r\x1b[K\x1b8\n",
+            // A vertical tab moves down a row as a line feed does.
+            "this row stays\x0b\r\x1b[Kthe row below\n",
+            // Not finished inside the page: nothing is decided.
+            "frame one\rframe two",
+            // A `\r\n` is a line end and erases nothing.
+            "line one\r\nline two\x1b[K\r\n",
+            // bash's `\x1b[?2004l\r` before a command's output: nothing
+            // printable precedes it, so there is nothing to erase.
+            "$ ls\r\n\x1b[?2004l\rCargo.toml\r\n",
+        ] {
+            let r = p.process_at_width(
+                &snapshot(&p, text.as_bytes(), 0, 1 << 20, true, false),
+                &ReadOptions::default(),
+                Some(WIDE),
+            );
+            assert_eq!(
+                r.output,
+                ansi::strip(text.as_bytes())
+                    .iter()
+                    .map(|b| *b as char)
+                    .collect::<String>(),
+                "{text:?}"
+            );
+        }
+    }
+
+    /// **A line that may have wrapped is not collapsed** (the independent
+    /// review of GH #247). `\r` returns to column 0 of the *last* row a
+    /// wrapped line reached and the erase clears that row alone, so the
+    /// rows above it are still on screen. Each case is paired with the
+    /// width at which the same bytes do collapse, so the rule is shown to
+    /// turn on the width and not on the shape.
+    #[test]
+    fn a_line_that_may_have_wrapped_is_not_collapsed() {
+        let p = processor();
+        let read = |text: &str, cols: u16| {
+            p.process_at_width(
+                &snapshot(&p, text.as_bytes(), 0, 1 << 20, true, false),
+                &ReadOptions::default(),
+                Some(cols),
+            )
+            .output
+        };
+        let strip = |text: &str| String::from_utf8(ansi::strip(text.as_bytes())).unwrap();
+
+        // The review's repro: 164 columns of text.
+        let wide = format!("{}IMPORTANT-TAIL\r\x1b[Kdone-51\r\n", "W".repeat(150));
+        assert_eq!(read(&wide, 80), strip(&wide));
+        assert_eq!(read(&wide, 163), strip(&wide), "one column short");
+        assert_eq!(read(&wide, 164), "done-51\r\n", "exactly the width");
+
+        // Wide characters are counted as two columns: 30 of them are 60.
+        let cjk = format!("{}\r\x1b[Kdone\r\n", "日本".repeat(15));
+        assert_eq!(read(&cjk, 59), strip(&cjk));
+        assert_eq!(read(&cjk, 60), "done\r\n");
+
+        // A tab is a jump, not a wrap, and it is counted.
+        let tabbed = "\t\t\tVISIBLE\r\x1b[Kdone\r\n";
+        assert_eq!(read(tabbed, 30), strip(tabbed));
+        assert_eq!(read(tabbed, 31), "done\r\n");
+
+        // A line whose start column is not known — it began in front of
+        // anything the window holds — is never collapsed, at any width.
+        let mut long = "x".repeat(4000);
+        long.push_str("\r\x1b[Kdone\r\n");
+        let r = p.process_at_width(
+            &snapshot(&p, long.as_bytes(), 2000, 1 << 20, true, false),
+            &ReadOptions::default(),
+            Some(u16::MAX),
+        );
+        assert!(r.output.starts_with("xxxx"), "{:?}", &r.output[..16]);
+        // …and one whose start the window does hold is.
+        let mut known = "x".repeat(4000);
+        known.push_str("\r\nbar 1/9\r\x1b[Kdone\r\n");
+        let at = known.find("bar").unwrap() as u64;
+        let r = p.process_at_width(
+            &snapshot(&p, known.as_bytes(), at, 1 << 20, true, false),
+            &ReadOptions::default(),
+            Some(80),
+        );
+        assert_eq!(r.output, "done\r\n");
+
+        // No width, no collapse: `process` is the spelling for a caller
+        // that cannot say.
+        let bar = "bar 1/9\r\x1b[Kdone\r\n";
+        let r = p.process(
+            &snapshot(&p, bar.as_bytes(), 0, 1 << 20, true, false),
+            &ReadOptions::default(),
+        );
+        assert_eq!(r.output, strip(bar));
+    }
+
+    /// **Every range the collapse drops wrote nothing a terminal still
+    /// shows** — the property GH #247 is allowed on, checked against a
+    /// terminal rather than argued.
+    ///
+    /// The oracle is the one `get_screen_state` masks keys with: replay the
+    /// stream through `vt100` twice, once as written and once with every
+    /// printable byte of the dropped ranges swapped for another, and
+    /// compare the final screens. If a dropped byte is still visible the
+    /// two differ. Streams are drawn at random from the pieces redraws are
+    /// made of — text, `\r`, erase-in-line in all three spellings, SGR,
+    /// line feeds, and the sequences that move the cursor or switch the
+    /// screen, which is where both of this rule's review findings lived
+    /// (`\x1b[?1049h`, `\x1b[A`). The screen is tall enough that nothing
+    /// scrolls, so "still visible" means exactly that.
+    ///
+    /// **At two widths, and the narrow one is the third finding.** A
+    /// 120-column terminal never wraps a line these pieces make, so a rule
+    /// that ignored the width passed here while dropping the rows of a
+    /// wrapped line a terminal still shows (150 `W`s and `\r\x1b[K` in an
+    /// 80-column session). At 20 columns most lines wrap, and every one
+    /// that does must be kept.
+    ///
+    /// **Paired**: the sweep must also have collapsed something at each
+    /// width, and a stream the rule is for must collapse, or the property
+    /// holds of a rule that drops nothing.
+    #[test]
+    fn nothing_a_collapse_drops_is_still_on_a_terminal() {
+        struct Rng(u64);
+        impl Rng {
+            fn below(&mut self, n: usize) -> usize {
+                self.0 ^= self.0 << 13;
+                self.0 ^= self.0 >> 7;
+                self.0 ^= self.0 << 17;
+                (self.0 % n as u64) as usize
+            }
+        }
+        // The ordinary pieces are repeated so that most streams contain
+        // a collapsible redraw; the rest are the ones that break it.
+        const PIECES: &[&str] = &[
+            "alpha",
+            "beta gamma",
+            "x",
+            "Building [==>  ] 3/9",
+            "alpha",
+            "beta gamma",
+            "\r",
+            "\r",
+            "\r",
+            "\r",
+            "\r\x1b[K",
+            "\r\x1b[K",
+            "\x1b[K",
+            "\x1b[K",
+            "\x1b[0K",
+            "\x1b[2K",
+            "\x1b[1K",
+            "\x1b[32m",
+            "\x1b[0m",
+            "\n",
+            "\r\n",
+            "\x1b[?1049h",
+            "\x1b[?1049l",
+            "\x1b[A",
+            "\x1b[B",
+            "\x1b[3C",
+            "\x1b[2D",
+            "\x1b[5G",
+            "\x1b7",
+            "\x1b8",
+            "\x1bM",
+            "\t",
+            "\x08",
+            "\x0b",
+            "\x1b]0;title\x07",
+            "\x1b[?25l",
+            "日本",
+        ];
+        // Leaving the alternate screen at the end, so a line the stream
+        // left on the main screen is on the screen compared.
+        let screen = |bytes: &[u8], cols: u16| {
+            let mut t = vt100::Parser::new(200, cols, 0);
+            t.process(bytes);
+            t.process(b"\x1b[?1049l");
+            t.screen().clone()
+        };
+        // The arrangements the reviews found, first, because a random walk
+        // reaches each of them too rarely to be the thing that pins it.
+        let wrapped = format!("{}IMPORTANT-TAIL\r\x1b[Kdone\r\n", "W".repeat(150));
+        let found: Vec<&str> = vec![
+            "VISIBLE\r\x1b[?1049h\x1b[K",
+            "VISIBLE\x1b[?1049h\r\x1b[K",
+            "VISIBLE\x1b[A\r\x1b[K",
+            "VISIBLE\x1b7\r\x1b[K\x1b8",
+            "VISIBLE\x0b\r\x1b[K",
+            &wrapped,
+            "a line of twenty-five chars\r\x1b[K",
+            "\t\t\tVISIBLE\r\x1b[K",
+        ];
+        let p = processor();
+        for cols in [120u16, 20] {
+            let mut rng = Rng(0x2545_f491_4f6c_dd1d);
+            let mut collapsed = 0usize;
+            for iter in 0..3000 + found.len() {
+                let text: String = match found.get(iter) {
+                    Some(found) => found.to_string(),
+                    None => {
+                        let n = 1 + rng.below(24);
+                        (0..n).map(|_| PIECES[rng.below(PIECES.len())]).collect()
+                    }
+                };
+                let buf = text.as_bytes();
+                let w = snapshot(&p, buf, 0, 1 << 20, true, false);
+                let erased = erased_redraws(&w, &[], buf.len() as u64, cols);
+                if erased.is_empty() {
+                    continue;
+                }
+                collapsed += 1;
+                let mut swapped = buf.to_vec();
+                let mut stripper = AnsiStripper::new();
+                for (i, byte) in swapped.iter_mut().enumerate() {
+                    let printed = stripper.feed(i as u64, *byte).is_some();
+                    let inside = erased
+                        .iter()
+                        .any(|(s, e)| *s <= i as u64 && (i as u64) < *e);
+                    if inside && printed && (0x20..=0x7e).contains(byte) {
+                        *byte = if *byte == b'#' { b'%' } else { b'#' };
+                    }
+                }
+                assert_eq!(
+                    screen(buf, cols).contents(),
+                    screen(&swapped, cols).contents(),
+                    "iter {iter} at {cols} columns: a dropped range is still on screen: \
+                 {text:?} dropped {erased:?}"
+                );
+            }
+            assert!(
+                collapsed > 100,
+                "only {collapsed} streams collapsed anything at {cols} columns"
+            );
+        }
+    }
+
+    /// **Dropping a redraw never removes a marker, and never lets the text
+    /// it joins carry a credential out** (GH #247's "must not change what
+    /// redaction sees").
+    ///
+    /// Two arrangements. A secret *inside* an erased frame keeps its
+    /// marker, because a frame a span touches is not dropped — the agent
+    /// is told something was redacted there, which is what REQ-O-012's
+    /// count says. And a value that only becomes a match *once* the frame
+    /// is gone — a label on one line, an erased frame, the value on the
+    /// next — is judged on the page the caller receives and replaced.
+    #[test]
+    fn collapsing_a_redraw_keeps_every_marker_and_hides_every_join() {
+        let p = processor();
+        let text = format!("progress {GITHUB}\r\x1b[Kdone\n");
+        let r = p.process_at_width(
+            &snapshot(&p, text.as_bytes(), 0, 1 << 20, true, false),
+            &ReadOptions::default(),
+            Some(WIDE),
+        );
+        assert_eq!(r.redactions.get("github"), Some(&1));
+        assert_eq!(
+            r.output, "progress [REDACTED:github]\rdone\n",
+            "a frame a redaction touches is kept whole, text and marker"
+        );
+
+        // `PASSWORD=` then a frame of ` x` then the value, indented.
+        // Uncollapsed, the value rule sees ` x` and nothing it can use;
+        // collapsed, the value is on the line after the `=`, indented —
+        // the one line break a label-keyed rule still crosses (GH #245:
+        // how rustfmt and prettier wrap a long assignment).
+        //
+        // **Not `PASSWORD:`, which is what this arm used until GH #245.**
+        // A `:` no longer crosses a line at all, so `PASSWORD:\n<value>`
+        // is not a match collapsed or not (a documented limitation of the
+        // rule, pinned in `tests/redaction_prose.rs`), and the arm was
+        // asserting a join that could no longer form.
+        let value = "hunter2hunter2hunter2";
+        let text = format!("PASSWORD=\n x\r\x1b[K    {value}\n");
+        let uncollapsed = p.process_at_width(
+            &snapshot(&p, text.as_bytes(), 0, 1 << 20, true, false),
+            &ReadOptions {
+                ansi: AnsiMode::Raw,
+                ..ReadOptions::default()
+            },
+            Some(WIDE),
+        );
+        assert!(
+            uncollapsed.redactions.is_empty(),
+            "the premise: no stream the old pipeline judged matches here: {:?}",
+            uncollapsed.redactions
+        );
+        let r = p.process_at_width(
+            &snapshot(&p, text.as_bytes(), 0, 1 << 20, true, false),
+            &ReadOptions::default(),
+            Some(WIDE),
+        );
+        assert!(
+            !r.output.contains(value),
+            "the join carried the value out: {:?}",
+            r.output
+        );
+        assert!(!r.redactions.is_empty(), "{:?}", r.redactions);
     }
 }

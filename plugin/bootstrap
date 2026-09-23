@@ -22,8 +22,149 @@
 # scripts/plugin-archive-tests.sh.
 set -u
 
-HF_URL_MANUAL="https://github.com/Sertelegger/holdfast/releases"
+HF_URL_RELEASES="https://github.com/Sertelegger/holdfast/releases"
 HF_URL_SOURCE="https://github.com/Sertelegger/holdfast#build-and-try-it"
+HF_URL_OWN_BIN="https://github.com/Sertelegger/holdfast/tree/main/plugin#using-a-binary-you-built-yourself"
+HF_REPO_GIT="https://github.com/Sertelegger/holdfast"
+HF_ARG1=${1:-}
+HF_NOTE=
+# The download's temp directory. **Empty until this run's own `mktemp` has
+# made it, and empty again once it is removed** -- never a value from the
+# environment. Every deletion in this file is `hf_rm_tmp`, which deletes
+# nothing while this is empty, so the bootstrap can only ever remove a
+# directory it created itself. The failure path used to run
+# `rm -rf "$HF_TMP"` from the very first `hf_die`, long before `mktemp`, and a
+# caller that happened to export HF_TMP lost whatever it named (T16).
+HF_TMP=
+hf_rm_tmp() {
+    [ -n "$HF_TMP" ] || return 0
+    rm -rf "$HF_TMP"
+    HF_TMP=
+}
+
+# --- how a failure reaches the person looking at Claude Code ---------------
+# **stderr alone does not.** Measured with Claude Code 2.1.280: a stdio
+# server that exits non-zero before answering shows in `claude mcp list` as
+# `Failed to connect -- CONNECTION_CLOSED`, and every word this script wrote
+# is in a jsonl log under ~/.cache that nobody is told about. A server that
+# answers `initialize` with a JSON-RPC error instead shows as
+# `Failed to connect -- -32603: <the message>`. So under `mcp` -- the only
+# argv the plugin's `.mcp.json` passes -- a dying bootstrap reads the one
+# request the client has already sent and answers it with the diagnosis.
+#
+# Nothing here runs on a success path: every exec below hands the binary an
+# untouched stdin. It is skipped when stdin is a terminal, so a person
+# running `bootstrap mcp` by hand gets the stderr line and no hang.
+#
+# **hf_die must never run inside `$(...)`.** There, stdout is the capture
+# rather than the transport, and the one request would be consumed by a
+# subshell the client cannot hear. `hf_sha256` used to die inside a command
+# substitution; the tool is now chosen up front, in the main shell, for this.
+hf_json_string() {   # a JSON string body: backslash, quote, no controls
+    printf '%s' "$1" | tr '\001-\037' ' ' | sed -e 's/\\/\\\\/g' -e 's/"/\\"/g'
+}
+hf_mcp_error() {
+    [ "$HF_ARG1" = mcp ] || return 0
+    [ -t 0 ] && return 0
+    # **The wait is bounded.** Claude Code writes `initialize` the moment it
+    # spawns us, but a caller whose stdin never speaks and never closes -- a
+    # CI step, a test harness, a wrapper -- would otherwise hang a failure
+    # forever. The diagnosis is already on stderr, so the watchdog loses
+    # nothing. Its own stdio is /dev/null so it cannot hold the client's pipe
+    # open after we are gone.
+    #
+    # **Each signal that can end the wait has a trap here, and each trap
+    # exits.** bash -- macOS's /bin/sh -- runs a trap in the middle of a
+    # `read` and then goes back to reading unless the trap exits. The
+    # watchdog used to send TERM, which the download phase trapped to clean
+    # up and carry on, and the wait lasted the writer's full 30 s under bash
+    # against 5 s under dash and busybox (measured). The watchdog sends ALRM,
+    # and its trap ends the wait under all three with 142.
+    #
+    # **And the watchdog is stopped on every way out, before we go.** It is a
+    # separate process, and it used to send its KILL a second after ALRM
+    # whether or not ALRM had already ended this shell -- so it signalled a
+    # PID that was nobody's by then, or somebody else's (measured: the
+    # watchdog ran `kill -KILL <pid>` one second after <pid> had exited 142).
+    # It is stopped with KILL, which a caller cannot have set to be ignored,
+    # and which lands even in the instant after the fork. TERM did not: with
+    # the request already waiting -- which is every run under Claude Code --
+    # the watchdog outlived the bootstrap in 7 of 30 runs under dash and 1 of
+    # 30 under bash (0 of 30 each with KILL; measured).
+    # **The KILL remains for the one case it is for:** a caller that started
+    # us with ALRM ignored, which a non-interactive shell can neither undo
+    # nor trap. Then ALRM does nothing, this shell is still alive and still
+    # the watchdog's parent, and the KILL is what ends it, with 137 -- which
+    # is how the harness tells that case from ALRM's 142, not by the time.
+    hf_rm_tmp
+    ( sleep 5; kill -ALRM $$; sleep 1; kill -KILL $$ ) < /dev/null > /dev/null 2>&1 &
+    _wd=$!
+    trap 'hf_wd_stop; exit 142' ALRM
+    trap 'hf_wd_stop; exit 143' TERM
+    trap 'hf_wd_stop; exit 129' HUP
+    trap 'hf_wd_stop; exit 130' INT
+    _req=
+    IFS= read -r _req
+    _rc=$?
+    hf_wd_stop
+    [ "$_rc" -eq 0 ] || [ -n "$_req" ] || return 0
+    # The request id is echoed back whatever its type. Claude Code sends the
+    # number 0; JSON-RPC also allows a string. Anything unreadable gets
+    # `null`, which is what JSON-RPC prescribes for exactly that case.
+    _id=$(printf '%s\n' "$_req" | sed -n 's/.*"id"[[:space:]]*:[[:space:]]*\(-\{0,1\}[0-9][0-9]*\).*/\1/p')
+    [ -n "$_id" ] || _id=$(printf '%s\n' "$_req" | sed -n 's/.*"id"[[:space:]]*:[[:space:]]*\("[A-Za-z0-9._:-]*"\).*/\1/p')
+    [ -n "$_id" ] || _id=null
+    printf '{"jsonrpc":"2.0","id":%s,"error":{"code":-32603,"message":"%s"}}\n' \
+        "$_id" "$(hf_json_string "$1")"
+}
+hf_wd_stop() { kill -KILL "$_wd" 2> /dev/null; }
+hf_die() {
+    # **A note goes FIRST.** It says why HOLDFAST_BOOTSTRAP_ALLOW_PATH
+    # declined, which is the thing a user who set it needs to read, and
+    # `claude mcp list` shows only 500 characters: the not-published message
+    # is most of them, so a note after it was cut off every time (T8).
+    # First, what gets cut is the end of the link.
+    _m="holdfast bootstrap: $*"
+    [ -n "$HF_NOTE" ] && _m="holdfast bootstrap: $HF_NOTE; and $*"
+    echo "$_m" >&2
+    hf_mcp_error "$_m"
+    exit 1
+}
+hf_log() { [ -n "${HOLDFAST_BOOTSTRAP_DEBUG:-}" ] && echo "holdfast bootstrap: $*" >&2; return 0; }
+
+# --- 0. an explicitly named binary -----------------------------------------
+# HOLDFAST_BOOTSTRAP_BIN=/abs/path/to/holdfast execs exactly that file and
+# nothing else: no $PATH search, no version comparison, no download. It is
+# the route for a binary built from source -- dogfooding a checkout, a
+# platform with no prebuilt, a release that is not published yet -- and, as
+# with HOLDFAST_BOOTSTRAP_ALLOW_PATH below, setting the variable IS the
+# authorisation: whoever can set it can already set PATH or LD_PRELOAD.
+#
+# It sits above everything that can fail for a reason it makes irrelevant:
+# a missing version.txt, an unsupported `uname`, an unwritable cache.
+#
+# **An absolute path, or a refusal.** The cwd is whichever project Claude
+# Code was started in, so `target/release/holdfast` would name a different
+# file -- or one a freshly cloned repository supplies -- in every project.
+# **And no fallback when the file is unusable**: a user who named a binary
+# and silently got a downloaded one is debugging the wrong program, which is
+# GH #237's complaint about HOLDFAST_BOOTSTRAP_ALLOW_PATH's fallback.
+if [ -n "${HOLDFAST_BOOTSTRAP_BIN:-}" ]; then
+    case "$HOLDFAST_BOOTSTRAP_BIN" in
+        /*) ;;
+        # Measured: Claude Code passes settings.json `env` values literally,
+        # so `~/.cargo/bin/holdfast` arrives with its tilde. Said, not
+        # guessed at: expanding it here would make the value mean one thing
+        # to this script and another to everything else that reads it.
+        '~'* | '$'*) hf_die "HOLDFAST_BOOTSTRAP_BIN is '$HOLDFAST_BOOTSTRAP_BIN', and nothing expands ~ or \$VARIABLES in it -- Claude Code's settings.json passes the value literally, so write the full path${HOME:+, such as $HOME/.cargo/bin/holdfast}" ;;
+        *) hf_die "HOLDFAST_BOOTSTRAP_BIN must be an absolute path, and '$HOLDFAST_BOOTSTRAP_BIN' is not -- this runs in whichever project Claude Code was started in, so a relative path names a different file in each one" ;;
+    esac
+    if [ ! -f "$HOLDFAST_BOOTSTRAP_BIN" ] || [ ! -x "$HOLDFAST_BOOTSTRAP_BIN" ]; then
+        hf_die "HOLDFAST_BOOTSTRAP_BIN is $HOLDFAST_BOOTSTRAP_BIN, which is not an executable file -- nothing was downloaded in its place, because the variable asks for exactly that binary"
+    fi
+    hf_log "HOLDFAST_BOOTSTRAP_BIN is set; exec $HOLDFAST_BOOTSTRAP_BIN"
+    exec "$HOLDFAST_BOOTSTRAP_BIN" "$@"
+fi
 
 # The script's own directory: version.txt and lib-safe-extract.sh ship beside
 # it, and only the `plugin/` subtree is copied into the plugin cache, so
@@ -36,13 +177,8 @@ if [ -z "$HF_ROOT" ] || [ ! -r "$HF_ROOT/lib-safe-extract.sh" ]; then
     HF_ROOT=${CLAUDE_PLUGIN_ROOT:-}
 fi
 if [ -z "$HF_ROOT" ] || [ ! -r "$HF_ROOT/lib-safe-extract.sh" ]; then
-    echo "holdfast bootstrap: cannot locate my own directory (tried \$0 and \$CLAUDE_PLUGIN_ROOT); reinstall the plugin" >&2
-    exit 1
+    hf_die "cannot locate my own directory (tried \$0 and \$CLAUDE_PLUGIN_ROOT); reinstall the plugin"
 fi
-
-# hf_die is defined by the library, which is sourced before anything can fail.
-hf_die() { echo "holdfast bootstrap: $*" >&2; exit 1; }
-hf_log() { [ -n "${HOLDFAST_BOOTSTRAP_DEBUG:-}" ] && echo "holdfast bootstrap: $*" >&2; return 0; }
 
 # shellcheck source=plugin/lib-safe-extract.sh
 . "$HF_ROOT/lib-safe-extract.sh"
@@ -55,6 +191,18 @@ case "$HF_VERSION" in
     *) hf_die "version.txt does not hold a version: '$HF_VERSION'" ;;
 esac
 
+# The one sentence every dead end below ends with. A binary built from source
+# and named by HOLDFAST_BOOTSTRAP_BIN is the route that needs nothing this
+# script failed to get -- no release, no network, no cache, no prebuilt for
+# this platform. The `--tag` is the release this plugin build is pinned to,
+# so what gets built is what the download would have fetched.
+#
+# **Length is a budget, not a style.** `claude mcp list` shows the first 500
+# characters of the error (measured, 2.1.280) and an ellipsis, so the
+# not-published message below -- the one every install sees until a release
+# is promoted -- is written to fit whole, link included.
+HF_BUILD_IT="build it -- cargo install --locked --git $HF_REPO_GIT --tag v$HF_VERSION holdfast -- and set HOLDFAST_BOOTSTRAP_BIN to its absolute path in the \"env\" block of Claude Code's settings.json, then restart. See $HF_URL_OWN_BIN"
+
 # --- target ---------------------------------------------------------------
 hf_os=$(uname -s 2>/dev/null || echo unknown)
 hf_arch=$(uname -m 2>/dev/null || echo unknown)
@@ -62,12 +210,12 @@ case "$hf_os" in
     Linux)                 HF_OS=linux ;;
     Darwin)                HF_OS=macos ;;
     MINGW* | MSYS* | CYGWIN*) HF_OS=windows ;;
-    *) hf_die "no prebuilt binary for '$hf_os' -- build from source: $HF_URL_SOURCE" ;;
+    *) hf_die "no prebuilt binary for '$hf_os' -- $HF_BUILD_IT. Build notes: $HF_URL_SOURCE" ;;
 esac
 case "$hf_arch" in
     x86_64 | amd64)  HF_ARCH=x86_64 ;;
     aarch64 | arm64) HF_ARCH=aarch64 ;;
-    *) hf_die "no prebuilt binary for '$hf_arch' -- build from source: $HF_URL_SOURCE" ;;
+    *) hf_die "no prebuilt binary for '$hf_arch' -- $HF_BUILD_IT. Build notes: $HF_URL_SOURCE" ;;
 esac
 HF_TARGET="$HF_OS-$HF_ARCH"
 HF_EXE=holdfast
@@ -94,7 +242,7 @@ else
         case "$XDG_CACHE_HOME" in /*) HF_CACHE_HOME=$XDG_CACHE_HOME ;; esac
     fi
     if [ -z "$HF_CACHE_HOME" ]; then
-        [ -n "${HOME:-}" ] || hf_die "neither CLAUDE_PLUGIN_DATA, XDG_CACHE_HOME nor HOME is set, so there is nowhere to cache the binary -- set one, or install holdfast manually from $HF_URL_MANUAL"
+        [ -n "${HOME:-}" ] || hf_die "neither CLAUDE_PLUGIN_DATA, XDG_CACHE_HOME nor HOME is set, so there is nowhere to cache the binary -- set one, or $HF_BUILD_IT"
         HF_CACHE_HOME="$HOME/.cache"
     fi
     HF_CACHE_ROOT="$HF_CACHE_HOME/holdfast"
@@ -106,18 +254,30 @@ HF_SUMS_CACHED="$HF_CACHE_DIR/SHA256SUMS-v$HF_VERSION.txt"
 HF_BASE_URL=${HOLDFAST_BOOTSTRAP_BASE_URL:-https://github.com/Sertelegger/holdfast/releases/download}
 
 # --- helpers --------------------------------------------------------------
-hf_sha256() {
+# The tool is CHOSEN here, in the main shell, and only USED inside the
+# command substitution that reads its output. Choosing inside `$(...)` put
+# the no-tool `hf_die` in a subshell, where its answer to the MCP client
+# would have landed in HF_GOT -- see the header of hf_mcp_error.
+hf_pick_sha256() {
     if command -v sha256sum > /dev/null 2>&1; then
-        sha256sum "$1" | cut -d' ' -f1
+        HF_SHA256='sha256sum'
     elif command -v shasum > /dev/null 2>&1; then
-        shasum -a 256 "$1" | cut -d' ' -f1
+        HF_SHA256='shasum'
     elif command -v openssl > /dev/null 2>&1; then
-        openssl dgst -sha256 "$1" | sed 's/.*= *//'
+        HF_SHA256='openssl'
     elif command -v cksum > /dev/null 2>&1 && cksum -a sha256 /dev/null > /dev/null 2>&1; then
-        cksum -a sha256 "$1" | sed 's/.*= *//'   # FreeBSD, illumos
+        HF_SHA256='cksum'   # FreeBSD, illumos
     else
-        hf_die "no SHA-256 tool found (need sha256sum, shasum, openssl or a cksum with -a); install one, or install holdfast manually from $HF_URL_MANUAL"
+        hf_die "no SHA-256 tool found (need sha256sum, shasum, openssl or a cksum with -a); install one, or $HF_BUILD_IT"
     fi
+}
+hf_sha256() {
+    case "$HF_SHA256" in
+        sha256sum) sha256sum "$1" | cut -d' ' -f1 ;;
+        shasum)    shasum -a 256 "$1" | cut -d' ' -f1 ;;
+        openssl)   openssl dgst -sha256 "$1" | sed 's/.*= *//' ;;
+        cksum)     cksum -a sha256 "$1" | sed 's/.*= *//' ;;
+    esac
 }
 
 # The expected hash for EXACTLY ONE filename. Not `grep "$name"`: substring
@@ -143,7 +303,14 @@ hf_expected_hash() {
     printf '%s\n' "$_found"
 }
 
-hf_fetch() {   # hf_fetch <url> <dest>
+# hf_fetch <url> <dest>. On failure HF_FETCH_HTTP says who failed: the final
+# HTTP status when a server answered the request with one, and empty when
+# nothing did. The first is "this release does not have that file" (404) or
+# "the server said no" (anything else), the second is "this host cannot get
+# there", and they need opposite advice -- a manual download from a release
+# page that does not exist is the dead end GH #237 reported.
+hf_fetch() {
+    HF_FETCH_HTTP=
     case "$1" in
         https://*) ;;
         http://* | file://*)
@@ -154,16 +321,70 @@ hf_fetch() {   # hf_fetch <url> <dest>
                 || hf_die "refusing a non-TLS URL ($1) -- TLS to GitHub is the whole of the v0.1.0 trust root (spec A-4)" ;;
         *) hf_die "unsupported URL scheme: $1" ;;
     esac
+    hf_log "fetching $1"
     if command -v curl > /dev/null 2>&1; then
-        curl --fail --silent --show-error --location --max-time 120 --output "$2" "$1"
+        # `%{http_code}` is written even when --fail fails, and is `000` when
+        # nothing answered.
+        HF_FETCH_HTTP=$(curl --fail --silent --show-error --location --max-time 120 \
+            --write-out '%{http_code}' --output "$2" "$1") && return 0
     elif command -v wget > /dev/null 2>&1; then
-        wget --quiet --timeout=120 --output-document="$2" "$1"
+        # **The status is read, not inferred from the exit code**, which
+        # cannot tell a 404 from anything else: busybox wget exits 1 for
+        # every failure, 404 and refused connection alike, and GNU wget exits
+        # 8 for every HTTP error, 404 and 503 alike (measured: busybox 1.36.1,
+        # GNU Wget 1.21.4). Under `-S` both print each response's status line
+        # on stderr, indented, one per redirect hop -- so the LAST one is the
+        # answer -- and both still do under `-q`. Short options only: busybox
+        # can be built without the long ones. Only stderr is captured; the
+        # body goes to the file.
+        #
+        # `-t 1`, as curl does not retry either. GNU wget's default is 20
+        # tries with a growing wait whenever the connection fails rather than
+        # the server answering -- dropped, reset, or silent past the read
+        # timeout -- which is minutes for a dropped one (measured) and up to
+        # twenty 120-second timeouts for a silent one; Claude Code has given
+        # up long before either. An HTTP error is not retried: measured, a
+        # 503 comes back at once with or without it.
+        _wout=$(wget -q -S -t 1 -T 120 -O "$2" "$1" 2>&1 > /dev/null)
+        _wrc=$?
+        # **A wget that says it did not check the certificate is refused.**
+        # busybox's built-in TLS does no certificate validation and says so
+        # on stderr, `-q` or not; it is what busybox falls back to when no
+        # `openssl` is on $PATH (with one, it runs `openssl s_client
+        # -verify_return_error`, which does check). TLS to GitHub is the
+        # whole trust root here -- the manifest that vouches for the archive
+        # arrives over the same connection -- so it stops here, success or
+        # not, and what it fetched goes with the temp directory it is in.
+        case "$_wout" in
+            *'certificate validation not implemented'*)
+                # Short on purpose: with the build route it has to fit the
+                # 500 characters `claude mcp list` shows, as T15 checks.
+                hf_die "this wget says it does not verify TLS certificates, and TLS is all that vouches for the download -- install curl, or openssl for busybox, or $HF_BUILD_IT" ;;
+        esac
+        [ "$_wrc" -eq 0 ] && return 0
+        HF_FETCH_HTTP=$(printf '%s\n' "$_wout" \
+            | sed -n 's/^ *HTTP\/[0-9.]* \([0-9][0-9][0-9]\).*/\1/p' | sed -n '$p')
+        # wget's own words, as `curl --show-error` gives curl's; the header
+        # lines `-S` added are the indented ones.
+        printf '%s\n' "$_wout" | sed -e '/^ /d' -e '/^$/d' >&2
     else
-        hf_die "neither curl nor wget is available, so the binary cannot be fetched -- download it from $HF_URL_MANUAL and place it at $HF_CACHED"
+        hf_die "neither curl nor wget is available, so the binary cannot be fetched -- install one, or $HF_BUILD_IT"
     fi
+    # **Only an answer to the request counts.** Nothing answered when curl
+    # writes `000` and when wget prints no status line. Nor did anything when
+    # the LAST status is a redirect: the hop it pointed at never answered --
+    # measured under curl, GNU wget and busybox wget alike, all three of which
+    # reported the 302 of a redirect to a port nothing listens on. On GitHub
+    # that is a firewall that lets github.com through and not the host the
+    # release assets are served from: a host that cannot get there, not a
+    # server that said no (T4c, T15).
+    case "$HF_FETCH_HTTP" in
+        000 | 3??) HF_FETCH_HTTP= ;;
+    esac
+    return 1
 }
 
-# --- 0. an explicitly opted-in $PATH holdfast ------------------------------
+# --- 0b. an explicitly opted-in $PATH holdfast -----------------------------
 # §13.3 step 2 says to exec whatever `holdfast` is on $PATH whenever
 # `holdfast version` agrees with version.txt. That is NOT shippable as the
 # default: self-reported version output is not authentication, so any
@@ -173,15 +394,36 @@ hf_fetch() {   # hf_fetch <url> <dest>
 # five-line shell script that echoes `holdfast 0.1.0` is enough.
 #
 # It survives as an explicit opt-in for the `cargo install` / Homebrew user
-# who wants it, where the env var IS the authorisation.
+# who wants it, where the env var IS the authorisation. HOLDFAST_BOOTSTRAP_BIN
+# above is the stricter spelling of the same wish and wins when both are set.
+#
+# **The version is compared whole.** `holdfast version` prints
+# `holdfast X.Y.Z (build ...) protocol M.N`, and this used to be
+# `grep -q "$HF_VERSION"` over that line -- a regex, unanchored, in which
+# `0.1.0` matches `0.1.00`, `10.1.0` and `0.1.0-rc1`. It is now the second
+# field against the whole of version.txt.
+#
+# **And a refusal is said, not swallowed.** A user who set the variable and
+# got a download instead used to find out from nothing at all; the reason
+# now goes to stderr at once and rides on any later failure's message, which
+# is the one line Claude Code shows.
 if [ -n "${HOLDFAST_BOOTSTRAP_ALLOW_PATH:-}" ]; then
     hf_path_bin=$(command -v holdfast 2>/dev/null) || hf_path_bin=
-    if [ -n "$hf_path_bin" ] && [ -x "$hf_path_bin" ]; then
-        if "$hf_path_bin" version 2>/dev/null | grep -q "$HF_VERSION"; then
-            hf_log "HOLDFAST_BOOTSTRAP_ALLOW_PATH is set; exec $hf_path_bin"
-            exec "$hf_path_bin" "$@"
-        fi
+    if [ -z "$hf_path_bin" ] || [ ! -x "$hf_path_bin" ]; then
+        HF_NOTE="HOLDFAST_BOOTSTRAP_ALLOW_PATH is set but there is no holdfast on \$PATH"
+    else
+        # `< /dev/null`: stdin is Claude Code's, with `initialize` waiting on
+        # it, and a probe that reads it takes the request away from whatever
+        # runs next -- the server, or the failure's answer (T8).
+        hf_path_says=$("$hf_path_bin" version 2>/dev/null < /dev/null | head -n 1) || hf_path_says=
+        case "$hf_path_says" in
+            "holdfast $HF_VERSION" | "holdfast $HF_VERSION "*)
+                hf_log "HOLDFAST_BOOTSTRAP_ALLOW_PATH is set; exec $hf_path_bin"
+                exec "$hf_path_bin" "$@" ;;
+        esac
+        HF_NOTE="HOLDFAST_BOOTSTRAP_ALLOW_PATH is set but $hf_path_bin reports '$hf_path_says', not holdfast $HF_VERSION"
     fi
+    echo "holdfast bootstrap: $HF_NOTE; falling back to the plugin's own cached or downloaded binary" >&2
 fi
 
 # --- 1. cache hit ----------------------------------------------------------
@@ -195,29 +437,55 @@ if [ -x "$HF_CACHED" ] && [ -r "$HF_SUMS_CACHED" ]; then
 fi
 
 # --- 2. download -----------------------------------------------------------
+hf_pick_sha256
 mkdir -p "$HF_CACHE_DIR" 2> /dev/null \
-    || hf_die "cannot create $HF_CACHE_DIR (read-only or full filesystem?) -- install holdfast manually from $HF_URL_MANUAL"
+    || hf_die "cannot create $HF_CACHE_DIR (read-only or full filesystem?) -- or $HF_BUILD_IT"
 [ -w "$HF_CACHE_DIR" ] \
-    || hf_die "$HF_CACHE_DIR is not writable -- install holdfast manually from $HF_URL_MANUAL"
+    || hf_die "$HF_CACHE_DIR is not writable -- make it so, or $HF_BUILD_IT"
 
 # The temp directory must be INSIDE the cache directory. §13.3 says "extract
 # into a fresh temp directory ... atomically rename into the cache path", and
 # a bare `mktemp -d` lands in $TMPDIR, which is a different filesystem from
 # $HOME on most Linux installs -- where `mv` degrades to copy-then-unlink and
 # a concurrent bootstrap can exec a half-written binary.
-HF_TMP=$(mktemp -d "$HF_CACHE_DIR/.dl.XXXXXX") || hf_die "cannot create a temp directory in $HF_CACHE_DIR"
+#
+# The traps go in first, so the directory is covered from the moment it
+# exists; `hf_rm_tmp` is a no-op until it does. **A signal exits** rather
+# than cleaning up and carrying on, which is what this used to do -- on
+# through commands whose paths are inside the directory it had just removed.
+trap 'hf_rm_tmp' EXIT
+trap 'exit 129' HUP
+trap 'exit 130' INT
+trap 'exit 143' TERM
+hf_t=$(mktemp -d "$HF_CACHE_DIR/.dl.XXXXXX") || hf_die "cannot create a temp directory in $HF_CACHE_DIR"
+HF_TMP=$hf_t
 chmod 700 "$HF_TMP"
-trap 'rm -rf "$HF_TMP"' EXIT HUP INT TERM
 
-hf_fetch "$HF_BASE_URL/v$HF_VERSION/SHA256SUMS.txt" "$HF_TMP/SHA256SUMS.txt" \
-    || hf_die "cannot reach $HF_BASE_URL/v$HF_VERSION/SHA256SUMS.txt -- is the release published, and is this host online? On an air-gapped or firewalled host, download holdfast-$HF_TARGET.$HF_EXT and SHA256SUMS.txt from $HF_URL_MANUAL on a connected machine, verify the checksum yourself, and place the extracted binary at $HF_CACHED (see plugin/README.md)"
+# **Not published and not reachable are different failures with opposite
+# fixes**, and this message used to be one sentence for both: it asked "is
+# the release published, and is this host online?" and then sent everybody
+# to download assets by hand -- from a release that, in the first case, does
+# not have any. A draft serves nothing at `releases/download/`, and a plugin
+# installed from the marketplace can be pinned to a release that is still
+# one, so the first case is the common one.
+HF_SUMS_URL="$HF_BASE_URL/v$HF_VERSION/SHA256SUMS.txt"
+if ! hf_fetch "$HF_SUMS_URL" "$HF_TMP/SHA256SUMS.txt"; then
+    case "$HF_FETCH_HTTP" in
+        404)
+            hf_die "no holdfast v$HF_VERSION binary to download: the v$HF_VERSION release answered 404 -- unpublished, a draft, or without binaries. To run Holdfast now, $HF_BUILD_IT" ;;
+        '')
+            hf_die "cannot reach $HF_SUMS_URL -- is this host online? On an air-gapped or firewalled host, fetch $HF_ARCHIVE and SHA256SUMS.txt from $HF_URL_RELEASES/tag/v$HF_VERSION on a connected machine, verify the checksum yourself, and place the extracted binary at $HF_CACHED with SHA256SUMS.txt beside it as $HF_SUMS_CACHED -- both files, or it is a cache miss. Or $HF_BUILD_IT" ;;
+        *)
+            hf_die "$HF_SUMS_URL answered HTTP $HF_FETCH_HTTP -- retry later, or $HF_BUILD_IT" ;;
+    esac
+fi
 HF_SUMS="$HF_TMP/SHA256SUMS.txt"
 
 HF_WANT=$(hf_expected_hash "$HF_ARCHIVE") \
     || hf_die "the v$HF_VERSION release manifest has no single well-formed entry for $HF_ARCHIVE -- this platform may not be built for that release"
 
 hf_fetch "$HF_BASE_URL/v$HF_VERSION/$HF_ARCHIVE" "$HF_TMP/$HF_ARCHIVE" \
-    || hf_die "cannot download $HF_ARCHIVE from $HF_BASE_URL/v$HF_VERSION/ -- see $HF_URL_MANUAL for a manual install"
+    || hf_die "cannot download $HF_ARCHIVE from $HF_BASE_URL/v$HF_VERSION/ (${HF_FETCH_HTTP:-no answer}) although the manifest lists it -- retry, or $HF_BUILD_IT"
 
 HF_GOT=$(hf_sha256 "$HF_TMP/$HF_ARCHIVE")
 [ "$HF_GOT" = "$HF_WANT" ] \
@@ -232,8 +500,7 @@ chmod 755 "$HF_TMP/x/$HF_EXE" || hf_die "cannot chmod the extracted binary"
 # a later run reads is never binary-without-manifest.
 mv -f "$HF_TMP/SHA256SUMS.txt" "$HF_SUMS_CACHED" || hf_die "cannot install the checksum manifest into $HF_CACHE_DIR"
 mv -f "$HF_TMP/x/$HF_EXE" "$HF_CACHED" || hf_die "cannot install the binary into $HF_CACHE_DIR"
-rm -rf "$HF_TMP"
-trap - EXIT
+hf_rm_tmp
 hf_log "installed $HF_CACHED"
 
 # One probe, on the install path only, never on the cache-hit path. A cache
@@ -242,9 +509,12 @@ hf_log "installed $HF_CACHED"
 # installs perfectly and then dies with a bare "Permission denied" on a file
 # that is mode 755 and owned by the caller. Measured: exit 126, no cause
 # named anywhere. This turns that into a sentence.
-if ! "$HF_CACHED" version > /dev/null 2>&1; then
+#
+# `< /dev/null`, as for the $PATH probe above: the `initialize` waiting on
+# stdin belongs to the server exec'd below (T1b).
+if ! "$HF_CACHED" version > /dev/null 2>&1 < /dev/null; then
     if [ -x "$HF_CACHED" ]; then
-        hf_die "installed $HF_CACHED but cannot run it -- is $HF_CACHE_ROOT on a noexec mount? Point CLAUDE_PLUGIN_DATA or XDG_CACHE_HOME at an exec-permitted filesystem, or install holdfast manually from $HF_URL_MANUAL"
+        hf_die "installed $HF_CACHED but cannot run it -- is $HF_CACHE_ROOT on a noexec mount? Point CLAUDE_PLUGIN_DATA or XDG_CACHE_HOME at an exec-permitted filesystem, or $HF_BUILD_IT"
     fi
     hf_die "installed $HF_CACHED but it is not executable"
 fi

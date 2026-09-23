@@ -178,6 +178,7 @@ fn unix_secs(t: std::time::SystemTime) -> u64 {
 /// here, and struct literals that must be updated in a dozen places
 /// each time are pure churn.
 #[derive(Debug, Default, Deserialize, Serialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
 pub struct StartSessionArgs {
     /// Program to run, e.g. "bash". Mutually exclusive with `profile`;
     /// supply exactly one.
@@ -202,11 +203,15 @@ pub struct StartSessionArgs {
     #[serde(default)]
     pub name: Option<String>,
     /// Working directory for the spawned process. Must already exist.
-    /// Defaults to the directory the Holdfast server itself was started in.
+    /// Defaults to the working directory of the Holdfast MCP server your
+    /// client launched, which is normally the project you are working in.
     #[serde(default)]
     pub cwd: Option<String>,
-    /// Extra environment variables for the spawned process. Do not pass
-    /// secrets: these values cross the MCP boundary (spec §5.2).
+    /// Extra environment variables for the spawned process, on top of the
+    /// environment of the Holdfast MCP server your client launched. PAGER,
+    /// GIT_PAGER, MANPAGER and SYSTEMD_PAGER default to `cat`, because a
+    /// pager waits for keystrokes; set one here to get a pager back. Do not
+    /// pass secrets: these values cross the MCP boundary (spec §5.2).
     #[serde(default)]
     pub env: Option<HashMap<String, String>>,
     /// Terminal width in columns, 1 to 1000. Defaults to 120. A value
@@ -251,6 +256,7 @@ pub struct StartSessionArgs {
 }
 
 #[derive(Debug, Deserialize, Serialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
 pub struct PromptPatternArg {
     /// Rust regex matched against the session's last logical line.
     pub regex: String,
@@ -261,8 +267,8 @@ pub struct PromptPatternArg {
 #[tool_router(vis = "pub(crate)")]
 impl HoldfastServer {
     /// Start a PTY-backed shell or program and return its session id.
-    /// Runs in `cwd` if given, otherwise in the directory the Holdfast
-    /// server was started in.
+    /// Runs in `cwd` if given, otherwise in the working directory of the
+    /// Holdfast MCP server your client launched.
     #[tool(
         annotations(
             title = "Start a PTY-backed shell session",
@@ -305,26 +311,74 @@ impl HoldfastServer {
         // canonicalisation, the same `invalid_params`. One resolution
         // function for both sources is what keeps the directory that is
         // approved, reported and actually run in from diverging.
-        cfg.cwd = match &launch.cwd {
-            Some(cwd) => {
-                let resolved = std::path::Path::new(cwd)
-                    .canonicalize()
-                    .ok()
-                    .filter(|p| p.is_dir());
-                match resolved {
-                    Some(p) => Some(p.to_string_lossy().into_owned()),
-                    None => {
-                        return Err(ErrorData::invalid_params(
-                            format!("cwd is not an existing directory: {cwd}"),
-                            None,
-                        ))
-                    }
+        //
+        // **Absent, it is the calling client's directory (GH #229)** —
+        // which in-process is this process's own, and in a daemon is the
+        // one the shim sent, because the daemon's own is whichever client
+        // happened to spawn it. A profile session never takes the
+        // client's: `host.start_dir` answers `Own` for it, and it keeps
+        // this process's directory as before (GH #55). See
+        // `session::launch` for the whole rule.
+        let host = crate::session::launch::host();
+        let profiled = launch.profile.is_some();
+        let canonical_dir = |dir: &str| {
+            std::path::Path::new(dir)
+                .canonicalize()
+                .ok()
+                .filter(|p| p.is_dir())
+                .map(|p| p.to_string_lossy().into_owned())
+        };
+        use crate::session::launch::StartDir;
+        cfg.cwd = match (&launch.cwd, host.start_dir(profiled)) {
+            (Some(cwd), _) => match canonical_dir(cwd) {
+                Some(p) => Some(p),
+                None => {
+                    return Err(ErrorData::invalid_params(
+                        format!("cwd is not an existing directory: {cwd}"),
+                        None,
+                    ))
                 }
+            },
+            // Both client arms are refused rather than fallen back from.
+            // Falling back to this process's directory is GH #229 exactly
+            // — a session running in somebody else's project — and each
+            // arm is a client whose own directory is gone, where no
+            // directory Holdfast could pick is the one the agent meant.
+            //
+            // This one is a shim that read its directory and the daemon
+            // cannot find it: removed between the two, or a platform whose
+            // `getcwd` still answers for a removed directory.
+            (None, StartDir::Client(client)) => match canonical_dir(client) {
+                Some(p) => Some(p),
+                None => {
+                    return Err(ErrorData::invalid_params(
+                        format!(
+                            "no cwd was given, and the MCP server's own working directory \
+                             is not an existing directory: {client}; pass `cwd`"
+                        ),
+                        None,
+                    ))
+                }
+            },
+            // And this one a shim that could not read its directory at
+            // all — Linux's `getcwd` fails with `ENOENT` once it has been
+            // removed — or whose path is not UTF-8. Found by review: this
+            // arm used to be the fallback below, so a client whose
+            // project had been deleted was started in the one that spawned
+            // the daemon, with `status: ok`.
+            (None, StartDir::ClientUnknown) => {
+                return Err(ErrorData::invalid_params(
+                    "no cwd was given, and the MCP server's own working directory could not \
+                     be read — it has been removed since the server started, or its path is \
+                     not valid UTF-8; pass `cwd`"
+                        .to_string(),
+                    None,
+                ))
             }
             // `getcwd(2)` already resolves symlinks, so this is canonical
             // by construction; canonicalise anyway so both arms are
             // provably producing the same kind of path.
-            None => std::env::current_dir()
+            (None, StartDir::Own) => std::env::current_dir()
                 .and_then(|p| p.canonicalize())
                 .ok()
                 .map(|p| p.to_string_lossy().into_owned()),
@@ -336,7 +390,21 @@ impl HoldfastServer {
         // `resolve_launch` refused the call outright if it tried. Already
         // sorted by whichever arm built it, so `env_keys` compares between
         // runs.
-        cfg.env = launch.env.clone();
+        //
+        // **Behind it, in order: the environment the child starts from,
+        // then Holdfast's own defaults** (GH #229, GH #239). `base_env` is
+        // the calling client's environment for a command session in a
+        // daemon, the daemon's own minus the spawning client's identity
+        // otherwise, and `None` — inherit — in-process, where this process
+        // *is* the client's. The defaults (`PAGER=cat` and its three
+        // siblings, and `PWD`) sit between the two, so an inherited pager
+        // loses to them and the call's own `env` beats them both. They go
+        // into `cfg.env` ahead of `launch.env` rather than into the base,
+        // because in-process there is no base to put them in; a later
+        // entry for the same key replaces an earlier one at the spawn.
+        let base_env = host.base_env(profiled, std::env::vars_os());
+        cfg.env = crate::session::launch::session_defaults(cfg.cwd.as_deref(), &launch.env);
+        cfg.env.extend(launch.env.iter().cloned());
 
         if let Some(c) = args.cols {
             cfg.cols = c;
@@ -436,6 +504,8 @@ impl HoldfastServer {
             // handed the set this server's processor runs. The same
             // `Arc`, so the two surfaces cannot drift.
             rules: Some(Arc::clone(&self.processor.rules)),
+            // §4.2's `output_broadcast_capacity`, live since GH #210.
+            output_broadcast_capacity: self.config.limits.output_broadcast_capacity,
             ..SessionConfig::default()
         };
 
@@ -468,7 +538,7 @@ impl HoldfastServer {
             Err(e) => return envelope::from_error(&e),
         };
 
-        let backend = match InProcessPty::spawn(&cfg) {
+        let backend = match InProcessPty::spawn_with_base_env(&cfg, base_env.as_deref()) {
             Ok(b) => Arc::new(b) as Arc<dyn PtyBackend>,
             Err(e) => {
                 // `brief` matters here: portable-pty's spawn error embeds
@@ -560,8 +630,14 @@ impl HoldfastServer {
         // `session_record` must not grow an `env` field —
         // `no_tool_advertises_an_env_field_to_echo` in `tests/schema.rs`
         // is what keeps that decision from being undone by convenience.
+        //
+        // **`launch.env`, not `cfg.env`**: the keys *this call* supplied
+        // (or the operator's profile did), which is what the field has
+        // always recorded. `cfg.env` now also carries Holdfast's own
+        // defaults, and listing `PAGER` on every session would record a
+        // constant as though somebody had chosen it.
         let env_keys: Vec<&str> = {
-            let mut keys: Vec<&str> = cfg.env.iter().map(|(k, _)| k.as_str()).collect();
+            let mut keys: Vec<&str> = launch.env.iter().map(|(k, _)| k.as_str()).collect();
             keys.sort_unstable();
             keys
         };
@@ -831,7 +907,28 @@ impl HoldfastServer {
 
     /// Read output from a session. Supply exactly one of since_cursor,
     /// tail_lines, or tail_bytes. Output is ANSI-stripped and
-    /// secret-redacted by default.
+    /// secret-redacted by default: a secret becomes `[REDACTED:<kind>]`,
+    /// naming the rule that matched it.
+    ///
+    /// `[REDACTED:unresolved]` is different: it covers bytes this read
+    /// could not vouch for. Either something began like a secret — a
+    /// token-shaped run of characters, or a private-key header followed
+    /// by what can still be key text — and the read could not see where
+    /// it ends; or the bytes are private-key material the read could not
+    /// tie to a whole key: a key cut short (`head` of a key file), or key
+    /// lines printed after a header that stopped short (a pager's next
+    /// screenful of a key, a key printed in pieces). A key header that is
+    /// only mentioned in prose is not masked. Either way it can hide a
+    /// real secret: the one it was placed for, or one a rule did match
+    /// inside the region, which is then counted as `unresolved` and not
+    /// under its own kind. A re-read — later, once more output has
+    /// arrived, or with a different `max_bytes` — sometimes clears it, but
+    /// neither is guaranteed. `redact: false` returns the raw text, any
+    /// secret in it included, and is recorded in the audit log: use it
+    /// only when you already know the region is not a credential, not to
+    /// find out whether it is. `redactions` counts only the markers this
+    /// response substituted, so marker-shaped text that was already in the
+    /// output is not counted.
     #[tool(
         annotations(
             title = "Read session output",
@@ -936,7 +1033,12 @@ impl HoldfastServer {
         } else if let Some(n) = args.tail_lines {
             ReadStart::TailLines(n)
         } else {
-            ReadStart::TailBytes(args.tail_bytes.unwrap().min(max_bytes))
+            // Not clamped to `max_bytes` here (GH #246): the session
+            // front-clips an oversized tail and says so with
+            // `truncated_for_size`. Clamping first made the clip invisible
+            // to it, and a 140 KB request came back cut to 32 KB with the
+            // flag false.
+            ReadStart::TailBytes(args.tail_bytes.unwrap())
         };
         // §4.1's bypass, and its whole extent. The caller named a tail
         // argument on the one tool that takes them, so it asked for the
@@ -1365,6 +1467,14 @@ impl HoldfastServer {
     /// call is in flight is not missed. match.text and
     /// output_since_start are secret-redacted; match.offset is the raw
     /// byte offset.
+    ///
+    /// With no pattern it waits for the session to stop executing, so
+    /// `Fullscreen`, `AwaitingSecret` and `Exited` come back promptly
+    /// rather than at the deadline: read `interaction_mode`, because each
+    /// needs a different action. `detection_tier` and `prompt.reason` tell
+    /// a measured prompt from a guessed one. A wait that ends unmatched
+    /// against a session already back at a measured prompt says so in
+    /// `warning`.
     #[tool(
         annotations(
             title = "Wait for a regex to match output",
@@ -1464,6 +1574,10 @@ impl HoldfastServer {
     }
 
     /// Send keystrokes to a session's stdin.
+    ///
+    /// Not for a password: when `interaction_mode` is `AwaitingSecret`, use
+    /// `request_secret_input`, so the secret is typed by a human and never
+    /// passes through you.
     #[tool(
         annotations(
             title = "Send keystrokes to a session",
@@ -1695,7 +1809,18 @@ impl HoldfastServer {
         } else {
             let _ = session.signal_tree(crate::pty::Signal::Terminate);
             let deadline = std::time::Instant::now() + std::time::Duration::from_millis(grace_ms);
+            // GH #234: an interactive shell ignores the `SIGTERM` above,
+            // so without this every `bash` session sat out the whole grace
+            // before the `SIGKILL` below. Asked on every poll, because the
+            // shell only qualifies once it is alone in its session — every
+            // job that got the `SIGTERM` and may be cleaning up, in the
+            // foreground or not, has finished; see
+            // `Session::hang_up_idle_shell` for what it will not touch.
+            let mut hung_up = false;
             while session.tree_alive() && std::time::Instant::now() < deadline {
+                if !hung_up {
+                    hung_up = session.hang_up_idle_shell();
+                }
                 tokio::time::sleep(std::time::Duration::from_millis(50)).await;
             }
             if session.tree_alive() {
@@ -1759,6 +1884,7 @@ impl HoldfastServer {
     /// shell is gone; read `state` to tell the two apart rather than
     /// assuming everything returned here is running.
     #[tool(
+        name = "list_sessions",
         annotations(
             title = "List all sessions",
             read_only_hint = true,
@@ -1766,6 +1892,21 @@ impl HoldfastServer {
         ),
         output_schema = schema::envelope_schema::<schema::ListSessions>()
     )]
+    pub async fn list_sessions_tool(
+        &self,
+        Parameters(ListSessionsArgs {}): Parameters<ListSessionsArgs>,
+    ) -> Result<CallToolResult, ErrorData> {
+        self.list_sessions().await
+    }
+
+    /// `list_sessions`'s answer, for a caller with no MCP `arguments` to
+    /// refuse — the tests, and anything in-process.
+    ///
+    /// The tool is [`list_sessions_tool`](Self::list_sessions_tool), and
+    /// it exists only to take a [`ListSessionsArgs`]: a tool that takes no
+    /// `Parameters` is handed no `arguments`, so it cannot refuse a key it
+    /// never sees (GH #219). Both transports reach it through that wrapper
+    /// — rmcp's router in-process, `passthrough::call_tool` in the daemon.
     pub async fn list_sessions(&self) -> Result<CallToolResult, ErrorData> {
         let sessions: Vec<serde_json::Value> = self
             .registry
@@ -3694,6 +3835,13 @@ impl HoldfastServer {
     /// `send_input` — stalling there would hide the one action that
     /// makes progress. `Exited` has no prompt to reach at all.
     ///
+    /// **Except a `Fullscreen` or `AwaitingSecret` already showing at the
+    /// first sample**, which may predate the write this wait follows. It is
+    /// answered once it has held for the settle window after the child has
+    /// written anything since that write, or for
+    /// `wait::CARRIED_WITHOUT_OUTPUT_HOLD` if it has written nothing (GH
+    /// #248, `wait::CarriedMode`).
+    ///
     /// So the caller must read `interaction_mode`, not just `reached`.
     /// That is why §8.3's tier rule applies here: `with_detection`
     /// attaches `detection_tier` and `prompt.reason` to this response,
@@ -3768,6 +3916,15 @@ impl HoldfastServer {
         // are unaffected and cover the common case; this window is only the
         // fallback for "no shell integration and never observed executing".
         let settle = Duration::from_millis(session.settle_threshold_ms()).min(timeout);
+        // GH #248. Both holds run from the first sample, which is a hair
+        // after the call, so one poll of headroom keeps them inside the
+        // deadline for the reason `room` below spells out.
+        let mut carried = wait::CarriedMode::new();
+        let carried_cap = timeout.saturating_sub(IDLE_WAIT_POLL);
+        let carried_hold = settle.min(carried_cap);
+        let silent_hold = wait::CARRIED_WITHOUT_OUTPUT_HOLD
+            .max(settle)
+            .min(carried_cap);
         let mut saw_executing = false;
         let mut idle_since: Option<std::time::Instant> = None;
         // The mode the wait stopped on, or `None` if the deadline won.
@@ -3788,13 +3945,30 @@ impl HoldfastServer {
                 break Some(InteractionMode::Exited);
             }
             let mode = session.detection().interaction_mode;
+            let fresh = carried.answerable(
+                mode,
+                std::time::Instant::now(),
+                session.output_since_last_write(),
+                carried_hold,
+                silent_hold,
+            );
             match mode {
-                // Neither can be mistaken for "about to start the command
-                // you just sent", so both answer at once.
-                InteractionMode::Exited | InteractionMode::AwaitingSecret => break Some(mode),
-                // §5.2: a TUI never returns to `AtPrompt`, so this reports
-                // the mode promptly rather than running out the deadline.
-                InteractionMode::Fullscreen => break Some(mode),
+                // Read from the process, so it cannot be stale.
+                InteractionMode::Exited => break Some(mode),
+                // §5.2: a TUI never returns to `AtPrompt`, and a secret
+                // prompt wants `request_secret_input`, so both report
+                // promptly rather than running out the deadline — once the
+                // sample is not the one from before the write (GH #248).
+                InteractionMode::AwaitingSecret | InteractionMode::Fullscreen => {
+                    if fresh {
+                        break Some(mode);
+                    }
+                    // While held it counts as `Executing`: something other
+                    // than the shell's prompt has the session, so a prompt
+                    // that replaces it was watched arriving.
+                    saw_executing = true;
+                    idle_since = None;
+                }
                 InteractionMode::Executing => {
                     saw_executing = true;
                     idle_since = None;
@@ -4177,6 +4351,7 @@ fn session_record(session: &Session, rules: &RuleSet) -> serde_json::Value {
 }
 
 #[derive(Debug, Default, Deserialize, Serialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
 pub struct ReadOutputArgs {
     /// Session id or live session name.
     pub session: String,
@@ -4215,6 +4390,7 @@ pub struct ReadOutputArgs {
 }
 
 #[derive(Debug, Default, Deserialize, Serialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
 pub struct SendInputArgs {
     /// Session id or live session name.
     pub session: String,
@@ -4235,10 +4411,13 @@ pub struct SendInputArgs {
 }
 
 #[derive(Debug, Default, Deserialize, Serialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
 pub struct WaitForPatternArgs {
     /// Session id or live session name.
     pub session: String,
-    /// Rust regex matched against the session's raw output bytes.
+    /// Rust regex, matched against the output both as text — ANSI escapes
+    /// removed, as read_output returns it — and as raw bytes; the earlier
+    /// match wins. match.offset is always a raw byte offset.
     ///
     /// **Omit it to wait for the session to stop executing instead. An empty      string is rejected rather than treated as either, because it is a likely client      encoding of \"omit\" and it used to match at offset zero and complete instantly** —
     /// which is not the same claim as "the command finished"; see
@@ -4265,6 +4444,7 @@ pub struct WaitForPatternArgs {
 }
 
 #[derive(Debug, Deserialize, Serialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
 pub struct TerminateArgs {
     /// Session id or live session name.
     pub session: String,
@@ -4277,6 +4457,7 @@ pub struct TerminateArgs {
 }
 
 #[derive(Debug, Deserialize, Serialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
 pub struct StatusArgs {
     /// Session id or live session name.
     pub session: String,
@@ -4284,22 +4465,25 @@ pub struct StatusArgs {
 
 /// `request_secret_input`'s arguments.
 ///
-/// **The only `*Args` struct in the tree that denies unknown fields, and
-/// deliberately so.** Every other one accepts an extra key silently, so
-/// without this line REQ-SEC-010a's *"the tool accepts `session` and
-/// never a `request_id`"* would rest on a schema a client is free to
-/// ignore: a smuggled `request_id` would be swallowed rather than
-/// refused, and the agent's inability to *name* a secret request would be
-/// documentation instead of a control. Two consequences, both
-/// load-bearing: the rejection surfaces as `invalid_params`, the same
-/// shape as every other input-schema violation here; and `schemars` emits
-/// `"additionalProperties": false` on this tool's input schema and no
-/// other's.
+/// **The first `*Args` struct in the tree to deny unknown fields, and the
+/// reason the rest now do (GH #219).** Without that line REQ-SEC-010a's
+/// *"the tool accepts `session` and never a `request_id`"* would rest on
+/// a schema a client is free to ignore: a smuggled `request_id` would be
+/// swallowed rather than refused, and the agent's inability to *name* a
+/// secret request would be documentation instead of a control. Two
+/// consequences, both load-bearing: the rejection surfaces as
+/// `invalid_params` on the daemon path, the same shape as every other
+/// input-schema violation there (in-process, rmcp 3 reports a failure of
+/// its own argument extractor as an `isError` result carrying the same
+/// text); and `schemars` emits `"additionalProperties": false` on the
+/// input schema.
 ///
-/// It is **not** extended to the other ten args structs in this
-/// milestone. Widening a deserialiser's strictness across the whole tool
-/// surface is a client-compatibility decision, and it is not a secrets
-/// decision.
+/// 0.0.7 kept it to this one struct as a client-compatibility question.
+/// GH #219 answered the question: a typo on any other tool was *honoured
+/// as its default* — `wait_for_pattern { patern }` became a pattern-less
+/// wait and answered `ok`, `send_input { apend_newline: false }` appended
+/// the newline — so the silent acceptance was the incompatibility. See
+/// [`ListSessionsArgs`] for why no MCP client is broken by the refusal.
 #[derive(Debug, Default, Deserialize, Serialize, schemars::JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct RequestSecretInputArgs {
@@ -4761,6 +4945,7 @@ async fn session_exit(
 /// later milestone adds arguments here, and an exhaustive literal repaired
 /// by naming the new field breaks again next milestone.
 #[derive(Debug, Default, Deserialize, Serialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
 pub struct GetScreenStateArgs {
     /// Session id or live session name.
     pub session: String,
@@ -4778,6 +4963,7 @@ pub struct GetScreenStateArgs {
 }
 
 #[derive(Debug, Default, Deserialize, Serialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
 pub struct ResizeArgs {
     /// Session id or live session name.
     pub session: String,
@@ -4790,12 +4976,14 @@ pub struct ResizeArgs {
 }
 
 #[derive(Debug, Default, Deserialize, Serialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
 pub struct InterruptArgs {
     /// Session id or live session name.
     pub session: String,
 }
 
 #[derive(Debug, Deserialize, Serialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
 pub struct GetCommandHistoryArgs {
     /// Session id or live session name.
     pub session: String,
@@ -4805,6 +4993,60 @@ pub struct GetCommandHistoryArgs {
     /// Only entries with `index >= since_index`.
     #[serde(default)]
     pub since_index: Option<u64>,
+}
+
+/// `list_sessions` takes no arguments, and **says so by refusing any**
+/// (GH #219).
+///
+/// A tool with no `Parameters` never looks at `arguments`, so before this
+/// type `list_sessions { session: "x" }` answered every session with
+/// `ok`, and an agent that believed it had filtered the list had no way
+/// to learn otherwise. Every `*Args` struct in this file carries
+/// `deny_unknown_fields` for the same reason. That puts
+/// `"additionalProperties": false` on all twelve input schemas, so the
+/// advertised schema and the deserialiser say the same thing, and it
+/// makes the refusal name the key and list the valid ones — serde's own
+/// *"unknown field \`patern\`, expected one of \`session\`, \`pattern\`,
+/// …"*, which `request_secret_input` already gave.
+///
+/// **Why no MCP client breaks.** Protocol metadata travels in
+/// `params._meta`, beside `arguments` rather than inside it — rmcp
+/// deserialises it into `CallToolRequestParams::meta` and hands the tool
+/// `arguments` alone — and the shim forwards `arguments` and nothing else
+/// (§7.4.1). The one in-tree caller that builds arguments by hand,
+/// `holdfast logs`, sends only keys `ReadOutputArgs` declares.
+///
+/// **Skew is the one real cost, and it is the right way round.** A shim a
+/// minor ahead forwards an argument its own `tools/list` advertised to a
+/// daemon that predates the argument; from this release on, that daemon
+/// refuses the call naming the argument where it used to run the call
+/// without it. GH #169's `apply_holdback` is what the old behaviour
+/// costs: a 0.0.7 daemon, which has neither the field nor this attribute,
+/// drops it without a word and serves the bypassing tail read the caller
+/// declined.
+///
+/// **`properties: {}` is written in by hand.** schemars omits the key for
+/// a struct with no fields, and rmcp's own schema for an argument-free
+/// tool — what this tool advertised before — carries it. It is optional
+/// in JSON Schema and in MCP; keeping it means the only change a client
+/// sees on this schema is the refusal, and not a key going missing.
+#[derive(Debug, Default, Deserialize, Serialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
+#[schemars(extend("properties" = {}))]
+pub struct ListSessionsArgs {}
+
+impl HoldfastServer {
+    /// `list_sessions`' advertised [`Tool`](rmcp::model::Tool), under the
+    /// `<tool>_tool_attr` name every other tool's has.
+    ///
+    /// rmcp names the generated function after the Rust method, and the
+    /// method is `list_sessions_tool` so that `list_sessions()` could stay
+    /// argument-free for its callers. Without this the one tool that took
+    /// no arguments would also be the one whose metadata is spelled
+    /// differently, at every site that maps a tool name to its `Tool`.
+    pub fn list_sessions_tool_attr() -> rmcp::model::Tool {
+        Self::list_sessions_tool_tool_attr()
+    }
 }
 
 #[cfg(test)]

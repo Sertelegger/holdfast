@@ -13,9 +13,10 @@ use holdfast_core::daemon::paths::RuntimePaths;
 use holdfast_core::daemon::{server, spawn};
 // The `diag!` macro, not the module — every diagnostic below goes to
 // stderr, and on `holdfast daemon run` stderr is `daemon.log`, which §9.2
-// lists as a redacted boundary. `println!` is left alone throughout:
+// lists as a redacted boundary. Stdout is left unredacted throughout:
 // that is the subcommands' actual answer, and `holdfast logs --raw` is
-// specified to be unredacted.
+// specified to be unredacted. It is written through `crate::out` rather
+// than `println!`, which panics when the reader has gone (GH #218).
 use holdfast_core::diag;
 #[cfg(unix)]
 use holdfast_core::mcp::shim::ShimServer;
@@ -128,18 +129,298 @@ pub(crate) fn attach_banner(
         Some((cols, rows)) if cols > 0 && rows > 0 => Some(cols as usize),
         _ => None,
     };
-    let geometry = match size {
-        Some((cols, rows)) if cols > 0 && rows > 0 => format!(" ({cols}x{rows})"),
-        _ => String::new(),
-    };
-    let text = format!(" holdfast: attached to {session}{geometry} — Ctrl-B d to detach ");
+    let text = attach_notice(session, size);
     let body = match cols {
         Some(cols) => fit_to_width(&text, cols),
         None => text,
     };
-    Some(format!(
-        "\x1b7\r\x1b[L\x1b[48;5;61m\x1b[38;5;231m{body}\x1b[0m\x1b8"
-    ))
+    Some(format!("\x1b7\r\x1b[L{NOTICE_COLOURS}{body}\x1b[0m\x1b8"))
+}
+
+/// The notice's colours, SGR 256: white on the bar's purple.
+#[cfg(unix)]
+const NOTICE_COLOURS: &str = "\x1b[48;5;61m\x1b[38;5;231m";
+
+/// What `holdfast attach` says once it has joined — the words, without
+/// the layout. [`attach_banner`] inserts them above the prompt when the
+/// daemon sends no opening screen; [`paint_snapshot`] puts them on the top
+/// row when it does (GH #235).
+#[cfg(unix)]
+fn attach_notice(session: &str, size: Option<(u16, u16)>) -> String {
+    let geometry = match size {
+        Some((cols, rows)) if cols > 0 && rows > 0 => format!(" ({cols}x{rows})"),
+        _ => String::new(),
+    };
+    format!(" holdfast: attached to {session}{geometry} — Ctrl-B d to detach ")
+}
+
+/// `holdfast watch`'s notice that it connected, and how to leave (GH
+/// #235).
+///
+/// The dogfood pass: *"Watch rendered 0 bytes and printed no 'watching…'
+/// line, so there is no sign it connected."* Two shapes, because a watch
+/// has two kinds of output:
+///
+/// * **stdout is a terminal**: the notice is the top row of the opening
+///   screen [`paint_snapshot`] draws, on *stdout* — the screen it
+///   decorates — and nowhere else, so it neither pushes the child's prompt
+///   off the bottom nor sits where the child's next line lands;
+/// * **stdout is not a terminal** (`holdfast watch s > log`): nothing is
+///   painted and nothing may be written into the capture, so the notice
+///   is a sentence on stderr, and only if stderr is a terminal a human is
+///   reading.
+///
+/// `None` when neither is a terminal: a script needs no reassurance.
+#[cfg(unix)]
+pub(crate) fn watch_banner(
+    session: &str,
+    size: Option<(u16, u16)>,
+    stdout_is_terminal: bool,
+    stderr_is_terminal: bool,
+) -> Option<WatchBanner> {
+    let geometry = match size {
+        Some((cols, rows)) if cols > 0 && rows > 0 => format!(" ({cols}x{rows})"),
+        _ => String::new(),
+    };
+    if stdout_is_terminal {
+        return Some(WatchBanner::OnScreen(format!(
+            " holdfast: watching {session}{geometry} — Ctrl-C to stop "
+        )));
+    }
+    if stderr_is_terminal {
+        return Some(WatchBanner::Sentence(format!(
+            "holdfast watch: watching {session}{geometry} — Ctrl-C to stop"
+        )));
+    }
+    None
+}
+
+/// Where [`watch_banner`] goes.
+#[cfg(unix)]
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) enum WatchBanner {
+    /// The words for the top row of the opening screen, on stdout.
+    OnScreen(String),
+    /// A line for stderr.
+    Sentence(String),
+}
+
+/// §7.5's `ScreenSnapshot`, as the bytes that paint it on a terminal of
+/// `local` size (GH #235). **Split out so a test can render it** through
+/// a real emulator, for [`attach_banner`]'s reason: this is cursor
+/// arithmetic, and an assertion that the stream contains the bytes the
+/// code just wrote cannot see a row land in the wrong place.
+///
+/// * **The whole screen is repainted** — `ESC[H ESC[2J`, then each row at
+///   its own absolute position — because the picture is a grid, and the
+///   terminal it lands on holds whatever the human had there before.
+/// * **The rows kept are the ones that matter when the terminal is
+///   shorter than the session**: a window ending at the cursor or the
+///   last row with text on it, whichever is lower, so the prompt the
+///   child is waiting at is on screen rather than below it. Each row is
+///   clipped to the local width in display columns (`fit_to_width`'s
+///   reason: a CJK row is two columns a character).
+/// * **The cursor goes where the child left it**, because the child's
+///   next write lands there — a picture with the cursor anywhere else
+///   has the live stream start in the wrong column.
+/// * **The terminal's modes are left alone** — no alternate screen, no
+///   hidden cursor — although the frame says whether the child is using
+///   either. This client is a pass-through and restores nothing on the
+///   way out but `termios`, so a mode it switched on at the join is a
+///   mode `Ctrl-B d` leaves switched on: a human detaching from `vim`
+///   would be returned to their shell inside the alternate screen, or
+///   with no cursor. The fields are on the wire for a renderer that owns
+///   its terminal — the web UI's — and a pass-through paints the picture
+///   into whatever screen the human already has.
+///
+/// * **A `notice` takes the top row, and the picture the rows below it.**
+///   That is where the client says it has joined and how to leave. The
+///   older notice was a line *inserted above the prompt*, which was sound
+///   while the terminal showed nothing of the session — and which, over a
+///   picture whose prompt sits on the last row, pushes the prompt off the
+///   bottom of the screen: the one line the human attached to see. The top
+///   row is out of the way of the child's next write and of a prompt
+///   repaint, and a full-screen program's first redraw simply paints over
+///   it, which a one-shot notice can afford.
+/// * **A full-screen program's picture never moves for the notice**
+///   (`alt_screen`, GH #235's review). A shell whose text fits below the
+///   notice is drawn a row lower, which costs nothing: a shell moves its
+///   cursor relative to where it is. A full-screen program addresses rows
+///   absolutely, so the same shift put `vim` — whose command line, its
+///   last row, is usually blank — a row below where its next `ESC[r;cH`
+///   lands, and every edit after the join was drawn on the wrong line. So
+///   on the alternate screen the notice is laid *over* a row instead: the
+///   last one when it is blank and the cursor is not on it, which hides
+///   nothing, and otherwise the top one, which the program redraws.
+///
+/// Plain text: the tool's grid has no attributes, and the child's own
+/// repaints bring colour back as it redraws.
+#[cfg(unix)]
+pub(crate) fn paint_snapshot(
+    lines: &[String],
+    cursor: (u16, u16),
+    local: Option<(u16, u16)>,
+    notice: Option<&str>,
+    alt_screen: bool,
+) -> Vec<u8> {
+    let (cursor_row, cursor_col) = (cursor.0 as usize, cursor.1 as usize);
+    let mut out = String::from("\x1b[0m\x1b[H\x1b[2J");
+    let (width, height) = match local {
+        Some((cols, rows)) if cols > 0 && rows > 0 => (Some(cols as usize), Some(rows as usize)),
+        _ => (None, None),
+    };
+    // No room for a notice on a one-row terminal; the picture wins.
+    let notice = notice.filter(|_| height.is_none_or(|h| h >= 2));
+    // The rows the picture moves down to make room for the notice: one
+    // for a shell, none for a full-screen program (see above).
+    let offset = usize::from(notice.is_some() && !alt_screen);
+    let rows_for_picture = height.map(|h| h - offset);
+    // The 1-based terminal row the notice goes on, once the picture's
+    // window is known. The top row unless a full-screen program's last
+    // row is free.
+    let mut notice_row = 1;
+    if !lines.is_empty() {
+        let last_text = lines
+            .iter()
+            .rposition(|l| !l.trim_end().is_empty())
+            .unwrap_or(0);
+        let bottom = last_text.max(cursor_row).min(lines.len() - 1);
+        let top = match rows_for_picture {
+            Some(h) => (bottom + 1).saturating_sub(h),
+            None => 0,
+        };
+        for (i, line) in lines[top..=bottom].iter().enumerate() {
+            // An empty row is already painted by the clear. A row with
+            // text is written as the grid has it, trailing spaces
+            // included — `Password: ` ends in one the child drew, and a
+            // renderer that trimmed it would leave the cursor a column
+            // away from the text in front of it.
+            if line.trim_end().is_empty() {
+                continue;
+            }
+            let text = match width {
+                Some(w) => clip_to_width(line, w),
+                None => line.clone(),
+            };
+            out.push_str(&format!("\x1b[{};1H{text}", i + 1 + offset));
+        }
+        let row = cursor_row.saturating_sub(top) + offset;
+        if alt_screen {
+            // The terminal's last row, and the session row painted there.
+            let last = height.unwrap_or(lines.len()) - 1;
+            let free = lines
+                .get(top + last)
+                .is_none_or(|l| l.trim_end().is_empty());
+            if free && row != last {
+                notice_row = last + 1;
+            }
+        }
+        let col = match width {
+            Some(w) => cursor_col.min(w.saturating_sub(1)),
+            None => cursor_col,
+        };
+        if let Some(text) = notice {
+            push_notice(&mut out, text, width, notice_row);
+        }
+        out.push_str(&format!("\x1b[{};{}H", row + 1, col + 1));
+    } else if let Some(text) = notice {
+        push_notice(&mut out, text, width, notice_row);
+    }
+    out.into_bytes()
+}
+
+/// The join notice on one terminal row, padded to the width as a bar.
+/// Drawn after the picture's rows, so on a full-screen program's top row
+/// it lies over the text rather than under it.
+#[cfg(unix)]
+fn push_notice(out: &mut String, text: &str, width: Option<usize>, row: usize) {
+    let body = match width {
+        Some(w) => fit_to_width(text, w),
+        None => text.to_string(),
+    };
+    out.push_str(&format!("\x1b[{row};1H{NOTICE_COLOURS}{body}\x1b[0m"));
+}
+
+/// `s` cut to at most `cols` display columns — [`fit_to_width`] without
+/// the padding, because a painted row must not overwrite the cells past
+/// its own text.
+#[cfg(unix)]
+fn clip_to_width(s: &str, cols: usize) -> String {
+    use unicode_width::UnicodeWidthChar;
+    let mut out = String::new();
+    let mut w = 0usize;
+    for ch in s.chars() {
+        let cw = UnicodeWidthChar::width(ch).unwrap_or(0);
+        if w + cw > cols {
+            break;
+        }
+        out.push(ch);
+        w += cw;
+    }
+    out
+}
+
+/// The line `holdfast attach` draws when a secret is asked for (GH #236).
+///
+/// **Labelled, and never the prompt again.** The client used to render
+/// `\r\n` + `prompt_text` + `\r\n`: when the child had drawn
+/// `Password: ` itself, the human saw `Password:` twice with nothing
+/// saying the second was Holdfast's, and when the agent had raised the
+/// request its words were indistinguishable from the program's. So:
+///
+/// * `echo_drop` — the text *is* the line the child just drew, which is
+///   on the screen above; repeating it is the duplicate, so it is not;
+/// * `tool_call` — the text is the agent's description, shown and
+///   **attributed to the agent**, because a person about to type a
+///   credential is owed the difference between a program's prompt and a
+///   claim about one;
+/// * absent — a daemon older than 1.5 that cannot say — the text is
+///   quoted neutrally rather than attributed to anybody.
+///
+/// §5.2 keeps an *adopting* call's text off the wire entirely (it would
+/// let an agent relabel a prompt a human may already be typing into), so
+/// an echo-raised request adopted by a tool call is still `echo_drop`
+/// here and the agent's text is still not shown. That is specified, not
+/// an omission.
+///
+/// The text arrives redacted and stripped of anything that can move the
+/// cursor (`redact_for_display`), so quoting it cannot rewrite this line.
+#[cfg(unix)]
+pub(crate) fn secret_prompt_label(prompt_text: &str, raised_by: Option<&str>) -> String {
+    let text = prompt_text.trim();
+    let what = match raised_by {
+        Some("echo_drop") => "the session is reading a secret at the prompt above".to_string(),
+        _ if text.is_empty() => "the session is waiting for a secret".to_string(),
+        Some("tool_call") => format!("the agent asks for a secret: “{text}”"),
+        _ => format!("secret requested: “{text}”"),
+    };
+    format!(
+        "\r\n[holdfast] {what} — type it here; it is not shown and goes only to the \
+         session. Enter sends it, Ctrl-C abandons.\r\n"
+    )
+}
+
+/// Whether an `AwaitingSecret` for `request_id` is a prompt `holdfast
+/// attach` should draw and start collecting for (GH #236's review).
+///
+/// **Not when it is the request already being typed into**, nor one this
+/// client has answered and is waiting to hear the outcome of. §7.5's frame
+/// names a request, so a second copy with the same id is the same request:
+/// the daemon sends one when an agent's `request_secret_input` raised it
+/// and the child's echo drop then finds it outstanding. Drawing it anew
+/// printed the label twice and emptied what the human had typed, so the
+/// child received the tail of the secret and the tool reported success.
+///
+/// A request the human **abandoned** (`Ctrl-C`) is neither, and is drawn
+/// again: that client dropped its line, and the second frame is how it
+/// learns the child is now reading.
+#[cfg(unix)]
+pub(crate) fn secret_prompt_is_new(
+    collecting: Option<&str>,
+    submitted: Option<&str>,
+    request_id: &str,
+) -> bool {
+    collecting != Some(request_id) && submitted != Some(request_id)
 }
 
 /// Truncate or pad `s` so it occupies exactly `cols` display columns.
@@ -302,7 +583,9 @@ async fn mcp_hybrid() -> ExitCode {
         }
     };
 
-    let service = match ShimServer::new(Arc::new(client))
+    // `with_respawn`: when this daemon goes away the shim starts another
+    // the way it started this one (GH #231).
+    let service = match ShimServer::with_respawn(Arc::new(client), paths, exe)
         .serve(rmcp::transport::stdio())
         .await
     {
@@ -383,13 +666,13 @@ pub fn daemon_start() -> ExitCode {
     match spawn::start_detached(&paths, &exe) {
         Ok(spawn::StartOutcome::AlreadyRunning { pid }) => {
             match pid {
-                Some(p) => println!("daemon already running (pid {p})"),
-                None => println!("daemon already running"),
+                Some(p) => crate::out::line(&format!("daemon already running (pid {p})")),
+                None => crate::out::line("daemon already running"),
             }
             ExitCode::SUCCESS
         }
         Ok(spawn::StartOutcome::Started { pid }) => {
-            println!("daemon started (pid {pid})");
+            crate::out::line(&format!("daemon started (pid {pid})"));
             ExitCode::SUCCESS
         }
         Err(e) => {
@@ -430,11 +713,13 @@ const FORCE_RPC_TIMEOUT: Duration = Duration::from_secs(2);
 /// would be a defect.** The daemon answers this method only *after* its
 /// own grace has run: `shutdown_graceful` SIGTERMs every live session,
 /// waits [`server::DEFAULT_STOP_GRACE_SECS`] — §3.2's ten — and then
-/// SIGKILLs whatever is left. An interactive shell ignores SIGTERM
-/// (§4.4) and therefore **always** reaches that escalation, so the full
-/// grace is the *ordinary* duration of this call rather than its worst
-/// case. A two-second bound would report failure on every stop that had
-/// a shell to kill, while the daemon went on stopping correctly.
+/// SIGKILLs whatever is left. Anything that ignores SIGTERM reaches that
+/// escalation, so the full grace is an *ordinary* duration of this call
+/// rather than a worst case: an interactive shell with a job that ignores
+/// SIGTERM, on any platform, and every interactive shell where a session
+/// cannot be enumerated for GH #234's hang-up (§4.4: a shell ignores
+/// SIGTERM). A two-second bound would report failure on every such stop,
+/// while the daemon went on stopping correctly.
 ///
 /// The five seconds on top cover the round trip and the SIGKILL sweep
 /// that follows the grace. The daemon's grace is the floor and this must
@@ -455,30 +740,102 @@ enum StopRpc {
     Failed(String),
 }
 
+/// How long a graceful `daemon/stop` may go unanswered before the operator
+/// is told why it is taking so long (GH #20).
+///
+/// Not a bound — [`STOP_RPC_TIMEOUT`] is — but the point past which silence
+/// reads as a hang. The cause is the whole of §3.2's grace, spent on a
+/// session process that ignores or outlasts `SIGTERM`, and it used to be
+/// spent without a word. Until GH #234 every stop with an interactive shell
+/// in it was that case (§4.4: a shell ignores `SIGTERM`); an idle shell
+/// alone in its session is now hung up, so what holds a stop is a job that
+/// kept its shell from being alone, a program, or a platform where a
+/// session cannot be enumerated.
 #[cfg(unix)]
-async fn stop_rpc(force: bool, paths: Option<&RuntimePaths>) -> StopRpc {
+const STOP_PROGRESS_AFTER: Duration = Duration::from_secs(1);
+
+/// How long `daemon stop` waits, after the daemon has answered or been
+/// killed, for the process to be gone (GH #20).
+///
+/// The answer is sent before the daemon's own teardown — the accept loop
+/// returns, the session sweep runs, `remove_runtime_files_we_own` takes
+/// `bind.lock` and removes the sockets and the pid file, and the runtime
+/// is given `SHUTDOWN_GRACE` to wind down — so a caller that trusted the
+/// answer raced all of that: `daemon stop && rm -rf "$HOLDFAST_RUNTIME_DIR"`
+/// removed the directory and the departing daemon's `ensure_dir` put it
+/// back. Generous, because the teardown is short and a loaded machine is
+/// the only thing that stretches it; a daemon still present at the end is
+/// reported rather than waited on for ever.
+#[cfg(unix)]
+const DAEMON_EXIT_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// `daemon/stop`, preceded by `daemon/status` on the same connection.
+///
+/// **The status is asked first so the stop can be waited out.** The pid
+/// it carries is the daemon's own answer about itself, from a process that
+/// is demonstrably alive and serving *this* runtime directory — stronger
+/// evidence than `holdfast.pid`, which `confirm_daemon_pid` exists to
+/// distrust, and it is gone by the time the stop has been answered,
+/// because the teardown removes it. `sessions_live` is what the progress
+/// line reports. A daemon that cannot answer `status` is not asked to
+/// stop any differently: the pid is simply not known, and nothing is
+/// waited for.
+#[cfg(unix)]
+async fn stop_rpc(force: bool, paths: Option<&RuntimePaths>) -> (StopRpc, Option<u32>) {
     // No discoverable runtime directory means no socket to call on and
     // no `holdfast.pid` to read, which is the same outcome as nothing
     // listening — and is what the old `connect()` reported too, since a
     // failed `discover()` was raised as `ClientError::Connect`.
     let Some(paths) = paths else {
-        return StopRpc::NotRunning;
+        return (StopRpc::NotRunning, None);
     };
     let client = match ControlClient::connect(&paths.control_sock(), ClientKind::Cli).await {
         Ok(c) => c,
-        Err(ClientError::Connect { .. }) => return StopRpc::NotRunning,
-        Err(e) => return StopRpc::Failed(e.to_string()),
+        Err(ClientError::Connect { .. }) => return (StopRpc::NotRunning, None),
+        Err(e) => return (StopRpc::Failed(e.to_string()), None),
     };
+    let status = client
+        .call::<_, server::DaemonStatus>(method::METHOD_DAEMON_STATUS, &json!({}))
+        .await
+        .ok();
+    let pid = status.as_ref().map(|s| s.pid);
     let params = server::StopParams {
         force: Some(force),
         timeout_secs: None,
     };
-    match client
-        .call::<_, server::StopOutcome>(method::METHOD_DAEMON_STOP, &params)
-        .await
-    {
+    let stop = client.call::<_, server::StopOutcome>(method::METHOD_DAEMON_STOP, &params);
+    tokio::pin!(stop);
+    let answered = if force {
+        stop.await
+    } else {
+        tokio::select! {
+            r = &mut stop => r,
+            () = tokio::time::sleep(STOP_PROGRESS_AFTER) => {
+                diag!("holdfast daemon stop: {}", stop_progress_note(status.as_ref()));
+                stop.await
+            }
+        }
+    };
+    let rpc = match answered {
         Ok(outcome) => StopRpc::Stopped(outcome),
         Err(e) => StopRpc::Failed(e.to_string()),
+    };
+    (rpc, pid)
+}
+
+/// What a slow graceful stop says while it waits.
+#[cfg(unix)]
+fn stop_progress_note(status: Option<&server::DaemonStatus>) -> String {
+    let grace = server::DEFAULT_STOP_GRACE_SECS;
+    match status.map(|s| s.sessions_live) {
+        Some(0) => "waiting for the daemon to finish stopping".to_string(),
+        Some(n) => format!(
+            "waiting for {n} live session(s) to end — a process that ignores SIGTERM \
+             is killed after {grace}s; `--force` does not wait"
+        ),
+        None => format!(
+            "waiting for the daemon's sessions to end — up to {grace}s; `--force` does not wait"
+        ),
     }
 }
 
@@ -491,6 +848,9 @@ async fn stop_rpc(force: bool, paths: Option<&RuntimePaths>) -> StopRpc {
 /// accept loop will not hear — so `--force` follows it with a signal to
 /// the daemon process itself, whether the RPC answered, failed, or never
 /// came back.
+///
+/// **Either way it returns once the daemon is gone, not once it has been
+/// asked** (GH #20) — see [`DAEMON_EXIT_TIMEOUT`].
 #[cfg(unix)]
 pub async fn daemon_stop(force: bool) -> ExitCode {
     let deadline = if force {
@@ -501,43 +861,56 @@ pub async fn daemon_stop(force: bool) -> ExitCode {
     // `paths()` is resolved once, here, rather than twice inside. An
     // undiscoverable runtime directory means no socket and no
     // `holdfast.pid`, and both halves below have to agree about that.
-    ExitCode::from(daemon_stop_within(force, paths().ok(), deadline).await)
+    ExitCode::from(daemon_stop_within(force, paths().ok(), deadline, DAEMON_EXIT_TIMEOUT).await)
 }
 
-/// [`daemon_stop`] with the runtime directory resolved and the RPC
-/// deadline supplied, returning §18.8's exit code as a `u8`.
+/// [`daemon_stop`] with the runtime directory resolved and both deadlines
+/// supplied, returning §18.8's exit code as a `u8`.
 ///
-/// Both seams exist for the same test: "the daemon accepts and never
-/// replies" is the state this bound was written for, and driving it
-/// through `daemon_stop` would mean discovering a real runtime directory
-/// and waiting a real [`STOP_RPC_TIMEOUT`]. `u8` rather than `ExitCode`
+/// The seams exist for the tests: "the daemon accepts and never replies"
+/// is the state the RPC bound was written for, and driving it through
+/// `daemon_stop` would mean discovering a real runtime directory and
+/// waiting a real [`STOP_RPC_TIMEOUT`]. `u8` rather than `ExitCode`
 /// because `ExitCode` cannot be compared, so a test could only assert on
 /// its `Debug` formatting.
 #[cfg(unix)]
-async fn daemon_stop_within(force: bool, paths: Option<RuntimePaths>, rpc_timeout: Duration) -> u8 {
+async fn daemon_stop_within(
+    force: bool,
+    paths: Option<RuntimePaths>,
+    rpc_timeout: Duration,
+    exit_timeout: Duration,
+) -> u8 {
     // **Both paths are bounded now.** `--force`'s bound was already here
     // because a daemon that accepts and never replies is the state
     // `--force` exists for; the graceful path had the same exposure with
     // nothing to catch it, and §3.2 bounds it too.
-    let rpc = match tokio::time::timeout(rpc_timeout, stop_rpc(force, paths.as_ref())).await {
-        Ok(rpc) => rpc,
-        Err(_) => StopRpc::Failed(format!(
-            "the daemon did not answer daemon/stop within {}s",
-            rpc_timeout.as_secs()
-        )),
-    };
+    let (rpc, status_pid) =
+        match tokio::time::timeout(rpc_timeout, stop_rpc(force, paths.as_ref())).await {
+            Ok(answered) => answered,
+            Err(_) => (
+                StopRpc::Failed(format!(
+                    "the daemon did not answer daemon/stop within {}s",
+                    rpc_timeout.as_secs()
+                )),
+                None,
+            ),
+        };
 
     if !force {
         return match rpc {
             StopRpc::Stopped(outcome) => {
-                println!(
+                if let Err(e) = await_daemon_exit(status_pid, exit_timeout).await {
+                    diag!("holdfast daemon stop: {e}");
+                    return EXIT_FAILED;
+                }
+                crate::out::line(&format!(
                     "daemon stopped ({} session(s) terminated)",
                     outcome.sessions_terminated
-                );
+                ));
                 0
             }
             StopRpc::NotRunning => {
-                println!("no daemon running");
+                crate::out::line("no daemon running");
                 0
             }
             // §18.8's "Operation failed: couldn't stop". Without
@@ -559,15 +932,24 @@ async fn daemon_stop_within(force: bool, paths: Option<RuntimePaths>, rpc_timeou
         // directory is `NotRunning`.
         None => Escalation::Nothing,
     };
+    // The process to wait out: the one killed, else the one that answered.
+    // Never a pid `escalate_to_sigkill` declined — that one was not
+    // confirmed to be this daemon, and waiting on a stranger would report
+    // its lifetime as ours.
+    let waited = match escalation {
+        Escalation::Killed(pid) => Some(pid),
+        _ => status_pid,
+    };
+    let exited = await_daemon_exit(waited, exit_timeout).await;
 
-    match rpc {
+    let code = match rpc {
         StopRpc::Stopped(outcome) => {
-            println!(
+            crate::out::line(&format!(
                 "daemon stopped ({} session(s) terminated)",
                 outcome.sessions_terminated
-            );
+            ));
             if let Escalation::Killed(pid) = escalation {
-                println!("SIGKILL sent to daemon pid {pid}");
+                crate::out::line(&format!("SIGKILL sent to daemon pid {pid}"));
             }
             // A `NotSignalled` here is not worth a warning: the daemon
             // answered, so the ordinary reason its pid no longer confirms
@@ -581,15 +963,15 @@ async fn daemon_stop_within(force: bool, paths: Option<RuntimePaths>, rpc_timeou
         // verdict.
         StopRpc::NotRunning => match escalation {
             Escalation::Killed(pid) => {
-                println!("daemon killed (pid {pid})");
+                crate::out::line(&format!("daemon killed (pid {pid})"));
                 0
             }
             Escalation::Nothing => {
-                println!("no daemon running");
+                crate::out::line("no daemon running");
                 0
             }
             Escalation::NotSignalled { pid, why } => {
-                println!("no daemon running");
+                crate::out::line("no daemon running");
                 diag!("holdfast daemon stop: holdfast.pid names pid {pid}, not signalled: {why}");
                 0
             }
@@ -598,7 +980,7 @@ async fn daemon_stop_within(force: bool, paths: Option<RuntimePaths>, rpc_timeou
             diag!("holdfast daemon stop: {e}");
             match escalation {
                 Escalation::Killed(pid) => {
-                    println!("daemon killed (pid {pid})");
+                    crate::out::line(&format!("daemon killed (pid {pid})"));
                     0
                 }
                 Escalation::Nothing => EXIT_FAILED,
@@ -610,7 +992,78 @@ async fn daemon_stop_within(force: bool, paths: Option<RuntimePaths>, rpc_timeou
                 }
             }
         }
+    };
+    match exited {
+        Ok(()) => code,
+        Err(e) => {
+            diag!("holdfast daemon stop: {e}");
+            EXIT_FAILED
+        }
     }
+}
+
+/// Wait, bounded, for `pid` to be gone (GH #20). `Ok` at once for `None`:
+/// with no pid there is nothing to wait on, and saying so every time would
+/// be noise about a case that has its own diagnostics.
+///
+/// Polled rather than waited on, because the daemon is not this process's
+/// child — `daemon start` detached it — so there is nothing to `waitpid`.
+#[cfg(unix)]
+async fn await_daemon_exit(pid: Option<u32>, limit: Duration) -> Result<(), String> {
+    let Some(pid) = pid else {
+        return Ok(());
+    };
+    let deadline = tokio::time::Instant::now() + limit;
+    loop {
+        if process_is_gone(pid) {
+            return Ok(());
+        }
+        if tokio::time::Instant::now() >= deadline {
+            return Err(format!(
+                "the daemon (pid {pid}) was stopped but had not exited after {}s; its \
+                 runtime directory may still be in use",
+                limit.as_secs()
+            ));
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+}
+
+/// Whether `pid` has finished everything it will ever do to the runtime
+/// directory: no such process, or a zombie.
+///
+/// **A zombie counts as gone**, and `kill(pid, 0)` alone cannot say so — it
+/// answers `0` for one. The daemon's parent after `daemon start` detached it
+/// is whatever reaps orphans here, and a container whose pid 1 never reaps
+/// would leave it a zombie for ever: exited, holding nothing, and
+/// indistinguishable by signal 0 from a daemon still tearing down. Linux
+/// says which through `/proc`; elsewhere the orphan reaper is `launchd` or
+/// `init`, which reap at once.
+///
+/// **`EPERM` is gone, too.** The pid exists and belongs to another user,
+/// so it is not our daemon: the daemon runs as the uid this CLI runs as —
+/// `peer::is_authorized` refuses every other uid, root included, so no
+/// other CLI could have asked it anything — and a process of our own uid
+/// is never `EPERM` to us. What `EPERM` means is that our daemon exited
+/// and its pid was reused. This read `EPERM` as alive, on the reasoning
+/// that a recycled pid is not ours — which is the reason to call ours
+/// gone — and waited out the bound on a stranger, then exited 1.
+#[cfg(unix)]
+fn process_is_gone(pid: u32) -> bool {
+    // SAFETY: signal 0 sends nothing and takes no pointers.
+    if unsafe { libc::kill(pid as libc::pid_t, 0) } != 0 {
+        return matches!(
+            std::io::Error::last_os_error().raw_os_error(),
+            Some(libc::ESRCH | libc::EPERM)
+        );
+    }
+    std::fs::read_to_string(format!("/proc/{pid}/stat"))
+        .ok()
+        .and_then(|stat| {
+            let (_, after_comm) = stat.rsplit_once(')')?;
+            after_comm.split_whitespace().next().map(|s| s == "Z")
+        })
+        .unwrap_or(false)
 }
 
 /// The result of §3.2's `--force` escalation.
@@ -815,9 +1268,9 @@ pub async fn daemon_status(as_json: bool) -> ExitCode {
         Ok(c) => c,
         Err(ClientError::Connect { .. }) => {
             if as_json {
-                println!("{}", json!({ "running": false }));
+                crate::out::line(&json!({ "running": false }).to_string());
             } else {
-                println!("holdfast daemon down");
+                crate::out::line("holdfast daemon down");
             }
             return ExitCode::from(EXIT_UNREACHABLE);
         }
@@ -835,10 +1288,10 @@ pub async fn daemon_status(as_json: bool) -> ExitCode {
             }
         };
     if as_json {
-        println!("{}", serde_json::to_string(&status).unwrap_or_default());
+        crate::out::line(&serde_json::to_string(&status).unwrap_or_default());
     } else {
         let s = status.uptime_secs;
-        println!(
+        crate::out::line(&format!(
             "holdfast daemon up — pid {}, uptime {}:{:02}:{:02}, sessions {} live + {} exited-retained, attach clients {}",
             status.pid,
             s / 3600,
@@ -847,7 +1300,7 @@ pub async fn daemon_status(as_json: bool) -> ExitCode {
             status.sessions_live,
             status.sessions_exited_retained,
             status.attach_clients,
-        );
+        ));
     }
     ExitCode::SUCCESS
 }
@@ -877,12 +1330,12 @@ pub async fn list(as_json: bool) -> ExitCode {
         }
     };
     if as_json {
-        println!("{}", serde_json::to_string(&data).unwrap_or_default());
+        crate::out::line(&serde_json::to_string(&data).unwrap_or_default());
         return ExitCode::SUCCESS;
     }
     let mut sessions = data["sessions"].as_array().cloned().unwrap_or_default();
     if sessions.is_empty() {
-        println!("no sessions");
+        crate::out::line("no sessions");
         return ExitCode::SUCCESS;
     }
     // Newest first, then by id so the order is total and stable. The sort
@@ -896,10 +1349,12 @@ pub async fn list(as_json: bool) -> ExitCode {
             .cmp(&a["started_at_unix_secs"].as_u64())
             .then_with(|| a["id"].as_str().cmp(&b["id"].as_str()))
     });
-    println!("ID                  NAME          STATE      PID      COMMAND");
+    // One write for the whole table: one place a departed reader is
+    // noticed, rather than one per row.
+    let mut table = String::from("ID                  NAME          STATE      PID      COMMAND\n");
     for s in sessions {
-        println!(
-            "{:<18}  {:<12}  {:<9}  {:<7}  {}",
+        table.push_str(&format!(
+            "{:<18}  {:<12}  {:<9}  {:<7}  {}\n",
             s["id"].as_str().unwrap_or("-"),
             s["name"].as_str().unwrap_or("-"),
             s["state"].as_str().unwrap_or("-"),
@@ -908,12 +1363,49 @@ pub async fn list(as_json: bool) -> ExitCode {
                 .map(|p| p.to_string())
                 .unwrap_or_else(|| "-".into()),
             s["command"].as_str().unwrap_or("-"),
-        );
+        ));
     }
+    crate::out::text(&table);
     ExitCode::SUCCESS
 }
 
+/// How much one `read_output` call asks for — the daemon's ceiling
+/// (`MAX_READ_MAX_BYTES`), so a drain is as few round trips as the wire
+/// allows.
+#[cfg(unix)]
+const LOGS_PAGE_BYTES: u64 = 256 * 1024;
+
 /// `holdfast logs <session> [--tail N] [--raw]`
+///
+/// **It prints everything the session's buffer still holds, and it used
+/// to print the oldest 256 KiB of it** (GH #232). One `read_output` call
+/// returns at most one page, and the command made one call and ignored
+/// both `truncated_for_size` and `next_cursor` — so on any session that
+/// had printed more than a page it stopped mid-line, said nothing, and
+/// exited 0. Both viewers' `slow_consumer` notices send the operator here
+/// for what they missed, which is almost never the oldest page.
+///
+/// It now follows `next_cursor` to the end, and stops early only where
+/// the daemon says to:
+///
+/// * **A `held_back` page that makes no progress** — §4.1's partial
+///   secret at the tail, which moves only with `buffer.head`, so asking
+///   again at once returns the same bytes; the loop stops and
+///   [`held_back_note`] says why, as before. A `held_back` page that
+///   *did* make progress is read past: REQ-O-008 withholds an escape
+///   sequence cut by the page's own end, wherever that falls, and the
+///   first version of this loop stopped there — a third of the way into
+///   coloured output, and at the same byte on every retry.
+/// * **The head as it stood when the command started.** A session that
+///   prints faster than this reads would otherwise never be caught up
+///   with, and `holdfast logs` would not return. What was there when you
+///   asked is what you get, which is the same contract `cat` gives a file
+///   that is still being written.
+///
+/// Bytes that are gone are said to be gone, on stderr: the ring keeps the
+/// newest output only (REQ-O-005), so a session that has printed more
+/// than it holds starts partway through, and a session that outruns the
+/// read can lose bytes between two pages. Both used to be silent.
 #[cfg(unix)]
 pub async fn logs(session: &str, tail_lines: Option<usize>, raw: bool) -> ExitCode {
     let client = match connect(ClientKind::Cli).await {
@@ -923,78 +1415,308 @@ pub async fn logs(session: &str, tail_lines: Option<usize>, raw: bool) -> ExitCo
             return ExitCode::from(EXIT_UNREACHABLE);
         }
     };
-    // §7.2: CLI commands ride the same control socket as the MCP tool
-    // handlers. `holdfast logs` is `read_output` with a human on the other
-    // end, so it goes through `tool/read_output` rather than growing a
-    // parallel method with its own bugs.
-    //
-    // **`apply_holdback` on the `--tail` arm, and it is not decoration
-    // (GH #169).** `tail_lines` alone is §4.1's per-call bypass, and this
-    // surface is named a non-member of it, twice: *"the exemption covers
-    // exactly those two arguments on the one tool that takes them, and
-    // nothing else"*, and then, by name, *"`--raw` is that surface's
-    // opt-in and it is audited; `--tail` is not an opt-in to anything."*
-    // The distinction has to be carried by what the CLI **sends**: the
-    // daemon may not recover it from `client_kind`, which is audit
-    // attribution and never a redaction input (REQ-SEC-018).
-    let mut args = match tail_lines {
-        Some(n) => json!({
-            "session": session,
+    let reader = LogReader {
+        client,
+        session,
+        raw,
+    };
+    let result = match tail_lines {
+        Some(n) => logs_tail(&reader, n).await,
+        None => logs_all(&reader).await,
+    };
+    match result {
+        Ok(()) => ExitCode::SUCCESS,
+        Err(code) => code,
+    }
+}
+
+/// One `holdfast logs` invocation's connection and the two arguments every
+/// call it makes carries.
+#[cfg(unix)]
+struct LogReader<'a> {
+    client: ControlClient,
+    session: &'a str,
+    raw: bool,
+}
+
+#[cfg(unix)]
+impl LogReader<'_> {
+    /// One `tool/<name>` call, answered `ok`, as JSON. Every failure is
+    /// reported here, so a caller only propagates the exit code.
+    async fn call(&self, tool: &str, mut args: Value) -> Result<Value, ExitCode> {
+        args["session"] = json!(self.session);
+        let params = method::to_cbor(&args).map_err(|e| {
+            diag!("holdfast logs: {e}");
+            ExitCode::from(EXIT_FAILED)
+        })?;
+        let resp = self
+            .client
+            .call_raw(&format!("tool/{tool}"), params)
+            .await
+            .map_err(|e| {
+                diag!("holdfast logs: {e}");
+                ExitCode::from(EXIT_UNREACHABLE)
+            })?;
+        if resp.status != "ok" {
+            diag!("holdfast logs: {} — {}", resp.status, resp.details);
+            return Err(ExitCode::from(EXIT_FAILED));
+        }
+        method::from_cbor(&resp.data).map_err(|e| {
+            diag!("holdfast logs: malformed response: {e}");
+            ExitCode::from(EXIT_FAILED)
+        })
+    }
+
+    /// `read_output`, with `--raw`'s one field when it was given.
+    ///
+    /// §3.2's `--raw` is "disable redaction, and audit-log that you did".
+    /// Both halves belong to the daemon: 0.0.3 put the `redaction_disabled`
+    /// audit write inside the read path itself (§9.4), precisely so every
+    /// transport inherits it instead of having to remember. So the flag is
+    /// one field on the call, and the CLI has no audit obligation of its
+    /// own — which also means a drain of several pages writes one row per
+    /// page, each of them true.
+    async fn read(&self, mut args: Value) -> Result<Page, ExitCode> {
+        if self.raw {
+            args["redact"] = json!(false);
+        }
+        let data = self.call("read_output", args).await?;
+        Page::from_wire(data)
+    }
+}
+
+/// One `read_output` answer, reduced to what the drain steers by.
+#[cfg(unix)]
+struct Page {
+    output: String,
+    /// Where this page actually began. Later than the cursor asked for
+    /// exactly when bytes between the two left the ring first.
+    start: u64,
+    truncated_for_size: bool,
+    held_back: bool,
+    next_cursor: Option<u64>,
+    /// The whole answer, for [`held_back_note`].
+    data: Value,
+}
+
+#[cfg(unix)]
+impl Page {
+    fn from_wire(data: Value) -> Result<Self, ExitCode> {
+        let (Some(end), Some(returned)) =
+            (data["cursor"].as_u64(), data["bytes_returned"].as_u64())
+        else {
+            diag!("holdfast logs: malformed response: no cursor or bytes_returned");
+            return Err(ExitCode::from(EXIT_FAILED));
+        };
+        Ok(Self {
+            output: data["output"].as_str().unwrap_or_default().to_string(),
+            start: end.saturating_sub(returned),
+            truncated_for_size: data["truncated_for_size"] == json!(true),
+            held_back: data["held_back"] == json!(true),
+            next_cursor: data["next_cursor"].as_u64(),
+            data,
+        })
+    }
+}
+
+/// What a drain saw besides the bytes, for the notes that follow them.
+#[cfg(unix)]
+#[derive(Default)]
+struct Drained {
+    /// Bytes the session printed before the oldest one the ring still held
+    /// when the drain began.
+    gone_before: u64,
+    /// Bytes that left the ring between two pages of this drain.
+    gone_during: u64,
+    /// The page that ended the drain at a holdback, if one did. Never a
+    /// holdback a later page read past: that one withheld nothing.
+    held: Option<Value>,
+}
+
+/// Every page from the ring's oldest byte to the head as it stood at the
+/// start, handed to `sink` in order.
+#[cfg(unix)]
+async fn drain(r: &LogReader<'_>, mut sink: impl FnMut(&str)) -> Result<Drained, ExitCode> {
+    // The extent comes from `status` and not from the first page, because
+    // a page says where it ended and not where the buffer does.
+    let status = r.call("status", json!({})).await?;
+    let (Some(head), Some(tail)) = (
+        status["buffer"]["head"].as_u64(),
+        status["buffer"]["tail"].as_u64(),
+    ) else {
+        diag!("holdfast logs: malformed response: `status` carried no buffer extent");
+        return Err(ExitCode::from(EXIT_FAILED));
+    };
+    let mut seen = Drained {
+        gone_before: tail,
+        ..Drained::default()
+    };
+    // From the ring's tail rather than from 0. Both return the same bytes,
+    // but a cursor below the tail is §9.4's `truncated_at_tail` and is
+    // audited as a reader that lost its place — which a command asking for
+    // "everything you have" is not.
+    let mut cursor = tail;
+    while cursor < head {
+        let page = r
+            .read(json!({ "since_cursor": cursor, "max_bytes": LOGS_PAGE_BYTES }))
+            .await?;
+        seen.gone_during += page.start.saturating_sub(cursor);
+        sink(&page.output);
+        match page.next_cursor {
+            // Caught up with the head, as it stands now.
+            None => {
+                seen.held = None;
+                break;
+            }
+            // **A holdback that made progress is read past, not stopped
+            // at.** REQ-O-008 withholds an escape sequence that straddles
+            // the page's own end, `since_cursor + max_bytes`, wherever
+            // that falls — so on coloured output most pages come back
+            // `held_back` with the rest of the buffer behind them, and the
+            // retry at `next_cursor` is §4.1's documented recourse and
+            // makes progress. Only the last page's holdback survives to
+            // the note: one that a later page read past withheld nothing.
+            Some(next) if next > cursor => {
+                seen.held = page.held_back.then_some(page.data);
+                cursor = next;
+            }
+            // A holdback that made none is the one that means it: §4.1's
+            // partial secret at the tail, which moves only with
+            // `buffer.head`, so asking again at once returns the same
+            // nothing. Stop, and keep the page for the note.
+            Some(_) if page.held_back => {
+                seen.held = Some(page.data);
+                break;
+            }
+            // Since GH #195 every other read makes progress, so this is a
+            // daemon that has regressed — and a loop that trusted it
+            // would spin.
+            Some(next) => {
+                diag!(
+                    "holdfast logs: the daemon returned no progress at byte {next}; \
+                     stopping rather than asking again"
+                );
+                return Err(ExitCode::from(EXIT_FAILED));
+            }
+        }
+    }
+    Ok(seen)
+}
+
+#[cfg(unix)]
+async fn logs_all(r: &LogReader<'_>) -> Result<(), ExitCode> {
+    let seen = drain(r, crate::out::text).await?;
+    report_gone(seen.gone_before, seen.gone_during);
+    if let Some(held) = &seen.held {
+        diag!("holdfast logs: {}", held_back_note(r.raw, held));
+    }
+    Ok(())
+}
+
+/// `--tail N`: one tail read, which is the whole answer unless the N lines
+/// are longer than one page.
+///
+/// **`apply_holdback`, and it is not decoration (GH #169).** `tail_lines`
+/// alone is §4.1's per-call bypass, and this surface is named a non-member
+/// of it, twice: *"the exemption covers exactly those two arguments on the
+/// one tool that takes them, and nothing else"*, and then, by name,
+/// *"`--raw` is that surface's opt-in and it is audited; `--tail` is not an
+/// opt-in to anything."* The distinction has to be carried by what the CLI
+/// **sends**: the daemon may not recover it from `client_kind`, which is
+/// audit attribution and never a redaction input (REQ-SEC-018).
+///
+/// **Longer than a page, and it used to be cut silently** (GH #232). A
+/// tail read keeps the newest `max_bytes` of the N lines and sets
+/// `truncated_for_size`, so `--tail 40000` printed the last 256 KiB
+/// starting mid-line. That case now drains the ring — at most
+/// `DEFAULT_BUFFER_BYTES`, a few pages — and keeps the last N lines of it
+/// here. The drain applies the holdback exactly as the tail read did, so
+/// the fallback withholds nothing less.
+#[cfg(unix)]
+async fn logs_tail(r: &LogReader<'_>, n: usize) -> Result<(), ExitCode> {
+    let page = r
+        .read(json!({
             "tail_lines": n,
             "apply_holdback": true,
-            "max_bytes": 256 * 1024,
-        }),
-        None => json!({ "session": session, "since_cursor": 0, "max_bytes": 256 * 1024 }),
-    };
-    if raw {
-        // §3.2's `--raw` is "disable redaction, and audit-log that you
-        // did". Both halves belong to the daemon: 0.0.3 put the
-        // `redaction_disabled` audit write inside the read path itself
-        // (§9.4), precisely so every transport inherits it instead of
-        // having to remember. So the flag is one field on the existing
-        // call, and the CLI does not get an audit obligation of its own.
-        args["redact"] = json!(false);
-    }
-    let params = match method::to_cbor(&args) {
-        Ok(p) => p,
-        Err(e) => {
-            diag!("holdfast logs: {e}");
-            return ExitCode::from(EXIT_FAILED);
+            "max_bytes": LOGS_PAGE_BYTES,
+        }))
+        .await?;
+    if !page.truncated_for_size {
+        crate::out::text(&page.output);
+        if page.held_back {
+            diag!("holdfast logs: {}", held_back_note(r.raw, &page.data));
         }
-    };
-    let resp = match client.call_raw("tool/read_output", params).await {
-        Ok(r) => r,
-        Err(e) => {
-            diag!("holdfast logs: {e}");
-            return ExitCode::from(EXIT_UNREACHABLE);
-        }
-    };
-    if resp.status != "ok" {
-        diag!("holdfast logs: {} — {}", resp.status, resp.details);
-        return ExitCode::from(EXIT_FAILED);
+        return Ok(());
     }
-    let data: Value = match method::from_cbor(&resp.data) {
-        Ok(v) => v,
-        Err(e) => {
-            diag!("holdfast logs: malformed response: {e}");
-            return ExitCode::from(EXIT_FAILED);
-        }
-    };
-    print!("{}", data["output"].as_str().unwrap_or_default());
-    // §4.1's holdback can now shorten this read, so say so — on stderr,
-    // because stdout is the log and this surface's point is that it
-    // survives being piped somewhere. Silence here would read as "the
-    // output ended", which is the one thing it does not mean.
-    //
-    // **Flush first.** `print!` goes through Rust's `LineWriter` and
-    // `diag!` writes an unbuffered, locked stderr, so `holdfast logs X
-    // 2>&1 | tail` spliced the note into the middle of the log text.
-    // Ordering two streams is the writer's job, not the reader's.
-    if data["held_back"] == json!(true) {
-        let _ = std::io::Write::flush(&mut std::io::stdout());
-        diag!("holdfast logs: {}", held_back_note(raw, &data));
+
+    let mut all = String::new();
+    let seen = drain(r, |s| all.push_str(s)).await?;
+    let lines = last_lines(&all, n);
+    crate::out::text(lines);
+    // The ring's missing front only matters when the N lines reach it.
+    let reaches_front = lines.len() == all.len();
+    report_gone(
+        if reaches_front { seen.gone_before } else { 0 },
+        seen.gone_during,
+    );
+    if let Some(held) = &seen.held {
+        diag!("holdfast logs: {}", held_back_note(r.raw, held));
     }
-    ExitCode::SUCCESS
+    Ok(())
+}
+
+/// The last `n` lines of `text`, counted the way the daemon's
+/// `tail_lines` counts them (`OutputBuffer::tail_lines_start`): a single
+/// trailing newline does not start another line, and fewer than `n` lines
+/// is all of them.
+///
+/// A port of that function rather than an equivalent, because "equivalent"
+/// is where two paths of one flag start to disagree:
+/// `the_tail_fallback_counts_lines_the_way_the_daemon_does` checks it
+/// against the original.
+#[cfg(unix)]
+fn last_lines(text: &str, n: usize) -> &str {
+    let b = text.as_bytes();
+    if n == 0 || b.is_empty() {
+        return "";
+    }
+    let search_end = if b[b.len() - 1] == b'\n' {
+        b.len() - 1
+    } else {
+        b.len()
+    };
+    let mut seen = 0usize;
+    let mut start = b.len();
+    for i in (0..search_end).rev() {
+        if b[i] == b'\n' {
+            seen += 1;
+            if seen == n {
+                start = i + 1;
+                break;
+            }
+        }
+        start = i;
+    }
+    // Every value `start` can take is 0, the length, or one past a
+    // newline, so it is always a char boundary.
+    &text[start..]
+}
+
+/// Say, on stderr, which bytes the output above does not have.
+#[cfg(unix)]
+fn report_gone(gone_before: u64, gone_during: u64) {
+    if gone_before > 0 {
+        diag!(
+            "holdfast logs: the first {gone_before} bytes this session printed have left its buffer \
+             and are not shown"
+        );
+    }
+    if gone_during > 0 {
+        diag!(
+            "holdfast logs: {gone_during} more bytes left the buffer while this was reading it — the \
+             session printed faster than it could be read — and are missing from the middle"
+        );
+    }
 }
 
 /// What `holdfast logs` says on stderr when the read came back
@@ -1428,8 +2150,9 @@ enum Truncation {
     /// over every gap.
     ///
     /// A lower bound and not a total, for `observer` connections. The
-    /// daemon counts the hole in the **raw** session stream (§4.3's
-    /// broadcast drop, measured from the `OutputFrame` offsets), and an
+    /// daemon counts the hole in the **raw** session stream — since GH
+    /// #210, bytes the session's ring buffer evicted before this
+    /// connection read them, measured from the stream offsets — and an
     /// observer renders the *redacted* stream — `StreamRedactor` can
     /// withhold on its own account, and its withholding window is not
     /// this number — and the redactor announces its own drops in band,
@@ -1454,6 +2177,14 @@ impl Truncation {
 /// Tell the operator the stream skipped bytes, at the point it skipped
 /// them.
 ///
+/// **And that they are gone, which is new with GH #210.** A gap used to
+/// be a broadcast drop, with the bytes still in the ring buffer, and this
+/// line sent the operator to `holdfast logs` for them. A connection now
+/// resumes from the ring whenever it falls behind, so the only hole left
+/// is the part the ring had already evicted — which `holdfast logs`,
+/// reading that same ring, does not have either. Saying otherwise would
+/// send a person looking for bytes that no longer exist anywhere.
+///
 /// Through `diag!` and therefore stderr, **not** through [`render`]:
 /// stdout is the session's own byte stream and a client that wrote its
 /// own prose into it would corrupt every `holdfast watch > file`. It is
@@ -1463,7 +2194,8 @@ impl Truncation {
 fn report_gap(what: &str, bytes: u64) {
     diag!(
         "holdfast {what}: at least {bytes} bytes of output were dropped here and are not \
-         shown — `holdfast logs` still has them"
+         shown — this view fell further behind than the session's output buffer reaches, \
+         so they are gone"
     );
 }
 
@@ -1485,16 +2217,28 @@ fn report_gap(what: &str, bytes: u64) {
 /// `EXIT_TRUNCATED`. That is the intended answer — the operator's
 /// capture really is missing twelve bytes — and it is written here
 /// because the sentence it replaces read as a promise of 0.
+///
+/// **A `u8` rather than an `ExitCode`** so `attach` can tell a clean
+/// ending from the others after a stall (GH #210); both callers convert
+/// at the `return`.
+///
+/// `attach` no longer reaches the `slow_consumer` arm — it holds the
+/// terminal instead ([`hold_after_stall`]) — so the sentence is
+/// `watch`'s, and it now says what the reason means since GH #210: the
+/// client stopped reading, not that it read too slowly.
 #[cfg(unix)]
-fn finish(what: &str, reason: &str, truncated: Truncation) -> ExitCode {
+fn finish(what: &str, reason: &str, truncated: Truncation) -> u8 {
     if reason == "slow_consumer" {
         // No byte count: see `Truncation`. What is knowable is where to
-        // get the rest, and the ring buffer still has it (REQ-O-005).
+        // get the rest, and the ring buffer has as much of it as it still
+        // holds (REQ-O-005) — not necessarily all of it, after a stall
+        // long enough to be detached for.
         diag!(
-            "holdfast {what}: detached ({reason}) — this view is incomplete from here on; \
-             `holdfast logs` has what the session printed"
+            "holdfast {what}: detached ({reason}) — this client stopped reading, and this \
+             view is incomplete from here on; `holdfast logs` has the session's recent \
+             output, as far back as its buffer reaches"
         );
-        return ExitCode::from(EXIT_TRUNCATED);
+        return EXIT_TRUNCATED;
     }
     diag!("holdfast {what}: detached ({reason})");
     left_cleanly(what, truncated)
@@ -1514,12 +2258,12 @@ fn finish(what: &str, reason: &str, truncated: Truncation) -> ExitCode {
 /// still exit 0, which is what `mcp-smoke.sh` asserts of `Ctrl-B d` and
 /// of `watch` under `SIGINT`.
 #[cfg(unix)]
-fn left_cleanly(what: &str, truncated: Truncation) -> ExitCode {
+fn left_cleanly(what: &str, truncated: Truncation) -> u8 {
     match truncated {
-        Truncation::None => ExitCode::SUCCESS,
+        Truncation::None => 0,
         Truncation::Gap(n) => {
             diag!("holdfast {what}: at least {n} bytes of this session were never shown");
-            ExitCode::from(EXIT_TRUNCATED)
+            EXIT_TRUNCATED
         }
     }
 }
@@ -1560,11 +2304,10 @@ fn render(bytes: &[u8]) {
 /// up front, by the person who knows which child they are attaching to.
 #[cfg(unix)]
 pub async fn attach(session: &str, allow_echo: bool) -> ExitCode {
-    use holdfast_core::attach::{AttachMode, AttachRole, ClientFrame, ServerFrame};
-    use holdfast_core::protocol::frame;
+    use holdfast_core::attach::{AttachMode, AttachRole};
     use std::os::unix::io::AsRawFd;
 
-    let (rd, mut wr) = match dial_attach(
+    let (mut rd, mut wr) = match dial_attach(
         session,
         AttachMode::ReadWrite,
         AttachRole::Interactive,
@@ -1632,7 +2375,6 @@ pub async fn attach(session: &str, allow_echo: bool) -> ExitCode {
         }
     };
 
-    let mut frames = spawn_frame_reader(rd);
     let mut keys = spawn_stdin_reader();
     let mut winch =
         match tokio::signal::unix::signal(tokio::signal::unix::SignalKind::window_change()) {
@@ -1642,6 +2384,116 @@ pub async fn attach(session: &str, allow_echo: bool) -> ExitCode {
                 return ExitCode::from(EXIT_FAILED);
             }
         };
+
+    // **Whether this view is a complete record of the session** (GH
+    // #200). Set by an `OutputGap` and by nothing else: a
+    // `slow_consumer` ending is the same fact stated as a termination,
+    // and `attach` tracks that one separately, in `stalled` below. An
+    // earlier version of this comment claimed both, and claiming both is
+    // what hid the fact that the `Gap` arm of `left_cleanly` was reached
+    // by no test at all — every row paired a gap with a `slow_consumer`
+    // ending, so the early return answered them and the arm could have
+    // been deleted green. Carried across a reattach: a gap is a fact
+    // about what this process showed, not about one connection.
+    let mut truncated = Truncation::None;
+    // **Whether a stall cut this process's view short** (GH #210). A
+    // `slow_consumer` detach loses everything the session printed while
+    // this client was not reading, and a reattach shows the screen as it
+    // now stands, not what scrolled past in between — so however the
+    // attachment ends afterwards, the view was not all of the session,
+    // and the exit status says so.
+    let mut stalled = false;
+
+    loop {
+        match attach_connected(
+            session,
+            allow_echo,
+            rd,
+            wr,
+            tty,
+            &mut keys,
+            &mut winch,
+            &mut sigterm,
+            &mut sighup,
+            &mut truncated,
+        )
+        .await
+        {
+            AttachEnd::Exit(code) if code == 0 && stalled => {
+                diag!(
+                    "\rholdfast attach: this view missed what the session printed while it \
+                     was detached; `holdfast logs` has as much of it as the session's buffer \
+                     still holds"
+                );
+                return ExitCode::from(EXIT_TRUNCATED);
+            }
+            AttachEnd::Exit(code) => return ExitCode::from(code),
+            AttachEnd::Stalled => {
+                stalled = true;
+                match hold_after_stall(tty, &mut keys, &mut sigterm, &mut sighup).await {
+                    Held::Reattach => {
+                        match dial_attach(
+                            session,
+                            AttachMode::ReadWrite,
+                            AttachRole::Interactive,
+                            "attach",
+                        )
+                        .await
+                        {
+                            Dialled::Ok(r, w) => (rd, wr) = (r, w),
+                            Dialled::Refused(code) => return ExitCode::from(code),
+                        }
+                    }
+                    Held::Leave => {
+                        render(b"\r\n");
+                        diag!(
+                            "\rholdfast attach: left without reattaching; the session keeps \
+                             running, and `holdfast logs` has its recent output, as far back \
+                             as its buffer reaches"
+                        );
+                        return ExitCode::from(EXIT_TRUNCATED);
+                    }
+                    Held::Signalled(code) => return ExitCode::from(code),
+                }
+            }
+        }
+    }
+}
+
+/// How one attachment of `holdfast attach` ended.
+#[cfg(unix)]
+enum AttachEnd {
+    /// Leave, with this status.
+    Exit(u8),
+    /// The daemon detached this client `slow_consumer` (GH #210): the
+    /// terminal is held and the human asked what to do.
+    Stalled,
+}
+
+/// One attachment of `holdfast attach`, from the handshake the caller
+/// already completed to the ending — separated from [`attach`] so a
+/// stall can end *this* and not the process (GH #210). The terminal, the
+/// keyboard reader and the signal handlers belong to the process and are
+/// lent; the socket and everything learned over it belong to the
+/// attachment and are not carried into the next one.
+#[cfg(unix)]
+#[allow(clippy::too_many_arguments)]
+async fn attach_connected(
+    session: &str,
+    allow_echo: bool,
+    rd: tokio::net::unix::OwnedReadHalf,
+    mut wr: tokio::net::unix::OwnedWriteHalf,
+    tty: std::os::unix::io::RawFd,
+    keys: &mut tokio::sync::mpsc::Receiver<Vec<u8>>,
+    winch: &mut tokio::signal::unix::Signal,
+    sigterm: &mut tokio::signal::unix::Signal,
+    sighup: &mut tokio::signal::unix::Signal,
+    truncated: &mut Truncation,
+) -> AttachEnd {
+    use holdfast_core::attach::{ClientFrame, ServerFrame};
+    use holdfast_core::protocol::frame;
+
+    let mut frames = spawn_frame_reader(rd);
 
     // One at startup, so the session reflows to *this* terminal
     // immediately rather than at the first time the user drags a window.
@@ -1785,17 +2637,6 @@ pub async fn attach(session: &str, allow_echo: bool) -> ExitCode {
     // credential, which is the defect the decline exists to prevent.
     let mut submitted: Option<String> = None;
 
-    // **Whether this view is a complete record of the session** (GH
-    // #200). Set by an `OutputGap` and by nothing else: a
-    // `slow_consumer` ending is the same fact stated as a termination,
-    // but `finish` answers that one directly and returns before it ever
-    // reads this. An earlier version of this comment claimed both, and
-    // claiming both is what hid the fact that the `Gap` arm of
-    // `left_cleanly` was reached by no test at all — every row paired a
-    // gap with a `slow_consumer` ending, so the early return answered
-    // them and the arm could have been deleted green.
-    let mut truncated = Truncation::None;
-
     loop {
         tokio::select! {
             body = frames.recv() => {
@@ -1804,13 +2645,13 @@ pub async fn attach(session: &str, allow_echo: bool) -> ExitCode {
                     // or the socket broke. Distinct from every clean
                     // ending, which returns from inside this match.
                     diag!("holdfast attach: the daemon closed the connection");
-                    return ExitCode::from(EXIT_UNREACHABLE);
+                    return AttachEnd::Exit(EXIT_UNREACHABLE);
                 };
                 let f = match holdfast_core::attach::decode_server_frame(&body) {
                     Ok(f) => f,
                     Err(e) => {
                         diag!("holdfast attach: undecodable frame: {e}");
-                        return ExitCode::from(EXIT_FAILED);
+                        return AttachEnd::Exit(EXIT_FAILED);
                     }
                 };
                 match f {
@@ -1829,16 +2670,79 @@ pub async fn attach(session: &str, allow_echo: bool) -> ExitCode {
                     ServerFrame::SessionExited { code } => {
                         diag!("holdfast attach: the session exited ({code})");
                     }
-                    ServerFrame::Detached { reason } => {
-                        return finish("attach", &reason, truncated);
+                    // **`slow_consumer` is not an ending for `attach`**
+                    // (GH #210). The human is still at this keyboard,
+                    // typing at a session they cannot see, and the two
+                    // things this client could do next both deliver
+                    // those keystrokes somewhere they were not meant for
+                    // — the local shell if it exits, or the session, blind,
+                    // if it reconnects. `attach` holds the terminal
+                    // instead and asks; see `hold_after_stall`.
+                    ServerFrame::Detached { reason } if reason == "slow_consumer" => {
+                        return AttachEnd::Stalled;
                     }
-                    ServerFrame::AwaitingSecret { request_id, prompt_text } => {
-                        // On its own line, so it cannot be mistaken for
-                        // part of whatever the child last drew.
-                        render(b"\r\n");
-                        render(prompt_text.as_bytes());
-                        render(b"\r\n");
-                        secret = Some((request_id, crate::attach_tty::SecretLine::default()));
+                    ServerFrame::Detached { reason } => {
+                        return AttachEnd::Exit(finish("attach", &reason, *truncated));
+                    }
+                    // **The session's screen as it stands** (GH #235),
+                    // painted before the stream resumes where it ends.
+                    // An idle session at its prompt used to render as an
+                    // empty terminal until somebody pressed Enter.
+                    // The notice rides on the picture's top row rather
+                    // than being inserted above the prompt later, which
+                    // over a painted screen pushes the prompt off the
+                    // bottom — see `paint_snapshot`. Taken, so the older
+                    // path below never prints a second one.
+                    ServerFrame::ScreenSnapshot {
+                        lines,
+                        cursor_row,
+                        cursor_col,
+                        alt_screen,
+                        ..
+                    } => {
+                        let size = crate::attach_tty::window_size(tty).ok();
+                        let notice = banner.take().map(|_| attach_notice(session, size));
+                        render(&paint_snapshot(
+                            &lines,
+                            (cursor_row, cursor_col),
+                            size,
+                            notice.as_deref(),
+                            alt_screen,
+                        ));
+                    }
+                    ServerFrame::AwaitingSecret {
+                        request_id,
+                        prompt_text,
+                        raised_by,
+                    } => {
+                        // **A request this client is already answering is
+                        // not a new prompt** (GH #236's review). When the
+                        // agent asks before the child reads, the daemon
+                        // announces the request twice with one id — once
+                        // for the tool call, again on the echo-drop edge
+                        // that finds it outstanding. Treating the second as
+                        // new printed the label again and **emptied the
+                        // line**: a human who had typed `ab` and then `c`
+                        // sent `c`, and the tool reported success. The
+                        // daemon's second frame is not wrong — a client
+                        // that abandoned the first prompt with `Ctrl-C`
+                        // needs it, because the child is only now reading
+                        // — so the rule is here: an id being typed, or one
+                        // already answered and waiting on its close,
+                        // changes nothing.
+                        if secret_prompt_is_new(
+                            secret.as_ref().map(|(id, _)| id.as_str()),
+                            submitted.as_deref(),
+                            &request_id,
+                        ) {
+                            // On its own line and labelled as Holdfast's,
+                            // so it cannot be mistaken for the child
+                            // drawing its prompt a second time (GH #236).
+                            render(
+                                secret_prompt_label(&prompt_text, raised_by.as_deref()).as_bytes(),
+                            );
+                            secret = Some((request_id, crate::attach_tty::SecretLine::default()));
+                        }
                     }
                     ServerFrame::SecretRequestClosed { request_id, outcome } => {
                         // **Two matches, two different clears, and
@@ -1955,7 +2859,7 @@ pub async fn attach(session: &str, allow_echo: bool) -> ExitCode {
                     // Local stdin closed. Leave without killing the
                     // session, exactly as the detach key does.
                     let _ = frame::write_frame(&mut wr, &ClientFrame::Detach).await;
-                    return left_cleanly("attach", truncated);
+                    return AttachEnd::Exit(left_cleanly("attach", *truncated));
                 };
                 // **§6.1's grammar runs first, and it runs during a
                 // secret prompt too.** The order is the whole point: a
@@ -2000,7 +2904,7 @@ pub async fn attach(session: &str, allow_echo: bool) -> ExitCode {
                                 secret = None;
                                 render(b"\r\n");
                                 if sent.is_err() {
-                                    return ExitCode::from(EXIT_UNREACHABLE);
+                                    return AttachEnd::Exit(EXIT_UNREACHABLE);
                                 }
                             }
                             // REQ-SEC-019's abandon, spelled the way the
@@ -2024,14 +2928,14 @@ pub async fn attach(session: &str, allow_echo: bool) -> ExitCode {
                                 diag!("holdfast attach: secret entry abandoned");
                                 let f = ClientFrame::Input { bytes };
                                 if frame::write_frame(&mut wr, &f).await.is_err() {
-                                    return ExitCode::from(EXIT_UNREACHABLE);
+                                    return AttachEnd::Exit(EXIT_UNREACHABLE);
                                 }
                             }
                         },
                         None => {
                             let f = ClientFrame::Input { bytes: forward };
                             if frame::write_frame(&mut wr, &f).await.is_err() {
-                                return ExitCode::from(EXIT_UNREACHABLE);
+                                return AttachEnd::Exit(EXIT_UNREACHABLE);
                             }
                         }
                     }
@@ -2039,7 +2943,7 @@ pub async fn attach(session: &str, allow_echo: bool) -> ExitCode {
                 if detached {
                     let _ = frame::write_frame(&mut wr, &ClientFrame::Detach).await;
                     render(b"\r\n");
-                    return left_cleanly("attach", truncated);
+                    return AttachEnd::Exit(left_cleanly("attach", *truncated));
                 }
             }
             // Returning, not re-raising: the `return` is what runs
@@ -2053,7 +2957,7 @@ pub async fn attach(session: &str, allow_echo: bool) -> ExitCode {
                 let _ = frame::write_frame(&mut wr, &ClientFrame::Detach).await;
                 render(b"\r\n");
                 diag!("holdfast attach: SIGTERM — detaching; the session keeps running");
-                return ExitCode::from(EXIT_SIGTERM);
+                return AttachEnd::Exit(EXIT_SIGTERM);
             }
             _ = sighup.recv() => {
                 // No `render`: `SIGHUP` says this terminal has already
@@ -2062,7 +2966,7 @@ pub async fn attach(session: &str, allow_echo: bool) -> ExitCode {
                 // whoever inherits the fd.
                 let _ = frame::write_frame(&mut wr, &ClientFrame::Detach).await;
                 diag!("holdfast attach: SIGHUP — detaching; the session keeps running");
-                return ExitCode::from(EXIT_SIGHUP);
+                return AttachEnd::Exit(EXIT_SIGHUP);
             }
             // A child that met `SIGWINCH` with silence still gets to
             // tell the operator they are attached.
@@ -2086,9 +2990,111 @@ pub async fn attach(session: &str, allow_echo: bool) -> ExitCode {
                         .await
                         .is_err()
                     {
-                        return ExitCode::from(EXIT_UNREACHABLE);
+                        return AttachEnd::Exit(EXIT_UNREACHABLE);
                     }
                 }
+            }
+        }
+    }
+}
+
+/// What the human chose after a stall — see [`hold_after_stall`].
+#[cfg(unix)]
+enum Held {
+    Reattach,
+    Leave,
+    Signalled(u8),
+}
+
+/// **Hold the terminal after a `slow_consumer` detach, and let the human
+/// say what happens next** (GH #210).
+///
+/// The dogfood pass found the hazard: *"a detach mid-takeover sends the
+/// human's next keystrokes to their local shell"*. `holdfast attach` put
+/// the terminal back and exited, so whatever the human was typing into the
+/// session — a command, an answer to a prompt, a password — went to the
+/// shell they had attached from instead.
+///
+/// **Held, rather than reconnected, and the choice is about keystrokes
+/// in flight.** A client that reconnected by itself would deliver the
+/// same keystrokes to the session instead — typed against a screen the
+/// human has not seen for as long as the client was stalled, at a prompt
+/// that may since have been replaced by another. A client that exits
+/// delivers them to the local shell. Holding is the only one of the
+/// three where nothing typed before the human has seen the current state
+/// reaches either shell; the cost is one keypress, and `Enter` reattaches
+/// with the screen repainted from scratch (GH #235) so the choice to type
+/// again is an informed one.
+///
+/// Typed-ahead is discarded on the way in — both what the terminal had
+/// queued (`tcflush`) and what the reader thread had already read — so a
+/// key pressed before the notice was on screen is not taken as the
+/// answer to it. A key already in flight between the two can still land;
+/// the only keys that act are `Enter` and `Ctrl-B d`, and both are safe
+/// to have pressed by accident — see the loop below for why no letter
+/// does.
+///
+/// **Not done for `session_exit` or `daemon_shutdown`**: there is no
+/// session to go back to, and returning the human to their shell is what
+/// `ssh` and `tmux` do in the same position.
+#[cfg(unix)]
+async fn hold_after_stall(
+    tty: std::os::unix::io::RawFd,
+    keys: &mut tokio::sync::mpsc::Receiver<Vec<u8>>,
+    sigterm: &mut tokio::signal::unix::Signal,
+    sighup: &mut tokio::signal::unix::Signal,
+) -> Held {
+    // SAFETY: `tcflush` takes the fd and a queue selector and touches no
+    // memory of ours; a failure leaves typed-ahead in place, which the
+    // drain below and the narrow key set above both bound.
+    unsafe { libc::tcflush(tty, libc::TCIFLUSH) };
+    while keys.try_recv().is_ok() {}
+
+    // `\r` in front of each line: the terminal is still raw, so the
+    // newline `diag!` appends moves down without returning, and a second
+    // line would start where the first one ended.
+    render(b"\r\n");
+    diag!(
+        "\rholdfast attach: this client stopped reading, so the daemon detached it \
+         (slow_consumer). The session is still running."
+    );
+    diag!(
+        "\rholdfast attach: nothing you type goes anywhere now — press Enter to reattach, \
+         or Ctrl-B d to return to your shell."
+    );
+
+    // **Two keys act, and neither is a letter.** A human who has not read
+    // the notice is typing a command: a letter that reattached would send
+    // the rest of the word into the session, and one that left would
+    // send it into the local shell — the hazard this exists to remove,
+    // one keystroke late. `Enter` reattaches: the line it ends was typed
+    // while held and goes nowhere, and what follows is typed at a freshly
+    // painted screen. `Ctrl-B d` leaves, because it is how an attachment
+    // is left and cannot be typed by accident.
+    let mut detach = crate::attach_tty::DetachKey::default();
+    loop {
+        tokio::select! {
+            chunk = keys.recv() => {
+                let Some(chunk) = chunk else {
+                    return Held::Leave;
+                };
+                let (pressed, detached) = detach.feed(&chunk);
+                if detached {
+                    return Held::Leave;
+                }
+                if pressed.iter().any(|&b| b == b'\r' || b == b'\n') {
+                    diag!("\rholdfast attach: reattaching");
+                    return Held::Reattach;
+                }
+            }
+            _ = sigterm.recv() => {
+                render(b"\r\n");
+                diag!("\rholdfast attach: SIGTERM — leaving; the session keeps running");
+                return Held::Signalled(EXIT_SIGTERM);
+            }
+            _ = sighup.recv() => {
+                diag!("holdfast attach: SIGHUP — leaving; the session keeps running");
+                return Held::Signalled(EXIT_SIGHUP);
             }
         }
     }
@@ -2135,6 +3141,19 @@ pub async fn watch(session: &str) -> ExitCode {
     use holdfast_core::attach::{AttachMode, AttachRole, ServerFrame};
     use holdfast_core::protocol::frame;
 
+    // Its stdout is the one this process exists for, so a reader that
+    // leaves ends it as `cat` would (GH #218) — at once, not at the
+    // session's next output.
+    crate::out::end_when_reader_leaves();
+    // **And every write below goes through `out`, under the name every
+    // arm already uses.** The module's `render` discards write errors,
+    // which is right for `attach` — its stdout is the terminal it holds in
+    // raw mode, and dying there would skip the restore — and was why
+    // `holdfast watch | head` outlived its reader for ever. Shadowing it
+    // here rather than renaming each call keeps a paint added to this loop
+    // on the right side of that line without its author having to know.
+    let render = crate::out::bytes;
+
     let (rd, mut wr) =
         match dial_attach(session, AttachMode::ReadOnly, AttachRole::Observer, "watch").await {
             Dialled::Ok(rd, wr) => (rd, wr),
@@ -2142,6 +3161,14 @@ pub async fn watch(session: &str) -> ExitCode {
         };
 
     let mut frames = spawn_frame_reader(rd);
+    let stdout_is_terminal = std::io::IsTerminal::is_terminal(&std::io::stdout());
+    let stderr_is_terminal = std::io::IsTerminal::is_terminal(&std::io::stderr());
+    // The local geometry, for clipping the opening screen — `TIOCGWINSZ`
+    // on stdout, which is the terminal the screen is painted on.
+    let local_size = || {
+        use std::os::unix::io::AsRawFd;
+        crate::attach_tty::window_size(std::io::stdout().as_raw_fd()).ok()
+    };
 
     // Same coalescing as `attach`, for the same reason (GH #66): a watcher
     // receives a `Resize` per frame of somebody else's window drag, and it
@@ -2156,6 +3183,31 @@ pub async fn watch(session: &str) -> ExitCode {
     // one a human is most likely to be reading as a record of what
     // happened.
     let mut truncated = Truncation::None;
+    // The id of the secret request this watch last said was pending, so
+    // the same request announced twice — a tool call's raise and then the
+    // child's echo drop finding it outstanding — is reported once (GH
+    // #236's review). Not cleared by the close: a request id is never
+    // reused, so the next request is new whatever this holds.
+    let mut noticed_secret: Option<String> = None;
+
+    // **Created once, above the loop** — `attach`'s rule for its signals,
+    // and for the reason that comment gives: tokio's listener marks the
+    // current delivery seen when it is built, so a `ctrl_c()` constructed
+    // afresh on every pass of the loop missed a `SIGINT` that landed while
+    // the body was rendering — the watch's own handler had already replaced
+    // the default action, so nothing at all happened. Measured by the
+    // review of GH #210: 1 run in 10 ignored a `Ctrl-C` sent the moment the
+    // opening screen appeared, and one watch sat for eleven minutes after
+    // an ignored one. The opening screen made the window easy to hit: it is
+    // a synchronous paint of the whole terminal.
+    let mut sigint = match tokio::signal::unix::signal(tokio::signal::unix::SignalKind::interrupt())
+    {
+        Ok(s) => s,
+        Err(e) => {
+            diag!("holdfast watch: cannot watch for Ctrl+C: {e}");
+            return ExitCode::from(EXIT_FAILED);
+        }
+    };
 
     loop {
         tokio::select! {
@@ -2173,6 +3225,41 @@ pub async fn watch(session: &str) -> ExitCode {
                 };
                 match f {
                     ServerFrame::Output { bytes, .. } => render(&bytes),
+                    // **The screen as it stands, then the notice that
+                    // this is a watch** (GH #235). Painted only onto a
+                    // terminal: `holdfast watch s > log` is a capture of
+                    // what the session prints from here on, and a picture
+                    // drawn into it would be bytes the session never
+                    // printed. The notice goes where a human will see it
+                    // — see `watch_banner` — and after the paint, which
+                    // would otherwise clear it.
+                    ServerFrame::ScreenSnapshot {
+                        session: id,
+                        cols,
+                        rows,
+                        lines,
+                        cursor_row,
+                        cursor_col,
+                        alt_screen,
+                        ..
+                    } => {
+                        let size = if stdout_is_terminal {
+                            local_size()
+                        } else {
+                            Some((cols, rows))
+                        };
+                        match watch_banner(&id, size, stdout_is_terminal, stderr_is_terminal) {
+                            Some(WatchBanner::OnScreen(notice)) => render(&paint_snapshot(
+                                &lines,
+                                (cursor_row, cursor_col),
+                                size,
+                                Some(&notice),
+                                alt_screen,
+                            )),
+                            Some(WatchBanner::Sentence(line)) => diag!("{line}"),
+                            None => {}
+                        }
+                    }
                     ServerFrame::OutputGap { bytes, .. } => {
                         truncated.saw_gap(bytes);
                         report_gap("watch", bytes);
@@ -2181,15 +3268,34 @@ pub async fn watch(session: &str) -> ExitCode {
                         diag!("holdfast watch: the session exited ({code})");
                     }
                     ServerFrame::Detached { reason } => {
-                        return finish("watch", &reason, truncated);
+                        return ExitCode::from(finish("watch", &reason, truncated));
                     }
                     // A watcher is told a secret is being asked for and
                     // **cannot answer it**: `SecretInput` is a write
                     // frame, refused `read_only_attach` by §7.5's table.
                     // Reported so the human knows why the session has
-                    // stopped drawing, and nothing more.
-                    ServerFrame::AwaitingSecret { .. } => {
-                        diag!("holdfast watch: the session is waiting for a secret");
+                    // stopped drawing — and, since GH #236, whose words
+                    // the description is, for `attach`'s reason.
+                    ServerFrame::AwaitingSecret {
+                        request_id,
+                        prompt_text,
+                        raised_by,
+                    } => {
+                        if noticed_secret.as_deref() == Some(request_id.as_str()) {
+                            continue;
+                        }
+                        noticed_secret = Some(request_id);
+                        match raised_by.as_deref() {
+                            Some("tool_call") if !prompt_text.trim().is_empty() => diag!(
+                                "holdfast watch: the agent asked for a secret (“{}”); only an \
+                                 attached client can answer it",
+                                prompt_text.trim()
+                            ),
+                            _ => diag!(
+                                "holdfast watch: the session is waiting for a secret; only an \
+                                 attached client can answer it"
+                            ),
+                        }
                     }
                     ServerFrame::SecretRequestClosed { .. } => {}
                     // A watcher is told an approval is pending and
@@ -2232,17 +3338,13 @@ pub async fn watch(session: &str) -> ExitCode {
                     diag!("holdfast watch: the session is now {cols}x{rows}");
                 }
             }
-            r = tokio::signal::ctrl_c() => {
-                if let Err(e) = r {
-                    diag!("holdfast watch: cannot watch for Ctrl+C: {e}");
-                    return ExitCode::from(EXIT_FAILED);
-                }
+            _ = sigint.recv() => {
                 // `Detach` and **not** the `0x03` byte. Forwarding it as
                 // `Input` is the tempting reading of "Ctrl+C detaches",
                 // and it is a write frame: §7.5 would refuse it
                 // `read_only_attach` and the client would sit there.
                 let _ = frame::write_frame(&mut wr, &WatchOut::Detach.frame()).await;
-                return left_cleanly("watch", truncated);
+                return ExitCode::from(left_cleanly("watch", truncated));
             }
         }
     }
@@ -2329,7 +3431,7 @@ pub async fn daemon_stop(_force: bool) -> ExitCode {
          Sessions live inside `holdfast mcp` and end with it. Use WSL for a \
          daemon that outlives the client."
     );
-    println!("no daemon running");
+    crate::out::line("no daemon running");
     ExitCode::SUCCESS
 }
 
@@ -2364,14 +3466,14 @@ pub async fn daemon_status(as_json: bool) -> ExitCode {
         // `supported` and `reason` are additive, and are what distinguish a
         // daemon that is down from a platform that has none: only the first
         // is worth retrying or starting.
-        println!(
-            "{}",
-            serde_json::json!({
+        crate::out::line(
+            &serde_json::json!({
                 "running": false,
                 "supported": false,
                 "reason": "no daemon on Windows native (§3.6); sessions live \
                            inside `holdfast mcp` and end with it",
             })
+            .to_string(),
         );
     }
     unsupported("daemon status", Remedy::Wsl)
@@ -2494,7 +3596,7 @@ pub async fn pty_worker(args: &[String]) -> ExitCode {
     use holdfast_core::pty::worker::child::{self, Argv};
     match child::parse_argv(args) {
         Argv::Help => {
-            print!("{PTY_WORKER_USAGE}");
+            crate::out::text(PTY_WORKER_USAGE);
             ExitCode::SUCCESS
         }
         Argv::Usage(why) => {
@@ -2532,15 +3634,21 @@ pub async fn pty_worker(_args: &[String]) -> ExitCode {
     ExitCode::from(EXIT_USAGE)
 }
 
-/// `holdfast version`
+/// `holdfast version`, and `holdfast --version`/`-V`.
+///
+/// The build is `handshake::build_id()` — the same function the daemon
+/// answers the control handshake with — so this binary and a daemon
+/// started from it cannot describe one build two ways. It said `unknown`
+/// on every build outside the release pipeline until `holdfast-core`'s
+/// `build.rs` derived it (GH #178).
 pub fn version() -> ExitCode {
-    println!(
+    crate::out::line(&format!(
         "holdfast {} (build {}) protocol {}.{}",
         env!("CARGO_PKG_VERSION"),
         holdfast_core::protocol::handshake::build_id(),
         holdfast_core::protocol::PROTOCOL_MAJOR,
         holdfast_core::protocol::PROTOCOL_MINOR,
-    );
+    ));
     ExitCode::SUCCESS
 }
 
@@ -2728,7 +3836,8 @@ mod tests {
                     if frame::write_frame(&mut stream, &resp).await.is_err() {
                         return;
                     }
-                    // Read the `daemon/stop` and never answer it. The
+                    // Read the next request — `daemon/status`, which the
+                    // stop asks first — and never answer it. The
                     // stream is held for the life of this task: letting
                     // it drop would EOF the client's read, the call would
                     // return an error on its own, and the row would be
@@ -2764,7 +3873,12 @@ mod tests {
 
         let code = tokio::time::timeout(
             Duration::from_secs(20),
-            daemon_stop_within(false, Some(paths.clone()), Duration::from_millis(200)),
+            daemon_stop_within(
+                false,
+                Some(paths.clone()),
+                Duration::from_millis(200),
+                DAEMON_EXIT_TIMEOUT,
+            ),
         )
         .await
         .expect(
@@ -2788,20 +3902,261 @@ mod tests {
 
         let code = tokio::time::timeout(
             Duration::from_secs(20),
-            daemon_stop_within(false, Some(paths.clone()), Duration::from_millis(200)),
+            daemon_stop_within(
+                false,
+                Some(paths.clone()),
+                Duration::from_millis(200),
+                DAEMON_EXIT_TIMEOUT,
+            ),
         )
         .await
         .expect("nothing to connect to must not wait for anything");
         assert_eq!(code, 0, "§3.2 makes `daemon stop` idempotent");
     }
 
+    /// A control socket that completes the handshake and answers every
+    /// other request with `answer(method, params)`, as `ok` data — or
+    /// never answers it, for `None`. Bound before it returns, for the
+    /// reason `wedged_daemon` gives.
+    fn fake_daemon(
+        paths: &RuntimePaths,
+        answer: impl Fn(&str, &Value) -> Option<Value> + Send + Sync + 'static,
+    ) -> tokio::task::JoinHandle<()> {
+        let listener = tokio::net::UnixListener::bind(paths.control_sock()).unwrap();
+        let answer = Arc::new(answer);
+        tokio::spawn(async move {
+            loop {
+                let Ok((mut stream, _)) = listener.accept().await else {
+                    return;
+                };
+                let answer = Arc::clone(&answer);
+                tokio::spawn(async move {
+                    while let Ok(req) = frame::read_frame::<_, Request>(&mut stream).await {
+                        let resp = if req.method == method::METHOD_HANDSHAKE {
+                            Response::ok(
+                                req.id,
+                                &HandshakeData {
+                                    protocol_major: handshake::PROTOCOL_MAJOR,
+                                    protocol_minor: handshake::PROTOCOL_MINOR,
+                                    daemon_version: "fake".into(),
+                                    build: "fake".into(),
+                                    accepted: true,
+                                    reject_reason: None,
+                                },
+                                "handshake accepted",
+                            )
+                        } else {
+                            let params: Value =
+                                method::from_cbor(&req.params).unwrap_or(Value::Null);
+                            match answer(&req.method, &params) {
+                                Some(data) => Response::ok(req.id, &data, "ok"),
+                                None => {
+                                    std::future::pending::<()>().await;
+                                    return;
+                                }
+                            }
+                        };
+                        if frame::write_frame(&mut stream, &resp.unwrap())
+                            .await
+                            .is_err()
+                        {
+                            return;
+                        }
+                    }
+                });
+            }
+        })
+    }
+
+    /// A daemon that answers `daemon/status` with `pid` and `daemon/stop`
+    /// at once — a real daemon's shape, whose process outlives its answer
+    /// by however long its teardown takes. `pid` is a process the test
+    /// controls and stands in for that process.
+    fn answering_daemon(paths: &RuntimePaths, pid: u32) -> tokio::task::JoinHandle<()> {
+        fake_daemon(paths, move |m, _| match m {
+            method::METHOD_DAEMON_STATUS => Some(json!({
+                "pid": pid,
+                "uptime_secs": 1,
+                "version": "fake",
+                "sessions_live": 0,
+                "sessions_exited_retained": 0,
+                "attach_clients": 0,
+                "bridge_sessions": 0,
+            })),
+            method::METHOD_DAEMON_STOP => Some(json!({
+                "stopped_at_unix_secs": 0,
+                "sessions_terminated": 0,
+            })),
+            _ => None,
+        })
+    }
+
+    /// A child of this test that exits after `secs`, reaped by a thread
+    /// the moment it does — so "gone" means gone, and no zombie of the
+    /// test's own making stands in for a daemon that has not exited.
+    fn short_lived(secs: &str) -> (u32, std::thread::JoinHandle<()>) {
+        let mut child = std::process::Command::new("sleep")
+            .arg(secs)
+            .spawn()
+            .expect("spawn sleep");
+        let pid = child.id();
+        let reaper = std::thread::spawn(move || {
+            let _ = child.wait();
+        });
+        (pid, reaper)
+    }
+
+    /// **GH #20: `daemon stop` returned on the answer, not on the exit.**
+    /// The daemon answers `daemon/stop` before its own teardown — which
+    /// takes `bind.lock`, runs `ensure_dir`, removes its sockets and pid
+    /// file — so `daemon stop && rm -rf "$HOLDFAST_RUNTIME_DIR"` raced it
+    /// and the directory came back. The stand-in process here outlives the
+    /// answer by a second; the stop must not return before it is gone.
+    ///
+    /// Both paths: `--force` answered by a daemon that could still answer
+    /// has nothing to escalate against, and returns on the same exit.
+    #[tokio::test]
+    async fn a_stop_returns_only_once_the_daemon_process_is_gone() {
+        for force in [false, true] {
+            let paths = scratch("waitexit");
+            let _scoped = Scoped(paths.clone());
+            paths.ensure_dir().unwrap();
+            let (pid, reaper) = short_lived("1");
+            let daemon = answering_daemon(&paths, pid);
+
+            let code = tokio::time::timeout(
+                Duration::from_secs(20),
+                daemon_stop_within(
+                    force,
+                    Some(paths.clone()),
+                    STOP_RPC_TIMEOUT,
+                    DAEMON_EXIT_TIMEOUT,
+                ),
+            )
+            .await
+            .expect("the stop is bounded");
+            assert_eq!(
+                code, 0,
+                "force {force}: an answered stop whose daemon exits is success"
+            );
+            assert!(
+                process_is_gone(pid),
+                "force {force}: `daemon stop` returned while the daemon's process \
+                 (pid {pid}) was still running"
+            );
+            daemon.abort();
+            reaper.join().unwrap();
+        }
+    }
+
+    /// The bound on that wait, and its verdict: a daemon that answered
+    /// and never exited is §18.8's "couldn't stop", not a success and not
+    /// a hang.
+    #[tokio::test]
+    async fn a_daemon_that_answers_and_never_exits_is_reported_within_the_bound() {
+        let paths = scratch("noexit");
+        let _scoped = Scoped(paths.clone());
+        paths.ensure_dir().unwrap();
+        let lingering = Reaped(
+            std::process::Command::new("sleep")
+                .arg("60")
+                .spawn()
+                .expect("spawn sleep"),
+        );
+        let daemon = answering_daemon(&paths, lingering.0.id());
+
+        let code = tokio::time::timeout(
+            Duration::from_secs(20),
+            daemon_stop_within(
+                false,
+                Some(paths.clone()),
+                STOP_RPC_TIMEOUT,
+                Duration::from_millis(300),
+            ),
+        )
+        .await
+        .expect("the wait for the exit is bounded");
+        assert_eq!(code, EXIT_FAILED);
+        assert!(
+            !process_is_gone(lingering.0.id()),
+            "the control: it really was alive"
+        );
+        daemon.abort();
+    }
+
+    /// `process_is_gone` in both directions, and on the case signal 0
+    /// gets wrong: an unreaped child is a zombie, which `kill(pid, 0)`
+    /// reports as alive.
+    #[test]
+    fn a_zombie_is_gone_and_a_live_process_is_not() {
+        let mut child = Reaped(
+            std::process::Command::new("sleep")
+                .arg("60")
+                .spawn()
+                .expect("spawn sleep"),
+        );
+        let pid = child.0.id();
+        assert!(!process_is_gone(pid), "a sleeping child is alive");
+        child.0.kill().unwrap();
+        if std::path::Path::new("/proc/self/stat").exists() {
+            // Not yet reaped: a zombie. Wait for the kill to land.
+            let deadline = std::time::Instant::now() + Duration::from_secs(5);
+            while !process_is_gone(pid) && std::time::Instant::now() < deadline {
+                std::thread::sleep(Duration::from_millis(10));
+            }
+            assert!(
+                process_is_gone(pid),
+                "an unreaped, killed child is a zombie and gone"
+            );
+        }
+        child.0.wait().unwrap();
+        assert!(process_is_gone(pid), "a reaped child is gone");
+    }
+
+    /// **A pid another user owns is not our daemon**, so a stop waiting on
+    /// ours is done. The daemon shares this CLI's uid — `is_authorized`
+    /// refuses every other — so `EPERM` from signal 0 means its pid was
+    /// reused by someone else's process. It used to read as alive, and a
+    /// stop waited out its whole bound on a stranger and then exited 1.
+    ///
+    /// Pid 1 stands in for the stranger: root's, wherever this runs as
+    /// anyone else, which CI does.
+    #[test]
+    fn a_pid_another_user_owns_is_gone_for_our_purposes() {
+        // SAFETY: signal 0 sends nothing and takes no pointers.
+        let refused = unsafe { libc::kill(1, 0) } != 0
+            && std::io::Error::last_os_error().raw_os_error() == Some(libc::EPERM);
+        if !refused {
+            println!(
+                "skipping: EPERM from signal 0 — this runs as pid 1's owner, so nothing refuses it"
+            );
+            return;
+        }
+        assert!(
+            process_is_gone(1),
+            "`EPERM` means the pid is another user's, so our daemon is not it"
+        );
+    }
+
+    /// A child that is killed and reaped when the row ends, pass or fail,
+    /// so a failing row does not leave a `sleep 60` behind it — which
+    /// nextest reports as a leak and a later row could trip over.
+    struct Reaped(std::process::Child);
+    impl Drop for Reaped {
+        fn drop(&mut self) {
+            let _ = self.0.kill();
+            let _ = self.0.wait();
+        }
+    }
+
     /// The bound the shipped command really passes must leave room for
     /// the grace the *daemon* takes before it answers.
     ///
     /// `shutdown_graceful` SIGTERMs every live session, waits
-    /// `DEFAULT_STOP_GRACE_SECS`, and only then SIGKILLs and replies. An
-    /// interactive shell ignores SIGTERM (§4.4) and therefore always
-    /// reaches that escalation, so the full grace is the **ordinary**
+    /// `DEFAULT_STOP_GRACE_SECS`, and only then SIGKILLs and replies.
+    /// Anything that ignores SIGTERM reaches that escalation — a shell with
+    /// such a job, or any interactive shell where GH #234's hang-up cannot
+    /// enumerate the session — so the full grace is an **ordinary**
     /// duration of this call. Reusing `FORCE_RPC_TIMEOUT` here — the
     /// obvious reading of "bound it like the force path" — would report
     /// failure on every stop that had a shell to kill, while the daemon
@@ -2819,6 +4174,248 @@ mod tests {
         );
         // And it is a bound rather than an absence of one.
         assert!(STOP_RPC_TIMEOUT <= grace * 3);
+    }
+
+    /// A `holdfast logs` reader connected to `paths`' fake daemon.
+    async fn log_reader(paths: &RuntimePaths) -> LogReader<'static> {
+        let client = ControlClient::connect(&paths.control_sock(), ClientKind::Cli)
+            .await
+            .expect("connect to the fake daemon");
+        LogReader {
+            client,
+            session: "fake",
+            raw: false,
+        }
+    }
+
+    /// One `read_output` page covering `[start, end)`, labelled with its
+    /// start so the test can see which pages were printed — and empty
+    /// when it is, as a real page that returned nothing is.
+    fn page(start: u64, end: u64, next: Option<u64>, held: bool) -> Value {
+        held_page(
+            start,
+            end,
+            next,
+            held.then_some(HeldBackCause::InFlightSecret),
+        )
+    }
+
+    /// [`page`], held back for `cause` when there is one.
+    fn held_page(start: u64, end: u64, next: Option<u64>, cause: Option<HeldBackCause>) -> Value {
+        json!({
+            "output": if end > start { format!("[{start}]") } else { String::new() },
+            "cursor": end,
+            "bytes_returned": end - start,
+            "truncated_for_size": next.is_some() && cause.is_none(),
+            "held_back": cause.is_some(),
+            "held_back_cause": cause.map(HeldBackCause::as_str),
+            "next_cursor": next,
+            "state": "Running",
+        })
+    }
+
+    fn since(params: &Value) -> u64 {
+        params["since_cursor"].as_u64().expect("a cursor read")
+    }
+
+    /// **GH #232's loop has to end.** A session printing faster than the
+    /// CLI reads never lets `next_cursor` come back `null`, so a drain
+    /// that followed it alone would not return — `holdfast logs` on a busy
+    /// build would hang. It stops at the head `status` reported when it
+    /// began. The fake's head never stops moving.
+    #[tokio::test]
+    async fn a_drain_stops_at_the_head_it_started_with_however_fast_the_session_prints() {
+        let paths = scratch("drainhead");
+        let _scoped = Scoped(paths.clone());
+        paths.ensure_dir().unwrap();
+        let daemon = fake_daemon(&paths, |m, p| match m {
+            "tool/status" => Some(json!({ "buffer": { "head": 5000, "tail": 1000 } })),
+            "tool/read_output" => {
+                let c = since(p);
+                Some(page(c, c + 1000, Some(c + 1000), false))
+            }
+            _ => None,
+        });
+        let r = log_reader(&paths).await;
+        let mut printed = String::new();
+        let seen =
+            tokio::time::timeout(Duration::from_secs(10), drain(&r, |s| printed.push_str(s)))
+                .await
+                .expect("a drain chasing a moving head never returned")
+                .unwrap_or_else(|_| panic!("the drain failed"));
+        assert_eq!(printed, "[1000][2000][3000][4000]");
+        // From the ring's tail, not from 0 — and what is below it is said
+        // to be gone rather than asked for.
+        assert_eq!(seen.gone_before, 1000);
+        assert_eq!(seen.gone_during, 0);
+        assert!(seen.held.is_none());
+        daemon.abort();
+    }
+
+    /// A holdback that makes no progress ends the drain, and the page
+    /// that said so is kept for the note. It is §4.1's partial secret at
+    /// the tail: the boundary moves only with `buffer.head`, so the read
+    /// that reaches it returns nothing, and so would every read after it.
+    /// The page *before* it was held back too, and made progress, which
+    /// is not a reason to stop — see the next row.
+    #[tokio::test]
+    async fn a_drain_stops_at_a_holdback_that_makes_no_progress_and_keeps_that_page() {
+        let paths = scratch("drainheld");
+        let _scoped = Scoped(paths.clone());
+        paths.ensure_dir().unwrap();
+        let reads = Arc::new(AtomicU32::new(0));
+        let counted = Arc::clone(&reads);
+        let secret = Some(HeldBackCause::InFlightSecret);
+        let daemon = fake_daemon(&paths, move |m, p| match m {
+            "tool/status" => Some(json!({ "buffer": { "head": 10_000, "tail": 0 } })),
+            "tool/read_output" => {
+                counted.fetch_add(1, Ordering::SeqCst);
+                Some(match since(p) {
+                    0 => page(0, 4000, Some(4000), false),
+                    4000 => held_page(4000, 6000, Some(6000), secret),
+                    6000 => held_page(6000, 6000, Some(6000), secret),
+                    c => page(c, c + 1, Some(c + 1), false),
+                })
+            }
+            _ => None,
+        });
+        let r = log_reader(&paths).await;
+        let mut printed = String::new();
+        let seen = drain(&r, |s| printed.push_str(s))
+            .await
+            .unwrap_or_else(|_| panic!("the drain failed"));
+        assert_eq!(printed, "[0][4000]");
+        assert_eq!(
+            reads.load(Ordering::SeqCst),
+            3,
+            "it asked again after a holdback that made no progress"
+        );
+        let held = seen.held.expect("the holdback page is kept");
+        assert_eq!(held["held_back_cause"], "in_flight_secret");
+        assert_eq!(
+            held["bytes_returned"], 0,
+            "the page kept is the one that stopped it"
+        );
+        daemon.abort();
+    }
+
+    /// **A holdback that made progress is read past** — the review of GH
+    /// #232's first fix. REQ-O-008 withholds an escape sequence cut by the
+    /// page's own end, `since_cursor + max_bytes`, wherever that falls, so
+    /// a page of coloured output comes back `held_back`,
+    /// `incomplete_escape`, with most of the buffer still behind it. The
+    /// drain took that for the end and stopped a third of the way into a
+    /// `grep --color` log, at the same byte on every retry. The fake
+    /// cuts two pages that way, so reading past one is not enough.
+    #[tokio::test]
+    async fn a_drain_reads_past_a_holdback_that_made_progress() {
+        let paths = scratch("drainansi");
+        let _scoped = Scoped(paths.clone());
+        paths.ensure_dir().unwrap();
+        let escape = Some(HeldBackCause::IncompleteEscape);
+        let daemon = fake_daemon(&paths, move |m, p| match m {
+            "tool/status" => Some(json!({ "buffer": { "head": 10_000, "tail": 0 } })),
+            "tool/read_output" => Some(match since(p) {
+                0 => held_page(0, 3997, Some(3997), escape),
+                3997 => held_page(3997, 7995, Some(7995), escape),
+                c => page(c, 10_000, None, false),
+            }),
+            _ => None,
+        });
+        let r = log_reader(&paths).await;
+        let mut printed = String::new();
+        let seen = drain(&r, |s| printed.push_str(s))
+            .await
+            .unwrap_or_else(|_| panic!("the drain failed"));
+        assert_eq!(printed, "[0][3997][7995]");
+        assert!(
+            seen.held.is_none(),
+            "a holdback the drain read past withheld nothing, and the note would say it did"
+        );
+        daemon.abort();
+    }
+
+    /// Bytes that left the ring between two pages are counted, not
+    /// silently skipped: the second page began later than it was asked to.
+    #[tokio::test]
+    async fn a_drain_counts_the_bytes_that_left_the_ring_while_it_read() {
+        let paths = scratch("draingone");
+        let _scoped = Scoped(paths.clone());
+        paths.ensure_dir().unwrap();
+        let daemon = fake_daemon(&paths, |m, p| match m {
+            "tool/status" => Some(json!({ "buffer": { "head": 3000, "tail": 0 } })),
+            "tool/read_output" => Some(match since(p) {
+                0 => page(0, 1000, Some(1000), false),
+                // Asked for 1000; the ring had moved on to 1500.
+                1000 => page(1500, 2500, Some(2500), false),
+                c => page(c, 3000, None, false),
+            }),
+            _ => None,
+        });
+        let r = log_reader(&paths).await;
+        let mut printed = String::new();
+        let seen = drain(&r, |s| printed.push_str(s))
+            .await
+            .unwrap_or_else(|_| panic!("the drain failed"));
+        assert_eq!(printed, "[0][1500][2500]");
+        assert_eq!(seen.gone_during, 500);
+        assert_eq!(seen.gone_before, 0);
+        daemon.abort();
+    }
+
+    /// A daemon that hands back the cursor it was given is refused with a
+    /// failure, not asked again for ever.
+    #[tokio::test]
+    async fn a_drain_refuses_a_daemon_that_makes_no_progress() {
+        let paths = scratch("drainstuck");
+        let _scoped = Scoped(paths.clone());
+        paths.ensure_dir().unwrap();
+        let daemon = fake_daemon(&paths, |m, p| match m {
+            "tool/status" => Some(json!({ "buffer": { "head": 3000, "tail": 0 } })),
+            "tool/read_output" => {
+                let c = since(p);
+                Some(page(c, c, Some(c), false))
+            }
+            _ => None,
+        });
+        let r = log_reader(&paths).await;
+        let outcome = tokio::time::timeout(Duration::from_secs(10), drain(&r, |_| {}))
+            .await
+            .expect("a drain that makes no progress must not spin");
+        assert!(outcome.is_err(), "no progress is a failure");
+        daemon.abort();
+    }
+
+    /// `--tail`'s fallback keeps the last N lines itself, so it has to
+    /// count them exactly as the daemon's `tail_lines` does — or one flag
+    /// means two things depending on how long the lines are. Checked
+    /// against `OutputBuffer::tail_lines_start` itself, over the edges its
+    /// own comments name: a leading newline, a trailing one, blank lines,
+    /// fewer lines than asked for, and nothing at all.
+    #[test]
+    fn the_tail_fallback_counts_lines_the_way_the_daemon_does() {
+        let texts = [
+            "",
+            "\n",
+            "\n\n",
+            "a",
+            "a\n",
+            "a\nb",
+            "a\nb\n",
+            "\na\nb\n",
+            "a\n\n\nb\n",
+            "a\nb\nc\n\n",
+            "é\nü\n",
+            "x\r\ny\r\n",
+        ];
+        for text in texts {
+            let mut buf = holdfast_core::buffer::OutputBuffer::new(1024);
+            buf.push(text.as_bytes());
+            for n in 0..6 {
+                let start = buf.tail_lines_start(n) as usize;
+                assert_eq!(last_lines(text, n), &text[start..], "{text:?}, n = {n}");
+            }
+        }
     }
 
     /// **`held_back_note` had no test at all, and the sentence it
@@ -2938,5 +4535,377 @@ mod tests {
         for cause in Hb::ALL {
             assert_eq!(Hb::from_wire(cause.as_str()), Some(*cause));
         }
+    }
+
+    // ------------------------------------ GH #235: painting the opening screen
+
+    fn grid(rows: &[&str], total: usize) -> Vec<String> {
+        let mut v: Vec<String> = rows.iter().map(|r| r.to_string()).collect();
+        v.resize(total, String::new());
+        v
+    }
+
+    /// **The picture lands where it was, and the cursor where the child
+    /// left it** — through a real emulator, over a terminal full of
+    /// something else, because a byte-stream assertion cannot see a row
+    /// land in the wrong place (GH #235).
+    #[test]
+    fn the_opening_screen_replaces_what_was_there_and_puts_the_cursor_back() {
+        let mut p = vt100::Parser::new(24, 80, 0);
+        p.process(b"the human's own shell history\r\nmore of it\r\n$ ");
+        let lines = grid(&["build output", "user@box $ "], 24);
+        p.process(&paint_snapshot(
+            &lines,
+            (1, 11),
+            Some((80, 24)),
+            None,
+            false,
+        ));
+
+        assert_eq!(row(&p, 0).trim_end(), "build output");
+        assert_eq!(row(&p, 1).trim_end(), "user@box $");
+        assert!(
+            !p.screen().contents().contains("shell history"),
+            "the terminal's previous contents survived the paint:\n{}",
+            p.screen().contents()
+        );
+        assert_eq!(
+            p.screen().cursor_position(),
+            (1, 11),
+            "the child's next write must land after its prompt"
+        );
+        assert!(!p.screen().hide_cursor());
+    }
+
+    /// **A terminal shorter than the session shows the rows around the
+    /// cursor, not the top of the grid** — otherwise a 40-row session's
+    /// prompt at row 35 is painted below a 24-row terminal's last line.
+    /// And rows wider than the terminal are cut to it, in display columns.
+    #[test]
+    fn a_smaller_terminal_keeps_the_cursors_rows_and_clips_their_width() {
+        // Text on every row down to the prompt's, and nothing below it —
+        // a session that has scrolled its prompt near the bottom.
+        let mut rows: Vec<String> = (0..40)
+            .map(|i| {
+                if i < 35 {
+                    format!("row {i:02}")
+                } else {
+                    String::new()
+                }
+            })
+            .collect();
+        rows[35] = format!("{}PROMPT$ ", "端".repeat(50));
+        let mut p = vt100::Parser::new(24, 80, 0);
+        p.process(&paint_snapshot(
+            &rows,
+            (35, 108),
+            Some((80, 24)),
+            None,
+            false,
+        ));
+        let bottom = row(&p, 23);
+        assert!(
+            bottom.starts_with('端'),
+            "the cursor's row should be the last one painted: {bottom:?}"
+        );
+        assert!(
+            !p.screen().contents().contains("row 00"),
+            "rows far above the cursor were painted instead of the ones around it"
+        );
+        assert_eq!(
+            p.screen().cursor_position().0,
+            23,
+            "the cursor must be on the prompt's row in the window"
+        );
+        assert!(
+            p.screen().cursor_position().1 < 80,
+            "the cursor was put past the terminal's last column"
+        );
+    }
+
+    /// **The picture changes no terminal mode**, whatever the child's
+    /// are: a pass-through that entered the alternate screen or hid the
+    /// cursor at the join would leave both behind on `Ctrl-B d`, and the
+    /// human back at their shell inside a screen with no scrollback, or
+    /// with no cursor.
+    #[test]
+    fn the_picture_changes_no_terminal_mode() {
+        let lines = grid(&["vim"], 24);
+        let mut p = vt100::Parser::new(24, 80, 0);
+        p.process(&paint_snapshot(&lines, (0, 0), Some((80, 24)), None, false));
+        assert!(
+            !p.screen().alternate_screen(),
+            "the join entered the alternate screen"
+        );
+        assert!(!p.screen().hide_cursor(), "the join hid the human's cursor");
+        assert_eq!(row(&p, 0).trim_end(), "vim");
+    }
+
+    /// **The join notice takes the top row, and the prompt stays on
+    /// screen** (GH #235) — the case that made the older notice wrong over
+    /// a painted screen: a session whose prompt is on its last row, joined
+    /// from a terminal of the same size. Inserted above the prompt, the
+    /// notice pushed the prompt off the bottom; on the top row it costs the
+    /// session's first row instead, which is the one furthest from where
+    /// the human is looking.
+    #[test]
+    fn the_join_notice_takes_the_top_row_and_the_prompt_stays_on_screen() {
+        let mut lines: Vec<String> = (0..24).map(|i| format!("output {i:02}")).collect();
+        lines[23] = "user@box $ ".into();
+        let mut p = vt100::Parser::new(24, 80, 0);
+        p.process(&paint_snapshot(
+            &lines,
+            (23, 11),
+            Some((80, 24)),
+            Some(" holdfast: attached to sess (80x24) — Ctrl-B d to detach "),
+            false,
+        ));
+        assert!(row(&p, 0).contains("attached to sess"), "{:?}", row(&p, 0));
+        assert_eq!(
+            row(&p, 23).trim_end(),
+            "user@box $",
+            "the prompt was pushed off the screen by the notice"
+        );
+        assert_eq!(
+            row(&p, 1).trim_end(),
+            "output 01",
+            "the rows below the notice shifted"
+        );
+        assert_eq!(
+            p.screen().cursor_position(),
+            (23, 11),
+            "the child's next write must land after its prompt"
+        );
+
+        // And `watch`'s words ride the same row.
+        let Some(WatchBanner::OnScreen(notice)) = watch_banner("sess", Some((80, 24)), true, true)
+        else {
+            panic!("a terminal stdout gets an on-screen notice");
+        };
+        let mut p = vt100::Parser::new(24, 80, 0);
+        p.process(&paint_snapshot(
+            &lines,
+            (23, 11),
+            Some((80, 24)),
+            Some(&notice),
+            false,
+        ));
+        assert!(row(&p, 0).contains("watching sess"), "{:?}", row(&p, 0));
+        assert_eq!(row(&p, 23).trim_end(), "user@box $");
+    }
+
+    /// **A shell whose screen fits below the notice keeps every row**, one
+    /// row down (GH #235's review). A freshly started shell has its prompt
+    /// on the top row; a notice laid over that row would hide the one line
+    /// the human attached to see. A shell moves its cursor relative to
+    /// where it is, so drawing the picture a row lower costs it nothing —
+    /// which is why only a full-screen program's picture is held in place.
+    #[test]
+    fn a_shell_that_fits_below_the_notice_is_drawn_whole_one_row_down() {
+        let lines = grid(&["last login: today", "user@box $ "], 24);
+        let mut p = vt100::Parser::new(24, 80, 0);
+        p.process(&paint_snapshot(
+            &lines,
+            (1, 11),
+            Some((80, 24)),
+            Some(" holdfast: attached to sess (80x24) — Ctrl-B d to detach "),
+            false,
+        ));
+        assert!(row(&p, 0).contains("attached to sess"), "{:?}", row(&p, 0));
+        assert_eq!(
+            row(&p, 1).trim_end(),
+            "last login: today",
+            "the shell's first row was hidden under the notice"
+        );
+        assert_eq!(row(&p, 2).trim_end(), "user@box $");
+        assert_eq!(
+            p.screen().cursor_position(),
+            (2, 11),
+            "the cursor must follow its prompt down"
+        );
+    }
+
+    /// **A full-screen program's rows stay on their own rows under the
+    /// notice** (GH #235's review). `vim` joined from a terminal of its own
+    /// size, its command line blank: shifting the picture down one row for
+    /// the notice — right for a shell, which moves relative to its cursor —
+    /// put every line a row below where `vim`'s next absolute cursor move
+    /// lands, so each edit after the join was drawn on the wrong line. So
+    /// on the alternate screen nothing moves: the notice lies on the blank
+    /// last row, or over the top row when the last one is in use.
+    #[test]
+    fn a_full_screen_programs_rows_stay_where_it_addresses_them() {
+        let notice = " holdfast: attached to sess (80x10) — Ctrl-B d to detach ";
+        // Text on rows 0..=8, the command line (row 9) blank, the cursor
+        // in the middle of the file.
+        let mut lines: Vec<String> = (0..9).map(|i| format!("line {i}")).collect();
+        lines[8] = "\"notes.txt\" 8L, 64B".into();
+        lines.push(String::new());
+        let mut p = vt100::Parser::new(10, 80, 0);
+        p.process(&paint_snapshot(
+            &lines,
+            (3, 2),
+            Some((80, 10)),
+            Some(notice),
+            true,
+        ));
+        for (r, want) in lines.iter().enumerate().take(9) {
+            assert_eq!(
+                row(&p, r as u16).trim_end(),
+                want,
+                "session row {r} was not painted on terminal row {r}:\n{}",
+                p.screen().contents()
+            );
+        }
+        assert!(row(&p, 9).contains("attached to sess"), "{:?}", row(&p, 9));
+        assert_eq!(
+            p.screen().cursor_position(),
+            (3, 2),
+            "the cursor must be where the program's next absolute move expects it"
+        );
+
+        // The last row in use (`-- INSERT --`): the notice lies over the
+        // top row, and still nothing moves.
+        lines[9] = "-- INSERT --".into();
+        let mut p = vt100::Parser::new(10, 80, 0);
+        p.process(&paint_snapshot(
+            &lines,
+            (3, 2),
+            Some((80, 10)),
+            Some(notice),
+            true,
+        ));
+        assert!(row(&p, 0).contains("attached to sess"), "{:?}", row(&p, 0));
+        for (r, want) in lines.iter().enumerate().skip(1) {
+            assert_eq!(row(&p, r as u16).trim_end(), want, "session row {r} moved");
+        }
+        assert_eq!(p.screen().cursor_position(), (3, 2));
+
+        // The last row blank but the cursor on it — a command line being
+        // opened: the program is about to write there, so the notice takes
+        // the top row rather than sitting under the cursor.
+        lines[9] = String::new();
+        let mut p = vt100::Parser::new(10, 80, 0);
+        p.process(&paint_snapshot(
+            &lines,
+            (9, 0),
+            Some((80, 10)),
+            Some(notice),
+            true,
+        ));
+        assert!(row(&p, 0).contains("attached to sess"), "{:?}", row(&p, 0));
+        assert!(
+            !row(&p, 9).contains("attached"),
+            "the notice was drawn on the row the cursor is on: {:?}",
+            row(&p, 9)
+        );
+        assert_eq!(p.screen().cursor_position(), (9, 0));
+    }
+
+    /// Into a capture, the notice is a sentence on stderr — or nothing,
+    /// when nobody is reading stderr either.
+    #[test]
+    fn the_watch_notice_never_goes_into_a_capture() {
+        assert_eq!(
+            watch_banner("sess", Some((80, 24)), false, true),
+            Some(WatchBanner::Sentence(
+                "holdfast watch: watching sess (80x24) — Ctrl-C to stop".into()
+            ))
+        );
+        assert_eq!(watch_banner("sess", Some((80, 24)), false, false), None);
+    }
+
+    // ---------------------------------- GH #236: whose words the prompt is
+
+    /// **The child's own prompt is not repeated; an agent's description
+    /// is attributed; an unknown source is quoted neutrally** — and every
+    /// form says it is Holdfast's line (GH #236).
+    #[test]
+    fn the_secret_line_says_whose_words_it_is_and_never_repeats_the_childs() {
+        let child = secret_prompt_label("Password: ", Some("echo_drop"));
+        assert!(child.contains("[holdfast]"));
+        assert!(
+            !child.contains("Password"),
+            "the child's prompt is already on screen; printing it again is the duplicate: \
+             {child:?}"
+        );
+        let agent = secret_prompt_label("deploy key passphrase", Some("tool_call"));
+        assert!(
+            agent.contains("the agent asks for a secret: “deploy key passphrase”"),
+            "{agent:?}"
+        );
+        let unknown = secret_prompt_label("Password: ", None);
+        assert!(
+            unknown.contains("secret requested: “Password:”"),
+            "{unknown:?}"
+        );
+        assert!(
+            !unknown.contains("agent"),
+            "text of unknown provenance was attributed to the agent: {unknown:?}"
+        );
+        // An empty agent text is not rendered as empty quotes.
+        let empty = secret_prompt_label("", Some("tool_call"));
+        assert!(!empty.contains("“”"), "{empty:?}");
+    }
+
+    /// **A second announcement of the request being typed, or of one just
+    /// answered, is not a new prompt; one the human abandoned is** (GH
+    /// #236's review). The three cases the attach loop's arm decides with
+    /// this, and the rows in `attach_cli.rs` drive the loop itself.
+    #[test]
+    fn a_secret_prompt_is_new_unless_it_is_being_typed_or_was_answered() {
+        // Being typed into: the second frame must not empty the line.
+        assert!(!secret_prompt_is_new(Some("req_1"), None, "req_1"));
+        // Answered, the outcome not yet back: nothing left to type.
+        assert!(!secret_prompt_is_new(None, Some("req_1"), "req_1"));
+        // Abandoned with Ctrl-C: the line was dropped, and the child is
+        // only now reading — drawn again.
+        assert!(secret_prompt_is_new(None, None, "req_1"));
+        // A different request is always new, whatever is in hand.
+        assert!(secret_prompt_is_new(Some("req_1"), Some("req_1"), "req_2"));
+    }
+
+    /// **`watch`'s `Ctrl-C` listener is built once, above its loop** (GH
+    /// #210's review), and this is a structural row because the defect is
+    /// a race: `tokio::signal::ctrl_c()` built afresh on each pass cannot
+    /// see a `SIGINT` delivered while the loop body runs, and the watch's
+    /// own handler has already replaced the default action — so the
+    /// signal did nothing. Measured through a real watch on a pty, `SIGINT`
+    /// sent the moment the opening screen appeared: 17 of 20 exits before,
+    /// 40 of 40 after. Scanned by lines, so a CRLF checkout reads it the
+    /// same way.
+    #[test]
+    fn watch_listens_for_ctrl_c_across_its_whole_loop() {
+        let src = include_str!("commands.rs");
+        let lines: Vec<&str> = src.lines().collect();
+        let start = lines
+            .iter()
+            .position(|l| l.starts_with("pub async fn watch(session: &str) -> ExitCode {"))
+            .expect("the unix watch()");
+        let len = lines[start..]
+            .iter()
+            .position(|l| *l == "}")
+            .expect("the end of watch()");
+        let body = &lines[start..start + len];
+        let at = |needle: &str| body.iter().position(|l| l.contains(needle));
+        assert_eq!(
+            at(&["tokio::signal::", "ctrl_c()"].concat()),
+            None,
+            "watch() builds a fresh ctrl_c() listener, which misses a SIGINT landing \
+             between two of them"
+        );
+        let listener = at("SignalKind::interrupt()").expect("watch() listens for SIGINT");
+        let top = body
+            .iter()
+            .position(|l| l.trim() == "loop {")
+            .expect("watch()'s loop");
+        assert!(
+            listener < top,
+            "the SIGINT listener is built inside the loop, once per pass"
+        );
+        assert!(
+            body[top..].iter().any(|l| l.contains("sigint.recv()")),
+            "the loop does not wait on the listener built above it"
+        );
     }
 }

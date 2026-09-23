@@ -16,7 +16,12 @@ over — a live session from any terminal. The web UI is still to come; see
 > default. Not yet suitable for real use; see [ROADMAP.md](https://github.com/Sertelegger/holdfast/blob/main/ROADMAP.md)
 > for what is and is not there.
 
-## What works today (`v0.0.7`)
+## What works today (on `main`)
+
+This list describes `main`, which is ahead of the newest tag; `CHANGELOG.md`'s
+`[Unreleased]` section says by how much. It used to carry the tag's version in
+this heading while describing `main`, which is a claim about `v0.0.7` that
+`v0.0.7` does not keep.
 
 - `start_session` — spawn a shell or program on a real PTY
 - `send_input` — type into it
@@ -160,19 +165,73 @@ is licensed by `read_output`'s own `tail_lines` / `tail_bytes` argument
 
 ## Build and try it
 
+From a checkout, which is the only way in today — the paragraph after the
+lifecycle notes says why:
+
 ```bash
-cargo build --workspace
-./scripts/mcp-smoke.sh                  # raw JSON-RPC smoke test (needs jq)
-claude mcp add --scope user holdfast -- "$(pwd)/target/debug/holdfast" mcp
+cargo install --locked --path crates/holdfast       # -> ~/.cargo/bin/holdfast
+./scripts/mcp-smoke.sh "$HOME/.cargo/bin/holdfast"  # raw JSON-RPC smoke test (needs jq)
+claude mcp add --scope user holdfast -- "$HOME/.cargo/bin/holdfast" mcp
+claude mcp list                                     # holdfast: ... ✔ Connected
 ```
 
-**Those commands assume a git checkout, and that is the only way in
-today.** `cargo install holdfast` resolves the `0.0.0` name reservation on
-crates.io and errors with "there is nothing to install"; the shipped
-GitHub Releases carry no binary assets. Publishing either is this
+**Install it; do not register `target/`.** This section used to register
+`target/debug/holdfast`. That works, and the debug build is not slow, but it
+ties every Claude Code session on the machine to your build directory:
+`cargo clean` breaks them all at once, and every rebuild swaps the binary out
+from under a daemon that is still running the old one. `cargo install --path`
+copies the binary out of `target/`, so neither happens and an upgrade is a
+step you take on purpose. The `holdfast` CLI below needs `~/.cargo/bin` on your
+`PATH`.
+
+**The daemon outlives Claude Code, and it runs the binary it was started
+from.** The first MCP call starts a background `holdfast daemon`. It owns the
+sessions, every Claude Code session on the machine shares it, and closing
+Claude Code does not stop it. So a rebuild changes nothing until the daemon
+restarts:
+
+```bash
+cargo install --locked --path crates/holdfast
+holdfast daemon stop               # ends every session it holds
+(cd ~ && holdfast daemon start)    # from ~, not from this checkout
+```
+
+`daemon stop` is the only way to put new code into the daemon, and it ends
+every live session, so choose the moment. **Start the new one yourself, and
+from `~`.** Each half answers a defect, and costs nothing on a build that has
+the fix. Without GH #231's fix, a Claude Code session whose `holdfast mcp` is
+already running does not start a daemon when its daemon goes away: its tools
+answer `daemon_unreachable` until one exists, and then reconnect (measured).
+Without GH #229's fix, a session started with no `cwd` begins in the daemon's
+working directory, with the daemon's environment — and `cargo install --path`
+runs in this checkout, so a daemon started from the same shell would point
+every such session, in every project, at the Holdfast repository. Those
+`holdfast mcp` processes are still the old binary until each Claude Code
+session restarts; a different protocol *minor* between them and the daemon is
+allowed, and a different major is refused with a message saying which side to
+restart. `holdfast daemon status` shows what is running.
+
+**One registration per Claude Code config directory.** `claude mcp add
+--scope user` writes to the config directory in effect — `~/.claude.json`, or
+`.claude.json` inside `$CLAUDE_CONFIG_DIR` — so a machine with several (one
+per account, say) needs the line once for each:
+
+```bash
+CLAUDE_CONFIG_DIR=/path/to/that/config claude mcp add --scope user holdfast -- "$HOME/.cargo/bin/holdfast" mcp
+```
+
+They all share the one daemon. **And register it one way, not two**: the
+plugin below and `claude mcp add` are two servers exposing the same tools
+under two names.
+
+**Why a checkout.** `cargo install holdfast` resolves the `0.0.0` name
+reservation on crates.io and errors with "there is nothing to install", and
+the shipped GitHub Releases carry no binary assets. (`cargo install --locked
+--git https://github.com/Sertelegger/holdfast holdfast` builds `main` without
+a checkout, and `--tag vX.Y.Z` builds a release.) Publishing either is this
 project's *first external distribution* — a decision it has not taken, and
 one that changes what several in-tree escapes are allowed to do (see
-[CONTRIBUTING.md](https://github.com/Sertelegger/holdfast/blob/main/CONTRIBUTING.md#no-binary-assets)).
+[CONTRIBUTING.md](https://github.com/Sertelegger/holdfast/blob/main/CONTRIBUTING.md#binary-assets-and-the-draft-that-keeps-them-a-decision)).
 When it is taken, releases are the channel and crates.io the source-build
 fallback beside it.
 
@@ -186,18 +245,23 @@ lines:
 /plugin install holdfast@holdfast
 ```
 
-**That path does not work yet, and the missing piece is named rather than
-implied**: the plugin's bootstrap downloads a prebuilt binary from the GitHub
-Release matching `plugin/version.txt`. `release.yml` now builds and attaches
-the five §12.1 assets and a `SHA256SUMS.txt` — but to a **draft** release, and
-a draft's assets are not served from `releases/download/vX.Y.Z/` at all. The
-bootstrap therefore still finds nothing to fetch until a human promotes a
-draft, which is the first-external-distribution decision and is deliberately
-not automated. Until then the two lines above install a plugin whose MCP
-server fails to start with a message naming the manual install.
-`plugin/README.md` documents that fallback, the safe-extraction rules the
-bootstrap enforces on what it downloads, and the one thing about the Windows
-entrypoint that is still unverified.
+**That path cannot download a binary yet, and the missing piece is named
+rather than implied**: the plugin's bootstrap fetches a prebuilt binary from
+the GitHub Release matching `plugin/version.txt`. `release.yml` builds and
+attaches the five §12.1 assets and a `SHA256SUMS.txt` — but to a **draft**
+release, whose assets are not served from `releases/download/vX.Y.Z/` at all,
+and promoting a draft is the first-external-distribution decision, deliberately
+not automated. Until one is promoted, the MCP server fails to start and
+`claude mcp list` says why and what to do instead (measured on Linux; on
+Windows the plugin's entrypoint is itself unverified): install a build from source
+as above, and name it with `HOLDFAST_BOOTSTRAP_BIN` in the `env` block of
+Claude Code's `settings.json`, and the plugin runs that binary.
+[`plugin/README.md`](https://github.com/Sertelegger/holdfast/blob/main/plugin/README.md#using-a-binary-you-built-yourself)
+has those steps, the safe-extraction rules the bootstrap enforces on what it
+downloads, and the one thing about the Windows entrypoint that is still
+unverified. Once a release is promoted, the marketplace listing is pinned to
+it (CONTRIBUTING.md, Releases, step 8), so an install stops following `main`
+onto a version that is still a draft.
 
 ## Development
 
@@ -226,7 +290,7 @@ request runs:
 | `windows-cross` | The same clippy invocation against `x86_64-pc-windows-gnu`, on a Linux runner. A **cross-compilation check, not a test run** — it proves Holdfast still *compiles* for Windows, against the GNU ABI, in about two minutes. It was red on `main` from before 0.0.6 until #19 |
 | `windows-native` | `windows-2022`. Native **MSVC** clippy over `--all-targets` (the ABI a Windows user actually installs, which `windows-cross` does not check), `tests/source_guards.rs`, a **filtered `--lib`**, and the `#[cfg(windows)]` CLI arms executed: the daemon-backed subcommands must exit 64 and name the reason, `daemon stop` must exit 0 (§3.2 is idempotent). The `--lib` filter names only the modules whose Windows arm differs from its Unix one, and it is load-bearing: it is the only gate anywhere that kills the `.append(true)` → `.truncate(true)` mutation, which would zero the §9.4 audit trail on every start. This row said "`--lib` is not run" — read that as the **full** `--lib`, which is not: 55 of its tests spawn a real shell — measured 721 passed / 55 failed natively — and gating those is 0.0.11's |
 | `macos-native` | `macos-14` — **the third platform, and the one this project develops on.** The full suite on a BSD kernel under `cargo-nextest` at a pinned digest, plus the shells the detection rows spawn and a check that the GH #96 exclusion is still earning its place. It exists because the defects it catches are runtime and kernel-shaped — pty buffering, accept ordering, line discipline — and a cross-compile cannot see any of them: a `#[cfg]` split that deleted the arm for every BSD compiled cleanly on both platforms anyone had tested. Free while this repository is public, and the first job to revisit if it ever is not |
-| `plugin` | The plugin and marketplace layer: `scripts/plugin-manifest-check.py` and its twelve breakage fixtures, shellcheck plus `dash -n`/`sh -n` over every shell file the plugin ships, and the bootstrap's safe-extraction rules against a generated corpus of 19 hostile tar archives and 12 hostile zips. **Four cells here and a fifth on `macos-native`**: dash + GNU tar unprivileged; bash with GNU tar and again with bsdtar, which together are what macOS `/bin/sh` and macOS `tar` are; busybox ash + busybox tar as root in a digest-pinned Alpine container; and the PowerShell extractor under `pwsh`. The cells are not repeats of each other — the bash cells exist because a bomb cap written in `ulimit -f` blocks is twice as large under bash as under dash, and every Linux cell used to be dash or busybox. Each check is deleted in turn and the corpus must go red; the post-extraction check is invisible outside the busybox-as-root cell, and every rejection is matched against the message of the check the case was written to provoke rather than against a non-zero status alone — which is itself what makes the mode check load-bearing in the busybox cell, where a bare exit-status assertion let a later check cover for its deletion. Then the download path itself, against a fabricated release served over loopback HTTP, because `release.yml` attaches its binaries to a *draft* and a draft's assets are not served from `releases/download/` — so there is no real release to point this at, and there will not be one until a human promotes a draft |
+| `plugin` | The plugin and marketplace layer: `scripts/plugin-manifest-check.py` and its self-test, which breaks the real tree one rule at a time and also requires the one pin shape the release procedure writes to pass — on a checkout with the tags, so a pin is checked against its tag and not skipped — shellcheck plus `dash -n`/`sh -n` over every shell file the plugin ships, and the bootstrap's safe-extraction rules against a generated corpus of 19 hostile tar archives and 12 hostile zips. **Four cells here and a fifth on `macos-native`**: dash + GNU tar unprivileged; bash with GNU tar and again with bsdtar, which together are what macOS `/bin/sh` and macOS `tar` are; busybox ash + busybox tar as root in a digest-pinned Alpine container; and the PowerShell extractor under `pwsh`. The cells are not repeats of each other — the bash cells exist because a bomb cap written in `ulimit -f` blocks is twice as large under bash as under dash, and every Linux cell used to be dash or busybox. Each check is deleted in turn and the corpus must go red; the post-extraction check is invisible outside the busybox-as-root cell, and every rejection is matched against the message of the check the case was written to provoke rather than against a non-zero status alone — which is itself what makes the mode check load-bearing in the busybox cell, where a bare exit-status assertion let a later check cover for its deletion. Then the download path itself, against a fabricated release served over loopback HTTP, because `release.yml` attaches its binaries to a *draft* and a draft's assets are not served from `releases/download/` — so there is no real release to point this at, and there will not be one until a human promotes a draft. The same harness runs `bootstrap.ps1`'s `HOLDFAST_BOOTSTRAP_BIN` arm, its 404-versus-unreachable split and its answer to `initialize` under `pwsh`, the only place anything executes that file, and runs the download under GNU wget and busybox wget on a `$PATH` with no curl, since each reports a 404 differently |
 | `probe` | `scripts/ci-probe.sh` — toolchain version, pseudoterminal allocation, and every shell and interpreter the suite spawns by name. Host-dependent rows of `tests/detection.rs` skip *and report as passing* when their program is absent, so this gate is part of what makes the test job's green mean something. The exact set is pinned by `scripts/ci-skip-census.sh` rather than counted here (GH #74) |
 | `test` | `scripts/ci-skip-census.sh --self-test` (the census's own gates, deleted one at a time against fixtures), then `cargo nextest run --workspace --locked --no-fail-fast -j 4 --success-output immediate --no-output-indent`, then `cargo test --workspace --locked --doc` because nextest runs no doctests, then `scripts/ci-skip-census.sh` over the captured log — which fails on any skipped row the pipeline has not agreed to, on any *assertion* gated off inside a row that ran without an agreed entry, **and on an agreed one of either kind that stopped happening** |
 | `fish-req-ts-008` | `ubuntu-24.04` with fish 4.x from `ppa:fish-shell/release-4`, running REQ-TS-008's three-arm row and nothing else — the measurement §4.5.1's decision to write unsolicited bytes into a child's stdin rests on, which had executed nowhere in this pipeline until 0.0.4. It gets its own job because installing fish in `test` takes `tests/detection.rs`'s fish row red for a defect that is not the pipeline's; the `detection` binary is never invoked here, so that row's agreed skip is untouched. Not gated on `probe` — fish is deliberately not among the shells the probe asserts |
@@ -375,7 +439,7 @@ its `--test-threads=192` banner suggests.
 | Linux x86_64 | **CI** — the full suite on every push and pull request |
 | Windows x86_64 | **CI on two jobs, one of them a real runner** — this row read "Nothing executes. There is no Windows runner and no Windows test job" while the CI table above it listed `windows-native` on `windows-2022`, so the same file contradicted itself. `windows-cross` cross-compiles for the GNU ABI on Linux; `windows-native` runs natively: MSVC clippy over `--all-targets`, `tests/source_guards.rs`, a filtered `--lib` over the modules whose Windows arm differs from its Unix one, and the `#[cfg(windows)]` CLI arms *executed* — exit-64 refusals with their reasons for the daemon-backed subcommands, and `daemon stop`'s idempotent 0. What Windows does at run time: `holdfast mcp` serves MCP over stdio in-process and writes the §9.4 audit trail (there is no daemon, so sessions end with the process), and `version` works. What is **still** unverified there is everything that needs a shell or a PTY — the 55 shell-spawning lib tests and the four shell-spawning integration targets do not run on Windows, so session behaviour on the platform rests on no test. Milestone 0.0.11 |
 | macOS aarch64 | **CI** — `macos-native` on `macos-14` (arm64) runs the full suite under `cargo-nextest` on every push and pull request, and it is a required check. This row read "Owner-run local execution … GitHub offers macOS runners; not using one is a deliberate decision rather than a constraint" while the CI table above it already listed the job: the same self-contradiction `windows-native` had, in the same file, one table apart |
-| macOS x86_64 | **The suite is not run.** `release-rehearsal.yml` builds, packs, checksums and extracts the `macos-x86_64` asset natively on `macos-15-intel`, then *runs the extracted binary* — `holdfast version`, asserted against `Cargo.toml`'s version and against reporting `build unknown`. So Intel macOS is proven to produce a binary that starts; it is not proven to pass a single test, because nothing anywhere executes the suite there. Do not read the aarch64 row as covering it |
+| macOS x86_64 | **The suite is not run.** `release-rehearsal.yml` builds, packs, checksums and extracts the `macos-x86_64` asset natively on `macos-15-intel`, then *runs the extracted binary* — `holdfast version`, asserted against `Cargo.toml`'s version and against the exact commit the rehearsal built (`build <GITHUB_SHA>`). So Intel macOS is proven to produce a binary that starts; it is not proven to pass a single test, because nothing anywhere executes the suite there. Do not read the aarch64 row as covering it |
 | WSL | Covered indirectly via Linux. GitHub-hosted runners offer no WSL image, so a dedicated runner is post-v0.1.0 |
 
 ### What CI does not verify

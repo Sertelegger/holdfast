@@ -13,6 +13,57 @@ is cut, named and published is in
 
 ### Added
 
+- `osc133_source` gains a fourth value, **`holdfast_degraded`**: every marker
+  is Holdfast's own, but the latest command's `C` arrived with no `B` in
+  front of it — the prompt is being regenerated over Holdfast's wrapping, so
+  exit codes are real and `command` text cannot be captured. It used to say
+  `holdfast` there, the one answer a caller checks before trusting the
+  history ([#220]).
+
+- Attach protocol **1.5**: `ServerFrame::ScreenSnapshot`, the session's
+  screen as it stands when a client joins — sent once, after `Attached` and
+  before the first `Output`, and built from `get_screen_state`'s own capture
+  and mask rather than from a second rendering of the ring buffer; and an
+  optional `AwaitingSecret.raised_by` (`echo_drop` | `tool_call`, §9.4's
+  spelling) saying whose words `prompt_text` is. Additive both ways: a 1.4
+  client skips the frame as `Unknown` and ignores the key ([#235], [#236]).
+
+- **`holdfast --help`, `-h`, `help [<subcommand>]`, `<subcommand> --help`,
+  `--version` and `-V`**, all of which were `unknown subcommand`, exit 64 —
+  including REQ-A-002's own stated verification, `holdfast --help`. Help that
+  was asked for goes to stdout and exits 0; one subcommand's help is that
+  subcommand's banner lines, and a group's (`holdfast daemon --help`) is its
+  members' ([#233], [#178]).
+
+- **`HOLDFAST_BOOTSTRAP_BIN=/absolute/path/to/holdfast`** makes the plugin's
+  bootstrap exec exactly that binary — no `$PATH` search, no version
+  comparison, no download — so the plugin can run a build from source: a
+  checkout being dogfooded, a platform with no prebuilt, a release that is not
+  promoted yet. Set it in the `env` block of Claude Code's `settings.json`.
+  **An absolute path or a refusal, and no fallback**: the bootstrap runs in
+  whichever project Claude Code was started in, so a relative path names a
+  different file in each, and a user who named a binary and silently got a
+  downloaded one is debugging the wrong program. A leading `~` or `$` is
+  refused by name, because Claude Code passes `settings.json` values literally
+  (measured). It is checked before `version.txt` and `uname`, so it works on a
+  target with no release asset. `bootstrap.ps1` has the same arm ([#237]).
+- **A bootstrap that cannot start the server now says why in Claude Code.**
+  It used to exit 1 with its diagnosis on stderr, which Claude Code files in a
+  jsonl log under `~/.cache` and shows as `Failed to connect — CONNECTION_CLOSED`
+  (measured, 2.1.280). Under `mcp` it now reads the `initialize` request
+  already waiting on stdin and answers it with a JSON-RPC error carrying the
+  diagnosis, which `claude mcp list` shows as `-32603: <the reason>`
+  (measured on Linux; the interactive `/mcp` panel was not checked). It reads
+  nothing on any success path, nothing when stdin is a terminal, and waits at
+  most five seconds for a request that never comes. The not-published message
+  is written to fit the 500 characters `claude mcp list` shows before it cuts
+  the line, and a harness row holds it there. `bootstrap.ps1` answers the same
+  way — including when it cannot create its cache or temp directory, which
+  was an uncaught PowerShell error — and the harness runs it under `pwsh` on
+  Linux; **on Windows itself that
+  is unverified**, as the Windows entrypoint that would reach it is, so a
+  Windows install may still see `CONNECTION_CLOSED` ([#237]).
+
 - A `windows-2022` CI job: native MSVC clippy over `--all-targets`, the source
   guards, the `#[cfg(windows)]` CLI arms executed, and a filtered `--lib` over
   the modules whose Windows arm differs from its Unix one. The full `--lib` is
@@ -219,6 +270,202 @@ is cut, named and published is in
 
 ### Changed
 
+- **`value_must_not_match` works on a rule with no `value` group, and judges
+  its whole match** ([#245]). #202 made that a load error, on the ground that
+  such a rule had no value to judge; but a rule without a `value` group
+  redacts its whole match, so its whole match is what a refusal must look at.
+  `openai-api-key` is the first shipped rule to use it. §4.1's partial-secret
+  scan asks the same question of the whole match, so a refused match still
+  arriving at the buffer head is held until the rule dies rather than released
+  on the ground that a marker covers it. `RuleError::ValueConstraintWithoutValue`
+  is gone with the error it named.
+
+- **A progress bar reads back as its last frame** ([#247]). `cargo build` and
+  most progress bars redraw a line by returning to column 0 with `\r` and
+  erasing it, so the byte stream holds every frame and a terminal shows one; a
+  nine-second build read back as mostly `Building [...]` redraws, and a 400-step
+  bar returned 32 KB to `tail_lines: 3`. Under `ansi: "strip"` a line the stream
+  itself erases — `\r` then an erase-in-line, or `\r` then a redraw that ends in
+  one — is now not shown. Nothing a terminal still shows is dropped: a `\r`
+  followed by a shorter line with no erase, a tab, a backspace or a cursor
+  movement is left as it was, so is a line a cursor move or a screen switch
+  separates from the erase, and so is everything under `ansi: "raw"` — a
+  property test replays each dropped range through a terminal emulator, at a
+  wide and a narrow width, to check it. **So is a line that may have wrapped**,
+  because `\r` returns only to the start of the last row a wrapped line reached
+  and the erase clears that row alone: the line is dropped only if it fits the
+  session's width, counted with every non-ASCII character as two columns, from
+  a start column the read can see (found by the independent review — 150 `W`s
+  and `\r\x1b[K` in an 80-column session read back as nothing while the grid
+  still showed two rows of them). A session widened after such a line was
+  painted is the residual. The cursor, `bytes_returned` and every flag are
+  unchanged, because the
+  bytes were read, only not shown; a frame a redaction touches is kept with its
+  marker; and the shortened page is itself judged, because removing a frame
+  joins the text either side of it.
+
+- **Every tool refuses an argument it does not declare, and names it (GH
+  #219).** Eleven of the twelve dropped an unknown key without a word, so a
+  typo was honoured as the default it meant to override:
+  `wait_for_pattern { patern: … }` became a pattern-less wait and answered
+  `ok, session is AtPrompt`, `send_input { apend_newline: false }` wrote the
+  newline anyway, and `list_sessions { session: … }` returned every session.
+  The refusal is serde's, and it is the one `request_secret_input` already
+  gave — *unknown field \`patern\`, expected one of \`session\`,
+  \`pattern\`, …* — so it names the key and lists the valid ones. The
+  advertised `inputSchema` of all twelve now says `additionalProperties:
+  false`, so the schema and the deserialiser agree; before, they agreed only
+  by both being open. `list_sessions`, which takes no arguments and so was
+  never handed any, now takes an empty argument type in order to refuse them.
+
+  **What a client sees depends on the transport, and that is rmcp's, not
+  this change's.** The daemon path — the default — answers JSON-RPC
+  `-32602`; `--no-daemon` and Windows answer a tool result with
+  `isError: true` carrying the same text, because rmcp 3 reports a failure
+  of its own argument extractor that way. `request_secret_input`'s refusal
+  already took both shapes before this change. **Nothing an MCP client sends is refused
+  that was not an argument:** `_meta` travels beside `arguments`, not inside
+  it, and a row pins that it is still served. The one real cost is skew — a
+  newer shim forwarding an argument an older daemon does not know is now
+  refused by name instead of run without it, which is the same trade.
+  `scripts/mcp-smoke.sh` carries one paired row per tool, and
+  `tests/tool_arguments.rs` drives both transports from the router's own
+  tool list.
+
+- **`holdfast attach` and `holdfast watch` open with the session's current
+  screen** ([#235]). Attaching to a session idling at its prompt rendered the
+  banner and nothing else until somebody pressed Enter, and `watch` rendered
+  nothing at all. The screen is painted over the terminal with the cursor
+  where the child left it and the join notice on its top row — not
+  inserted above the prompt, which over a painted screen pushed a prompt on
+  the last row off the bottom — and without touching the terminal's modes,
+  so a detach from `vim` does not leave the human inside the alternate
+  screen. A full-screen program's rows are never moved to make room for the
+  notice, which lies over its blank last row or its top row instead: `vim`
+  addresses rows absolutely, and a picture one row low put every edit after
+  the join on the wrong line. Then the live stream resumes where the picture ends — or a few
+  bytes before it, never after: the resume point is read
+  before the capture, so the error a busy session can produce is a few bytes
+  drawn twice rather than a few bytes never drawn. `watch` into a file paints
+  nothing, because a picture in a capture is bytes the session never printed,
+  and says it is watching on stderr instead. The picture is masked for both
+  roles — it is a re-rendering of history, not the live stream `interactive`
+  is entitled to raw — and plain text: colour returns as the child redraws.
+  **It is exactly as masked as `get_screen_state`'s grid, because it is that
+  grid**, and so it needs [#224]'s key mask on the grid: without it a late
+  `watch` was shown the body of a private key cut short (`head -n 20
+  key.pem`), or of one whose header had scrolled off, that an observer
+  attached during the print never saw — a leak new to the observer surface,
+  since a late `watch` was shown nothing from before its join.
+  `a_client_joining_after_a_key_was_printed_is_shown_none_of_its_body` is red
+  on any tree without that fix.
+- **A `slow_consumer` detach now means the client stopped reading, not that
+  it read too slowly** ([#210]). The daemon detaches a connection whose
+  socket has accepted no bytes for 30 seconds while bytes were waiting for
+  it (`ATTACH_STALL_TIMEOUT`); a client that drains, however slowly, is never
+  detached. A client that resumes within one more stall bound is told why
+  (`Detached`), and one that does not is closed on rather than waited for.
+  **A gap now means the ring evicted the bytes**, so `holdfast logs` no
+  longer has them either, and the client says so instead of sending the
+  operator there.
+- **`holdfast attach` holds the terminal after a `slow_consumer` detach
+  instead of exiting** ([#210]). Exiting sent whatever the human typed next —
+  into what they believed was the session — to their local shell. Nothing
+  typed while held goes anywhere; `Enter` reattaches with the screen
+  repainted, `Ctrl-B d` leaves. No letter does either, because a human who
+  has not read the notice is typing a word. A view that missed output this
+  way never exits 0: a clean detach later exits 3, and any other ending keeps
+  its own status.
+- **The attach secret prompt is labelled, says whose words it quotes, and no
+  longer prints the child's prompt a second time** ([#236]). An echo-drop
+  request's text is the line the child already drew and is not repeated; a
+  tool call's is shown as the agent's. An *adopting* call's text is still not
+  shown — §5.2 keeps it off the wire so an agent cannot relabel a prompt a
+  human may already be typing into.
+- `limits.output_broadcast_capacity` **is live** ([#210]): `start_session`
+  sizes the output broadcast from it. It was accepted, validated and
+  documented as a control while the hardcoded `OUTPUT_BROADCAST_FRAMES` sized
+  every channel. It is no longer an attach client's loss bound either (see
+  *Fixed*), so it decides how often a lagging consumer takes the ring-buffer
+  path, not what it is shown. **It has a ceiling now that it is live**,
+  `MAX_OUTPUT_BROADCAST_FRAMES` (sixteen times the default), and a larger
+  value is refused at load: every slot is allocated when a session starts,
+  and at 4,194,304 each `start_session` cost about 230 MB of daemon RSS while
+  1,000,000,000 aborted the daemon with every session in it. A `config.toml`
+  that set it past the ceiling while it was inert now fails to load and says
+  why.
+
+- **The CLI refuses a flag it does not have**, with exit 64 and that
+  subcommand's usage, where it used to drop it and run: `holdfast list --jsn`
+  printed the table, `holdfast logs big --tial 5` the whole log, and
+  `holdfast daemon stop --forse` **stopped the daemon**, all exit 0. The
+  grammar is read out of the usage banner itself — `[--flag]` is a switch,
+  `[--flag N]` takes a value, `<session>` is required — so a flag the banner
+  does not document is one the binary refuses, and the two cannot drift.
+  Flags may now come before the session (`holdfast logs --raw big`), `--x=v`
+  is `--x v`, and `--` ends the flags for a session whose name starts with a
+  dash ([#233]).
+- **`holdfast version` names the commit it was built from** instead of
+  `(build unknown)` on every build outside the release pipeline, and so does
+  the daemon's control handshake, from the same function. `holdfast-core`'s
+  new `build.rs` takes `HOLDFAST_BUILD_SHA` when the caller set it (the
+  release pipeline does), else the commit in `.cargo_vcs_info.json` (a
+  crates.io package), else the checkout's `HEAD` — read from `.git` beside
+  the workspace and never by walking upward, so a package unpacked under an
+  unrelated repository cannot report that repository's commit — else
+  `unknown`. It never fails a build. Every commit now recompiles
+  `holdfast-core`, which is what a build id that changes with the commit
+  costs. The release rehearsal's check that `HOLDFAST_BUILD_SHA` reached the
+  build now looks for the exact 40-hex sha, since a build it did not reach
+  no longer says `build unknown` ([#178]).
+- **`holdfast daemon stop` returns once the daemon has exited**, not once it
+  has answered. The answer comes before the daemon's teardown, so `daemon
+  stop && rm -rf "$HOLDFAST_RUNTIME_DIR"` raced it; the stop now waits up to
+  five seconds more for the process to be gone (a zombie counts), and says so
+  with exit 1 if it is not. A graceful stop that has not been answered after
+  a second says what it is waiting for — a session process that ignores
+  `SIGTERM` holds the stop for §3.2's whole ten-second grace, and it did so in
+  silence ([#20]). An idle shell no longer does: it is hung up once it is
+  alone in its session ([#234]), so the wait is now for a job, or a program,
+  that caught or ignored the `SIGTERM`.
+
+- **The marketplace listing is pinned to a promoted release, after
+  promotion.** The release PR bumps `plugin/version.txt` on `main` before the
+  tag, the release stays a draft until a person promotes it, and the listing's
+  `source: "./plugin"` reads `main` — so every install or update in between
+  pinned a version with no served assets and its MCP server failed to start.
+  `CONTRIBUTING.md`'s release procedure gains a step 8: once promoted, a pull
+  request points the listing at a `git-subdir` pin of `plugin/` at that tag
+  **and its commit**. `scripts/plugin-manifest-check.py` accepts `"./plugin"`
+  or exactly that shape — this repository's URL, `path: "plugin"`, a `vX.Y.Z`
+  ref no newer than `Cargo.toml`, a full sha — checks the sha against the tag
+  and the pinned tree's `plugin.json` against the ref, and asks the release
+  whether it serves its `SHA256SUMS.txt`. **That last one is the rule the
+  pin exists for**: a release that is tagged and still a draft satisfies every
+  other one, `Cargo.toml` having already moved to it, and serves nothing, so
+  a pin to it is this failure again. CI's `plugin` job fetches the tags, and
+  under CI a tag that is not there, or a release that does not answer, fails
+  rather than skips. Each refusal has a breakage fixture — the tag half's in
+  a fixture made a git clone with the tag in it, the served half's against a
+  local release server — and the self-test gains its first *acceptance*
+  fixtures, so a rule that refused every pin — the rule as it stood — now
+  fails it. The listing itself stays `"./plugin"` until a release whose tag
+  contains `plugin/` is promoted: `v0.0.7`'s does not, and the check refuses
+  that pin, in CI too — its tree has no `plugin.json`, and it serves no
+  assets. `release.yml`'s post-draft checklist names the step ([#237]).
+
+- **`HOLDFAST_BOOTSTRAP_ALLOW_PATH` compares the version whole, and says when
+  it declines.** It was `grep -q "$version"` over `holdfast version`'s output
+  — a regex, unanchored, which `holdfast 0.1.00` and `10.1.0` both satisfy for
+  `0.1.0` — and a mismatch or a missing binary fell back to the download in
+  silence. The second field must now equal `version.txt`, and a refusal is one
+  stderr line at once and the start of any later failure's message, which is
+  the line Claude Code shows — the start, because `claude mcp list` shows 500
+  characters of it and the not-published message is most of them. The probe
+  runs with stdin from `/dev/null`: Claude Code's `initialize` is waiting on
+  the real one, and a `holdfast` that read it there took it from the server
+  ([#237]).
+
 - **`scripts/ci-hygiene.sh`'s release-trigger gate is an allowlist.** It was a
   denylist of four triggers — `branches`, `schedule`, `pull_request`,
   `pull_request_target` — and `release.yml`'s header claimed on the strength of
@@ -336,6 +583,149 @@ is cut, named and published is in
 
 ### Security
 
+- **Database URLs outside the old scheme list, and several common credential
+  spellings, went out raw; they are redacted now** ([#244]).
+  `database-connection-password` takes the TLS schemes (`rediss://`,
+  `amqps://`), `mariadb`, `mssql`, `sqlserver`, `oracle`, `cockroachdb`,
+  `clickhouse`, `snowflake`, `valkey`, `neo4j` and `bolt`; a `+driver` suffix
+  (SQLAlchemy's `postgresql+psycopg2://`, `mysql+pymysql://`, and
+  `mongodb+srv://`); an empty user (`redis://:<password>@host`); and a `/` or
+  an `@` inside the password — while a `'`, `"` or backtick inside it is still
+  redacted, as it was in 0.0.7. Four rules are new: `url-userinfo-password`
+  (`https://user:<password>@host`, a `git clone` with a token in it, a proxy
+  URL, an RTSP camera), `basic-authorization` (`Authorization: Basic <base64>`
+  as curl `-v`, a `requests` dict, a JSON body or an nginx `proxy_set_header`
+  spell it), `mysql-cli-password` (`mysql -u root -p<password>`, the spelling
+  §9.2's own table names) and `registry-login-password` (`docker login -p
+  <password>`, `-p<password>` and `--password=<password>`, and its
+  `podman`/`nerdctl`/`buildah`/`skopeo`/`oras`/`helm registry` siblings). A
+  quoted command-line password is redacted to its closing quote, so a `&`,
+  `|`, `;` or space inside `-p'…'` is covered with the rest.
+  `generic-secret-assignment` takes `_PASS`, `_PWD` and `PASSPHRASE` labels —
+  behind a separator, so `bypass=` and the shell's own `PWD=` and `OLDPWD=` are
+  not labels — and `secret-key-assignment` takes Laravel's `APP_KEY`.
+  Measured over the credential-free corpora #245 used (49.5 MB), the new
+  rules and labels add **seven** spans, every one of them a credential-shaped
+  example: `mysql -ppassword` in the design doc, `http://letme:in@yo.local` in
+  `reqwest`'s proxy tests.
+
+- `basic-authorization`, every `database-connection-password` scheme,
+  `mysql-cli-password` as a command's first argument and a token-carrying
+  `https://x-access-token:`/`oauth2:`/`gitlab-ci-token:`/`x-token-auth:` URL are
+  **held back while still arriving** at the buffer head: each rule's
+  prefix-index entries are the literal where its credential begins, so no byte
+  of one is handed out raw one read before the rest arrives (§4.1). For
+  `basic-authorization` that is one entry per header spelling — the HTTP header
+  with and without its space, a YAML or TOML value in either quote, JSON pretty
+  and compact, a Python dict pretty and compact, nginx's `proxy_set_header`,
+  and an `=` assignment; `no_byte_of_a_credential_still_arriving_is_handed_out_raw`
+  drives each one a byte at a time. An entry at the program name or the scheme
+  would instead hold `mysqldump`, `docker-compose`, curl's `Authorization:` and
+  every URL a program prints — `ordinary_command_heads_are_not_held_back` pins
+  that it does not.
+
+- **A private key's body no longer goes out raw through a read that starts
+  inside it, or through `get_screen_state` once its header has scrolled
+  off** ([#243], [#224]). [#195]'s fix masked a key for a read that starts
+  *before* its header. A read that starts inside it — every `tail_lines` and
+  `tail_bytes` read, and a cursor partway in — never saw the header, because
+  the window reaches 512 bytes behind the page and a key is kilobytes, so
+  nothing marked the body: on `main` at `a81b02d`, `tail_lines: 30` of a
+  complete 4096-bit key returned 26 raw body lines with `redactions: {}` and
+  `held_back: false`. A read now also looks for a complete `binary`-rule match
+  in the 16 KiB carry region behind its window, which covers the largest key
+  the rule can match, and masks the part that reaches the page with the rule's
+  own marker. The grid had the same gap from the other side — its mask reached
+  the trailing 512 bytes, so with the header scrolled off it returned 36 raw
+  body lines, and `head -n 15` of a key returned all fourteen where
+  `read_output` masked them. It now asks the processor which bytes behind the
+  screen are a key and masks the cells those bytes wrote, found by replaying
+  the parser's own input with the key's printable bytes swapped and comparing
+  cell by cell, so scrolling does not smear the mask onto the prompt after it;
+  and it judges a header still on screen against the text the screen shows.
+  A key a program puts in the window title — which `redact_str` redacted only
+  when the title held all of it — is masked in `get_screen_state`'s `title`
+  and `status`'s and `list_sessions`' too.
+  Both surfaces are swept over every key format — PKCS#1, PKCS#8, encrypted
+  PKCS#8, legacy encrypted PKCS#1 with its `Proc-Type`/`DEK-Info` headers, SEC1
+  EC, DSA and OpenSSH — using throwaway keys stored without their boundaries.
+- **One unterminated `-----BEGIN … PRIVATE KEY-----` no longer blinds every
+  read surface for the next 16 KiB** ([#242]). `private-key-block`'s
+  `[\s\S]*?` never reaches a dead state, so a header nobody closes — this
+  repository's own CHANGELOG has several as prose, and the agent's own command
+  echo is enough — stayed believed until the carry ran out, and the next
+  thirty-odd commands came back as a lone `[REDACTED:unresolved]`, a quarter of
+  `cat CHANGELOG.md` on a read and about a third on `holdfast watch`. The rule
+  is unchanged — a complete `BEGIN`…`END` pair still redacts whatever lies
+  between, a `bat` gutter or a `git show` diff included. What changed is the
+  *candidate*: it is believed only while what follows can still be PEM text
+  (base64 in lines, RFC 1421/4880 armour headers, JSON's escaped line breaks,
+  or whitespace where `echo $KEY` flattened the lines), judged over every
+  stream a read can emit. A prose mention now costs nothing. A candidate that
+  dies *with key material behind it* — `head -n 15 id_rsa` and then a prompt —
+  is masked from its header to the line that ended it, on the read, the grid
+  and the stream alike, rather than released; and a key still arriving when a
+  `watch` stream ends is masked rather than flushed. **And the key body that
+  goes on after a candidate stopped is masked too**, which the narrowing had
+  released and the independent review found: the next screenful of `less`
+  (`less` then a space returned 23 raw body lines with `redactions: {}`), the
+  middle of a key `sed` prints in chunks, and every line of a key printed under
+  a timestamp, a `bat` gutter or a diff's `-` that a pager cut off before its
+  `-----END`, which also covers such a key longer than the read's lookahead.
+  After a private-key header that stopped short of its closing boundary, each
+  line within the carry that carries a key-body run — 48 base64 characters,
+  or 16 on the line after one — is masked on the read, the grid and `watch`,
+  and nothing else is: the prompt, the command and ordinary output between
+  them keep their text. To do that on `watch`, the stream keeps the header in
+  its lookbehind for the carry and holds a line that may still be key body
+  until its line break arrives. The residuals are stated in `output/pem.rs`: a
+  key cut inside the first sixteen characters of its body; a body line of
+  fewer than 48 characters that follows no other; a line holding a SHA-256
+  digest inside the carry behind a private-key header, which is masked; and a
+  key painted a colour per character (`grep -n .` under `--color=auto`), whose
+  header is not in the raw bytes at all.
+- **A `holdfast watch` that joined part way through a key was streamed the
+  rest of it raw** (integration review of [#235] and [#242]). A watch's
+  redactor decides what is key body from bytes it has already seen — the
+  header whose body a pager is about to repaint, the partial a key still
+  printing holds open — and a watch that joined late started with an empty
+  one. Measured on the integrated build with `less` of a 4096-bit key: a watch
+  opened after the first screen and followed through two more was streamed 28
+  of the 50 body lines raw, in 3 of 3 trials, while one attached before
+  `less` started, `get_screen_state` and `read_output` showed none; a watch
+  that joined while a key printed a line every 0.25 s was streamed 14 of 26.
+  `a81b02d` leaks the same 28, so this predates the release. The joining
+  watch's redactor is now seeded from the output buffer behind the point it
+  joins at — the 16 KiB a redactor that had watched from the start would
+  still be holding — and sends nothing from before that point, which the
+  opening screen already drew. A watch that joins while the stream is being
+  withheld is sent the `[REDACTED:unresolved]` the others got when it began,
+  and the rest of a key that began before the join is marked rather than
+  dropped in silence.
+
+- **The plugin bootstrap refuses a wget that says it did not verify the TLS
+  certificate.** busybox's built-in TLS validates no certificate and says so on
+  stderr — *"TLS certificate validation not implemented"*, `-q` or not — and
+  busybox falls back to it whenever no `openssl` is on `$PATH`. On a host whose
+  only fetcher was that, the release manifest and the archive it vouches for
+  arrived over the same unauthenticated connection, and TLS to GitHub is the
+  bootstrap's entire trust root (spec A-4). What such a wget fetched is now
+  discarded and the bootstrap stops, naming curl, `openssl` or a build from
+  source as the way on. A busybox that hands TLS to `openssl s_client
+  -verify_return_error` — Ubuntu's does, when `openssl` is present (measured) —
+  says nothing and is unaffected. A busybox built to use `openssl s_client`
+  *without* that flag would validate nothing and say nothing; none was found
+  to test against, and this does not catch it (review of [#237]).
+- **`/holdfast:install` and `/holdfast:attach` pre-approve only the commands
+  they run.** `/holdfast:install` pre-approved `Bash(command:*)` and
+  `Bash(printenv:*)`, and `/holdfast:attach` had copied both: the first
+  matches `command <any program>`, which runs it, and the second a bare
+  `printenv`, which puts every environment variable — including any token in
+  `settings.json`'s `env` block — into the transcript without a prompt. They
+  are now `Bash(command -v:*)` and `printenv` of the named variables only. How
+  Claude Code's matcher treats `command` was not measured; the narrowing does
+  not depend on it (review of [#237]).
+
 - **A read window that cannot vouch for a region now emits one
   `[REDACTED:unresolved]` over it and completes, instead of choosing between
   withholding it for ever and releasing it raw** ([#195], [#14]). GH #14's
@@ -370,6 +760,8 @@ is cut, named and published is in
   returns one marker where the grid returns 39 raw key-body lines. That is
   pre-existing and untouched here, but it is now a gap **between** two surfaces
   rather than shared behaviour, and it is filed rather than described away.
+  *(Since fixed — see [#224] above: the grid now masks the bytes the read
+  does. Kept as written: it is the measurement that fix answers.)*
 
   **The candidate is believed for `UNVOUCHED_CARRY_BYTES` (16,384) past its
   anchor, and that bound is the whole of what the change costs.** The
@@ -393,7 +785,11 @@ is cut, named and published is in
 
   **The false-positive cost, measured rather than asserted**, as the share of
   a corpus covered by `unresolved` markers, at `max_bytes` 4,096 / 32,768 /
-  262,144 / 4 MiB:
+  262,144 / 4 MiB. *(Since changed — see [#242] above: a candidate is now
+  dropped at the first text that cannot be PEM, so a header quoted in prose
+  costs nothing, and the table and the paragraph after it describe the
+  behaviour [#242] replaced. Kept as written: they are the measurement it
+  answers.)*
 
   | corpus | capped (shipped) | uncapped |
   |---|---|---|
@@ -647,6 +1043,516 @@ is cut, named and published is in
   optimized both.
 
 ### Fixed
+- **A label at the end of a line no longer swallows the next line's first
+  word** ([#245]). Every label-keyed rule separated its label from its value
+  with `\s*`, which crosses line breaks, so ssh's `password: ` followed by
+  `Permission denied, please try again.` came back `[REDACTED:generic]
+  denied`, and so did `Vault token:` over `Successfully authenticated!` and a
+  line of prose ending in `token:` over the `rg -n` hit printed under it. The
+  separator is now horizontal whitespace, with one exception: an `=` may be
+  followed by a line break into an **indented** line, which is how rustfmt and
+  prettier wrap `let token = "<long literal>";` — a shape a hard-coded secret
+  has, and one the old separator caught. A `:` never crosses: over the corpora
+  measured, every `:` that crossed into an indented line was a Python block
+  (`if not have_password:` and the statement under it) — seven of the CPython
+  standard library's 22 `generic` spans. `bearer-authorization`'s
+  `\s+` became `[ \t]+` for the same reason. What that gives up is under
+  Known limitations.
+
+- **`generic-secret-assignment` and `secret-key-assignment` refuse two more
+  code shapes, which were most of what #202 left** ([#245]). A digit-free
+  `::` path (`pub paren_token: token::Paren`, `token: mio::Token`,
+  `secret_key: &crate::SecretKey`) and a digit-free lower-case field access
+  carrying an `_` (`semi_token: node.semi_token`,
+  `self.add_password = self.passwd.add_password`) are no longer redacted.
+  Both branches are digit-free on purpose: allowing digits in the `::` branch
+  also refuses `uuid::Uuid::new_v4(` and a human's `Summer2024::Beach`, and the
+  digit is the one thing in a value that says a person chose it. The
+  field-access branch needs an `_` so that `correct.horse.battery.staple`
+  stays redacted, and lower case so that a Doppler token under a config named
+  `dev_personal` does. Measured over the same credential-free corpora at
+  REQ-O-007's default 41,472 B window: third-party Rust (`syn`, `tokio`,
+  `hyper`, `serde`, `regex`, `rmcp`, `reqwest`, `mio`; 12.2 MB) **342 → 96**
+  label-keyed spans; `rustls`/`jsonwebtoken`/`sqlx` **45 → 43**; every other
+  corpus unchanged or lower, and **every removed span is code** — the list is
+  in the pull request. None of the real-shaped credentials in
+  `tests/redaction_prose.rs` is dropped, and the seven rows this change adds
+  sit one on each side of every new branch.
+
+- **OpenSSH's `sk-ecdsa-sha2-nistp256-cert-v01@openssh.com` is no longer
+  reported as an OpenAI key** ([#245]). `ssh -G`, `ssh -vvv` and any
+  `sshd_config` listing algorithms carried three markers. `openai-api-key`
+  now refuses exactly that family — lower-case letters, digits and hyphens
+  after `sk-ecdsa-` or `sk-ssh-` — and a real key beside the name on the same
+  line is still redacted.
+
+- **The `read_output` paging loop no longer splits a UTF-8 character across
+  two pages** ([#241]). The cap is a raw byte count and each page is decoded
+  on its own, so a character straddling a page boundary came back as U+FFFD
+  on *both* sides, with nothing in the response saying so — on CJK or
+  emoji-heavy output about every other page, and in the emoji of a starship
+  prompt on any page. A read that would end inside a character now ends
+  before it, and the rest of the character is the first thing the next read
+  returns. Where that would return nothing — a `max_bytes` smaller than one
+  character, or a page that *is* the front of one — the read finishes the
+  character instead, at most three bytes past `max_bytes`; pulling back there
+  would hand the caller its own cursor on every retry, which is GH #195's
+  wedge through a third rule. At `buffer.head` a character still arriving is
+  left for the next read while the child lives and emitted as what it is once
+  it has exited. `tail_bytes` and a front-clipped tail no longer open a page
+  on a continuation byte either. None of it is a holdback: no flag, no cause,
+  and `cursor` names the byte the next read starts at.
+- **A `tail_bytes` read larger than `max_bytes` says it was cut** ([#246]).
+  `read_output` clamped `tail_bytes` to `max_bytes` before the session saw
+  it, so the session was asked for a tail that fit, returned it whole, and
+  reported `truncated_for_size: false` over a read that had dropped most of
+  what the caller asked for — `tail_bytes: 140000` came back as 32,768 bytes
+  that claimed to be complete. The clamp is gone: the session front-clips an
+  oversized tail itself, keeps the newest bytes, and sets the flag, exactly
+  as `tail_lines` always did.
+
+- **A pattern-less wait right after a key to a full-screen program could
+  answer from before the key** ([#248]). `send_input{data: "q"}` to `less`
+  and then `wait_for_pattern` with no pattern answered `Fullscreen` in under
+  a millisecond, 3 times in 10 here, because `less` had not read the `q`
+  yet — and an agent that believes it presses `q` again, leaving a stray `q`
+  at the shell. A `Fullscreen` or `AwaitingSecret` already showing at the
+  wait's first sample is now not the answer until there is evidence it is
+  current: the child has printed something since the last input reached it
+  and the mode has held for the settle window, or nothing has come back and
+  it has held for two seconds (never less than the settle window, never past
+  the deadline). One the wait watched arrive answers at once, as before, and
+  so does a prompt that replaces a held one. A settle-window hold alone, the
+  first form of this fix, only moved the stale answer: a `less` still
+  starting took longer than 250 ms to read its `q` under load. Measured with
+  a raw-mode program that reads its key 600 ms late: that hold answered
+  `Fullscreen` 10 times in 10, this one `AtPrompt` 10 times in 10. Still
+  open: a program slower than the two-second hold and silent until then,
+  and output that is not an answer to the key — a draw still in flight, or
+  the line discipline echoing it while `ECHO` is on.
+
+- **`wait_for` and `wait_for_pattern` could not match coloured output with a
+  pattern written from the text an agent reads** ([#238]). cargo prints its
+  verdict as `test result: \x1b[32mok\x1b[m`, so `wait_for: "test result:
+  ok"` used its whole deadline and answered `timeout` on a run that had
+  succeeded — with the matching text in the same response's
+  `output_since_start`. The scan window now carries an escape-free view
+  beside the raw bytes, built by the read path's own stripper with a map
+  back to raw offsets (one entry per escape, not per byte), and the pattern
+  is searched in both; the earlier match wins. A pattern that spells an
+  escape still matches the raw bytes, and `match.offset` is still a raw byte
+  offset, as §5.2 requires.
+
+- **A program stopped at a `[Y/n] ` confirmation could read `Executing` for
+  the whole wait** ([#240]). The detector records who held the terminal when
+  a signal arrived, so that a shell's markers license nothing about the
+  program it launches — and it took that sample when the reader *scanned*
+  the chunk, not when the shell *emitted* it. bash emits `PS0`'s `C` (and
+  readline its paste-off) and forks in the same breath, so a reader that
+  reached the chunk a moment late recorded the **child** as the owner of
+  both; owner then equalled holder, both executing rungs stayed licensed,
+  and a pattern-less wait ran out its deadline. The dogfood pass measured 2
+  trials in 8 on a loaded box. Now a `C` takes the owner recorded at the
+  shell's last `A`/`B`/`D`, and a paste-off that ends an enabled paste keeps
+  the owner that enabled it — both sampled while the shell sat idle holding
+  the terminal. Measured causally: a 30 ms delay in front of the reader's
+  owner sample made the unfixed build answer `Executing` / `semantic` for
+  the whole 4 s wait in 8 trials of 8, and the fixed build `AtPrompt` in 8
+  of 8. Not covered: a `[Y/n]` asked by a shell builtin (`read -p` in a
+  function or a sourced installer) still reads `Executing`, because the
+  shell really is running it.
+
+- **A prompt that regenerates `PS1` at every prompt — starship, the owner's —
+  emptied `get_command_history` and dropped the session's first command**
+  ([#220]). Holdfast wrapped `PS1` with its `A`/`B` markers once; starship's
+  `PROMPT_COMMAND` hook assigns `PS1` afresh before every prompt, so from the
+  first prompt on no `B` arrived, the echo capture never armed, and every
+  entry was `command: ""` beside a correct exit code. Worse, the first command
+  was suppressed outright: its `C` looked like Holdfast's own injection line
+  to the history ring, which took any first `C` with no `B` before it for
+  one. Measured on this machine's starship bash before the fix: three entries
+  for four commands, all empty, at `terminal_mode`, while `osc133_source`
+  said `holdfast`. Now:
+
+  - the bash snippet re-wraps the prompt (and `PS0`) from the **end** of
+    `PROMPT_COMMAND`, after whatever regenerated it — as its own element
+    when `PROMPT_COMMAND` is an array, so a regenerator at index ≥ 1 cannot
+    run after it — and zsh's `precmd` does the same for a configuration that
+    assigns `PS1` there (starship's zsh integration sets `PROMPT` once and
+    was measured unaffected). The call is joined with a newline, so a
+    `PROMPT_COMMAND` ending in `;`, `; `, a newline or a `# comment` keeps
+    parsing — `; ` did not, and made bash print a syntax error at every
+    prompt and run none of the line. And it goes immediately *before*
+    bash-preexec's `__bp_interactive_mode`, which has to run last: after
+    it, bash-preexec's `DEBUG` trap took `__holdfast_p` for the user's
+    command and no `preexec` hook — atuin, iTerm2's integration, starship's
+    `took 2s` under bash-preexec — ran for any command. Both were found in
+    review, and measured against bash-preexec 0.5.0, 0.6.0 and master;
+  - the injection-line rule applies only to a *foreign* `C`: Holdfast's own
+    `C` cannot mark the line that installed it, because the snippet defines
+    that emitter while the line runs;
+  - a prompt width is counted in characters, not bytes. The owner's starship
+    prompt ends `⬢ [Docker] ❯ ` — 13 columns, 17 bytes — so a human's Ctrl-U
+    at it came back as `[REDACTED:unresolved]` for a command that was whole;
+  - when the prompt markers still do not arrive (a hook appended *after*
+    the snippet ran, such as `eval "$(starship init bash)"` typed into a live
+    session) `osc133_source` says `holdfast_degraded`, and the T1 rung no
+    longer holds such a session at `Executing` / `semantic` on the `D` that
+    no `A` will ever follow.
+
+  Re-measured against the real starship: 4 of 4 entries with their text and
+  exit codes, at `semantic`, in bash and in zsh. The CI rows need no
+  starship — they drive a `PROMPT_COMMAND` (and a zsh `precmd`) that
+  regenerates the prompt every cycle.
+
+  Also corrected in passing: `shell.rs` said zsh runs `precmd_functions`
+  before the bare `precmd`. zsh 5.9 does the reverse, measured.
+
+- **Once the daemon stopped, every open client answered `daemon_unreachable`
+  until something else started one** ([#231]). `holdfast daemon stop` is the
+  only way to load a new build, so this was every upgrade. The shim now
+  starts a daemon the way it started the first — through `holdfast daemon
+  start`, whose lock and re-check keep several clients noticing at once to
+  one daemon — and the call that found the daemon gone says so at the front
+  of its `details`: *"The Holdfast daemon had stopped, so a new one was
+  started for this call: every session from the previous daemon is gone…"*.
+  **A call is re-sent only when it provably never reached the old daemon** —
+  a dial that failed, or a write into a connection already closed, which is
+  what the first call after a `daemon stop` meets. A call that may already
+  have run — the daemon died while it waited for an answer — is not re-sent,
+  because a `send_input` or `start_session` would run twice; it is answered
+  with a new `data.reason`, `daemon_restarted`, saying the old sessions are
+  gone and whether the call took effect is unknown. A handshake reset by a
+  dead daemon's listener that has not closed yet — measured after `SIGKILL`
+  — is waited out for up to two seconds rather than reported; a handshake
+  that times out is still a wedged daemon and is still reported. If a
+  re-sent call is refused by the new daemon, the refusal's message carries
+  the same note at its front. With the hang-up in the next entry, the stop
+  half of an upgrade no longer sits out its whole grace for an idle shell.
+
+- **`terminate` on a shell took its whole grace, and `daemon stop` the whole
+  of its own** ([#234]). An interactive shell ignores `SIGTERM` (§4.4), so
+  the sweep reached every job and left the shell: `terminate` of any `bash`
+  session waited out its 5 s default before `SIGKILL`, and `daemon stop` its
+  10 s whenever a shell session was open. A shell is now **hung up** —
+  `SIGHUP`, what closing its terminal sends — once two things hold, and each
+  is a case the hangup would otherwise break:
+  - **it is alone in its session.** A shell passes a hangup on to every job
+    it has, so a job that caught the `SIGTERM` — in the foreground or the
+    background — and is still cleaning up would be cut short. The hangup
+    waits until each has finished.
+  - **the leader is an interactive shell now** (no `-c`, no script operand),
+    read from its current argv rather than from what the session was started
+    with. A shell that ran `exec python3 app.py` keeps its pid and group, and
+    a hangup there interrupts that program's `SIGTERM` handler — or makes a
+    server that reads `SIGHUP` as "reload" reload mid-shutdown. Such a
+    program is left to its own handling and the escalation, as before.
+
+  Linux and macOS only; where a session cannot be enumerated nothing
+  changes. The reported case — an idle shell whose background jobs die at
+  the sweep — now ends as soon as they have. The exit code a hung-up shell
+  reports is still `1`: REQ-P-007's documented limitation, which the
+  `SIGKILL` it replaces reported too. The idle reaper still waits out its
+  grace for a shell; it is a background path and was left alone.
+- **An exited session's name, as `holdfast list` shows it, answered a bare
+  `session not found`** ([#234]). §4.1 keeps exited sessions off the name
+  space, so `holdfast logs x79` and `status x79` are still refused once `x79`
+  has exited — but the refusal now says the session with that name has
+  exited and gives the id that still reaches it, newest first when several
+  have carried the name.
+
+- **`git log` and `git diff` sat in `less` until the wait timed out** ([#239]).
+  A session inherited no `PAGER`, so git ran `less` with its default
+  `LESS=FRX`, and the `X` keeps it off the alternate screen: the session read
+  `Executing` rather than `Fullscreen`, `wait_for_pattern` ran to its
+  deadline, and the tail held one screen of the log above a `:`. Every
+  session now starts with `PAGER`, `GIT_PAGER`, `MANPAGER` and
+  `SYSTEMD_PAGER` set to `cat`, after the inherited environment and before
+  the call's own `env` — so a pager inherited from the user's environment
+  loses to them, and a caller that sets any of them in `start_session`'s
+  `env` gets the one it asked for. `GIT_PAGER` is the one that matters most:
+  it outranks `core.pager`, so a git config that pipes through `delta` or
+  `less -S` is covered too, where `PAGER` alone would not be.
+
+- **A session started without `cwd` ran in whichever project had spawned the
+  shared daemon, with that project's environment** ([#229]). The daemon is
+  shared by every MCP client on the machine and outlives them all, and it
+  started every session from its own working directory and environment —
+  which were those of the first client. An agent in project B that omitted
+  `cwd` ran `git`, `cargo` or `rm` in project A, with A's
+  `CLAUDE_PROJECT_DIR` and another Claude session's
+  `CLAUDE_CODE_SESSION_ID`; the tool schema called that default *"the
+  directory the Holdfast server itself was started in"*, which an agent reads
+  as its own project.
+
+  The shim now attaches its own working directory and **its whole
+  environment** to every `start_session`, under a reserved `@client` params
+  key that no tool argument can have, and a `command` session starts from
+  those — the directory and environment of the `holdfast mcp` process the
+  client launched, which is what `--no-daemon` (and so Windows) always did.
+  The whole environment rather than a deny-list of per-project variables,
+  because the list has no end: read off the MCP servers Claude Code had
+  running on the machine this was fixed on, it would have had to include one
+  VS Code window's `SSH_AUTH_SOCK` and askpass handle, one Claude session's
+  messaging token, and whatever `direnv` or `mise` exported for the spawning
+  project. The values cross the control socket and never MCP, so they reach
+  no transcript, and `session_start.env_keys` still records only the keys the
+  call supplied. An explicit `cwd` or `env` still wins.
+
+  **A `profile` session takes neither**, and keeps the daemon's own directory
+  and environment as before: the operator wrote that process ([#55]), and the
+  context is reachable by anything that can speak the control protocol. A
+  daemon-hosted session with no client environment — a profile session, or a
+  request from an older shim — still starts from the daemon's, minus
+  `CLAUDECODE` and the `CLAUDE_` family, which name the spawning client and
+  are wrong for every other. Every session is also given `PWD` naming the
+  directory it really starts in.
+
+  **A client whose own directory has been removed is refused with
+  `invalid_params` and told to pass `cwd`**, rather than started somewhere
+  else: on Linux the shim can no longer read that directory at all, and a
+  context that arrives without one is not read as "use the daemon's", which
+  would be this defect again. A client that names a `cwd` is unaffected.
+  The context's fields are read leniently — one a later shim adds costs a
+  daemon of this release nothing but that field — because a daemon
+  outlives the shims that talk to it.
+
+  **And it is taken only from a shim that sends one.** A shim older than
+  the key forwards an agent's arguments verbatim, and keeps running against
+  the upgraded daemon until its Claude Code session restarts; through one, an
+  agent that typed `@client` into `start_session` had its own `env` replace
+  the session's whole environment — measured with an `a81b02d` shim: the
+  shell saw the agent's `HOME` and variables and no `CLAUDE_PROJECT_DIR` —
+  and `session_start.env_keys` recorded none of it. The key is part of
+  control protocol 1.5, and the daemon now takes it only from a peer whose
+  handshake declared 1.5 or later; an older shim's is left in the arguments,
+  where `start_session` refuses it as the unknown argument it is, as
+  `--no-daemon` does (integration review of [#229]).
+
+- **The server instructions lead with the password-prompt rule, and all of
+  them now reach the model (GH #230).** Claude Code passes the first 2048
+  characters of a server's instructions to the model and drops the rest
+  (2.1.280: `CLAUDE_CODE_MAX_MCP_DESCRIPTION_LENGTH ?? 2048`, counted in
+  UTF-16 units). Holdfast's ran past that, and the one rule whose absence
+  costs a credential — *at a password prompt use `request_secret_input`,
+  never `send_input`* — was the last thing in them, so on the default
+  transport no agent ever read it; the likely failure is an agent asking the
+  user to paste the password into the chat. The text is rewritten in
+  priority order — secrets, then how to wait for a command without guessing
+  at `$PS1`, then what `interaction_mode` and `detection_tier` mean, then
+  output handling, then a one-line map of the rest — and now also says
+  never to ask for a secret in chat, and what to do when nobody answers.
+  That comes back two ways: under `--no-daemon` no client can attach, so
+  the request ends `secret_cancelled` at its timeout, and on Windows it is
+  refused at once as `not_supported_on_platform`. On either, the agent is
+  told to name the command that needs the credential rather than ask for
+  it. `send_input`'s own description carries the password rule, the hybrid
+  transport's suffix says how a human answers (`holdfast attach
+  <session>`), and what the old text said about `wait_for_pattern` alone —
+  that a pattern-less wait ends promptly for `Fullscreen`, `AwaitingSecret`
+  and `Exited`, that
+  `prompt.reason` tells a measured prompt from a guessed one, and the
+  `warning` on an unmatched wait at a measured prompt — moved into that
+  tool's description.
+
+  **Both strings a client can receive are held to the budget, through
+  `get_info`:** the shim's — the shared text plus its suffix, which is what
+  the plugin serves on Unix and what the dogfood log measured — and the
+  in-process one for `--no-daemon` and Windows. Each must fit, and must
+  carry the secret rule within its first quarter, so a later edit that
+  grows the text loses the map at the end rather than the rule at the top.
+  The rule is pinned as whole clauses rather than as its words, because
+  the words survive deleting the chat prohibition, deleting the fallback,
+  and inverting `send_input`'s rule. `scripts/mcp-smoke.sh` asserts the
+  same on the wire. To see the served text and its length, run `holdfast
+  mcp` and read `initialize`'s `instructions`.
+
+- **`[REDACTED:unresolved]` is explained to the agent (GH #242, the
+  explanation half).** It is the one marker that names no rule, and agents
+  were told nothing about it. `read_output`'s description now says what it
+  covers, as GH #242's other half (under *Security*) left it: something that
+  began like a secret — a token-shaped run, or a private-key header
+  followed by what can still be key text — whose end the read could not
+  see, or private-key material the read could not tie to a whole key, such
+  as a key cut short by `head` or a pager's next screenful of one; and that
+  a key header merely mentioned in prose is not masked. It says the marker
+  **can hide a real secret** — the one it was placed for, or a token a rule
+  did match inside the region, which `merge_spans` then counts as
+  `unresolved` and not under its own kind; that a re-read — later, or with
+  a different `max_bytes` — sometimes clears it but is not guaranteed to
+  (`output/mod.rs` records protection as non-monotonic in `max_bytes`);
+  that `redact: false` returns the text with any secret in it, is
+  audit-logged, and is for a region the agent already knows is not a
+  credential, not for finding out; and that `redactions` counts only the
+  markers a response substituted, which is how a real marker is told from
+  marker-shaped text already in the output. The server instructions carry
+  the short form.
+
+  **It does not say *nothing matched*, which is how the marker is usually
+  glossed and is false.** A token inside a region the marker covers is
+  folded into it: a private-key header, then key-shaped text with an AWS
+  key id in it, comes back as one `[REDACTED:unresolved]` with
+  `redactions: {unresolved: 1}` and no `aws` count
+  (`an_unresolved_mask_that_meets_a_real_match_is_one_marker_and_the_weaker_kind`),
+  so a text that called the bytes unmatched and then offered
+  `redact: false` would send an agent to read a live credential raw. A row
+  holds the instructions and every tool description to never saying it.
+  Nor does it call the marker *often ordinary text*, as the first draft
+  did while a prose mention of a key header still masked the next 16 KiB:
+  after the narrowing, a marker a key header produces is a key still
+  arriving, cut short or paged through — the case where reaching for
+  `redact: false` costs a key.
+
+- **Ordinary bursts no longer detach `holdfast watch`, or `attach`** ([#210]).
+  1,500 lines of test output detached `watch` four runs in four on the
+  dogfood pass, showing it between 4.5% and 32% of the lines; `ps`, `git
+  diff` and a build with warnings did the same. Two bounds in series did it,
+  and both stopped being loss bounds:
+  - **the per-connection queue is bounded in bytes and pauses instead of
+    detaching.** It was 64 *frames*, a frame being one PTY `read`, so a
+    line-at-a-time child filled it in 64 lines. The forwarder now batches a
+    backlog into one `Output` of up to `MAX_BATCH_BYTES` (64 KiB), stops
+    reading when `ATTACH_QUEUE_BYTES` (256 KiB) is queued, and resumes when
+    the writer drains;
+  - **a lagging connection resumes from the ring buffer**, like every other
+    offset-aware consumer (REQ-C-006). The 256-frame broadcast was a
+    connection's whole headroom; the ring holds a megabyte by default and
+    counts bytes. A connection now loses only what the ring has already
+    evicted, and is told the exact count as an `OutputGap`.
+
+  The revert [#200] recorded — a megabyte of queue headroom, after which a
+  client that drained nothing was never detached — was the first of these
+  without a way to detach a stopped client other than by occupancy. The
+  stall bound under *Changed* is that way, and it is what let the bound be
+  raised. §7.5's `Detached` still arrives for every ending that has a reader
+  to receive it.
+- **`a_slow_consumer_is_detached_and_the_reader_keeps_running`'s scenario is
+  now a row per claim** ([#210]): a stopped client detached in bounded time
+  with the reader and a draining client untouched; told why if it resumes
+  inside the grace; closed on if it does not; a slow reader never detached,
+  with shown-plus-reported equal to printed, byte for byte, across a ring it
+  falls behind; and the dogfood burst reaching an `interactive` and an
+  `observer` client whole.
+- **A secret the agent asked for before the child read it reaches the child
+  whole** ([#236]'s review). When `request_secret_input` raised the request
+  and the child reached `read -s` afterwards, the echo-drop edge announced
+  the same request again, and `holdfast attach` took the second announcement
+  as a new prompt: it printed the label twice and emptied what the human had
+  typed, so `ab`, the announcement, then `c` + Enter sent the child `c` —
+  and the tool reported success. An announcement of the request being typed,
+  or of one just answered, now changes nothing; a request the human abandoned
+  with `Ctrl-C` is still drawn again, because that is how they learn the
+  child is now reading. `holdfast watch` reports each request once.
+- **`holdfast watch` no longer ignores a `Ctrl-C` that lands while it is
+  drawing** ([#210]'s review). Its listener was rebuilt on every pass of the
+  loop, and a `SIGINT` delivered between two of them did nothing at all — the
+  watch's own handler had already replaced the default action. The opening
+  screen, a synchronous paint of the whole terminal, made that window easy to
+  hit: a `SIGINT` sent the moment it appeared was sometimes ignored, and one
+  watch sat for eleven minutes after it. The listener is now built once, as
+  `attach`'s are.
+
+- **`holdfast logs` printed only the oldest 256 KiB of a session**, silently,
+  exit 0 — and both viewers' `slow_consumer` notices send the operator there
+  for what they missed. One `read_output` returns at most one page, and the command
+  made one call and ignored `truncated_for_size` and `next_cursor`. It now
+  follows `next_cursor` to the end, stopping only at a holdback that makes no
+  progress (where `held_back_note` says why, as before) and at the head as it
+  stood when the command started, so a session printing faster than it can be
+  read cannot keep it running. A page the daemon ended early at an escape
+  sequence its own boundary cut in half — most pages of coloured output — is
+  read past, as §4.1 says to: stopping there would have ended `holdfast logs`
+  of a `grep --color` log a third of the way in. It reads from the ring's tail rather than from 0, so it is
+  no longer audited as `truncated_at_tail`, and says on stderr when the
+  session's front has left the buffer or bytes left it mid-read. `--tail N`
+  longer than one page was cut to the newest 256 KiB, starting mid-line; it
+  now drains and keeps the last N lines itself, counted exactly as the
+  daemon's `tail_lines` counts them ([#232]).
+- **`holdfast logs | head` panicked with a backtrace note and exited 101**, as
+  did `list`, `version`, `daemon status` and `daemon start|stop` whenever the
+  reader left first — the dogfood pass measured it on every `logs` of a long
+  session piped to `head`, and on a third of `list | head -1` runs. Rust
+  ignores `SIGPIPE`, so the write returned `EPIPE` and `println!` panicked.
+  These subcommands now write stdout through one helper that, when the reader
+  has gone, dies of `SIGPIPE` exactly as `cat` does — no message, and 141 from
+  the shell. It is scoped to the stdout write and not the process: the same
+  commands write to the control socket, and a daemon dying mid-call must still
+  read as "unreachable", exit 2. Any other stdout failure (`> /dev/full`) is
+  said on stderr and exits 1. **`holdfast watch | head` never exited at all**,
+  because it discarded its write errors; it now ends as soon as its reader has
+  gone, including on a session that has stopped printing — `holdfast watch s
+  | grep -m1 READY` no longer waits for the session's next output to notice.
+  `attach` is unchanged: its stdout is the terminal it holds in raw mode
+  ([#218]).
+
+- **The install documentation recommended routes that do not work, and left
+  out the one that bites on every upgrade.** `plugin/README.md` said
+  `cargo install holdfast` "also works" and `/holdfast:install` recommended
+  it; crates.io holds a `0.0.0` name reservation with no binary, and cargo
+  refuses it with *"there is nothing to install"*. Both now give
+  `cargo install --locked --git … --tag vX.Y.Z holdfast` with
+  `HOLDFAST_BOOTSTRAP_BIN`, and `plugin/README.md` has a section for exactly
+  that. `README.md`'s *Build and try it* registered `target/debug/holdfast`
+  with Claude Code — which `cargo clean` deletes out from under every session
+  — and said nothing about the daemon: that it outlives Claude Code, is shared
+  by every session, and keeps running the binary it started from until
+  `holdfast daemon stop`, which ends every session it holds. It now installs
+  with `cargo install --path`, gives the stop-and-start upgrade and the reason
+  for starting it yourself and from `~` (GH #231, GH #229: before their fixes,
+  an open session does not restart the daemon, and a daemon started in the
+  checkout is where every session without a `cwd` begins), and says that each
+  `CLAUDE_CONFIG_DIR` needs its own
+  registration and that the plugin and `claude mcp add` should not both be
+  used. `CONTRIBUTING.md`'s setup had the same `target/debug` line and still
+  said *"milestones 0.0.1 through 0.0.5 have landed … nothing is released"*.
+  The *What works today* heading said `v0.0.7` over a list describing `main`;
+  it says `main` now, and the release procedure no longer asks for it to be
+  bumped. A link to `CONTRIBUTING.md#no-binary-assets` pointed at a heading
+  that had been renamed ([#237]).
+- **The plugin bootstrap's "release not found" message sent everyone to a
+  manual download that does not exist.** One sentence covered two failures —
+  *"is the release published, and is this host online?"* — and then told the
+  user to fetch the assets by hand from the releases page, which for an
+  unpublished release, a draft, or `v0.0.5`–`v0.0.7` (published with no
+  assets) has nothing on it. A 404 is now *"no holdfast vX.Y.Z binary to
+  download"* with the from-source route — the `cargo install --git … --tag
+  vX.Y.Z` line and `HOLDFAST_BOOTSTRAP_BIN` — and only a host that reaches no
+  server at all gets the air-gapped placement. That placement also named only
+  the binary: a binary without its `SHA256SUMS-vX.Y.Z.txt` beside it is a cache
+  miss, so following it re-downloaded forever. It names both now. Every other
+  dead end that said *"install holdfast manually from …/releases"* points at the
+  from-source route instead. `bootstrap.ps1` matches, and its `Die` writes one
+  plain stderr line rather than a `Write-Error` record that pwsh wraps at the
+  console width and colours ([#237]).
+- **On a host with wget and no curl, an unpublished release still got the
+  "cannot reach" advice.** The bootstrap's wget fallback read only wget's exit
+  status, which cannot tell a 404 from anything else: busybox wget exits 1 for
+  every failure and GNU wget exits 8 for every HTTP error (both measured). So
+  under busybox — Alpine, slim containers — a 404 got the air-gapped placement
+  advice, the dead end the entry above removes for curl, and under GNU wget a
+  403 or a 503 was called "unpublished, a draft, or without binaries". The
+  bootstrap now reads the status line wget prints under `-S` — the last one,
+  since a release asset is a redirect — so 404, any other status and no answer
+  at all get the same three messages under curl, GNU wget and busybox wget. A
+  redirect whose target never answers is no answer, under all three: its last
+  status is the redirect's own, and a firewall that passes `github.com` and
+  not the host release assets are served from read *"answered HTTP 302 —
+  retry later"* rather than the air-gapped advice (measured). It
+  also runs wget with one try, as curl runs: GNU wget's default retries a
+  dropped or silent connection twenty times with a growing wait — minutes for
+  a dropped one (measured), and up to twenty 120-second read timeouts for a
+  silent one. `scripts/plugin-bootstrap-tests.sh`
+  runs every wget it finds on a `$PATH` with no curl, and CI now installs both
+  (review of [#237]).
+- **A signal during the plugin bootstrap's download ends it.** `HUP`, `INT`
+  and `TERM` were trapped to remove the download's temp directory, and the
+  bootstrap then carried on — into a fetch, a checksum and an extraction whose
+  paths were all inside the directory it had just removed, until one of them
+  failed and said something else. It now exits, `128+n`, and removes the
+  directory on the way out. Its one probe of a freshly installed binary runs
+  it with stdin from `/dev/null`, so it cannot take the `initialize` request
+  the binary is exec'd to answer (review of [#237]).
+
 - **The guard that was supposed to refuse an empty release body could not
   fire, and the release procedure did not mention `Cargo.lock`.** Both are
   release-time defects that no test or check would have caught, because the
@@ -813,7 +1719,9 @@ is cut, named and published is in
 
 - **Not fixed here, and measured rather than assumed: §4.3's
   per-connection bound is counted in *frames*, and a frame is one PTY
-  `read` ([#200]).** So 64 is half a megabyte of 8 KiB chunks and about six
+  `read` ([#200]).** *(Since fixed — see [#210] at the top of this
+  section. Kept as written: it is the measurement that fix answers.)* So 64
+  is half a megabyte of 8 KiB chunks and about six
   kilobytes of the line-sized ones a `cat` through a PTY actually produces
   — a threshold that varies by four orders of magnitude with how chatty the
   child is. That is why the loss is as large as it is, and the same client
@@ -1518,6 +2426,79 @@ is cut, named and published is in
 
 ### Known limitations
 
+- **A URL password behind an ordinary username is not held back while it is
+  still arriving** ([#244]). `url-userinfo-password` indexes only the
+  token-carrying usernames, because an entry at `https://` would hold every URL
+  a program prints. Such a password is redacted as soon as its `@` arrives; a
+  read that lands before then hands out the part that has.
+
+- `bearer-authorization`, `registry-login-password` and a `mysql -p` that is
+  not the first argument keep GH #152's gap: a context rule's candidate is
+  held only while every byte after its prefix is printable, and each of these
+  has a space before its value.
+
+- **`mysql-cli-password` does not reach a `-p` the shell quoted as a whole
+  word** ([#244]). `set -x` prints `mysql -u root '-pXk9#mP&2qLzQ'` when the
+  password carries a shell metacharacter, and the rule wants `-p` after a
+  space. A password with none is traced unquoted and is redacted.
+
+- **A Basic credential on a header spelling `basic-authorization` does not
+  index can hand out the start of its base64 while it arrives** ([#244]) —
+  two spaces or a tab before `Basic`, say. The first three bytes go out
+  because the value is not yet a match; after that it is covered, except
+  that the rule's refusal still declines a partial value while every byte of
+  it is a lower-case letter. Those bytes encode the user name:
+  `a_refused_basic_partial_never_decodes_into_the_password` measures that
+  a refused partial of a real `user:password` never decodes past the colon,
+  and `an_unindexed_basic_spelling_hands_out_no_more_than_the_value_floor`
+  that the leak on the spellings it drives is exactly the three bytes. A
+  length-only refusal released up to every byte but the last. The rule does
+  not reach `HTTP_AUTHORIZATION` (CGI's spelling, whose `_` defeats the word
+  boundary) or a header escaped inside a JSON string (`\"Authorization\":
+  \"Basic …`) at all.
+
+- **A value on the line after a `:` is not reached by a label-keyed rule**
+  ([#245]): YAML's plain scalar on the line after its key, and a credential a
+  prompt echoes on the line after it. The second is the same bytes as ssh's
+  retry prompt with a credential where `Permission` was; the first is legal
+  and rare beside `key: value`. The `=` spelling of the same value is still
+  redacted.
+
+- **An `=` reaches the next line only as a formatter wraps it** ([#245]): at
+  the end of the label's own line, into one indented line. A label with its
+  `=` on the next line (`password\n    = "…"`) and an `=` with a blank line
+  before its value were both redacted by 0.0.7's `\s*` and are not now;
+  neither is what rustfmt or prettier produce.
+
+- **The new rules and labels mark some things that are not credentials**
+  ([#244]). `mysql-cli-password` reads any `-p…` after the word `mysql` or
+  `mariadb` on a line as a password flag, so `docker run --name mysql
+  -p3306:3306`, `find / -name mysql -prune` and a compiler line carrying
+  `-I/usr/include/mysql … -pipe` each get a marker. The `_PWD` and `_PASS`
+  labels reach `OLD_PWD=/home/…` and `self.render_pass = render_pass`, and
+  four lower-case letters after `Authorization: Basic` (`auth`) pass the length
+  test. Each is a marker over ordinary text, not a leak.
+
+- **A digit-free credential shaped like code is not redacted by the
+  label-keyed rules** ([#245]): letters joined by `::` (`Hello::World`), or
+  lower-case letters mixing `.` and `_` (`correct.horse_battery`). One digit
+  anywhere brings either back.
+
+- **A client is detached for making no progress, and on Linux progress
+  arrives in steps of most of a socket buffer** ([#210]). A Unix socket wakes
+  its writer only once the reader has drained most of the buffer, so a reader
+  slower than roughly one socket buffer per stall bound is indistinguishable
+  from a stopped one. At the 30-second bound that is far below any terminal.
+  A suspended viewer on an idle session is not detached at all — nothing is
+  waiting for it — until output backs up behind it, as with a suspended
+  `ssh`.
+- **Joining a session is a screen-state consumer** ([#235]). The opening
+  picture is `get_screen_state`'s capture, which in `adaptive` mode switches
+  the session's VT100 tracking on until `screen_tracking_idle_disable_secs`
+  pass with no consumer — the cost §4.2a measures, and the `cursor_score`
+  sub-signal becoming available to prompt detection meanwhile, exactly as an
+  agent's own `get_screen_state` call does.
+
 - **The plugin's Windows entrypoint is unverified, and it is unverified in a
   way no amount of care on this side settles.** `.mcp.json` holds exactly one
   `command` string and the schema has no platform conditional, so §13.3's
@@ -2000,6 +2981,9 @@ residuals that are known and accepted.
 [#169]: https://github.com/Sertelegger/holdfast/issues/169
 [#163]: https://github.com/Sertelegger/holdfast/issues/163
 [#200]: https://github.com/Sertelegger/holdfast/issues/200
+[#210]: https://github.com/Sertelegger/holdfast/issues/210
+[#235]: https://github.com/Sertelegger/holdfast/issues/235
+[#236]: https://github.com/Sertelegger/holdfast/issues/236
 [#194]: https://github.com/Sertelegger/holdfast/issues/194
 [#217]: https://github.com/Sertelegger/holdfast/issues/217
 [#98]: https://github.com/Sertelegger/holdfast/issues/98
@@ -2011,3 +2995,25 @@ residuals that are known and accepted.
 [#203]: https://github.com/Sertelegger/holdfast/issues/203
 [#202]: https://github.com/Sertelegger/holdfast/issues/202
 [#206]: https://github.com/Sertelegger/holdfast/issues/206
+[#245]: https://github.com/Sertelegger/holdfast/issues/245
+[#244]: https://github.com/Sertelegger/holdfast/issues/244
+[#241]: https://github.com/Sertelegger/holdfast/issues/241
+[#246]: https://github.com/Sertelegger/holdfast/issues/246
+[#243]: https://github.com/Sertelegger/holdfast/issues/243
+[#224]: https://github.com/Sertelegger/holdfast/issues/224
+[#242]: https://github.com/Sertelegger/holdfast/issues/242
+[#247]: https://github.com/Sertelegger/holdfast/issues/247
+[#220]: https://github.com/Sertelegger/holdfast/issues/220
+[#240]: https://github.com/Sertelegger/holdfast/issues/240
+[#238]: https://github.com/Sertelegger/holdfast/issues/238
+[#248]: https://github.com/Sertelegger/holdfast/issues/248
+[#229]: https://github.com/Sertelegger/holdfast/issues/229
+[#239]: https://github.com/Sertelegger/holdfast/issues/239
+[#234]: https://github.com/Sertelegger/holdfast/issues/234
+[#231]: https://github.com/Sertelegger/holdfast/issues/231
+[#20]: https://github.com/Sertelegger/holdfast/issues/20
+[#178]: https://github.com/Sertelegger/holdfast/issues/178
+[#218]: https://github.com/Sertelegger/holdfast/issues/218
+[#232]: https://github.com/Sertelegger/holdfast/issues/232
+[#233]: https://github.com/Sertelegger/holdfast/issues/233
+[#237]: https://github.com/Sertelegger/holdfast/issues/237
