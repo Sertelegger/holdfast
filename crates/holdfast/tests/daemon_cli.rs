@@ -2158,6 +2158,191 @@ fn the_no_daemon_server_honours_a_configured_session_cap() {
 
 // ------------------------------------------------ GH #218, #232, #233, #178, #20
 
+/// Run `holdfast args` with a stdout whose reader has already gone, and
+/// return how it ended and what it said on stderr.
+///
+/// **A pipe whose read end is closed before the child starts**, rather than
+/// `| head` and a race: every write the child makes to stdout then fails
+/// with `EPIPE`, so the outcome does not depend on how much it prints or
+/// how fast `head` exits. The dogfood pass measured `list | head -1`
+/// panicking in 10 of 30 runs because it depended on exactly that.
+fn run_with_stdout_closed(env: &TestEnv, args: &[&str]) -> (std::process::ExitStatus, String) {
+    let (reader, writer) = std::io::pipe().expect("pipe");
+    drop(reader);
+    let mut child = env
+        .cmd()
+        .args(args)
+        .stdin(Stdio::null())
+        .stdout(writer)
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("run holdfast");
+    let mut err = child.stderr.take().expect("piped stderr");
+    let err_h = std::thread::spawn(move || {
+        let mut buf = Vec::new();
+        let _ = err.read_to_end(&mut buf);
+        buf
+    });
+    let deadline = Instant::now() + CLI_TIMEOUT;
+    let status = loop {
+        if let Some(status) = child.try_wait().expect("wait") {
+            break status;
+        }
+        if Instant::now() >= deadline {
+            let _ = child.kill();
+            let _ = child.wait();
+            panic!(
+                "`holdfast {}` with its stdout closed did not exit within {CLI_TIMEOUT:?}",
+                args.join(" ")
+            );
+        }
+        std::thread::sleep(Duration::from_millis(10));
+    };
+    let stderr = String::from_utf8_lossy(&err_h.join().expect("stderr reader")).into_owned();
+    (status, stderr)
+}
+
+/// **GH #218: a reader that leaves early ends the CLI the way it ends
+/// `cat`**, not with a panic, a backtrace note and exit 101.
+///
+/// Every stdout-writing one-shot subcommand, including the two that only
+/// print a line — they share the write path, so one of them regressing
+/// alone is exactly the case a single row would miss.
+#[test]
+fn a_closed_stdout_ends_the_cli_as_it_ends_cat_rather_than_panicking() {
+    use std::os::unix::process::ExitStatusExt;
+
+    let env = TestEnv::new("sigpipe");
+    let mut shim = Shim::start(&env);
+    let started = shim.call_tool(
+        "start_session",
+        json!({ "command": "bash", "args": ["--norc", "--noprofile"], "name": "piped" }),
+    );
+    let session_id = started["result"]["structuredContent"]["data"]["session_id"]
+        .as_str()
+        .expect("session id")
+        .to_string();
+    shim.call_tool(
+        "send_input",
+        json!({ "session": session_id, "data": "echo PIPE''_MARK" }),
+    );
+    let seen = shim.read_until(&session_id, "PIPE_MARK");
+    assert!(seen.contains("PIPE_MARK"), "the session never printed: {seen:?}");
+
+    for args in [
+        &["version"][..],
+        &["list"][..],
+        &["list", "--json"][..],
+        &["logs", "piped"][..],
+        &["logs", "piped", "--tail", "5"][..],
+        &["daemon", "status"][..],
+    ] {
+        let (status, err) = run_with_stdout_closed(&env, args);
+        assert!(
+            !err.contains("panicked"),
+            "`holdfast {}` panicked on a closed stdout: {err}",
+            args.join(" ")
+        );
+        assert_eq!(
+            status.signal(),
+            Some(libc::SIGPIPE),
+            "`holdfast {}` must die of SIGPIPE, as `cat` does, when its reader has gone; \
+             it ended {status} with stderr: {err}",
+            args.join(" ")
+        );
+    }
+
+    shim.call_tool("terminate", json!({ "session": session_id, "force": true }));
+    shim.kill();
+}
+
+/// The other half: a write that fails for any reason *but* a departed
+/// reader is a real failure — said on stderr, exit 1 — and not a panic
+/// with 101. `/dev/full` answers every write with `ENOSPC`, and exists
+/// on Linux only.
+#[test]
+fn a_stdout_that_cannot_be_written_is_a_reported_failure() {
+    if !Path::new("/dev/full").exists() {
+        println!("skipping: no /dev/full on this platform");
+        return;
+    }
+    let env = TestEnv::new("devfull");
+    let full = std::fs::OpenOptions::new()
+        .write(true)
+        .open("/dev/full")
+        .expect("open /dev/full");
+    let out = env
+        .cmd()
+        .arg("version")
+        .stdin(Stdio::null())
+        .stdout(full)
+        .stderr(Stdio::piped())
+        .output()
+        .expect("run holdfast version");
+    let err = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(out.status.code(), Some(1), "stderr: {err}");
+    assert!(!err.contains("panicked"), "{err}");
+    assert!(err.contains("cannot write to stdout"), "{err}");
+}
+
+/// **`holdfast watch | head` never exited** (GH #218): the watcher threw
+/// its write errors away and went on rendering into nothing. It now ends
+/// at the first write after its reader has gone — which, for a session
+/// that is printing, is at once.
+#[test]
+fn watch_ends_when_its_reader_does() {
+    use std::os::unix::process::ExitStatusExt;
+
+    let env = TestEnv::new("watchpipe");
+    let mut shim = Shim::start(&env);
+    let started = shim.call_tool(
+        "start_session",
+        json!({ "command": "bash", "args": ["--norc", "--noprofile"], "name": "watched" }),
+    );
+    let session_id = started["result"]["structuredContent"]["data"]["session_id"]
+        .as_str()
+        .expect("session id")
+        .to_string();
+
+    let (reader, writer) = std::io::pipe().expect("pipe");
+    drop(reader);
+    let mut watch = env
+        .cmd()
+        .args(["watch", "watched"])
+        .stdin(Stdio::null())
+        .stdout(writer)
+        .stderr(Stdio::null())
+        .spawn()
+        .expect("spawn holdfast watch");
+
+    // Keep the session printing until the watcher has had something to
+    // write — bounded, and every round is a fresh chance for it to notice.
+    let deadline = Instant::now() + Duration::from_secs(30);
+    let status = loop {
+        if let Some(status) = watch.try_wait().expect("wait for watch") {
+            break status;
+        }
+        if Instant::now() >= deadline {
+            let _ = watch.kill();
+            let _ = watch.wait();
+            panic!("`holdfast watch` outlived its reader by 30s of session output");
+        }
+        shim.call_tool(
+            "send_input",
+            json!({ "session": session_id, "data": "echo still-printing" }),
+        );
+        std::thread::sleep(Duration::from_millis(200));
+    };
+    assert_eq!(
+        status.signal(),
+        Some(libc::SIGPIPE),
+        "`holdfast watch` must end as `cat` would when its reader has gone: {status}"
+    );
+
+    shim.call_tool("terminate", json!({ "session": session_id, "force": true }));
+    shim.kill();
+}
+
 /// **GH #178: `holdfast version` said `(build unknown)` on every build
 /// that was not the release pipeline's**, identical to the tag for a tree
 /// a hundred commits past it. A build from a git checkout now names the

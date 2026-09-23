@@ -13,9 +13,10 @@ use holdfast_core::daemon::paths::RuntimePaths;
 use holdfast_core::daemon::{server, spawn};
 // The `diag!` macro, not the module — every diagnostic below goes to
 // stderr, and on `holdfast daemon run` stderr is `daemon.log`, which §9.2
-// lists as a redacted boundary. `println!` is left alone throughout:
+// lists as a redacted boundary. Stdout is left unredacted throughout:
 // that is the subcommands' actual answer, and `holdfast logs --raw` is
-// specified to be unredacted.
+// specified to be unredacted. It is written through `crate::out` rather
+// than `println!`, which panics when the reader has gone (GH #218).
 use holdfast_core::diag;
 #[cfg(unix)]
 use holdfast_core::mcp::shim::ShimServer;
@@ -383,13 +384,13 @@ pub fn daemon_start() -> ExitCode {
     match spawn::start_detached(&paths, &exe) {
         Ok(spawn::StartOutcome::AlreadyRunning { pid }) => {
             match pid {
-                Some(p) => println!("daemon already running (pid {p})"),
-                None => println!("daemon already running"),
+                Some(p) => crate::out::line(&format!("daemon already running (pid {p})")),
+                None => crate::out::line("daemon already running"),
             }
             ExitCode::SUCCESS
         }
         Ok(spawn::StartOutcome::Started { pid }) => {
-            println!("daemon started (pid {pid})");
+            crate::out::line(&format!("daemon started (pid {pid})"));
             ExitCode::SUCCESS
         }
         Err(e) => {
@@ -530,14 +531,14 @@ async fn daemon_stop_within(force: bool, paths: Option<RuntimePaths>, rpc_timeou
     if !force {
         return match rpc {
             StopRpc::Stopped(outcome) => {
-                println!(
+                crate::out::line(&format!(
                     "daemon stopped ({} session(s) terminated)",
                     outcome.sessions_terminated
-                );
+                ));
                 0
             }
             StopRpc::NotRunning => {
-                println!("no daemon running");
+                crate::out::line("no daemon running");
                 0
             }
             // §18.8's "Operation failed: couldn't stop". Without
@@ -562,12 +563,12 @@ async fn daemon_stop_within(force: bool, paths: Option<RuntimePaths>, rpc_timeou
 
     match rpc {
         StopRpc::Stopped(outcome) => {
-            println!(
+            crate::out::line(&format!(
                 "daemon stopped ({} session(s) terminated)",
                 outcome.sessions_terminated
-            );
+            ));
             if let Escalation::Killed(pid) = escalation {
-                println!("SIGKILL sent to daemon pid {pid}");
+                crate::out::line(&format!("SIGKILL sent to daemon pid {pid}"));
             }
             // A `NotSignalled` here is not worth a warning: the daemon
             // answered, so the ordinary reason its pid no longer confirms
@@ -581,15 +582,15 @@ async fn daemon_stop_within(force: bool, paths: Option<RuntimePaths>, rpc_timeou
         // verdict.
         StopRpc::NotRunning => match escalation {
             Escalation::Killed(pid) => {
-                println!("daemon killed (pid {pid})");
+                crate::out::line(&format!("daemon killed (pid {pid})"));
                 0
             }
             Escalation::Nothing => {
-                println!("no daemon running");
+                crate::out::line("no daemon running");
                 0
             }
             Escalation::NotSignalled { pid, why } => {
-                println!("no daemon running");
+                crate::out::line("no daemon running");
                 diag!("holdfast daemon stop: holdfast.pid names pid {pid}, not signalled: {why}");
                 0
             }
@@ -598,7 +599,7 @@ async fn daemon_stop_within(force: bool, paths: Option<RuntimePaths>, rpc_timeou
             diag!("holdfast daemon stop: {e}");
             match escalation {
                 Escalation::Killed(pid) => {
-                    println!("daemon killed (pid {pid})");
+                    crate::out::line(&format!("daemon killed (pid {pid})"));
                     0
                 }
                 Escalation::Nothing => EXIT_FAILED,
@@ -815,9 +816,9 @@ pub async fn daemon_status(as_json: bool) -> ExitCode {
         Ok(c) => c,
         Err(ClientError::Connect { .. }) => {
             if as_json {
-                println!("{}", json!({ "running": false }));
+                crate::out::line(&json!({ "running": false }).to_string());
             } else {
-                println!("holdfast daemon down");
+                crate::out::line("holdfast daemon down");
             }
             return ExitCode::from(EXIT_UNREACHABLE);
         }
@@ -835,10 +836,10 @@ pub async fn daemon_status(as_json: bool) -> ExitCode {
             }
         };
     if as_json {
-        println!("{}", serde_json::to_string(&status).unwrap_or_default());
+        crate::out::line(&serde_json::to_string(&status).unwrap_or_default());
     } else {
         let s = status.uptime_secs;
-        println!(
+        crate::out::line(&format!(
             "holdfast daemon up — pid {}, uptime {}:{:02}:{:02}, sessions {} live + {} exited-retained, attach clients {}",
             status.pid,
             s / 3600,
@@ -847,7 +848,7 @@ pub async fn daemon_status(as_json: bool) -> ExitCode {
             status.sessions_live,
             status.sessions_exited_retained,
             status.attach_clients,
-        );
+        ));
     }
     ExitCode::SUCCESS
 }
@@ -877,12 +878,12 @@ pub async fn list(as_json: bool) -> ExitCode {
         }
     };
     if as_json {
-        println!("{}", serde_json::to_string(&data).unwrap_or_default());
+        crate::out::line(&serde_json::to_string(&data).unwrap_or_default());
         return ExitCode::SUCCESS;
     }
     let mut sessions = data["sessions"].as_array().cloned().unwrap_or_default();
     if sessions.is_empty() {
-        println!("no sessions");
+        crate::out::line("no sessions");
         return ExitCode::SUCCESS;
     }
     // Newest first, then by id so the order is total and stable. The sort
@@ -896,10 +897,12 @@ pub async fn list(as_json: bool) -> ExitCode {
             .cmp(&a["started_at_unix_secs"].as_u64())
             .then_with(|| a["id"].as_str().cmp(&b["id"].as_str()))
     });
-    println!("ID                  NAME          STATE      PID      COMMAND");
+    // One write for the whole table: one place a departed reader is
+    // noticed, rather than one per row.
+    let mut table = String::from("ID                  NAME          STATE      PID      COMMAND\n");
     for s in sessions {
-        println!(
-            "{:<18}  {:<12}  {:<9}  {:<7}  {}",
+        table.push_str(&format!(
+            "{:<18}  {:<12}  {:<9}  {:<7}  {}\n",
             s["id"].as_str().unwrap_or("-"),
             s["name"].as_str().unwrap_or("-"),
             s["state"].as_str().unwrap_or("-"),
@@ -908,8 +911,9 @@ pub async fn list(as_json: bool) -> ExitCode {
                 .map(|p| p.to_string())
                 .unwrap_or_else(|| "-".into()),
             s["command"].as_str().unwrap_or("-"),
-        );
+        ));
     }
+    crate::out::text(&table);
     ExitCode::SUCCESS
 }
 
@@ -980,7 +984,7 @@ pub async fn logs(session: &str, tail_lines: Option<usize>, raw: bool) -> ExitCo
             return ExitCode::from(EXIT_FAILED);
         }
     };
-    print!("{}", data["output"].as_str().unwrap_or_default());
+    crate::out::text(data["output"].as_str().unwrap_or_default());
     // §4.1's holdback can now shorten this read, so say so — on stderr,
     // because stdout is the log and this surface's point is that it
     // survives being piped somewhere. Silence here would read as "the
@@ -2172,7 +2176,15 @@ pub async fn watch(session: &str) -> ExitCode {
                     }
                 };
                 match f {
-                    ServerFrame::Output { bytes, .. } => render(&bytes),
+                    // `out::bytes` and not `render`: a watcher's stdout is
+                    // the one this process is for, and when its reader
+                    // goes — `holdfast watch build | head` — the process
+                    // ends as `cat` would (GH #218). `render` discarded the
+                    // error, so the watcher outlived its reader for ever.
+                    // `attach` keeps `render`: its stdout is the terminal
+                    // it holds in raw mode, and dying there would skip the
+                    // restore.
+                    ServerFrame::Output { bytes, .. } => crate::out::bytes(&bytes),
                     ServerFrame::OutputGap { bytes, .. } => {
                         truncated.saw_gap(bytes);
                         report_gap("watch", bytes);
@@ -2329,7 +2341,7 @@ pub async fn daemon_stop(_force: bool) -> ExitCode {
          Sessions live inside `holdfast mcp` and end with it. Use WSL for a \
          daemon that outlives the client."
     );
-    println!("no daemon running");
+    crate::out::line("no daemon running");
     ExitCode::SUCCESS
 }
 
@@ -2364,14 +2376,14 @@ pub async fn daemon_status(as_json: bool) -> ExitCode {
         // `supported` and `reason` are additive, and are what distinguish a
         // daemon that is down from a platform that has none: only the first
         // is worth retrying or starting.
-        println!(
-            "{}",
-            serde_json::json!({
+        crate::out::line(
+            &serde_json::json!({
                 "running": false,
                 "supported": false,
                 "reason": "no daemon on Windows native (§3.6); sessions live \
                            inside `holdfast mcp` and end with it",
             })
+            .to_string(),
         );
     }
     unsupported("daemon status", Remedy::Wsl)
@@ -2532,7 +2544,7 @@ pub async fn pty_worker(_args: &[String]) -> ExitCode {
     ExitCode::from(EXIT_USAGE)
 }
 
-/// `holdfast version`.
+/// `holdfast version`, and `holdfast --version`/`-V`.
 ///
 /// The build is `handshake::build_id()` — the same function the daemon
 /// answers the control handshake with — so this binary and a daemon
@@ -2540,13 +2552,13 @@ pub async fn pty_worker(_args: &[String]) -> ExitCode {
 /// on every build outside the release pipeline until `holdfast-core`'s
 /// `build.rs` derived it (GH #178).
 pub fn version() -> ExitCode {
-    println!(
+    crate::out::line(&format!(
         "holdfast {} (build {}) protocol {}.{}",
         env!("CARGO_PKG_VERSION"),
         holdfast_core::protocol::handshake::build_id(),
         holdfast_core::protocol::PROTOCOL_MAJOR,
         holdfast_core::protocol::PROTOCOL_MINOR,
-    );
+    ));
     ExitCode::SUCCESS
 }
 

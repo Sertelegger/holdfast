@@ -4,7 +4,8 @@
 // MCP client surfaces as server logs, so both are output boundaries in
 // §9.2's sense. `print_stdout` is deliberately **not** denied: `holdfast
 // list`, `holdfast logs` and `holdfast daemon status` write their real answers
-// there, and `holdfast logs --raw` is specified to be unredacted.
+// there, and `holdfast logs --raw` is specified to be unredacted. They write
+// it through [`out`] rather than `println!`, for the reason that module gives.
 #![deny(clippy::print_stderr)]
 
 /// The local terminal half of `holdfast attach`.
@@ -126,6 +127,98 @@ FILES:
 /// every regex outside it, so all but a sliver of a scan's life is spent
 /// holding nothing that a later call would have to wait for.
 const SHUTDOWN_GRACE: Duration = Duration::from_millis(250);
+
+/// Where a subcommand's answer goes, and what happens when nobody is
+/// reading it any more (GH #218).
+///
+/// **Rust ignores `SIGPIPE`**: the runtime installs `SIG_IGN` before `main`,
+/// so a write to a pipe whose reader has gone returns `EPIPE` instead of
+/// ending the process the way it ends `cat`. `println!` answers `EPIPE` by
+/// panicking, so `holdfast logs big | head -1` — the first thing an
+/// operator does with a long log — printed a panic and a backtrace note and
+/// exited 101, and `holdfast watch`, which discarded its write errors,
+/// never exited at all.
+///
+/// **Dying of the signal, and only for stdout.** When stdout's reader has
+/// gone this restores `SIGPIPE`'s default action and raises it, so the
+/// process ends exactly as `cat` would — no message, and a status the
+/// shell reports as 141 — which is the Unix convention for "the consumer
+/// stopped listening" and what a script under `set -o pipefail` already
+/// expects of every other producer. The alternative the issue offers,
+/// `SIG_DFL` for the whole process at startup, is deliberately not taken:
+/// these subcommands also write to the daemon's control socket, and a
+/// daemon that dies mid-call would then kill the CLI silently with 141
+/// instead of letting it say "daemon unreachable" and exit 2. Scoped to
+/// the stdout write, a closed socket stays an error the caller reports.
+///
+/// `holdfast mcp` and `holdfast daemon run` never come here: the shim's
+/// stdout is the MCP transport, owned by `rmcp`, and the daemon writes
+/// nothing to stdout. Neither may die of a peer going away.
+///
+/// Any *other* write failure — `holdfast logs X > /dev/full` — is a real
+/// failure and not a departed reader: it is said on stderr and exits 1
+/// (§18.8), rather than panicking with 101.
+pub(crate) mod out {
+    use std::io::Write;
+
+    /// Write `text` to stdout, and flush it.
+    ///
+    /// **Flushed on every call**, because an unflushed tail is written by
+    /// the runtime's exit path, which ignores the error — so a reader that
+    /// left during the last line would have been reported as success.
+    pub(crate) fn text(text: &str) {
+        bytes(text.as_bytes());
+    }
+
+    /// [`text`] with a newline, for the one-line answers.
+    pub(crate) fn line(text: &str) {
+        let mut buf = String::with_capacity(text.len() + 1);
+        buf.push_str(text);
+        buf.push('\n');
+        bytes(buf.as_bytes());
+    }
+
+    /// Write raw bytes to stdout, unmodified, and flush them. `holdfast
+    /// watch`'s payload is a PTY's byte stream, which is not UTF-8.
+    pub(crate) fn bytes(b: &[u8]) {
+        let mut out = std::io::stdout().lock();
+        let written = out.write_all(b).and_then(|()| out.flush());
+        drop(out);
+        if let Err(e) = written {
+            failed(&e);
+        }
+    }
+
+    fn failed(e: &std::io::Error) -> ! {
+        if e.kind() == std::io::ErrorKind::BrokenPipe {
+            reader_gone();
+        }
+        holdfast_core::diag!("holdfast: cannot write to stdout: {e}");
+        std::process::exit(i32::from(crate::commands::EXIT_FAILED))
+    }
+
+    #[cfg(unix)]
+    fn reader_gone() -> ! {
+        // SAFETY: `signal` and `raise` take no pointers. Restoring the
+        // default action first is what makes the raise fatal — under the
+        // runtime's `SIG_IGN` it would be discarded.
+        unsafe {
+            libc::signal(libc::SIGPIPE, libc::SIG_DFL);
+            libc::raise(libc::SIGPIPE);
+        }
+        // Reached only when the parent left `SIGPIPE` blocked, so the
+        // signal is pending rather than delivered. The status is the one a
+        // shell would have shown for the death.
+        std::process::exit(128 + libc::SIGPIPE)
+    }
+
+    /// There is no `SIGPIPE` to die of. No message either way: a reader
+    /// that left is not something the operator needs telling about.
+    #[cfg(not(unix))]
+    fn reader_gone() -> ! {
+        std::process::exit(i32::from(crate::commands::EXIT_FAILED))
+    }
+}
 
 fn usage_error(msg: &str) -> ExitCode {
     diag!("holdfast: {msg}\n\n{USAGE}{PLATFORM_NOTE}");
