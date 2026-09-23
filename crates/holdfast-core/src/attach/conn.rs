@@ -492,11 +492,19 @@ pub async fn run(daemon: Arc<Daemon>, stream: UnixStream, peer_pid: Option<i32>,
     // pane opens one connection per pane. One `StreamRedactor` **per
     // connection**, never per session — two observers must not share
     // carry state, and an interactive client must not pay for one.
+    //
+    // **Seeded from the ring behind the floor, never started empty**
+    // (`StreamRedactor::resume_at`). A redactor that starts at the join
+    // has not seen the key header whose body a pager is about to repaint,
+    // or the partial a key still printing holds open, and sends that body
+    // raw to the one client that joined late.
     let redactor = match conn.role {
         AttachRole::Interactive => None,
-        AttachRole::Observer => Some(super::redact_stream::StreamRedactor::new(Arc::clone(
-            &daemon.server.processor,
-        ))),
+        AttachRole::Observer => Some(super::redact_stream::StreamRedactor::resume_at(
+            Arc::clone(&daemon.server.processor),
+            &stream_behind(&session, floor),
+            floor,
+        )),
     };
 
     // §4.3's bound for this connection, in bytes, shared by the one task
@@ -2023,6 +2031,28 @@ fn redact(redactor: &mut Option<super::redact_stream::StreamRedactor>, bytes: &[
     }
 }
 
+/// The ring's bytes that end at `floor` — as many as a joining
+/// observer's redactor is seeded with, fewer where the ring has already
+/// evicted them.
+///
+/// The read starts [`RESUME_CONTEXT_BYTES`] behind the floor and is cut
+/// at the floor, so what it returns ends exactly there: the redactor's
+/// offsets and the stream's then agree, and a byte after the floor is
+/// never context — it is the stream, and the stream's to send.
+///
+/// [`RESUME_CONTEXT_BYTES`]: super::redact_stream::RESUME_CONTEXT_BYTES
+fn stream_behind(session: &Session, floor: u64) -> Vec<u8> {
+    use super::redact_stream::RESUME_CONTEXT_BYTES;
+    let read = session.read_from(
+        floor.saturating_sub(RESUME_CONTEXT_BYTES as u64),
+        RESUME_CONTEXT_BYTES,
+    );
+    let start = read.cursor - read.bytes.len() as u64;
+    let mut bytes = read.bytes;
+    bytes.truncate(usize::try_from(floor.saturating_sub(start)).unwrap_or(usize::MAX));
+    bytes
+}
+
 /// The status a `SessionExited` reports for a session that had already
 /// ended before this connection existed.
 ///
@@ -2552,6 +2582,39 @@ mod tests {
                 _ => None,
             })
             .collect()
+    }
+
+    /// **The context a joining observer's redactor is seeded with ends
+    /// exactly at the floor** — the seam GH #235's join and the seeded
+    /// redactor share.
+    ///
+    /// A byte past the floor fed as context would be judged and never
+    /// sent — the stream starts at the floor, and the redactor emits
+    /// nothing before where its context ended — so the context must stop
+    /// at the floor even when the head has moved on. And where the ring has
+    /// evicted part of the window it is shorter, not shifted: what comes
+    /// back still ends at the floor.
+    #[tokio::test]
+    async fn the_context_behind_a_join_ends_at_the_floor() {
+        use super::super::redact_stream::RESUME_CONTEXT_BYTES;
+        for ring in [64 * 1024, 4096] {
+            let pty = Arc::new(MockPty::new());
+            let session = session_on(Arc::clone(&pty) as Arc<dyn PtyBackend>, ring, 16);
+            let bytes = pattern(RESUME_CONTEXT_BYTES + 5000);
+            pty.queue_output(&bytes);
+            wait_head(&session, bytes.len() as u64).await;
+            let tail = bytes.len().saturating_sub(ring);
+            for floor in [bytes.len(), bytes.len() - 100, tail + 10, tail] {
+                let got = stream_behind(&session, floor as u64);
+                let from = floor.saturating_sub(RESUME_CONTEXT_BYTES).max(tail);
+                assert_eq!(
+                    got,
+                    bytes[from..floor],
+                    "ring {ring}, floor {floor}: the context must be the ring's bytes \
+                     that end at the floor"
+                );
+            }
+        }
     }
 
     /// **A broadcast lag is not a loss** (GH #210, REQ-C-006).

@@ -1842,6 +1842,122 @@ async fn a_client_joining_after_a_key_was_printed_is_shown_none_of_its_body() {
     }
 }
 
+/// **A `watch` that joins part way through a key is streamed none of
+/// the rest of it** — the stream's half of the join, where the row above
+/// is the picture's (the integration review of GH #235 × GH #242).
+///
+/// Two ways a human opens `holdfast watch` on an agent's session while a
+/// key is on its way:
+///
+/// * **between a pager's screens** — `less` has drawn the header and the
+///   first screen of body, and the agent pages on. Measured on the
+///   integrated release build: a watch joined there was sent 28 of a
+///   4096-bit key's 50 body lines raw over the next two screens, in 3 of
+///   3 trials, and one attached before `less` started was sent none;
+/// * **while the key is still printing** — measured the same way at a
+///   line every 0.25 s: 14 of 26 raw.
+///
+/// Both leaked because the observer's redactor started empty at the join:
+/// it had not seen the header, so the body after it was ordinary base64.
+/// It is now seeded from the ring behind the join
+/// (`StreamRedactor::resume_at`).
+///
+/// **The control is an interactive client that joins at the same
+/// moment**, whose stream is raw by design (REQ-SEC-008): it must carry
+/// most of the body, or the fixture never put the body on the stream
+/// after the join and "none leaked" would be true of an empty stream.
+#[tokio::test]
+async fn a_watch_joining_part_way_through_a_key_is_streamed_none_of_the_rest() {
+    let d = TestDaemon::start("latejoin").await;
+    let body = key_body(45);
+    let line = |l: &String| format!("{l}\r\n");
+    // (label, before the join, after the join)
+    let cases = [
+        (
+            "between a pager's screens",
+            format!(
+                "$ less -XM key.pem\r\n-----BEGIN RSA PRIVATE KEY-----\r\n{}\
+                 \x1b[7mkey.pem lines 1-23 51%\x1b[27m\x1b[K",
+                body[..22].iter().map(line).collect::<String>()
+            ),
+            format!(
+                "\r\x1b[K{}\x1b[7m:\x1b[27m\x1b[K\r\x1b[K$ echo done\r\ndone\r\n$ ",
+                body[22..].iter().map(line).collect::<String>()
+            ),
+        ),
+        (
+            "still printing",
+            format!(
+                "$ cat key.pem\r\n-----BEGIN RSA PRIVATE KEY-----\r\n{}",
+                body[..10].iter().map(line).collect::<String>()
+            ),
+            format!(
+                "{}-----END RSA PRIVATE KEY-----\r\n$ echo done\r\ndone\r\n$ ",
+                body[10..].iter().map(line).collect::<String>()
+            ),
+        ),
+    ];
+    for (case, before, after) in cases {
+        let (s, pty) = d.session(None);
+        s.resize(80, 24).expect("resize the fixture's screen");
+        pty.queue_output(before.as_bytes());
+        wait_for_head(&s, before.len() as u64).await;
+
+        let mut watch = d.dial().await;
+        send(
+            &mut watch,
+            &attach_as(&s.id, AttachMode::ReadOnly, AttachRole::Observer),
+        )
+        .await;
+        assert!(matches!(
+            recv_raw(&mut watch).await,
+            ServerFrame::Attached { .. }
+        ));
+        let mut raw = d.dial().await;
+        send(
+            &mut raw,
+            &attach_as(&s.id, AttachMode::ReadWrite, AttachRole::Interactive),
+        )
+        .await;
+        assert!(matches!(
+            recv_raw(&mut raw).await,
+            ServerFrame::Attached { .. }
+        ));
+
+        // A line at a time, each its own read: the rest of a key being
+        // printed does not arrive in one piece, and a redactor that held
+        // the header for one frame and lost it the next is caught only by
+        // the frames after the first.
+        let mut head = before.len() as u64;
+        for piece in after.split_inclusive('\n') {
+            pty.queue_output(piece.as_bytes());
+            head += piece.len() as u64;
+            wait_for_head(&s, head).await;
+        }
+        let done = b"done\r\n$ ";
+        let in_stream = |seen: &[u8]| body.iter().filter(|l| contains(seen, l.as_bytes())).count();
+        let control = in_stream(&stream_until(&mut raw, done, 10).await);
+        assert!(
+            control >= 20,
+            "{case}: control — the interactive client was streamed only {control} body \
+             lines, so the fixture never put the rest of the key on the stream"
+        );
+        let watched = stream_until(&mut watch, done, 10).await;
+        assert_eq!(
+            in_stream(&watched),
+            0,
+            "{case}: the watch that joined part way through was streamed key body raw — \
+             its redactor had not seen the header: {:?}",
+            String::from_utf8_lossy(&watched)
+        );
+        assert!(
+            contains(&watched, b"[REDACTED:"),
+            "{case}: the rest of the key was dropped without a marker: {:?}",
+            String::from_utf8_lossy(&watched)
+        );
+    }
+}
+
 /// **The picture goes before a replayed secret prompt**, or it paints
 /// over it (GH #235, §7.5's replay).
 #[tokio::test]

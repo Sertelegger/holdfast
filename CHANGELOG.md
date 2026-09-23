@@ -684,6 +684,24 @@ is cut, named and published is in
   digest inside the carry behind a private-key header, which is masked; and a
   key painted a colour per character (`grep -n .` under `--color=auto`), whose
   header is not in the raw bytes at all.
+- **A `holdfast watch` that joined part way through a key was streamed the
+  rest of it raw** (integration review of [#235] and [#242]). A watch's
+  redactor decides what is key body from bytes it has already seen — the
+  header whose body a pager is about to repaint, the partial a key still
+  printing holds open — and a watch that joined late started with an empty
+  one. Measured on the integrated build with `less` of a 4096-bit key: a watch
+  opened after the first screen and followed through two more was streamed 28
+  of the 50 body lines raw, in 3 of 3 trials, while one attached before
+  `less` started, `get_screen_state` and `read_output` showed none; a watch
+  that joined while a key printed a line every 0.25 s was streamed 14 of 26.
+  `a81b02d` leaks the same 28, so this predates the release. The joining
+  watch's redactor is now seeded from the output buffer behind the point it
+  joins at — the 16 KiB a redactor that had watched from the start would
+  still be holding — and sends nothing from before that point, which the
+  opening screen already drew. A watch that joins while the stream is being
+  withheld is sent the `[REDACTED:unresolved]` the others got when it began,
+  and the rest of a key that began before the join is marked rather than
+  dropped in silence.
 
 - **The plugin bootstrap refuses a wget that says it did not verify the TLS
   certificate.** busybox's built-in TLS validates no certificate and says so on
