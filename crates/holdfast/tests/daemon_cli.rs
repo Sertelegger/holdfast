@@ -2816,3 +2816,202 @@ fn logs_of_a_session_longer_than_its_buffer_says_the_front_is_gone() {
     shim.call_tool("terminate", json!({ "session": session_id, "force": true }));
     shim.kill();
 }
+
+/// The last number [`a_coloured_session`] prints. Chosen so the output —
+/// 37 bytes a line once the pty has made each `\n` a `\r\n` — is longer
+/// than the 1 MiB ring, which [`align_a_seam_inside_an_escape`] relies on.
+const COLOURED_LAST: u64 = 32_000;
+
+/// A session that has printed `1..=COLOURED_LAST`, every number wrapped in
+/// SGR sequences, and a marker. Nearly three bytes in four sit inside an
+/// escape sequence, so a page boundary almost always lands inside one.
+fn a_coloured_session(env: &TestEnv, name: &str) -> (Shim, String) {
+    let mut shim = Shim::start(env);
+    let started = shim.call_tool(
+        "start_session",
+        json!({ "command": "bash", "args": ["--norc", "--noprofile"], "name": name }),
+    );
+    let session_id = started["result"]["structuredContent"]["data"]["session_id"]
+        .as_str()
+        .expect("session id")
+        .to_string();
+    shim.call_tool(
+        "send_input",
+        json!({
+            "session": session_id,
+            "data": format!(
+                "printf '\\033[1;3;4;38;5;196;48;5;21m%06d\\033[0m\\n' $(seq 1 {COLOURED_LAST}); \
+                 echo COLOURED''_DONE"
+            ),
+        }),
+    );
+    wait_for_tail(&mut shim, &session_id, "COLOURED_DONE");
+    (shim, session_id)
+}
+
+/// `buffer.head` and `buffer.tail`, from `status`.
+fn buffer_extent(shim: &mut Shim, session: &str) -> (u64, u64) {
+    let st = shim.call_tool("status", json!({ "session": session }));
+    let buffer = &st["result"]["structuredContent"]["data"]["buffer"];
+    (
+        buffer["head"].as_u64().expect("buffer.head"),
+        buffer["tail"].as_u64().expect("buffer.tail"),
+    )
+}
+
+/// Wait until the session has stopped printing: the same head, twice, a
+/// quarter of a second apart. Bounded.
+fn await_quiet(shim: &mut Shim, session: &str) -> u64 {
+    let deadline = Instant::now() + Duration::from_secs(30);
+    let mut last = buffer_extent(shim, session).0;
+    loop {
+        std::thread::sleep(Duration::from_millis(250));
+        let now = buffer_extent(shim, session).0;
+        if now == last {
+            return now;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "the session never stopped printing"
+        );
+        last = now;
+    }
+}
+
+/// Whether the drain `holdfast logs` will make of `session` as it stands —
+/// 256 KiB pages from the ring's tail, following `next_cursor` — meets a
+/// page the daemon cut short at an unfinished escape sequence **with more
+/// of the buffer behind it**. That is the page the first fix of GH #232
+/// took for the end of the buffer.
+fn a_seam_lands_inside_an_escape(shim: &mut Shim, session: &str) -> bool {
+    let (head, tail) = buffer_extent(shim, session);
+    let mut cursor = tail;
+    while cursor < head {
+        let resp = shim.call_tool(
+            "read_output",
+            json!({ "session": session, "since_cursor": cursor, "max_bytes": 262_144 }),
+        );
+        let data = &resp["result"]["structuredContent"]["data"];
+        let Some(next) = data["next_cursor"].as_u64() else {
+            return false;
+        };
+        if data["held_back"] == json!(true)
+            && data["held_back_cause"] == json!("incomplete_escape")
+            && next < head
+        {
+            return true;
+        }
+        if next <= cursor {
+            return false;
+        }
+        cursor = next;
+    }
+    false
+}
+
+/// Make the drain's page boundaries fall inside an escape sequence, and
+/// leave the session idle so they stay there.
+///
+/// **Deterministic by construction rather than by luck.** The ring is
+/// full, so its tail — where the drain starts — moves one-for-one with
+/// its head, and every page seam moves with it. A seam that happens to
+/// fall between two sequences is moved by printing a few bytes more; the
+/// loop is bounded, and a fixture that never aligns fails here, by name,
+/// rather than letting the row pass without testing anything.
+fn align_a_seam_inside_an_escape(shim: &mut Shim, session: &str) {
+    for pad in 1..=40 {
+        await_quiet(shim, session);
+        if a_seam_lands_inside_an_escape(shim, session) {
+            return;
+        }
+        shim.call_tool(
+            "send_input",
+            json!({ "session": session, "data": format!("printf '%{pad}s\\n' ''") }),
+        );
+    }
+    panic!("no page seam of the drain could be made to land inside an escape sequence");
+}
+
+/// **The first fix of GH #232 stopped at the first escape sequence a page
+/// boundary cut in half**, which is most pages of coloured output.
+///
+/// `read_output` ends a page at `since_cursor + max_bytes`, and when an
+/// escape sequence straddles that point REQ-O-008 withholds it:
+/// `held_back`, `incomplete_escape`, `next_cursor` at the sequence's
+/// introducer — with the rest of the buffer still behind it. The drain
+/// read every `held_back` as the end of the buffer, so `holdfast logs` on
+/// `grep --color=always` output stopped a third of the way in, said
+/// "read again", and stopped at the same byte every time; and `--tail N`,
+/// which drains when the N lines are longer than a page, printed the
+/// session's *oldest* lines as its tail. §4.1's recourse for this cause is
+/// "retry at `next_cursor`", and the retry makes progress.
+///
+/// Both paths, over the same buffer, after checking that the buffer does
+/// what the row is about — so a fixture that stops producing the seam
+/// fails rather than passing on a drain that never met one.
+#[test]
+fn holdfast_logs_reads_on_past_an_escape_sequence_cut_by_a_page_boundary() {
+    const N: usize = 20_000;
+    let env = TestEnv::new("logsansi");
+    let (mut shim, session_id) = a_coloured_session(&env, "coloured");
+    align_a_seam_inside_an_escape(&mut shim, &session_id);
+    let head = buffer_extent(&mut shim, &session_id).0;
+
+    let (code, out, err) = env.run(&["logs", "coloured"]);
+    assert_eq!(code, 0, "stderr: {err}");
+    assert!(
+        out.contains("COLOURED_DONE"),
+        "the drain stopped short of the end of the buffer; stderr: {err}"
+    );
+    assert!(
+        !err.contains("Read again"),
+        "a seam inside an escape is not a holdback the reader has to retry: {err}"
+    );
+    // The ring's oldest byte can fall mid-line, so the first line may be a
+    // fragment; everything after it is whole and consecutive.
+    let numbers = numbered_lines(out.split_once('\n').map_or("", |(_, rest)| rest));
+    let first = *numbers.first().expect("numbered lines");
+    assert_eq!(
+        numbers,
+        (first..=COLOURED_LAST).collect::<Vec<_>>(),
+        "a page seam dropped or repeated a line"
+    );
+
+    // The fallback is taken on the *raw* extent of the N lines, which the
+    // stripped output does not show, so it is asked of the daemon.
+    let tail_read = shim.call_tool(
+        "read_output",
+        json!({ "session": session_id, "tail_lines": N, "max_bytes": 262_144 }),
+    );
+    assert_eq!(
+        tail_read["result"]["structuredContent"]["data"]["truncated_for_size"],
+        json!(true),
+        "{N} lines have to be longer than one page for this to test the fallback"
+    );
+    let (code, out, err) = env.run(&["logs", "coloured", "--tail", &N.to_string()]);
+    assert_eq!(code, 0, "stderr: {err}");
+    assert_eq!(
+        out.lines().count(),
+        N,
+        "`--tail {N}` did not print {N} lines"
+    );
+    let numbers = numbered_lines(&out);
+    let first = *numbers.first().expect("numbered lines");
+    assert_eq!(
+        numbers,
+        (first..=COLOURED_LAST).collect::<Vec<_>>(),
+        "`--tail {N}` is not the session's last {N} lines"
+    );
+    assert!(
+        out.contains("COLOURED_DONE"),
+        "the tail's own end is missing"
+    );
+
+    assert_eq!(
+        buffer_extent(&mut shim, &session_id).0,
+        head,
+        "the session printed during the row, so the seam it aligned may have moved"
+    );
+    shim.call_tool("terminate", json!({ "session": session_id, "force": true }));
+    shim.kill();
+}

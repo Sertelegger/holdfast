@@ -1094,10 +1094,14 @@ const LOGS_PAGE_BYTES: u64 = 256 * 1024;
 /// It now follows `next_cursor` to the end, and stops early only where
 /// the daemon says to:
 ///
-/// * **`held_back`** — §4.1's holdback, or REQ-O-008's unfinished escape,
-///   at the tail. Since GH #195 both boundaries move only with
-///   `buffer.head`, so asking again at once returns the same bytes; the
-///   loop stops and [`held_back_note`] says why, as before.
+/// * **A `held_back` page that makes no progress** — §4.1's partial
+///   secret at the tail, which moves only with `buffer.head`, so asking
+///   again at once returns the same bytes; the loop stops and
+///   [`held_back_note`] says why, as before. A `held_back` page that
+///   *did* make progress is read past: REQ-O-008 withholds an escape
+///   sequence cut by the page's own end, wherever that falls, and the
+///   first version of this loop stopped there — a third of the way into
+///   coloured output, and at the same byte on every retry.
 /// * **The head as it stood when the command started.** A session that
 ///   prints faster than this reads would otherwise never be caught up
 ///   with, and `holdfast logs` would not return. What was there when you
@@ -1230,7 +1234,8 @@ struct Drained {
     gone_before: u64,
     /// Bytes that left the ring between two pages of this drain.
     gone_during: u64,
-    /// The page that stopped at a holdback, if one did.
+    /// The page that ended the drain at a holdback, if one did. Never a
+    /// holdback a later page read past: that one withheld nothing.
     held: Option<Value>,
 }
 
@@ -1263,16 +1268,35 @@ async fn drain(r: &LogReader<'_>, mut sink: impl FnMut(&str)) -> Result<Drained,
             .await?;
         seen.gone_during += page.start.saturating_sub(cursor);
         sink(&page.output);
-        if page.held_back {
-            seen.held = Some(page.data);
-            break;
-        }
         match page.next_cursor {
             // Caught up with the head, as it stands now.
-            None => break,
-            Some(next) if next > cursor => cursor = next,
-            // Since GH #195 every read makes progress, so this is a daemon
-            // that has regressed — and a loop that trusted it would spin.
+            None => {
+                seen.held = None;
+                break;
+            }
+            // **A holdback that made progress is read past, not stopped
+            // at.** REQ-O-008 withholds an escape sequence that straddles
+            // the page's own end, `since_cursor + max_bytes`, wherever
+            // that falls — so on coloured output most pages come back
+            // `held_back` with the rest of the buffer behind them, and the
+            // retry at `next_cursor` is §4.1's documented recourse and
+            // makes progress. Only the last page's holdback survives to
+            // the note: one that a later page read past withheld nothing.
+            Some(next) if next > cursor => {
+                seen.held = page.held_back.then_some(page.data);
+                cursor = next;
+            }
+            // A holdback that made none is the one that means it: §4.1's
+            // partial secret at the tail, which moves only with
+            // `buffer.head`, so asking again at once returns the same
+            // nothing. Stop, and keep the page for the note.
+            Some(_) if page.held_back => {
+                seen.held = Some(page.data);
+                break;
+            }
+            // Since GH #195 every other read makes progress, so this is a
+            // daemon that has regressed — and a loop that trusted it
+            // would spin.
             Some(next) => {
                 diag!(
                     "holdfast logs: the daemon returned no progress at byte {next}; \
@@ -3473,15 +3497,26 @@ mod tests {
     }
 
     /// One `read_output` page covering `[start, end)`, labelled with its
-    /// start so the test can see which pages were printed.
+    /// start so the test can see which pages were printed — and empty
+    /// when it is, as a real page that returned nothing is.
     fn page(start: u64, end: u64, next: Option<u64>, held: bool) -> Value {
+        held_page(
+            start,
+            end,
+            next,
+            held.then_some(HeldBackCause::InFlightSecret),
+        )
+    }
+
+    /// [`page`], held back for `cause` when there is one.
+    fn held_page(start: u64, end: u64, next: Option<u64>, cause: Option<HeldBackCause>) -> Value {
         json!({
-            "output": format!("[{start}]"),
+            "output": if end > start { format!("[{start}]") } else { String::new() },
             "cursor": end,
             "bytes_returned": end - start,
-            "truncated_for_size": next.is_some() && !held,
-            "held_back": held,
-            "held_back_cause": if held { json!("in_flight_secret") } else { Value::Null },
+            "truncated_for_size": next.is_some() && cause.is_none(),
+            "held_back": cause.is_some(),
+            "held_back_cause": cause.map(HeldBackCause::as_str),
             "next_cursor": next,
             "state": "Running",
         })
@@ -3525,23 +3560,28 @@ mod tests {
         daemon.abort();
     }
 
-    /// A holdback ends the drain on the page that reported it, and that
-    /// page is kept for the note. Reading on would return the same bytes:
-    /// since GH #195 the boundary moves only with `buffer.head`.
+    /// A holdback that makes no progress ends the drain, and the page
+    /// that said so is kept for the note. It is §4.1's partial secret at
+    /// the tail: the boundary moves only with `buffer.head`, so the read
+    /// that reaches it returns nothing, and so would every read after it.
+    /// The page *before* it was held back too, and made progress, which
+    /// is not a reason to stop — see the next row.
     #[tokio::test]
-    async fn a_drain_stops_at_a_holdback_and_keeps_the_page_that_said_so() {
+    async fn a_drain_stops_at_a_holdback_that_makes_no_progress_and_keeps_that_page() {
         let paths = scratch("drainheld");
         let _scoped = Scoped(paths.clone());
         paths.ensure_dir().unwrap();
         let reads = Arc::new(AtomicU32::new(0));
         let counted = Arc::clone(&reads);
+        let secret = Some(HeldBackCause::InFlightSecret);
         let daemon = fake_daemon(&paths, move |m, p| match m {
             "tool/status" => Some(json!({ "buffer": { "head": 10_000, "tail": 0 } })),
             "tool/read_output" => {
                 counted.fetch_add(1, Ordering::SeqCst);
                 Some(match since(p) {
                     0 => page(0, 4000, Some(4000), false),
-                    4000 => page(4000, 6000, Some(6000), true),
+                    4000 => held_page(4000, 6000, Some(6000), secret),
+                    6000 => held_page(6000, 6000, Some(6000), secret),
                     c => page(c, c + 1, Some(c + 1), false),
                 })
             }
@@ -3553,9 +3593,53 @@ mod tests {
             .await
             .unwrap_or_else(|_| panic!("the drain failed"));
         assert_eq!(printed, "[0][4000]");
-        assert_eq!(reads.load(Ordering::SeqCst), 2, "it read past a holdback");
+        assert_eq!(
+            reads.load(Ordering::SeqCst),
+            3,
+            "it asked again after a holdback that made no progress"
+        );
         let held = seen.held.expect("the holdback page is kept");
         assert_eq!(held["held_back_cause"], "in_flight_secret");
+        assert_eq!(
+            held["bytes_returned"], 0,
+            "the page kept is the one that stopped it"
+        );
+        daemon.abort();
+    }
+
+    /// **A holdback that made progress is read past** — the review of GH
+    /// #232's first fix. REQ-O-008 withholds an escape sequence cut by the
+    /// page's own end, `since_cursor + max_bytes`, wherever that falls, so
+    /// a page of coloured output comes back `held_back`,
+    /// `incomplete_escape`, with most of the buffer still behind it. The
+    /// drain took that for the end and stopped a third of the way into a
+    /// `grep --color` log, at the same byte on every retry. The fake
+    /// cuts two pages that way, so reading past one is not enough.
+    #[tokio::test]
+    async fn a_drain_reads_past_a_holdback_that_made_progress() {
+        let paths = scratch("drainansi");
+        let _scoped = Scoped(paths.clone());
+        paths.ensure_dir().unwrap();
+        let escape = Some(HeldBackCause::IncompleteEscape);
+        let daemon = fake_daemon(&paths, move |m, p| match m {
+            "tool/status" => Some(json!({ "buffer": { "head": 10_000, "tail": 0 } })),
+            "tool/read_output" => Some(match since(p) {
+                0 => held_page(0, 3997, Some(3997), escape),
+                3997 => held_page(3997, 7995, Some(7995), escape),
+                c => page(c, 10_000, None, false),
+            }),
+            _ => None,
+        });
+        let r = log_reader(&paths).await;
+        let mut printed = String::new();
+        let seen = drain(&r, |s| printed.push_str(s))
+            .await
+            .unwrap_or_else(|_| panic!("the drain failed"));
+        assert_eq!(printed, "[0][3997][7995]");
+        assert!(
+            seen.held.is_none(),
+            "a holdback the drain read past withheld nothing, and the note would say it did"
+        );
         daemon.abort();
     }
 
