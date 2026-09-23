@@ -336,6 +336,48 @@ is cut, named and published is in
 
 ### Security
 
+- **A private key's body no longer goes out raw through a read that starts
+  inside it, or through `get_screen_state` once its header has scrolled
+  off** ([#243], [#224]). [#195]'s fix masked a key for a read that starts
+  *before* its header. A read that starts inside it — every `tail_lines` and
+  `tail_bytes` read, and a cursor partway in — never saw the header, because
+  the window reaches 512 bytes behind the page and a key is kilobytes, so
+  nothing marked the body: on `main` at `a81b02d`, `tail_lines: 30` of a
+  complete 4096-bit key returned 26 raw body lines with `redactions: {}` and
+  `held_back: false`. A read now also looks for a complete `binary`-rule match
+  in the 16 KiB carry region behind its window, which covers the largest key
+  the rule can match, and masks the part that reaches the page with the rule's
+  own marker. The grid had the same gap from the other side — its mask reached
+  the trailing 512 bytes, so with the header scrolled off it returned 36 raw
+  body lines, and `head -n 15` of a key returned all fourteen where
+  `read_output` masked them. It now asks the processor which bytes behind the
+  screen are a key and masks the cells those bytes wrote, found by replaying
+  the parser's own input with the key's printable bytes swapped and comparing
+  cell by cell, so scrolling does not smear the mask onto the prompt after it;
+  and it judges a header still on screen against the text the screen shows.
+  Both surfaces are swept over every key format — PKCS#1, PKCS#8, encrypted
+  PKCS#8, legacy encrypted PKCS#1 with its `Proc-Type`/`DEK-Info` headers, SEC1
+  EC, DSA and OpenSSH — using throwaway keys stored without their boundaries.
+- **One unterminated `-----BEGIN … PRIVATE KEY-----` no longer blinds every
+  read surface for the next 16 KiB** ([#242]). `private-key-block`'s
+  `[\s\S]*?` never reaches a dead state, so a header nobody closes — this
+  repository's own CHANGELOG has several as prose, and the agent's own command
+  echo is enough — stayed believed until the carry ran out, and the next
+  thirty-odd commands came back as a lone `[REDACTED:unresolved]`, a quarter of
+  `cat CHANGELOG.md` on a read and about a third on `holdfast watch`. The rule
+  is unchanged — a complete `BEGIN`…`END` pair still redacts whatever lies
+  between, a `bat` gutter or a `git show` diff included. What changed is the
+  *candidate*: it is believed only while what follows can still be PEM text
+  (base64 in lines, RFC 1421/4880 armour headers, JSON's escaped line breaks,
+  or whitespace where `echo $KEY` flattened the lines), judged over every
+  stream a read can emit. A prose mention now costs nothing. A candidate that
+  dies *with key material behind it* — `head -n 15 id_rsa` and then a prompt —
+  is masked from its header to the line that ended it, on the read, the grid
+  and the stream alike, rather than released. The residual is stated in
+  `output/pem.rs`: a key cut inside the first sixteen characters of its body,
+  or one a program interrupts with junk and then paints over, is judged on the
+  bytes rather than on what a terminal would show.
+
 - **A read window that cannot vouch for a region now emits one
   `[REDACTED:unresolved]` over it and completes, instead of choosing between
   withholding it for ever and releasing it raw** ([#195], [#14]). GH #14's
@@ -2037,3 +2079,6 @@ residuals that are known and accepted.
 [#206]: https://github.com/Sertelegger/holdfast/issues/206
 [#241]: https://github.com/Sertelegger/holdfast/issues/241
 [#246]: https://github.com/Sertelegger/holdfast/issues/246
+[#243]: https://github.com/Sertelegger/holdfast/issues/243
+[#224]: https://github.com/Sertelegger/holdfast/issues/224
+[#242]: https://github.com/Sertelegger/holdfast/issues/242

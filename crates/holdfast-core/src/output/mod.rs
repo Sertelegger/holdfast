@@ -22,6 +22,7 @@
 pub mod ansi;
 pub mod encoding;
 pub mod normalise;
+pub mod pem;
 pub mod prefix_index;
 pub mod redact;
 pub mod rules;
@@ -86,6 +87,16 @@ use std::sync::Arc;
 /// it *falls*, because a wider window resolves more candidates outright —
 /// where masking `[u, window_end)` uncapped costs 3.91% and **38.65%**.
 /// Uncapped, the damage scales with a number the caller chooses.
+///
+/// **Those shares were measured before GH #242, and GH #242 is why they
+/// no longer describe this repository.** Every candidate they counted was
+/// a `-----BEGIN` in prose or test source, believed for the whole carry
+/// because `private-key-block`'s `[\s\S]*?` never dies. A `-----BEGIN`
+/// candidate is now believed only while what follows can be PEM text
+/// (`pem.rs`), so a prose mention costs nothing:
+/// `the_documented_read_loop_drains_this_repositorys_own_changelog`
+/// asserts the CHANGELOG's share is zero. The cap still bounds what a
+/// candidate that *is* PEM text can cost, which is what it is for.
 pub const UNVOUCHED_CARRY_BYTES: usize = 16 * 1024;
 
 /// The second half of [`UNVOUCHED_CARRY_BYTES`]'s derivation, asserted at
@@ -669,6 +680,119 @@ impl OutputProcessor {
         redact::merge_spans(spans)
     }
 
+    /// Every complete `binary`-rule match in `region`, over each stream a
+    /// read of it could emit — [`Self::all_spans`] restricted to the rules
+    /// whose one match can outrun a lookbehind.
+    pub(crate) fn binary_spans(&self, region: &[u8], region_start: u64) -> Vec<Span> {
+        let mut spans = redact::find_binary_spans(&self.rules, region, region_start);
+        for view in normalise::emitted_views(region, region_start) {
+            spans.extend(
+                redact::find_binary_spans(&self.rules, view.bytes(), 0)
+                    .into_iter()
+                    .map(|s| view.map_span(s)),
+            );
+        }
+        redact::merge_spans(spans)
+    }
+
+    /// The byte ranges of `region` that are a private key as far as this
+    /// processor can tell — for a surface that masks by *what bytes wrote
+    /// a cell* rather than by a read range (GH #224, `get_screen_state`).
+    ///
+    /// Three kinds, and they are the same three `process` masks: a
+    /// complete `binary` match; a `-----BEGIN` candidate still believed at
+    /// the region's end; and one that died with key material behind it.
+    /// The last two are capped at [`UNVOUCHED_CARRY_BYTES`] past their
+    /// anchor, as a read caps them, and a candidate a complete match
+    /// covers is that match's. Sorted and disjoint.
+    pub fn key_regions(&self, region: &[u8], region_start: u64) -> Vec<(u64, u64)> {
+        let mut spans = self.binary_spans(region, region_start);
+        let complete = spans.clone();
+        for c in self
+            .index
+            .unterminated_candidates(&self.rules, region, region_start)
+        {
+            if !complete
+                .iter()
+                .any(|s| s.start <= c.start && s.end > c.start)
+            {
+                let end = c.end.min(c.start + UNVOUCHED_CARRY_BYTES as u64);
+                spans.push(Span::unresolved(c.start, end));
+            }
+        }
+        redact::merge_spans(spans)
+            .into_iter()
+            .map(|s| (s.start, s.end))
+            .collect()
+    }
+
+    /// The complete `binary` matches that open **behind** the window and
+    /// reach the page (GH #243) — the ones `all_spans` over the window
+    /// cannot see, because their anchor is not in it.
+    ///
+    /// Over `carry_region` rather than a wider window, and for the
+    /// `binary` rules alone, for one reason: every other rule's match fits
+    /// inside `lookbehind_bytes` and is already found from the window, so
+    /// asking them again about sixteen more kilobytes costs a scan and
+    /// finds nothing. A match wholly behind `req_start` is dropped, since
+    /// the caller receives none of it; one that starts inside the window
+    /// is `all_spans`'s already.
+    ///
+    /// **Scanned to `window_start + UNVOUCHED_CARRY_BYTES` and no
+    /// further**, which bounds the cost on a read of any size — without
+    /// it a 256 KiB read would re-judge its whole window for one rule, and
+    /// the views over it are most of what a read costs on colourised
+    /// output. A match found this way is therefore at most
+    /// `UNVOUCHED_CARRY_BYTES` long, the same bound a candidate is
+    /// believed over and the one `_RSA_16384_PEM_FITS_INSIDE_THE_CARRY`
+    /// holds against the largest key the rule can match. A key painted
+    /// with a colour change on every character can exceed it in raw
+    /// bytes; that is outside this reach.
+    fn carry_spans(&self, w: &WindowSnapshot<'_>) -> Vec<Span> {
+        if w.carry_region_start >= w.window_start || w.carry_region.is_empty() {
+            return Vec::new();
+        }
+        let region_end = w.carry_region_start + w.carry_region.len() as u64;
+        let scan_end = (w.window_start + UNVOUCHED_CARRY_BYTES as u64).min(region_end);
+        let region = &w.carry_region[..(scan_end - w.carry_region_start) as usize];
+        self.binary_spans(region, w.carry_region_start)
+            .into_iter()
+            .filter(|s| s.start < w.window_start && s.end > w.req_start)
+            .collect()
+    }
+
+    /// The unterminated candidates in `carry_region` that died with key
+    /// material behind them and that no span in `spans` covers — each one
+    /// capped at [`UNVOUCHED_CARRY_BYTES`] past its anchor and the window's
+    /// end. See [`PrefixIndex::unterminated_candidates`].
+    ///
+    /// [`PrefixIndex::unterminated_candidates`]: prefix_index::PrefixIndex::unterminated_candidates
+    fn dead_candidates(
+        &self,
+        w: &WindowSnapshot<'_>,
+        spans: &[Span],
+    ) -> Vec<prefix_index::Unterminated> {
+        let window_end = w.window_start + w.window.len() as u64;
+        self.index
+            .unterminated_candidates(&self.rules, w.carry_region, w.carry_region_start)
+            .into_iter()
+            .filter(|c| !c.in_flight)
+            .filter(|c| {
+                !spans
+                    .iter()
+                    .any(|s| !s.is_unresolved() && s.start <= c.start && s.end > c.start)
+            })
+            .map(|c| prefix_index::Unterminated {
+                end: c
+                    .end
+                    .min(c.start + UNVOUCHED_CARRY_BYTES as u64)
+                    .min(window_end),
+                ..c
+            })
+            .filter(|c| c.end > w.req_start && c.start < c.end)
+            .collect()
+    }
+
     /// The earliest anchor in `[head − `[`UNVOUCHED_CARRY_BYTES`]`, head −
     /// partial_secret_scan_bytes)` that is still alive at the end of the
     /// window — the at-`buffer.head` half of GH #14, which no window size
@@ -812,7 +936,19 @@ impl OutputProcessor {
         }
 
         let mut spans = if opts.redact {
-            self.all_spans(w.window, w.window_start)
+            let mut spans = self.all_spans(w.window, w.window_start);
+            // **A match that opened behind the window still covers the
+            // page (GH #243).** The window reaches `lookbehind_bytes` —
+            // 512 — behind `req_start`, and a private key is kilobytes, so
+            // a read that starts inside a *complete* key never saw its
+            // `-----BEGIN` and `find_spans` matched nothing: `tail_lines`,
+            // `tail_bytes` and a cursor partway in all returned the rest
+            // of the body raw with `redactions: {}`. The carry region
+            // reaches `UNVOUCHED_CARRY_BYTES` back, which covers the
+            // largest key the rule can match, and only the `binary` rules
+            // can need it — every other rule's match fits the lookbehind.
+            spans.extend(self.carry_spans(w));
+            redact::merge_spans(spans)
         } else {
             Vec::new()
         };
@@ -869,17 +1005,14 @@ impl OutputProcessor {
         // the one a bounded window emits for *"a match the window cannot
         // judge"*; this is a bounded window.
         //
-        // **`get_screen_state` is not a third example, and an earlier
-        // draft of this comment listed it as one.** It masks the cells
-        // where the live render differs from the render at
-        // `holdback_boundary`, which is driven by `unvouched_boundary`
-        // over the trailing `partial_secret_scan_bytes` — so it masks an
-        // in-flight *prefix* and has no handling at all for a candidate
-        // anchored further back. Measured on one buffer in one moment,
-        // `read_output` returns one marker and the grid returns 39 raw
-        // body lines. That is pre-existing and outside this change, but
-        // it is the gap this change opens *between* the two surfaces and
-        // it should not be described as prior art for it.
+        // **`get_screen_state` was not a third example until GH #224,
+        // and an earlier draft of this comment listed it as one.** Its
+        // mask covered the trailing `partial_secret_scan_bytes` only, so
+        // `read_output` returned one marker where the grid returned 39 raw
+        // body lines. It now asks this processor which bytes behind the
+        // screen are a key (`key_regions`) and masks the cells those
+        // bytes wrote — the same regions this read masks, by a different
+        // unit — which is `ScreenTracker::capture_judged`'s business.
         //
         // **A mask is legal here where a view-driven *withhold* is not.**
         // `holdback_boundary` explains the asymmetry: a shortened read
@@ -993,6 +1126,21 @@ impl OutputProcessor {
                 spans.push(redact::Span::unresolved(u, end));
                 spans = redact::merge_spans(spans);
             }
+
+            // **A candidate that died with key material behind it is
+            // masked, not released (GH #242).** The two detectors above
+            // own the candidates still believed at the window's edge.
+            // Since a `-----BEGIN` candidate can stop at the first byte
+            // that is not PEM text, there is a second kind — `head -n 15
+            // id_rsa` and then a prompt — that is neither believed nor
+            // matched, and nothing above sees it. Its extent is where
+            // `pem::extent` stopped believing it, capped at the same
+            // `UNVOUCHED_CARRY_BYTES` for the same reason, and one that a
+            // complete match covers is left to that match's own marker.
+            for c in self.dead_candidates(w, &spans) {
+                spans.push(redact::Span::unresolved(c.start, c.end));
+            }
+            spans = redact::merge_spans(spans);
         }
 
         let mut read_end = safety_end.max(w.req_start).min(w.cap_end);
@@ -2050,6 +2198,17 @@ mod tests {
     /// one goes red if the corpus stops containing the shape *or* if the
     /// shape stops being handled, and the first assertion tells the two
     /// apart.
+    ///
+    /// **Since GH #242 the prose anchors are not masked at all**, and the
+    /// row asserts that as well as the drain. #195's fix made the loop
+    /// progress by masking each unterminated anchor for
+    /// `UNVOUCHED_CARRY_BYTES`; on this corpus that was a quarter of the
+    /// text. A `-----BEGIN` candidate is now believed only while what
+    /// follows can be PEM text, and a closing backtick is not, so every
+    /// prose mention comes back verbatim with no marker. The paired half
+    /// — that the check was *narrowed* and not deleted — is the same
+    /// corpus with a truncated key planted in it, which must come back
+    /// masked on the same loop.
     #[test]
     fn the_documented_read_loop_drains_this_repositorys_own_changelog() {
         let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
@@ -2073,28 +2232,40 @@ mod tests {
 
         let p = processor();
         let o = ReadOptions::default();
-        let mut cursor = 0u64;
-        let mut reads = 0usize;
-        let mut saw_marker = false;
-        while cursor < buf.len() as u64 {
-            reads += 1;
-            assert!(reads <= 32, "the read loop did not terminate");
-            let w = snapshot(&p, &buf, cursor, 32 * 1024, true, false);
-            let r = p.process(&w, &o);
-            assert!(
-                r.cursor > cursor,
-                "read {reads} returned {} bytes and left the cursor at \
-                 {cursor}: that is GH #195",
-                r.bytes_returned
+        // One pass of the documented loop, returning the joined payload,
+        // the read count and the `unresolved` markers it reported.
+        let drain = |buf: &[u8]| {
+            let mut cursor = 0u64;
+            let mut reads = 0usize;
+            let mut unresolved = 0usize;
+            let mut joined = String::new();
+            while cursor < buf.len() as u64 {
+                reads += 1;
+                assert!(reads <= 32, "the read loop did not terminate");
+                let w = snapshot(&p, buf, cursor, 32 * 1024, true, false);
+                let r = p.process(&w, &o);
+                assert!(
+                    r.cursor > cursor,
+                    "read {reads} returned {} bytes and left the cursor at \
+                     {cursor}: that is GH #195",
+                    r.bytes_returned
+                );
+                unresolved += r
+                    .redactions
+                    .get(redact::UNRESOLVED_KIND)
+                    .copied()
+                    .unwrap_or(0);
+                joined.push_str(&r.output);
+                cursor = r.cursor;
+            }
+            assert_eq!(
+                cursor,
+                buf.len() as u64,
+                "the loop must consume the corpus, not merely terminate"
             );
-            saw_marker |= r.redactions.contains_key(redact::UNRESOLVED_KIND);
-            cursor = r.cursor;
-        }
-        assert_eq!(
-            cursor,
-            buf.len() as u64,
-            "the loop must consume the corpus, not merely terminate"
-        );
+            (joined, reads, unresolved)
+        };
+        let (joined, reads, unresolved) = drain(&buf);
         // **Relative to the corpus, not an absolute.** These three files
         // grow, and an absolute bound goes red from documentation growth
         // alone — which would be misdiagnosed as the wedge returning. The
@@ -2108,12 +2279,42 @@ mod tests {
              degrees",
             buf.len()
         );
-        assert!(
-            saw_marker,
-            "the prose anchor must be reported as unresolved rather than \
-             silently released — without this the row passes against a \
-             fix that simply deleted the check"
+        // GH #242: every prose anchor comes back verbatim, and nothing is
+        // masked on their account.
+        let anchors = |t: &[u8]| {
+            t.windows(31)
+                .filter(|w| *w == b"-----BEGIN RSA PRIVATE KEY-----")
+                .count()
+        };
+        assert_eq!(
+            unresolved, 0,
+            "a prose `-----BEGIN` is not a candidate past its closing \
+             backtick, so nothing in this corpus is unresolved"
         );
+        assert_eq!(
+            anchors(joined.as_bytes()),
+            anchors(&buf),
+            "every prose anchor must reach the caller"
+        );
+
+        // The paired half: the check was narrowed, not deleted. A key cut
+        // short in the middle of the same corpus is still masked, whole.
+        let key = pem::fixtures::KEYS[0].pem();
+        let truncated: String = key.lines().take(12).map(|l| format!("{l}\n")).collect();
+        let mid = buf.len() / 2;
+        let mut planted = buf[..mid].to_vec();
+        planted.extend_from_slice(b"\n$ head -n 12 id_rsa\n");
+        planted.extend_from_slice(truncated.as_bytes());
+        planted.extend_from_slice(b"$ ");
+        planted.extend_from_slice(&buf[mid..]);
+        let (joined, _, unresolved) = drain(&planted);
+        assert!(unresolved >= 1, "the planted key must be masked");
+        for line in truncated.lines().skip(1) {
+            assert!(
+                !joined.contains(line),
+                "a line of the planted key reached the caller: {line}"
+            );
+        }
     }
 
     /// **The gap between surfaces, closed and asserted in both
@@ -2463,11 +2664,21 @@ mod tests {
         let p = processor();
 
         // ---- arm 1: the mask starts first and swallows the real match.
+        //
+        // **The real match is an AWS key id, and it was a GitHub token
+        // until GH #242.** A `-----BEGIN` candidate is now believed only
+        // while what follows can be PEM text, and `ghp_`'s underscore is
+        // not — the candidate ended in front of the token, and the row was
+        // no longer about a mask meeting a match. `AKIA…` is sixteen
+        // base64 characters behind a base64 prefix, so it sits inside text
+        // the candidate still believes, which is the arrangement this row
+        // needs.
+        const AWS: &str = "AKIAIOSFODNN7EXAMPLE";
         let prologue = "$ cat bundle\n";
         let mut buf = format!("{prologue}-----BEGIN RSA PRIVATE KEY-----\n").into_bytes();
         buf.extend(std::iter::repeat_n(b'A', 1024));
         buf.extend_from_slice(b"\ntoken ");
-        buf.extend_from_slice(GITHUB.as_bytes());
+        buf.extend_from_slice(AWS.as_bytes());
         buf.extend_from_slice(b"\n");
         buf.extend(std::iter::repeat_n(b'B', 1024));
         buf.extend_from_slice(b"\n");
@@ -4115,5 +4326,254 @@ mod tests {
         let w = snapshot(&p, partial, 2, 4096, true, false);
         let r = p.process(&w, &ReadOptions::default());
         assert_eq!(r.cursor, 4, "no zero-byte read at head");
+    }
+
+    // ------------------------------------ GH #243 / #242: every read shape
+
+    /// A PTY's rendering of `cat <key>` in the middle of a session: the
+    /// command, the key with `\r\n` line ends, and a later command.
+    fn catted(pem: &str) -> String {
+        format!(
+            "$ cat id_key\r\n{}$ echo done\r\ndone\r\n$ ",
+            pem.replace('\n', "\r\n")
+        )
+    }
+
+    /// The offsets a `tail_lines` read of each size would start at — the
+    /// byte after each `\n`, newest first — plus the buffer's start.
+    fn line_starts(buf: &[u8]) -> Vec<u64> {
+        let mut starts: Vec<u64> = std::iter::once(0)
+            .chain(
+                buf.iter()
+                    .enumerate()
+                    .filter(|(_, b)| **b == b'\n')
+                    .map(|(i, _)| i as u64 + 1),
+            )
+            .filter(|s| (*s as usize) < buf.len())
+            .collect();
+        starts.reverse();
+        starts
+    }
+
+    /// **No read shape returns key material, for any key format, whether
+    /// the key is complete or cut short** (GH #243, GH #242).
+    ///
+    /// #223 masked a key for a read that starts *before* its header. A
+    /// read that starts *inside* it never saw the header, so nothing
+    /// marked the body: on `main` at `a81b02d` a `tail_lines` read of a
+    /// complete 4096-bit key returned most of its body raw with
+    /// `redactions: {}`, and so did `tail_bytes` and a cursor partway in.
+    /// Every such shape is driven here, at every line and at a spread of
+    /// byte offsets, against every fixture format:
+    ///
+    /// * `tail_lines` of every size, which is a read starting after each
+    ///   `\n`;
+    /// * `tail_bytes` at every size up to the whole buffer, in steps;
+    /// * a cursor read starting at every such offset, at the default
+    ///   `max_bytes` and at a small one, so both the at-`head` branch and
+    ///   the truncated one run.
+    ///
+    /// The truncated key is `head -n 9` followed by a prompt — the case
+    /// that is neither closed nor in flight, and that GH #242's narrowing
+    /// would release if dying released.
+    #[test]
+    fn no_read_shape_returns_key_material_for_any_key_format() {
+        let p = processor();
+        let o = ReadOptions::default();
+        let mut reads = 0usize;
+        for key in pem::fixtures::KEYS {
+            let pem = key.pem();
+            let cut: String = pem.lines().take(9).map(|l| format!("{l}\n")).collect();
+            // Three decorations a complete key reaches a terminal in, none
+            // of which is PEM text on its lines — so for these only the
+            // rule's own `[\s\S]*?` match, found behind the window, covers
+            // a read that starts inside them: a removed key in `git show`,
+            // `bat`'s gutter, and `grep -n`.
+            let decorated = |prefix: &dyn Fn(usize) -> String| -> String {
+                pem.lines()
+                    .enumerate()
+                    .map(|(i, l)| format!("{}{l}\n", prefix(i)))
+                    .collect()
+            };
+            let removed = decorated(&|_| "-".into());
+            let gutter = decorated(&|i| format!("{:>4} \u{2502} ", i + 1));
+            let grepped = decorated(&|i| format!("keys/id_key:{}:", i + 1));
+            // And one the raw regex cannot match at all: a colour change
+            // inside both labels, which a terminal paints as the plain
+            // boundary. Only the stripped view carries the match.
+            let painted = pem.replace("PRIVATE KEY", "PRIV\x1b[1;31mATE KEY\x1b[0m");
+            for (shape, text) in [
+                ("painted", catted(&painted)),
+                ("complete", catted(&pem)),
+                ("head -n 9", catted(&cut)),
+                ("git show", catted(&removed)),
+                ("bat", catted(&gutter)),
+                ("grep -n", catted(&grepped)),
+            ] {
+                let buf = text.as_bytes();
+                let head = buf.len() as u64;
+                // Control: the whole-buffer read masks it, so a leak below
+                // is the read shape's and not the fixture's.
+                let whole = p.process(&snapshot(&p, buf, 0, 1 << 20, true, false), &o);
+                assert_eq!(key.leaked_in(&whole.output), None, "{} {shape}", key.name);
+
+                let mut starts = line_starts(buf);
+                starts.extend((0..head).step_by(53));
+                for start in starts {
+                    for (max_bytes, bypass) in [(32 * 1024, true), (32 * 1024, false), (256, false)]
+                    {
+                        reads += 1;
+                        let w = snapshot(&p, buf, start, max_bytes, true, bypass);
+                        let r = p.process(&w, &o);
+                        assert_eq!(
+                            key.leaked_in(&r.output),
+                            None,
+                            "{} ({shape}): a read from {start} of {head} at max_bytes \
+                             {max_bytes} returned key material: {:?} redactions {:?}",
+                            key.name,
+                            r.output,
+                            r.redactions
+                        );
+                        // A complete key the rule matched keeps the rule's
+                        // name from inside it too — `unresolved` is for a
+                        // region nothing matched, and this one did.
+                        if shape != "head -n 9" && r.output.contains("[REDACTED:") {
+                            assert!(
+                                r.redactions.contains_key("private-key"),
+                                "{} ({shape}) from {start}: {:?}",
+                                key.name,
+                                r.redactions
+                            );
+                        }
+                    }
+                }
+            }
+        }
+        assert!(reads > 1000, "the sweep shrank to {reads} reads");
+    }
+
+    /// **A PEM block that is not a private key is never masked**, from
+    /// any read position — a certificate, a public key, EC parameters, a
+    /// CSR. Each opens `-----BEGIN` and carries a base64 body the PEM walk
+    /// believes; what keeps them out is the rule's own automaton dying on
+    /// the label, and without that the walk would mask every certificate
+    /// chain a TLS tool prints as "a key that died with material".
+    #[test]
+    fn a_pem_block_that_is_not_a_private_key_is_never_masked() {
+        let p = processor();
+        let o = ReadOptions::default();
+        let body: String = pem::fixtures::KEYS[1]
+            .material_lines()
+            .iter()
+            .map(|l| format!("{l}\r\n"))
+            .collect();
+        for label in [
+            "CERTIFICATE",
+            "PUBLIC KEY",
+            "RSA PUBLIC KEY",
+            "EC PARAMETERS",
+            "CERTIFICATE REQUEST",
+        ] {
+            let text = format!(
+                "$ cat f.pem\r\n-----BEGIN {label}-----\r\n{body}-----END {label}-----\r\n$ "
+            );
+            let cut = format!(
+                "$ head f.pem\r\n-----BEGIN {label}-----\r\n{}$ ",
+                &body[..700]
+            );
+            for text in [text, cut] {
+                let buf = text.as_bytes();
+                for start in (0..buf.len() as u64).step_by(97) {
+                    let r = p.process(&snapshot(&p, buf, start, 32 * 1024, true, false), &o);
+                    assert!(
+                        r.redactions.is_empty(),
+                        "{label} from {start}: {:?}",
+                        r.redactions
+                    );
+                    assert_eq!(
+                        r.output.as_bytes(),
+                        &buf[start as usize..],
+                        "{label} from {start}"
+                    );
+                }
+            }
+        }
+    }
+
+    /// **A candidate that died is believed over the carry and no further**,
+    /// the same bound a candidate still arriving gets (GH #242). Without
+    /// the cap a PEM-shaped blob of any length followed by a prompt would
+    /// be masked whole by a read that starts before it, while a read that
+    /// starts past the carry — which cannot see the anchor — releases the
+    /// same bytes; the two reads would disagree about one region by a
+    /// distance the child chooses. The residual is asserted, as the
+    /// in-flight one is in
+    /// `a_private_key_longer_than_the_lookahead_window_is_never_emitted_raw`.
+    #[test]
+    fn a_dead_candidate_is_believed_for_the_carry_and_no_further() {
+        let carry = UNVOUCHED_CARRY_BYTES as u64;
+        let (pem, _) = pem_longer_than(40 * 1024);
+        let prologue = "$ cat blob\n";
+        let buf = format!("{prologue}{}\n$ echo done\n", &pem[..pem.len() - 30]).into_bytes();
+        let anchor = prologue.len() as u64;
+        let line_at = |i: usize| anchor + 32 + 65 * i as u64;
+        let r = read(&buf, 0, 256 * 1024);
+        for i in (0..600).take_while(|i| line_at(*i) + 65 <= anchor + carry) {
+            assert!(
+                !r.output.contains(&format!("KEYBODY{i:06}")),
+                "line {i} is inside the carry"
+            );
+        }
+        let past = (0..600).find(|i| line_at(*i) > anchor + carry).unwrap();
+        assert!(
+            r.output.contains(&format!("KEYBODY{past:06}")),
+            "the residual moved: a dead candidate past {carry} bytes is not believed"
+        );
+        assert!(r.output.ends_with("$ echo done\n"));
+    }
+
+    /// The paired direction for the row above: the reads that must *not*
+    /// be masked still are not. Without this the sweep passes against a
+    /// processor that masks every read carrying a `-----BEGIN` in its
+    /// carry region, which would be GH #242 back at full size.
+    #[test]
+    fn output_after_a_key_is_not_masked_on_its_account() {
+        let p = processor();
+        let o = ReadOptions::default();
+        for key in pem::fixtures::KEYS {
+            let pem = key.pem();
+            let cut: String = pem.lines().take(9).map(|l| format!("{l}\n")).collect();
+            for (shape, text) in [("complete", catted(&pem)), ("head -n 9", catted(&cut))] {
+                let buf = text.as_bytes();
+                let done = text.rfind("$ echo done").unwrap() as u64;
+                // A read that starts at the next command sees it verbatim,
+                // though the key is well inside its carry region.
+                let r = p.process(&snapshot(&p, buf, done, 32 * 1024, true, false), &o);
+                assert_eq!(
+                    r.output, "$ echo done\r\ndone\r\n$ ",
+                    "{} {shape}",
+                    key.name
+                );
+                assert!(
+                    r.redactions.is_empty(),
+                    "{} {shape}: {:?}",
+                    key.name,
+                    r.redactions
+                );
+                // And the whole-buffer read masks the key and nothing else.
+                let r = p.process(&snapshot(&p, buf, 0, 1 << 20, true, false), &o);
+                assert!(
+                    r.output.starts_with("$ cat id_key\r\n[REDACTED:"),
+                    "{}",
+                    r.output
+                );
+                assert!(
+                    r.output.ends_with("$ echo done\r\ndone\r\n$ "),
+                    "{} {shape}: {:?}",
+                    key.name,
+                    r.output
+                );
+            }
+        }
     }
 }

@@ -17,6 +17,7 @@
 //! that edge, and answers it for rules with no indexed prefix as well,
 //! which is the half no window size reaches.
 
+use super::pem::{self, PemExtent};
 use super::rules::RuleSet;
 use regex_automata::{
     dfa::{dense, Automaton, StartKind},
@@ -59,7 +60,7 @@ fn is_value_byte(b: u8) -> bool {
 /// which a match the raw bytes cannot complete is completed in a view
 /// that `all_spans` judges.
 ///
-/// Used only by [`PrefixIndex::binary_in_flight`], because it is only
+/// Used only by [`PrefixIndex::binary_rule_alive`], because it is only
 /// there that a raw byte decides a *release* (GH #166). `\n` is in the
 /// set: the grid joins real line breaks with `\n` and only a wrapped
 /// continuation is joined with nothing, so a line feed present in the
@@ -467,6 +468,25 @@ pub struct PrefixIndex {
     /// One liveness automaton per rule, parallel to `rules.rules`. See
     /// [`build_liveness`]; `None` means the rule keeps [`is_value_byte`].
     liveness: Vec<Option<dense::DFA<Vec<u32>>>>,
+    /// The bucket keys a `binary` rule's prefix can open with — `-` alone
+    /// in the shipped set — so [`Self::unterminated_candidates`], which
+    /// asks about those rules and no others, skips every other byte of a
+    /// region without a bucket lookup. It runs on every read.
+    binary_first_byte: Box<[bool; 256]>,
+}
+
+/// A `binary` candidate the redactor will not see closed — see
+/// [`PrefixIndex::unterminated_candidates`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Unterminated {
+    /// Absolute offset of the anchor.
+    pub start: u64,
+    /// Absolute offset one past the last byte it is believed over: the
+    /// region's end when `in_flight`, otherwise where it died or closed.
+    pub end: u64,
+    /// Still believed at the region's end. The ones that are not were
+    /// returned because they carry key material.
+    pub in_flight: bool,
 }
 
 impl PrefixIndex {
@@ -475,6 +495,7 @@ impl PrefixIndex {
             Box::new(std::array::from_fn(|_| Vec::new()));
         let mut total = 0usize;
         let mut liveness: Vec<Option<dense::DFA<Vec<u32>>>> = Vec::with_capacity(rules.rules.len());
+        let mut binary_first_byte = Box::new([false; 256]);
         for (idx, rule) in rules.rules.iter().enumerate() {
             let derived = derive_prefixes(&rule.pattern, expansion_limit);
             // A derivable leading literal means the prefix is where the
@@ -531,6 +552,9 @@ impl PrefixIndex {
 
             for prefix in &prefixes {
                 total += 1;
+                if rule.binary {
+                    binary_first_byte[prefix[0].to_ascii_lowercase() as usize] = true;
+                }
                 by_first_byte[prefix[0].to_ascii_lowercase() as usize].push(Candidate {
                     prefix: prefix.clone(),
                     rule: idx,
@@ -548,6 +572,7 @@ impl PrefixIndex {
             by_first_byte,
             total,
             liveness,
+            binary_first_byte,
         }
     }
 
@@ -680,7 +705,66 @@ impl PrefixIndex {
     /// **The direction is still release-only.** Every arm above either
     /// returns `true`, which is what this replaced, or returns `false`
     /// having proved the rule cannot match from here.
+    ///
+    /// **Since GH #242 that is half of the answer.** The two guards above
+    /// now live in [`Self::binary_rule_alive`], and an anchor that opens a
+    /// PEM boundary is also bounded by what can follow it — see
+    /// [`Self::binary_extent`]. A candidate that answers `false` here
+    /// because its PEM text ended is not thereby released: when it ended
+    /// with key material behind it, [`Self::unterminated_candidates`]
+    /// reports it and every surface masks it.
     fn binary_in_flight(&self, rule: usize, region: &[u8], at: usize) -> bool {
+        self.binary_extent(rule, region, at).alive
+    }
+
+    /// How far the `binary` candidate at `region[at..]` is believed, and
+    /// whether it is still believed at the region's end (GH #242).
+    ///
+    /// **Two judges, and the candidate needs both.** The rule's own
+    /// automaton, walked exactly as [`Self::binary_in_flight`]'s two
+    /// guards describe, decides whether this anchor is the rule's at all
+    /// — it is what kills `-----BEGIN CERTIFICATE-----` on its label. It
+    /// cannot bound the candidate after that, because
+    /// `private-key-block`'s `[\s\S]*?` has no dead state: until GH #242
+    /// an unterminated header was therefore believed until the carry ran
+    /// out, and one line of prose masked the next 16 KiB of every surface.
+    /// When the anchor opens an RFC 7468 boundary, [`pem::extent`] bounds
+    /// it instead — see that module for the alphabet, the streams it is
+    /// judged over, and why "died with material" is masked rather than
+    /// released.
+    ///
+    /// **The rule's automaton is walked only as far as the PEM walk got**,
+    /// which is what keeps a region of many dead candidates linear: with
+    /// `[\s\S]*?` and no control byte to stop at, the automaton alone
+    /// walks every candidate to the region's end.
+    ///
+    /// An anchor that opens no RFC 7468 boundary — a user `binary` rule of
+    /// some other shape — keeps exactly the behaviour it had: the rule's
+    /// automaton over the whole region, and no material, so nothing is
+    /// masked for it once it dies.
+    pub(crate) fn binary_extent(&self, rule: usize, region: &[u8], at: usize) -> PemExtent {
+        let pem = pem::opens_boundary(region, at).then(|| pem::extent(region, at));
+        let limit = pem.map_or(region.len(), |p| p.end.max(at));
+        let rule_alive = self.binary_rule_alive(rule, &region[..limit], at);
+        match pem {
+            Some(p) if rule_alive => p,
+            Some(_) => PemExtent {
+                end: at,
+                alive: false,
+                material: false,
+            },
+            None => PemExtent {
+                end: if rule_alive { region.len() } else { at },
+                alive: rule_alive,
+                material: false,
+            },
+        }
+    }
+
+    /// The rule's own automaton from `at` to the end of `region`, with the
+    /// two guards [`Self::binary_in_flight`] documents: no automaton means
+    /// alive, and a byte some emitted view alters ends the walk alive.
+    fn binary_rule_alive(&self, rule: usize, region: &[u8], at: usize) -> bool {
         let Some(dfa) = self.liveness.get(rule).and_then(Option::as_ref) else {
             return true;
         };
@@ -701,6 +785,71 @@ impl PrefixIndex {
             }
         }
         true
+    }
+
+    /// Every `binary` candidate in `region` that the redactor will not see
+    /// closed: the ones still believed at the region's end, and the ones
+    /// that died with key material behind them (GH #242, GH #243).
+    ///
+    /// **A candidate that dies is not released by dying.** Before GH #242
+    /// no `private-key-block` candidate could die after its label, so
+    /// "not in flight" only ever meant "closed", and the redactor had the
+    /// span. Once a candidate can stop at the first byte that is not PEM
+    /// text, `head -n 15 id_rsa` and then a prompt is a candidate that is
+    /// neither in flight nor matched — and releasing it would put fourteen
+    /// lines of key body on the wire because a prompt followed them. So
+    /// the dead ones carrying material are returned too, with the extent
+    /// [`pem::extent`] found, and every surface masks them.
+    ///
+    /// **Candidates a complete match covers are not filtered here**, and
+    /// that is deliberate: the answer would need the rule's anchored
+    /// regex, which for `[\s\S]*?` scans to the next `-----END` from every
+    /// anchor — the quadratic walk GH #163 took out of this module. Every
+    /// caller already holds the complete spans for the same bytes and
+    /// drops a candidate one of them covers; see
+    /// [`OutputProcessor::process`](super::OutputProcessor::process).
+    ///
+    /// Same anchor rules as [`Self::earliest_partial`] — the word
+    /// boundary, the prefix, one byte after it — and one entry per anchor.
+    pub fn unterminated_candidates(
+        &self,
+        rules: &RuleSet,
+        region: &[u8],
+        region_start: u64,
+    ) -> Vec<Unterminated> {
+        let mut out = Vec::new();
+        for (i, byte) in region.iter().enumerate() {
+            if !self.binary_first_byte[byte.to_ascii_lowercase() as usize] {
+                continue;
+            }
+            for candidate in self.bucket(*byte) {
+                if !rules.rules[candidate.rule].binary {
+                    continue;
+                }
+                if candidate.requires_word_boundary
+                    && i > 0
+                    && (region[i - 1].is_ascii_alphanumeric() || region[i - 1] == b'_')
+                {
+                    continue;
+                }
+                let value_start = i + candidate.prefix.len();
+                if value_start >= region.len()
+                    || !region[i..value_start].eq_ignore_ascii_case(&candidate.prefix)
+                {
+                    continue;
+                }
+                let e = self.binary_extent(candidate.rule, region, i);
+                if e.alive || e.material {
+                    out.push(Unterminated {
+                        start: region_start + i as u64,
+                        end: region_start + e.end as u64,
+                        in_flight: e.alive,
+                    });
+                }
+                break;
+            }
+        }
+        out
     }
 
     pub fn len(&self) -> usize {
@@ -2302,12 +2451,24 @@ mod tests {
         let mut carriage = b"-----BEGIN CERTIFICATE\r-----BEGIN RSA PRIVATE KEY-----\n".to_vec();
         carriage.extend_from_slice(body.as_bytes());
 
+        // **Two of the five routes changed shape at GH #242, and neither
+        // changed what reaches the wire.** A `-----BEGIN` candidate is now
+        // believed only while what follows can be PEM text (`pem.rs`), so:
+        //
+        // * the lone continuation byte is not PEM text and *ends* the
+        //   candidate — which no longer releases it, because a candidate
+        //   that dies with key material behind it is masked from its
+        //   anchor to the byte that killed it. The hold becomes a mask; the
+        //   key body stays off every surface. Asserted below the loop.
+        // * the redraw's first anchor dies on the `\r` inside its label, and
+        //   the second — the header the rendered row actually shows — is
+        //   the one held. What is released is `-----BEGIN CERTIFICATE\r`,
+        //   which is not a secret, and the grid judges the row it renders
+        //   on its own account. Asserted below the loop.
         for (name, region) in [
             ("c1-in-body", &c1),
-            ("lone-utf8-continuation", &lone_continuation),
             ("escape-in-label", &escape),
             ("tab-in-label", &tab),
-            ("carriage-return-redraw", &carriage),
         ] {
             // Premises. The candidate is found, the region is far past
             // 512 bytes, and — the one that makes this a leak — the
@@ -2338,6 +2499,33 @@ mod tests {
                 "{name}: the read must stop at the anchor"
             );
         }
+
+        // The lone continuation byte: not in flight, and masked instead.
+        let kill = lone_continuation.len() - 1;
+        assert!(!rules.rules[pk].regex.is_match(&lone_continuation));
+        assert!(!index.binary_in_flight(pk, &lone_continuation, 0));
+        assert_eq!(
+            index.unterminated_candidates(&rules, &lone_continuation, 0),
+            vec![Unterminated {
+                start: 0,
+                end: kill as u64,
+                in_flight: false
+            }],
+            "the whole body in front of the byte that ended it is reported, \
+             and every surface masks what is reported"
+        );
+
+        // The redraw: the anchor that is held is the one a terminal shows.
+        let second = carriage
+            .windows(10)
+            .rposition(|w| w == b"-----BEGIN")
+            .expect("the fixture carries two anchors");
+        assert!(second > 0 && !rules.rules[pk].regex.is_match(&carriage));
+        assert_eq!(
+            index.earliest_partial(&rules, &carriage, 0),
+            Some(second as u64),
+            "the body is held from the header the rendered row shows"
+        );
     }
 
     /// **A streaming certificate is released, because the rule anchored

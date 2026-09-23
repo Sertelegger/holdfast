@@ -238,7 +238,7 @@ impl StreamRedactor {
         // one written here for the reason this file's header already
         // gives: two rule sets cannot be kept from drifting, so there is
         // one.
-        let spans = self.processor.all_spans(&self.buf, self.base);
+        let spans = self.spans();
         let mut out = self.render(&spans, emit_end);
         self.retire(emit_end);
 
@@ -274,7 +274,7 @@ impl StreamRedactor {
             return Vec::new();
         }
         let stream_end = self.base + self.buf.len() as u64;
-        let spans = self.processor.all_spans(&self.buf, self.base);
+        let spans = self.spans();
         let out = self.render(&spans, stream_end);
         self.retire(stream_end);
         out
@@ -320,6 +320,43 @@ impl StreamRedactor {
         Vec::new()
     }
 
+    /// What `render` substitutes a marker for: every match over the
+    /// emitted views, plus every `-----BEGIN` candidate that **died** in
+    /// the carry with key material behind it (GH #242).
+    ///
+    /// The second half is new, and it is what makes GH #242's narrowing
+    /// safe on this surface. A candidate the stream is holding used to
+    /// leave the carry only by completing (and being matched here) or by
+    /// overflowing it (and being withheld). Since a candidate can now stop
+    /// at the first byte that is not PEM text, it has a third exit —
+    /// `head -n 15 id_rsa` and then a prompt — on which `earliest_partial`
+    /// answers `None`, nothing has matched, and the held body would go out
+    /// raw. It is the same `PrefixIndex::unterminated_candidates` answer
+    /// `OutputProcessor::process` masks, so the stream and the read agree
+    /// about which bytes are a key.
+    fn spans(&self) -> Vec<crate::output::redact::Span> {
+        use crate::output::redact::{merge_spans, Span};
+        let mut spans = self.processor.all_spans(&self.buf, self.base);
+        let dead: Vec<Span> = self
+            .processor
+            .index
+            .unterminated_candidates(&self.processor.rules, &self.buf, self.base)
+            .into_iter()
+            .filter(|c| !c.in_flight)
+            .filter(|c| {
+                !spans
+                    .iter()
+                    .any(|s| !s.is_unresolved() && s.start <= c.start && s.end > c.start)
+            })
+            .map(|c| Span::unresolved(c.start, c.end))
+            .collect();
+        if dead.is_empty() {
+            return spans;
+        }
+        spans.extend(dead);
+        merge_spans(spans)
+    }
+
     /// Copy `buf[split..emit_end]` out, substituting a marker for every
     /// span that overlaps it.
     fn render(&self, spans: &[crate::output::redact::Span], emit_end: u64) -> Vec<u8> {
@@ -346,7 +383,9 @@ impl StreamRedactor {
             // emitting the tail raw would hand over the value half of a
             // token whose prefix already went out.
             if span.start >= region_start {
-                let kind = &self.processor.rules.rules[span.rule].kind;
+                // `span_kind`, not `rules[span.rule]`: a span may be the
+                // synthetic `unresolved` one, which names no rule.
+                let kind = crate::output::redact::span_kind(&self.processor.rules, span);
                 out.extend_from_slice(marker(kind).as_bytes());
             }
             pos = pos.max(span.end.min(emit_end));
@@ -735,5 +774,104 @@ mod tests {
             1
         );
         assert!(!out.windows(64).any(|w| w.iter().all(|b| *b == b'K')));
+    }
+
+    /// **Every key format stays off the stream, whole or cut short, at
+    /// every chunk size** (GH #242's safety half, on the `watch` surface).
+    ///
+    /// The cut-short arm is the one GH #242 could have broken: the key is
+    /// held while it arrives, and the prompt that follows `head -n 9` ends
+    /// the candidate. Before this change nothing ended it except the
+    /// carry; now something does, and ending it must mask the held body
+    /// rather than release it.
+    #[test]
+    fn every_key_format_stays_off_the_stream_whole_or_cut_short() {
+        use crate::output::pem::fixtures::KEYS;
+        for key in KEYS {
+            let pem = key.pem().replace('\n', "\r\n");
+            let cut: String = pem.split_inclusive('\n').take(9).collect();
+            for (shape, text) in [
+                (
+                    "complete",
+                    format!("$ cat k\r\n{pem}$ echo done\r\ndone\r\n"),
+                ),
+                (
+                    "head -n 9",
+                    format!("$ head -n 9 k\r\n{cut}user@host:~$ echo done\r\ndone\r\n"),
+                ),
+            ] {
+                // Thirteen rather than one: every feed re-judges the whole
+                // carry, so a one-byte chunk costs the square of the key
+                // and buys no boundary thirteen does not also reach.
+                for chunk in [13usize, 64, 1000, 8192] {
+                    let mut r = redactor();
+                    let mut out = Vec::new();
+                    for piece in text.as_bytes().chunks(chunk) {
+                        out.extend(r.feed(piece));
+                    }
+                    out.extend(r.flush());
+                    let out = String::from_utf8_lossy(&out).into_owned();
+                    assert_eq!(
+                        key.leaked_in(&out),
+                        None,
+                        "{} {shape} at chunk {chunk}: {out:?}",
+                        key.name
+                    );
+                    assert!(
+                        out.ends_with("echo done\r\ndone\r\n"),
+                        "{} {shape} at chunk {chunk}: what follows the key must \
+                         still arrive: {out:?}",
+                        key.name
+                    );
+                }
+            }
+        }
+    }
+
+    /// **The stream and the read agree about prose** (GH #242). A
+    /// `-----BEGIN` in running text used to cost an observer a marker and
+    /// up to `2 × STREAM_CARRY_BYTES` of dropped output; measured on
+    /// `main` at `a81b02d`, about three lines in ten of this repository's
+    /// `CHANGELOG.md` never reached `holdfast watch`. The candidate now
+    /// dies on the text that follows the header, so nothing is held and
+    /// nothing is masked on its account.
+    ///
+    /// The file is read from disk for the reason
+    /// `the_documented_read_loop_drains_this_repositorys_own_changelog`
+    /// gives, and the corpus carries `[REDACTED:unresolved]` as prose too,
+    /// so the assertion is that the stream adds none.
+    #[test]
+    fn the_stream_masks_no_prose_anchor_in_this_repositorys_changelog() {
+        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../CHANGELOG.md");
+        let text = std::fs::read(path).expect("the repository's own changelog");
+        let anchors = |t: &[u8]| {
+            t.windows(31)
+                .filter(|w| *w == b"-----BEGIN RSA PRIVATE KEY-----")
+                .count()
+        };
+        let markers = |t: &[u8]| {
+            t.windows(21)
+                .filter(|w| *w == b"[REDACTED:unresolved]")
+                .count()
+        };
+        assert!(anchors(&text) > 0, "the corpus no longer carries the shape");
+
+        let mut r = redactor();
+        let mut out = Vec::new();
+        for piece in text.chunks(8192) {
+            out.extend(r.feed(piece));
+            assert!(!r.is_withholding(), "the stream withheld prose");
+        }
+        out.extend(r.flush());
+        assert_eq!(
+            markers(&out),
+            markers(&text),
+            "the stream added an unresolved marker"
+        );
+        assert_eq!(
+            anchors(&out),
+            anchors(&text),
+            "a prose anchor did not arrive"
+        );
     }
 }

@@ -2411,9 +2411,16 @@ impl Session {
         // surface may take this value; see
         // [`Session::open_unvouched_holdback`].
         let holdback = self.open_unvouched_holdback(processor);
-        self.screen
-            .lock()
-            .capture(diff_from, redact, Instant::now(), &*self.buffer, holdback)
+        // `capture_judged` and not `capture`: the processor is also what
+        // judges which bytes behind the screen are a private key (GH #224).
+        self.screen.lock().capture_judged(
+            diff_from,
+            redact,
+            Instant::now(),
+            &*self.buffer,
+            holdback,
+            Some(processor),
+        )
     }
 
     /// The §8.6 T3c cursor sub-signal, or `None` when Tier B is off.
@@ -4738,6 +4745,187 @@ mod tests {
         let g = grid(s.screen_state(None, true, &OutputProcessor::builtin().unwrap()));
         assert_eq!(g.lines[0].trim_end(), "ONCE");
         assert_eq!((g.cursor_row, g.cursor_col), (0, 4));
+    }
+
+    // ---------------------------------------- GH #224: keys on the grid
+
+    /// A session with a ring large enough for any fixture key, Tier B on,
+    /// at `rows × cols`.
+    fn key_session(rows: u16, cols: u16) -> (Arc<Session>, Arc<MockPty>) {
+        let pty = Arc::new(MockPty::new());
+        let s = Session::new(
+            new_session_id(),
+            None,
+            "bash".into(),
+            vec![],
+            Arc::clone(&pty) as Arc<dyn PtyBackend>,
+            SessionConfig::with_buffer_capacity(1 << 20),
+        );
+        s.set_screen_config(ScreenConfig {
+            mode: ScreenTracking::On,
+            rows,
+            cols,
+            ..ScreenConfig::default()
+        });
+        (s, pty)
+    }
+
+    /// Queue `text` and return the grid once the *parser* has caught up
+    /// with it — the reader publishes to the buffer first and to the
+    /// screen after, so waiting on the buffer alone races that gap.
+    fn painted_grid(s: &Session, pty: &MockPty, text: &str, p: &OutputProcessor) -> ScreenGrid {
+        pty.queue_output(text.as_bytes());
+        wait_for_bytes(s, text.len() as u64);
+        let mut g = grid(s.screen_state(None, true, p));
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while !g.lines.iter().any(|l| l.starts_with("done")) && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(5));
+            g = grid(s.screen_state(None, true, p));
+        }
+        assert!(
+            g.lines.iter().any(|l| l.starts_with("done")),
+            "the parser never reached the end of the fixture: {:?}",
+            g.lines
+        );
+        g
+    }
+
+    /// **`get_screen_state` masks a private key on the grid wherever
+    /// `read_output` masks it** (GH #224, GH #243).
+    ///
+    /// Two shapes, and each was a leak on `main` at `a81b02d` measured on
+    /// the real wire:
+    ///
+    /// * **complete, with its header scrolled off the top.** The render
+    ///   never sees `-----BEGIN`, so its own redactor matches nothing and
+    ///   the holdback mask reaches 512 bytes back: 36 of a 4096-bit key's
+    ///   body lines came back raw. The two larger keys here are taller
+    ///   than a 24-row screen, and every key is taller than the 10-row
+    ///   one, so every fixture reaches this arm at some geometry.
+    /// * **cut short** (`head -n 15`), with a prompt after it. Nothing
+    ///   closes the key, so the render matches nothing whether or not the
+    ///   header is on screen; `read_output` masked the body and the grid
+    ///   returned all of it.
+    ///
+    /// **Paired** with what must survive: the command after the key comes
+    /// back verbatim, on every arm. A grid that masked everything below a
+    /// `-----BEGIN` would pass the rest of this row.
+    #[test]
+    fn the_grid_masks_a_private_key_that_read_output_masks() {
+        use crate::output::pem::fixtures::KEYS;
+        let p = OutputProcessor::builtin().unwrap();
+        let mut scrolled_off = 0usize;
+        for key in KEYS {
+            let pem = key.pem().replace('\n', "\r\n");
+            let cut: String = pem.split_inclusive('\n').take(15).collect();
+            for (shape, body) in [("complete", &pem), ("head -n 15", &cut)] {
+                for (rows, cols) in [(40u16, 120u16), (24, 80), (10, 100)] {
+                    let (s, pty) = key_session(rows, cols);
+                    let text = format!("$ cat k\r\n{body}$ echo done\r\ndone\r\n$ ");
+                    let g = painted_grid(&s, &pty, &text, &p);
+                    let screen = g.lines.join("\n");
+                    scrolled_off += (!screen.contains("-----BEGIN")
+                        && !screen.contains("[REDACTED:private-key]"))
+                        as usize;
+                    assert_eq!(
+                        key.leaked_in(&screen),
+                        None,
+                        "{} {shape} at {rows}x{cols}: {screen}",
+                        key.name
+                    );
+                    assert!(
+                        g.lines.iter().any(|l| l.trim_end() == "$ echo done"),
+                        "{} {shape} at {rows}x{cols}: the next command was masked: {screen}",
+                        key.name
+                    );
+                    // One marker per masked row at most: the two judges
+                    // overlap on a header that is on screen, and a render
+                    // that painted both would print two markers there.
+                    assert!(
+                        g.lines.iter().all(|l| l.matches("[REDACTED:").count() <= 1),
+                        "{} {shape} at {rows}x{cols}: {screen}",
+                        key.name
+                    );
+                    // The read path agrees, in the same moment.
+                    let r = s.read_processed(&ReadRequest::since(0, 1 << 20), &p);
+                    assert_eq!(key.leaked_in(&r.output), None, "{} {shape}", key.name);
+                    // The key session's own ring is the only reason this
+                    // is not a leak on a fixture shaped differently: the
+                    // row's premise is that the screen really is showing
+                    // part of the key.
+                    assert!(
+                        screen.contains("[REDACTED:"),
+                        "{} {shape} at {rows}x{cols}: nothing of the key is on \
+                         screen, so this arm tests nothing: {screen}",
+                        key.name
+                    );
+                }
+            }
+        }
+        assert!(
+            scrolled_off > 0,
+            "no arm scrolled a header off the screen, which is the case GH #224 reports"
+        );
+    }
+
+    /// **The grid judges the key it shows, not only the bytes behind it**
+    /// (GH #224's second judge).
+    ///
+    /// A render is a reconstruction: here a line of junk follows the
+    /// header and is then overwritten by a carriage return, so the screen
+    /// shows the header and the key body contiguous. The byte stream does
+    /// not — it carries the junk between them, and since GH #242 a
+    /// `-----BEGIN` candidate ends at the first byte that cannot be PEM
+    /// text, so the stream's judge sees prose after a header and nothing
+    /// to mask. That is the read path's residual for this shape, stated in
+    /// `pem.rs`: it takes a program that writes junk into its own key and
+    /// then paints over it. The grid is not left to the stream's answer on
+    /// it, because the grid emits what it renders.
+    #[test]
+    fn the_grid_masks_a_key_whose_stream_was_overwritten_on_screen() {
+        use crate::output::pem::fixtures::KEYS;
+        let p = OutputProcessor::builtin().unwrap();
+        let key = &KEYS[0];
+        let pem = key.pem().replace('\n', "\r\n");
+        let mut lines = pem.split_inclusive('\n');
+        let header = lines.next().unwrap();
+        let body: String = lines.take(12).collect();
+        let (s, pty) = key_session(40, 120);
+        let text = format!("$ cat k\r\n{header}JUNK.\r{body}user@host:~$ echo done\r\ndone\r\n$ ");
+        // The premise: the stream judges this candidate dead with nothing
+        // to mask, so the byte-stream judge cannot be what masks it.
+        assert!(
+            p.key_regions(text.as_bytes(), 0).is_empty(),
+            "the stream's judge must see nothing here, or this row tests the other judge"
+        );
+        let g = painted_grid(&s, &pty, &text, &p);
+        let screen = g.lines.join("\n");
+        assert!(
+            !screen.contains("JUNK"),
+            "the fixture must overwrite its junk: {screen}"
+        );
+        assert_eq!(key.leaked_in(&screen), None, "{screen}");
+        assert!(g.held_back, "{screen}");
+        assert!(screen.contains("$ echo done"), "{screen}");
+    }
+
+    /// The negative the row above cannot give: prose that *names* a key
+    /// header costs the grid nothing (GH #242), and a grid with no key on
+    /// it reports `held_back: false`.
+    #[test]
+    fn the_grid_does_not_mask_prose_that_mentions_a_key_header() {
+        let p = OutputProcessor::builtin().unwrap();
+        let (s, pty) = key_session(24, 80);
+        let text = "$ git grep -n BEGIN CHANGELOG.md\r\n\
+            CHANGELOG.md:12: contains `-----BEGIN RSA PRIVATE KEY-----` as prose\r\n\
+            $ printf -- '-----BEGIN RSA PRIVATE KEY-----\\n'\r\n\
+            -----BEGIN RSA PRIVATE KEY-----\r\n\
+            user@host:~$ echo done\r\ndone\r\n$ ";
+        let g = painted_grid(&s, &pty, text, &p);
+        let screen = g.lines.join("\n");
+        assert!(!g.held_back, "{screen}");
+        assert!(!screen.contains("[REDACTED"), "{screen}");
+        assert!(screen.contains("as prose"), "{screen}");
     }
 
     // ---------------------------------------------- geometry bounds (C3)

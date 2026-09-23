@@ -22,6 +22,7 @@ use crate::buffer::OutputBuffer;
 // for the window title, which is one contiguous string with no rows in it.
 use crate::output::redact::{find_spans, marker, redact_str, Span, UNRESOLVED_KIND};
 use crate::output::rules::RuleSet;
+use crate::output::{ansi::AnsiStripper, OutputProcessor, UNVOUCHED_CARRY_BYTES};
 use parking_lot::Mutex;
 use std::collections::VecDeque;
 use std::sync::Arc;
@@ -409,6 +410,53 @@ impl ScreenTracker {
         seed: &dyn SeedSource,
         holdback: Option<u64>,
     ) -> ScreenCapture {
+        self.capture_judged(diff_from, redact, now, seed, holdback, None)
+    }
+
+    /// [`Self::capture`], with the processor that judges **private keys**
+    /// on the grid (GH #224). `Session::screen_state` always passes its
+    /// own; `None` is the spelling the unit tests of everything else in
+    /// this module use, and it leaves exactly the grid `capture` renders.
+    ///
+    /// **Why the holdback mask was not enough.** It masks the cells the
+    /// bytes after `holdback` wrote, and `holdback` is asked of the
+    /// trailing `partial_secret_scan_bytes` only — so it reaches a secret
+    /// still arriving and nothing anchored further back. A key is
+    /// kilobytes. Measured on `main` at `a81b02d`: with the header of a
+    /// complete 4096-bit key scrolled off a 40-row screen, the grid
+    /// returned 36 of its body lines raw, and `head -n 15` of a 2048-bit
+    /// key returned all fourteen body lines raw where `read_output` masked
+    /// them — on the `readOnlyHint: true` tool an agent reasonably treats
+    /// as the safe one to call freely.
+    ///
+    /// Two judges are added, and each reaches a case the other cannot:
+    ///
+    /// * **The byte stream's.** [`Self::key_screen`] asks the processor
+    ///   which bytes behind the screen are a key — a complete
+    ///   `private-key-block` match, or a `-----BEGIN` candidate that is
+    ///   still believed or died with key material behind it — and masks
+    ///   the cells *those bytes* wrote, wherever the live grid put them.
+    ///   It is the only one that reaches a key whose header has scrolled
+    ///   off the top, which is the case the issue reports.
+    /// * **The grid's own.** The same candidate walk run over the joined
+    ///   render, in `rendered_screen`. A render is a reconstruction: `\r`
+    ///   and cursor movement can overwrite the byte that ended a candidate
+    ///   in the stream, so a header still on screen is judged on what the
+    ///   screen shows.
+    ///
+    /// Both mask with `[REDACTED:unresolved]` and set `held_back`, which
+    /// is §18.2's vocabulary for a masked cell. A key the render itself
+    /// matches whole still comes back as `[REDACTED:private-key]`, because
+    /// redaction claims its spans before any mask (REQ-O-011a's order).
+    pub fn capture_judged(
+        &mut self,
+        diff_from: Option<u64>,
+        redact: bool,
+        now: Instant,
+        seed: &dyn SeedSource,
+        holdback: Option<u64>,
+        judge: Option<&OutputProcessor>,
+    ) -> ScreenCapture {
         if self.cfg.mode == ScreenTracking::Off {
             // The operator said never to run emulation on the write path.
             // Honour that, but still answer: render once from the seed
@@ -425,20 +473,20 @@ impl ScreenTracker {
             // an `off` session from touching the policy at all — but a
             // reader must not take `off_answers_without_ever_running_…`
             // as pinning this branch, because it does not.
-            return ScreenCapture::Full(self.one_shot(redact, seed, holdback));
+            return ScreenCapture::Full(self.one_shot(redact, seed, holdback, judge));
         }
         self.policy.note_consumer(now);
         self.policy.evaluate(now);
         self.sync_parser(seed);
         match self.parser.take() {
             Some(parser) => {
-                let capture = self.render(&parser, diff_from, redact, seed, holdback);
+                let capture = self.render(&parser, diff_from, redact, seed, holdback, judge);
                 self.parser = Some(parser);
                 capture
             }
             // Unreachable: note_consumer enables every non-`off` mode.
             // Answer anyway rather than inventing a failure status.
-            None => ScreenCapture::Full(self.one_shot(redact, seed, holdback)),
+            None => ScreenCapture::Full(self.one_shot(redact, seed, holdback, judge)),
         }
     }
 
@@ -674,6 +722,7 @@ impl ScreenTracker {
         redact: bool,
         seed: &dyn SeedSource,
         holdback: Option<u64>,
+        judge: Option<&OutputProcessor>,
     ) -> ScreenGrid {
         let taken = seed.recent(self.cfg.seed_bytes());
         let mut parser = self.new_parser();
@@ -694,8 +743,10 @@ impl ScreenTracker {
             changes: &[],
             current,
         };
+        let keys = self.key_screen(&span, redact, seed, judge);
         let boundary = self.boundary_screen(span, redact, seed, holdback);
-        let (rendered, held_back) = self.rendered_screen(&parser, redact, boundary.as_ref());
+        let against: Vec<&vt100::Screen> = boundary.iter().chain(keys.iter()).collect();
+        let (rendered, held_back) = self.rendered_screen(&parser, redact, &against, judge);
         let title = self.rendered_title(&parser, redact);
         grid_of(rendered.screen(), title, UNRETAINED_REVISION, held_back)
     }
@@ -794,27 +845,88 @@ impl ScreenTracker {
             return None;
         }
         let replay = seed.replay(span.from, boundary);
-        let mut parser = vt100::Parser::new(span.origin.0, span.origin.1, 0);
-        // The same bytes through the same `set_size` calls at the same
-        // points. `at <= replay.start` leaves nothing to process and just
-        // applies the size, which is right: the front the ring evicted was
-        // painted at a geometry no cell of this render survives from.
-        let mut pos = replay.start;
-        for &(at, rows, cols) in span.changes {
-            let upto = at.clamp(pos, boundary);
-            parser.process(slice_of(&replay, pos, upto));
-            pos = upto;
-            parser.screen_mut().set_size(rows, cols);
+        Some(replay_screen(&span, &replay, boundary))
+    }
+
+    /// The render with every byte of a **key** replaced (GH #224): the
+    /// parser's own input, replayed exactly as [`Self::boundary_screen`]
+    /// replays it, except that each printable ASCII byte a key region
+    /// wrote — space included — is swapped for a different printable
+    /// ASCII byte. The cells
+    /// where the live grid differs from this render are then exactly the
+    /// cells the key's bytes still hold, wherever scrolling moved them.
+    ///
+    /// **A substitution, not a truncation, and the difference is what
+    /// makes the extent right.** The holdback mask truncates, because the
+    /// withheld bytes are the tail and nothing follows them. A key region
+    /// is usually followed by more output — a prompt, the next command —
+    /// and a replay that stopped at the key would differ from the live
+    /// grid on every row that output scrolled, masking the screen. One
+    /// that swaps the key's printable bytes one for one keeps every
+    /// cursor movement, every wrap and every scroll the key caused, so
+    /// only the cells holding its characters differ. The swap is
+    /// same-length, so every stream offset in the geometry schedule still
+    /// names the same byte.
+    ///
+    /// **What it swaps is what `AnsiStripper` emits**, the same notion of
+    /// "printed" `read_output` renders with. A byte the stripper places in
+    /// a sequence and the emulator prints instead is not swapped and not
+    /// masked; that takes a deliberately malformed sequence inside the
+    /// key, and the grid's own candidate walk still judges a header that
+    /// is on screen.
+    ///
+    /// **Which bytes are a key is the processor's answer, over the bytes
+    /// that can still be on screen plus the carry behind them** — the
+    /// seed window, `rows × cols × 4`, and `UNVOUCHED_CARRY_BYTES` more so
+    /// a key whose header is further back than the screen is still
+    /// recognised. A key older than that and still painted — a TUI that
+    /// has not redrawn since — is outside this reach, the §4.5 seed
+    /// window's residual reached from the other side.
+    ///
+    /// **It shares the holdback mask's one residual and fails the same
+    /// way.** A ring that has evicted the front of `[seeded_from, head)`
+    /// replays from a later start, disagrees with the live grid about
+    /// which cell holds what, and masks every cell it disagrees about —
+    /// over-masking, the direction this must fail in.
+    fn key_screen(
+        &self,
+        span: &ReplaySpan<'_>,
+        redact: bool,
+        seed: &dyn SeedSource,
+        judge: Option<&OutputProcessor>,
+    ) -> Option<vt100::Screen> {
+        let judge = judge?;
+        if !redact || span.head <= span.from {
+            return None;
         }
-        parser.process(slice_of(&replay, pos, boundary));
-        // A resize *after* the boundary still applies: the mask compares
-        // this render with the live grid cell by cell, and the live grid
-        // has been through it.
-        let (rows, cols) = span.current;
-        if parser.screen().size() != (rows, cols) {
-            parser.screen_mut().set_size(rows, cols);
+        let reach = (self.cfg.seed_bytes() + UNVOUCHED_CARRY_BYTES) as u64;
+        let scan = seed.replay(span.head.saturating_sub(reach), span.head);
+        let regions: Vec<(u64, u64)> = judge
+            .key_regions(&scan.bytes, scan.start)
+            .into_iter()
+            .filter(|(_, end)| *end > span.from)
+            .collect();
+        if regions.is_empty() {
+            return None;
         }
-        Some(parser.screen().clone())
+        let mut replay = seed.replay(span.from, span.head);
+        let mut stripper = AnsiStripper::new();
+        let mut region = regions.iter().peekable();
+        for (i, byte) in replay.bytes.iter_mut().enumerate() {
+            let off = replay.start + i as u64;
+            let printed = stripper.feed(off, *byte).is_some();
+            while region.peek().is_some_and(|(_, end)| *end <= off) {
+                region.next();
+            }
+            let inside = region.peek().is_some_and(|(start, _)| *start <= off);
+            // Spaces too: a row's run of masked cells is one marker only
+            // if nothing inside it compares equal, and `-----END RSA
+            // PRIVATE KEY-----` has two spaces in it.
+            if inside && printed && (0x20..=0x7e).contains(byte) {
+                *byte = if *byte == b'#' { b'%' } else { b'#' };
+            }
+        }
+        Some(replay_screen(span, &replay, span.head))
     }
 
     /// Re-render the raw parser grid into the screen that leaves this
@@ -910,7 +1022,8 @@ impl ScreenTracker {
         &self,
         parser: &vt100::Parser<TitleSink>,
         redact: bool,
-        mask_against: Option<&vt100::Screen>,
+        mask_against: &[&vt100::Screen],
+        judge: Option<&OutputProcessor>,
     ) -> (vt100::Parser, bool) {
         let screen = parser.screen();
         let (rows, cols) = screen.size();
@@ -954,6 +1067,36 @@ impl ScreenTracker {
         } else {
             Vec::new()
         };
+
+        // 2a. The grid's own key candidates (GH #224): a `-----BEGIN`
+        //     header on screen whose key the render does not close — cut
+        //     short, or still arriving — judged on the text the grid
+        //     shows rather than on the bytes behind it, because a render
+        //     can overwrite the byte that ended the candidate in the
+        //     stream. A candidate a span already covers is the span's.
+        if let Some(judge) = judge.filter(|_| redact) {
+            for c in judge
+                .index
+                .unterminated_candidates(&judge.rules, joined.as_bytes(), 0)
+            {
+                if !spans.iter().any(|s| s.start <= c.start && s.end > c.start) {
+                    masked.push((c.start as usize, c.end as usize));
+                }
+            }
+            // `compose` expects disjoint runs in order; a candidate's range
+            // overlaps the per-row runs the key render masked, so they are
+            // merged here. Touching ones too — `compose` would join them
+            // anyway, as a wrap.
+            masked.sort_unstable();
+            let mut merged: Vec<(usize, usize)> = Vec::with_capacity(masked.len());
+            for (start, end) in masked.drain(..) {
+                match merged.last_mut() {
+                    Some(last) if start <= last.1 => last.1 = last.1.max(end),
+                    _ => merged.push((start, end)),
+                }
+            }
+            masked = merged;
+        }
 
         // 3. Compose: the redaction's spans, plus whatever of the mask
         //    they did not already cover.
@@ -1027,6 +1170,7 @@ impl ScreenTracker {
         redact: bool,
         seed: &dyn SeedSource,
         holdback: Option<u64>,
+        judge: Option<&OutputProcessor>,
     ) -> ScreenCapture {
         let revision = self.next_revision;
         self.next_revision += 1;
@@ -1037,13 +1181,11 @@ impl ScreenTracker {
         // renderings and the mask joins that rule rather than getting a
         // second one, so a `diff_from` across a moving holdback describes
         // the masking as an ordinary screen change.
-        let boundary = self.boundary_screen(
-            self.tracked_span(parser.screen().size()),
-            redact,
-            seed,
-            holdback,
-        );
-        let (redacted, held_back) = self.rendered_screen(parser, redact, boundary.as_ref());
+        let span = self.tracked_span(parser.screen().size());
+        let keys = self.key_screen(&span, redact, seed, judge);
+        let boundary = self.boundary_screen(span, redact, seed, holdback);
+        let against: Vec<&vt100::Screen> = boundary.iter().chain(keys.iter()).collect();
+        let (redacted, held_back) = self.rendered_screen(parser, redact, &against, judge);
         let title = self.rendered_title(parser, redact);
 
         // The `mode == redact` conjunct is REQ-O-011's second normative
@@ -1125,6 +1267,35 @@ fn char_slice(text: &str, start: usize, end: usize) -> &str {
     }
 }
 
+/// A parser fed `replay` up to `end` through the same `set_size` calls, at
+/// the same stream offsets, that `span` recorded — the live parser's own
+/// history, reproduced. Shared by the holdback render (truncated at the
+/// boundary) and the key render (substituted, to `head`), so the two
+/// cannot disagree about the geometry they compare against.
+fn replay_screen(span: &ReplaySpan<'_>, replay: &Replay, end: u64) -> vt100::Screen {
+    let mut parser = vt100::Parser::new(span.origin.0, span.origin.1, 0);
+    // The same bytes through the same `set_size` calls at the same
+    // points. `at <= replay.start` leaves nothing to process and just
+    // applies the size, which is right: the front the ring evicted was
+    // painted at a geometry no cell of this render survives from.
+    let mut pos = replay.start;
+    for &(at, rows, cols) in span.changes {
+        let upto = at.clamp(pos, end);
+        parser.process(slice_of(replay, pos, upto));
+        pos = upto;
+        parser.screen_mut().set_size(rows, cols);
+    }
+    parser.process(slice_of(replay, pos, end));
+    // A resize *after* the end still applies: the mask compares this
+    // render with the live grid cell by cell, and the live grid has been
+    // through it.
+    let (rows, cols) = span.current;
+    if parser.screen().size() != (rows, cols) {
+        parser.screen_mut().set_size(rows, cols);
+    }
+    parser.screen().clone()
+}
+
 /// `replay.bytes` for the absolute range `[start, end)`, clamped to what
 /// the replay actually holds. Absolute offsets go in, so a range the ring
 /// evicted comes back empty rather than shifted — the one arithmetic in
@@ -1190,7 +1361,7 @@ fn write_row(
     row: u16,
     cols: u16,
     joined: &mut String,
-    against: Option<&vt100::Screen>,
+    against: &[&vt100::Screen],
     masked: &mut Vec<(usize, usize)>,
 ) {
     let mut prev_was_wide = false;
@@ -1216,9 +1387,9 @@ fn write_row(
         joined.push_str(cell.contents());
         let end = joined.len();
 
-        let differs = against.is_some_and(|base| {
-            base.cell(row, col).map(vt100::Cell::contents) != Some(cell.contents())
-        });
+        let differs = against
+            .iter()
+            .any(|base| base.cell(row, col).map(vt100::Cell::contents) != Some(cell.contents()));
         match (differs, run) {
             // Cells adjacent in the join extend one run, so a withheld
             // value becomes one marker rather than one per character.
