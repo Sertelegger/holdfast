@@ -629,6 +629,11 @@ async fn started_reports_the_childs_real_pgid_and_sid() {
     let token = unique_token("groups");
     let booted = boot(&long_lived(&token)).await;
     let child_pid = booted.started.child_pid;
+    // Read only by the `/proc` block below, so it is gated with it: an
+    // ungated binding is an unused variable on every other Unix, and
+    // `cargo clippy --all-targets --target aarch64-apple-darwin -- -D
+    // warnings` refused to compile this file over it.
+    #[cfg(target_os = "linux")]
     let worker_pid = booted.worker.pid();
 
     // `portable-pty` `setsid`s the child, so all three of these are the
