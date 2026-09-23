@@ -4927,6 +4927,66 @@ mod tests {
         }
     }
 
+    /// **A key still arriving, with its header scrolled off, is masked on
+    /// the grid** — the in-flight arm of `OutputProcessor::key_regions`,
+    /// which no row reached (the independent review of GH #242: deleting
+    /// that arm left every test green and put 23 body lines on a 24-row
+    /// grid).
+    ///
+    /// `head -n 45 k; sleep 8` of a 4096-bit key: forty-four body lines
+    /// with nothing after them yet. The header has scrolled off, so the
+    /// grid's own candidate walk sees no anchor; the candidate is alive,
+    /// so it is neither a dead one nor followed by body lines. Only the
+    /// in-flight arm names these bytes. The last line is left half
+    /// written, as a key still streaming is, which is also what gives the
+    /// row a cursor position to wait on — the parser is fed after the
+    /// buffer, and a fixture with no sentinel after it has no other.
+    #[test]
+    fn the_grid_masks_a_key_still_arriving_with_its_header_scrolled_off() {
+        use crate::output::pem::fixtures::KEYS;
+        let p = OutputProcessor::builtin().unwrap();
+        for key in KEYS.iter().filter(|k| k.material_lines().len() > 30) {
+            let (rows, cols) = (24u16, 100u16);
+            let pem = key.pem().replace('\n', "\r\n");
+            let lines: Vec<&str> = pem.split_inclusive('\n').collect();
+            // Up to the forty-fifth line, and never the closing boundary.
+            let cut = (lines.len() - 2).min(44);
+            let last = lines[cut].trim_end();
+            let text = format!(
+                "$ head -n 45 k; sleep 8\r\n{}{}",
+                lines[..cut].concat(),
+                &last[..last.len() / 2]
+            );
+            assert!(!text.contains("-----END"), "{}", key.name);
+            let expect = {
+                let mut t = vt100::Parser::new(rows, cols, 0);
+                t.process(text.as_bytes());
+                t.screen().cursor_position()
+            };
+            let (s, pty) = key_session(rows, cols);
+            pty.queue_output(text.as_bytes());
+            wait_for_bytes(&s, text.len() as u64);
+            let deadline = Instant::now() + Duration::from_secs(5);
+            let mut g = grid(s.screen_state(None, true, &p));
+            while (g.cursor_row, g.cursor_col) != expect && Instant::now() < deadline {
+                std::thread::sleep(Duration::from_millis(5));
+                g = grid(s.screen_state(None, true, &p));
+            }
+            assert_eq!(
+                (g.cursor_row, g.cursor_col),
+                expect,
+                "{}: the parser never reached the end of the fixture",
+                key.name
+            );
+            let screen = g.lines.join("\n");
+            // The premise: the header is off the screen, so this is the
+            // byte stream's judge and not the grid's own.
+            assert!(!screen.contains("-----BEGIN"), "{}: {screen}", key.name);
+            assert_eq!(key.leaked_in(&screen), None, "{}: {screen}", key.name);
+            assert!(g.held_back, "{}: {screen}", key.name);
+        }
+    }
+
     /// **The grid judges the key it shows, not only the bytes behind it**
     /// (GH #224's second judge).
     ///
