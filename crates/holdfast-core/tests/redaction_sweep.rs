@@ -452,6 +452,15 @@ struct Tally {
 fn sweep(processor: &OutputProcessor, redact: bool) -> Tally {
     let rules = &processor.rules;
     let mut tally = Tally::default();
+    // **One processor for every stream row, built once.** Each row gets a
+    // fresh `StreamRedactor` — that is where a stream's state lives — but
+    // the processor behind it is the shipped rule set and nothing a feed
+    // mutates. Building it per row cost one `PrefixIndex::build` (a dense
+    // liveness DFA per rule) for every fixture × payload, which dominated
+    // this target's run time and grew with every positive fixture the rule
+    // file gained; GH #244's took both arms past nextest's 300 s kill on a
+    // loaded machine.
+    let stream_processor = Arc::new(OutputProcessor::builtin().unwrap());
     for fixture in fixtures(rules) {
         for (payload_name, payload) in PAYLOADS {
             let mut planted = fixture.text.as_bytes()[..fixture.plant_at].to_vec();
@@ -510,7 +519,7 @@ fn sweep(processor: &OutputProcessor, redact: bool) -> Tally {
             // in the carry when it is judged. A chunk *split* inside the
             // token is GH #142 at this boundary and is measured by
             // `the_stream_residual_at_a_chunk_split_is_bounded` instead.
-            let mut redactor = StreamRedactor::new(Arc::new(OutputProcessor::builtin().unwrap()));
+            let mut redactor = StreamRedactor::new(Arc::clone(&stream_processor));
             let mut out = redactor.feed(&planted);
             out.extend_from_slice(&redactor.feed(TAIL.as_bytes()));
             out.extend_from_slice(&redactor.flush());
