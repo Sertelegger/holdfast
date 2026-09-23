@@ -2235,6 +2235,10 @@ fn a_closed_stdout_ends_the_cli_as_it_ends_cat_rather_than_panicking() {
     for args in [
         &["version"][..],
         &["--help"][..],
+        // The hidden worker's help is printed by the worker's own code,
+        // not `help`'s, and was the one help path still panicking.
+        &["help", "pty-worker"][..],
+        &["pty-worker", "--help"][..],
         &["list"][..],
         &["list", "--json"][..],
         &["logs", "piped"][..],
@@ -2796,6 +2800,29 @@ fn logs_of_a_session_longer_than_its_buffer_says_the_front_is_gone() {
     let first = *rest.first().expect("numbered lines");
     assert!(first > 1, "a 1 MiB ring cannot still hold the first line");
     assert_eq!(rest, (first..=WRAP_LAST).collect::<Vec<_>>().as_slice());
+
+    // `--tail N` says so only when its N lines reach back to where the
+    // ring begins. Both directions, because either alone is satisfied by
+    // a constant: 60,000 lines is longer than a page, so it takes the
+    // drain, and stops well short of the ring's front; 190,000 is more
+    // than the ring holds.
+    let (code, out, err) = env.run(&["logs", "wrapped", "--tail", "60000"]);
+    assert_eq!(code, 0, "stderr: {err}");
+    assert_eq!(out.lines().count(), 60_000, "stderr: {err}");
+    assert!(
+        !err.contains("have left its buffer"),
+        "the last 60000 lines are all in the ring, and the note says some are not: {err}"
+    );
+    let (code, out, err) = env.run(&["logs", "wrapped", "--tail", "190000"]);
+    assert_eq!(code, 0, "stderr: {err}");
+    assert!(
+        out.lines().count() < 190_000,
+        "the ring cannot hold 190000 lines"
+    );
+    assert!(
+        err.contains("have left its buffer"),
+        "`--tail` asked for more than the ring holds and was not told the front is gone: {err}"
+    );
 
     let audit_path = env.dir.join("logs").join("audit.log");
     let audit = std::fs::read_to_string(&audit_path).unwrap_or_default();

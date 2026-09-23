@@ -753,15 +753,22 @@ async fn await_daemon_exit(pid: Option<u32>, limit: Duration) -> Result<(), Stri
 /// says which through `/proc`; elsewhere the orphan reaper is `launchd` or
 /// `init`, which reap at once.
 ///
-/// **`EPERM` is alive**: the pid exists and belongs to someone else, which
-/// is a recycled pid rather than our daemon — and since this is only asked
-/// of a pid that was ours a moment ago, the answer that stops the wait
-/// early would be the wrong one to give.
+/// **`EPERM` is gone, too.** The pid exists and belongs to another user,
+/// so it is not our daemon: the daemon runs as the uid this CLI runs as —
+/// `peer::is_authorized` refuses every other uid, root included, so no
+/// other CLI could have asked it anything — and a process of our own uid
+/// is never `EPERM` to us. What `EPERM` means is that our daemon exited
+/// and its pid was reused. This read `EPERM` as alive, on the reasoning
+/// that a recycled pid is not ours — which is the reason to call ours
+/// gone — and waited out the bound on a stranger, then exited 1.
 #[cfg(unix)]
 fn process_is_gone(pid: u32) -> bool {
     // SAFETY: signal 0 sends nothing and takes no pointers.
     if unsafe { libc::kill(pid as libc::pid_t, 0) } != 0 {
-        return std::io::Error::last_os_error().raw_os_error() == Some(libc::ESRCH);
+        return matches!(
+            std::io::Error::last_os_error().raw_os_error(),
+            Some(libc::ESRCH | libc::EPERM)
+        );
     }
     std::fs::read_to_string(format!("/proc/{pid}/stat"))
         .ok()
@@ -2930,7 +2937,7 @@ pub async fn pty_worker(args: &[String]) -> ExitCode {
     use holdfast_core::pty::worker::child::{self, Argv};
     match child::parse_argv(args) {
         Argv::Help => {
-            print!("{PTY_WORKER_USAGE}");
+            crate::out::text(PTY_WORKER_USAGE);
             ExitCode::SUCCESS
         }
         Argv::Usage(why) => {
@@ -3445,6 +3452,31 @@ mod tests {
         }
         child.0.wait().unwrap();
         assert!(process_is_gone(pid), "a reaped child is gone");
+    }
+
+    /// **A pid another user owns is not our daemon**, so a stop waiting on
+    /// ours is done. The daemon shares this CLI's uid — `is_authorized`
+    /// refuses every other — so `EPERM` from signal 0 means its pid was
+    /// reused by someone else's process. It used to read as alive, and a
+    /// stop waited out its whole bound on a stranger and then exited 1.
+    ///
+    /// Pid 1 stands in for the stranger: root's, wherever this runs as
+    /// anyone else, which CI does.
+    #[test]
+    fn a_pid_another_user_owns_is_gone_for_our_purposes() {
+        // SAFETY: signal 0 sends nothing and takes no pointers.
+        let refused = unsafe { libc::kill(1, 0) } != 0
+            && std::io::Error::last_os_error().raw_os_error() == Some(libc::EPERM);
+        if !refused {
+            println!(
+                "skipping: EPERM from signal 0 — this runs as pid 1's owner, so nothing refuses it"
+            );
+            return;
+        }
+        assert!(
+            process_is_gone(1),
+            "`EPERM` means the pid is another user's, so our daemon is not it"
+        );
     }
 
     /// A child that is killed and reaped when the row ends, pass or fail,
