@@ -493,8 +493,8 @@ mod tests {
     /// **The forward-compatibility half of the wire.** A daemon of this
     /// release will be sent contexts by later shims; a field it does not
     /// know is dropped and the rest is read. Found by review: the struct
-    /// shipped `deny_unknown_fields`, which turned any later field into a
-    /// `bad_params` on every `start_session`.
+    /// was first written with `deny_unknown_fields`, which would have
+    /// turned any later field into a `bad_params` on every `start_session`.
     #[test]
     fn a_later_shims_context_is_read_for_what_this_daemon_knows() {
         let mut args = serde_json::json!({
