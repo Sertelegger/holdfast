@@ -55,7 +55,7 @@ const START_SESSION: &str = "start_session";
 /// What a response carries when the call that produced it had to start a
 /// new daemon first (GH #231). Put in front of `details`, or of the
 /// message of an error, so it is the first thing read.
-pub const DAEMON_RESTARTED: &str = "The Holdfast daemon had stopped, so a new one was \
+const DAEMON_RESTARTED: &str = "The Holdfast daemon had stopped, so a new one was \
     started for this call: every session from the previous daemon is gone, and its session \
     ids no longer resolve.";
 
@@ -158,8 +158,7 @@ impl ShimServer {
     /// there is none (GH #231).
     ///
     /// `None` when there is nothing to do: this shim does not respawn, or
-    /// `err` is not a lost daemon. **Only `Connect` and `Frame` are** —
-    /// "nobody is listening" and "the connection broke". A refusal, a
+    /// `err` is not a lost daemon ([`lost_the_daemon`]). A refusal, a
     /// protocol-major mismatch above all, is a daemon that is there and
     /// said no, and starting a second one over it is the response §7.3
     /// forbids at startup and that is no better here.
@@ -176,7 +175,7 @@ impl ShimServer {
         err: &ClientError,
     ) -> Option<Result<Reconnected, ClientError>> {
         let respawn = self.link.respawn.as_ref()?;
-        if !matches!(err, ClientError::Connect { .. } | ClientError::Frame(_)) {
+        if !lost_the_daemon(err) {
             return None;
         }
         let _one_at_a_time = self.link.reconnecting.lock().await;
@@ -229,7 +228,7 @@ impl ShimServer {
         Some(Ok(Reconnected { client, restarted }))
     }
 
-    /// One tool round trip on `client`, racing `cancelled` as §GH #127
+    /// One tool round trip on `client`, racing `cancelled` as GH #127
     /// requires. `cancel_seen` records that the cancel arm fired, which
     /// is what stops a cancelled call from being re-sent after a
     /// reconnection.
@@ -600,6 +599,22 @@ fn a_closing_listener(e: &ClientError) -> bool {
         ),
         _ => false,
     }
+}
+
+/// Whether a failed round trip means the daemon is gone: "nobody is
+/// listening", or the connection broke under the call.
+///
+/// **Not every `Frame` error.** `TooLarge` is this side's own request
+/// refused before a byte was written, and `Cbor` an answer that did not
+/// decode — both from a daemon that is plainly there, and reconnecting
+/// over either would report a restart that did not happen.
+fn lost_the_daemon(e: &ClientError) -> bool {
+    matches!(
+        e,
+        ClientError::Connect { .. }
+            | ClientError::Frame(FrameError::Eof)
+            | ClientError::Frame(FrameError::Io(_))
+    )
 }
 
 /// Whether a failed round trip provably never reached a daemon, so the
@@ -1530,6 +1545,29 @@ mod tests {
     /// listener still closing, and so worth one more `ensure_daemon`. A
     /// timeout is not — that is a daemon that is there and not answering,
     /// and GH #15 is why nothing spawns over it.
+    /// Which failures reconnect at all. The two refused here come from a
+    /// daemon that is plainly still there — this side's own oversized
+    /// request, and an answer that did not decode — and reconnecting over
+    /// them would tell the agent its sessions were gone when they are not.
+    #[test]
+    fn only_a_missing_or_broken_connection_is_a_lost_daemon() {
+        let io = |kind| ClientError::Frame(FrameError::Io(std::io::Error::from(kind)));
+        assert!(lost_the_daemon(&ClientError::Connect {
+            path: "control.sock".into(),
+            source: std::io::Error::from(std::io::ErrorKind::ConnectionRefused),
+        }));
+        assert!(lost_the_daemon(&ClientError::Frame(FrameError::Eof)));
+        assert!(lost_the_daemon(&io(std::io::ErrorKind::BrokenPipe)));
+        for there in [
+            ClientError::Frame(FrameError::TooLarge { len: 1 << 30 }),
+            ClientError::Frame(FrameError::Cbor("truncated".into())),
+            ClientError::Refused("client_too_old".into()),
+            ClientError::VersionMismatch { ours: 1, theirs: 2 },
+        ] {
+            assert!(!lost_the_daemon(&there), "{there:?}");
+        }
+    }
+
     #[test]
     fn a_reset_handshake_is_a_closing_listener_and_a_silent_one_is_not() {
         let io = |kind| ClientError::Frame(FrameError::Io(std::io::Error::from(kind)));
