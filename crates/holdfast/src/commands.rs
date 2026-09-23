@@ -1428,8 +1428,9 @@ enum Truncation {
     /// over every gap.
     ///
     /// A lower bound and not a total, for `observer` connections. The
-    /// daemon counts the hole in the **raw** session stream (§4.3's
-    /// broadcast drop, measured from the `OutputFrame` offsets), and an
+    /// daemon counts the hole in the **raw** session stream — since GH
+    /// #210, bytes the session's ring buffer evicted before this
+    /// connection read them, measured from the stream offsets — and an
     /// observer renders the *redacted* stream — `StreamRedactor` can
     /// withhold on its own account, and its withholding window is not
     /// this number — and the redactor announces its own drops in band,
@@ -1454,6 +1455,14 @@ impl Truncation {
 /// Tell the operator the stream skipped bytes, at the point it skipped
 /// them.
 ///
+/// **And that they are gone, which is new with GH #210.** A gap used to
+/// be a broadcast drop, with the bytes still in the ring buffer, and this
+/// line sent the operator to `holdfast logs` for them. A connection now
+/// resumes from the ring whenever it falls behind, so the only hole left
+/// is the part the ring had already evicted — which `holdfast logs`,
+/// reading that same ring, does not have either. Saying otherwise would
+/// send a person looking for bytes that no longer exist anywhere.
+///
 /// Through `diag!` and therefore stderr, **not** through [`render`]:
 /// stdout is the session's own byte stream and a client that wrote its
 /// own prose into it would corrupt every `holdfast watch > file`. It is
@@ -1463,7 +1472,8 @@ impl Truncation {
 fn report_gap(what: &str, bytes: u64) {
     diag!(
         "holdfast {what}: at least {bytes} bytes of output were dropped here and are not \
-         shown — `holdfast logs` still has them"
+         shown — this view fell further behind than the session's output buffer reaches, \
+         so they are gone"
     );
 }
 
@@ -1485,16 +1495,28 @@ fn report_gap(what: &str, bytes: u64) {
 /// `EXIT_TRUNCATED`. That is the intended answer — the operator's
 /// capture really is missing twelve bytes — and it is written here
 /// because the sentence it replaces read as a promise of 0.
+///
+/// **A `u8` rather than an `ExitCode`** so `attach` can tell a clean
+/// ending from the others after a stall (GH #210); both callers convert
+/// at the `return`.
+///
+/// `attach` no longer reaches the `slow_consumer` arm — it holds the
+/// terminal instead ([`hold_after_stall`]) — so the sentence is
+/// `watch`'s, and it now says what the reason means since GH #210: the
+/// client stopped reading, not that it read too slowly.
 #[cfg(unix)]
-fn finish(what: &str, reason: &str, truncated: Truncation) -> ExitCode {
+fn finish(what: &str, reason: &str, truncated: Truncation) -> u8 {
     if reason == "slow_consumer" {
         // No byte count: see `Truncation`. What is knowable is where to
-        // get the rest, and the ring buffer still has it (REQ-O-005).
+        // get the rest, and the ring buffer has as much of it as it still
+        // holds (REQ-O-005) — not necessarily all of it, after a stall
+        // long enough to be detached for.
         diag!(
-            "holdfast {what}: detached ({reason}) — this view is incomplete from here on; \
-             `holdfast logs` has what the session printed"
+            "holdfast {what}: detached ({reason}) — this client stopped reading, and this \
+             view is incomplete from here on; `holdfast logs` has the session's recent \
+             output, as far back as its buffer reaches"
         );
-        return ExitCode::from(EXIT_TRUNCATED);
+        return EXIT_TRUNCATED;
     }
     diag!("holdfast {what}: detached ({reason})");
     left_cleanly(what, truncated)
@@ -1514,12 +1536,12 @@ fn finish(what: &str, reason: &str, truncated: Truncation) -> ExitCode {
 /// still exit 0, which is what `mcp-smoke.sh` asserts of `Ctrl-B d` and
 /// of `watch` under `SIGINT`.
 #[cfg(unix)]
-fn left_cleanly(what: &str, truncated: Truncation) -> ExitCode {
+fn left_cleanly(what: &str, truncated: Truncation) -> u8 {
     match truncated {
-        Truncation::None => ExitCode::SUCCESS,
+        Truncation::None => 0,
         Truncation::Gap(n) => {
             diag!("holdfast {what}: at least {n} bytes of this session were never shown");
-            ExitCode::from(EXIT_TRUNCATED)
+            EXIT_TRUNCATED
         }
     }
 }
@@ -1560,11 +1582,10 @@ fn render(bytes: &[u8]) {
 /// up front, by the person who knows which child they are attaching to.
 #[cfg(unix)]
 pub async fn attach(session: &str, allow_echo: bool) -> ExitCode {
-    use holdfast_core::attach::{AttachMode, AttachRole, ClientFrame, ServerFrame};
-    use holdfast_core::protocol::frame;
+    use holdfast_core::attach::{AttachMode, AttachRole};
     use std::os::unix::io::AsRawFd;
 
-    let (rd, mut wr) = match dial_attach(
+    let (mut rd, mut wr) = match dial_attach(
         session,
         AttachMode::ReadWrite,
         AttachRole::Interactive,
@@ -1632,7 +1653,6 @@ pub async fn attach(session: &str, allow_echo: bool) -> ExitCode {
         }
     };
 
-    let mut frames = spawn_frame_reader(rd);
     let mut keys = spawn_stdin_reader();
     let mut winch =
         match tokio::signal::unix::signal(tokio::signal::unix::SignalKind::window_change()) {
@@ -1642,6 +1662,116 @@ pub async fn attach(session: &str, allow_echo: bool) -> ExitCode {
                 return ExitCode::from(EXIT_FAILED);
             }
         };
+
+    // **Whether this view is a complete record of the session** (GH
+    // #200). Set by an `OutputGap` and by nothing else: a
+    // `slow_consumer` ending is the same fact stated as a termination,
+    // and `attach` tracks that one separately, in `stalled` below. An
+    // earlier version of this comment claimed both, and claiming both is
+    // what hid the fact that the `Gap` arm of `left_cleanly` was reached
+    // by no test at all — every row paired a gap with a `slow_consumer`
+    // ending, so the early return answered them and the arm could have
+    // been deleted green. Carried across a reattach: a gap is a fact
+    // about what this process showed, not about one connection.
+    let mut truncated = Truncation::None;
+    // **Whether a stall cut this process's view short** (GH #210). A
+    // `slow_consumer` detach loses everything the session printed while
+    // this client was not reading, and a reattach shows the screen as it
+    // now stands, not what scrolled past in between — so however the
+    // attachment ends afterwards, the view was not all of the session,
+    // and the exit status says so.
+    let mut stalled = false;
+
+    loop {
+        match attach_connected(
+            session,
+            allow_echo,
+            rd,
+            wr,
+            tty,
+            &mut keys,
+            &mut winch,
+            &mut sigterm,
+            &mut sighup,
+            &mut truncated,
+        )
+        .await
+        {
+            AttachEnd::Exit(code) if code == 0 && stalled => {
+                diag!(
+                    "\rholdfast attach: this view missed what the session printed while it \
+                     was detached; `holdfast logs` has as much of it as the session's buffer \
+                     still holds"
+                );
+                return ExitCode::from(EXIT_TRUNCATED);
+            }
+            AttachEnd::Exit(code) => return ExitCode::from(code),
+            AttachEnd::Stalled => {
+                stalled = true;
+                match hold_after_stall(tty, &mut keys, &mut sigterm, &mut sighup).await {
+                    Held::Reattach => {
+                        match dial_attach(
+                            session,
+                            AttachMode::ReadWrite,
+                            AttachRole::Interactive,
+                            "attach",
+                        )
+                        .await
+                        {
+                            Dialled::Ok(r, w) => (rd, wr) = (r, w),
+                            Dialled::Refused(code) => return ExitCode::from(code),
+                        }
+                    }
+                    Held::Leave => {
+                        render(b"\r\n");
+                        diag!(
+                            "\rholdfast attach: left without reattaching; the session keeps \
+                             running, and `holdfast logs` has its recent output, as far back \
+                             as its buffer reaches"
+                        );
+                        return ExitCode::from(EXIT_TRUNCATED);
+                    }
+                    Held::Signalled(code) => return ExitCode::from(code),
+                }
+            }
+        }
+    }
+}
+
+/// How one attachment of `holdfast attach` ended.
+#[cfg(unix)]
+enum AttachEnd {
+    /// Leave, with this status.
+    Exit(u8),
+    /// The daemon detached this client `slow_consumer` (GH #210): the
+    /// terminal is held and the human asked what to do.
+    Stalled,
+}
+
+/// One attachment of `holdfast attach`, from the handshake the caller
+/// already completed to the ending — separated from [`attach`] so a
+/// stall can end *this* and not the process (GH #210). The terminal, the
+/// keyboard reader and the signal handlers belong to the process and are
+/// lent; the socket and everything learned over it belong to the
+/// attachment and are not carried into the next one.
+#[cfg(unix)]
+#[allow(clippy::too_many_arguments)]
+async fn attach_connected(
+    session: &str,
+    allow_echo: bool,
+    rd: tokio::net::unix::OwnedReadHalf,
+    mut wr: tokio::net::unix::OwnedWriteHalf,
+    tty: std::os::unix::io::RawFd,
+    keys: &mut tokio::sync::mpsc::Receiver<Vec<u8>>,
+    winch: &mut tokio::signal::unix::Signal,
+    sigterm: &mut tokio::signal::unix::Signal,
+    sighup: &mut tokio::signal::unix::Signal,
+    truncated: &mut Truncation,
+) -> AttachEnd {
+    use holdfast_core::attach::{ClientFrame, ServerFrame};
+    use holdfast_core::protocol::frame;
+
+    let mut frames = spawn_frame_reader(rd);
 
     // One at startup, so the session reflows to *this* terminal
     // immediately rather than at the first time the user drags a window.
@@ -1785,17 +1915,6 @@ pub async fn attach(session: &str, allow_echo: bool) -> ExitCode {
     // credential, which is the defect the decline exists to prevent.
     let mut submitted: Option<String> = None;
 
-    // **Whether this view is a complete record of the session** (GH
-    // #200). Set by an `OutputGap` and by nothing else: a
-    // `slow_consumer` ending is the same fact stated as a termination,
-    // but `finish` answers that one directly and returns before it ever
-    // reads this. An earlier version of this comment claimed both, and
-    // claiming both is what hid the fact that the `Gap` arm of
-    // `left_cleanly` was reached by no test at all — every row paired a
-    // gap with a `slow_consumer` ending, so the early return answered
-    // them and the arm could have been deleted green.
-    let mut truncated = Truncation::None;
-
     loop {
         tokio::select! {
             body = frames.recv() => {
@@ -1804,13 +1923,13 @@ pub async fn attach(session: &str, allow_echo: bool) -> ExitCode {
                     // or the socket broke. Distinct from every clean
                     // ending, which returns from inside this match.
                     diag!("holdfast attach: the daemon closed the connection");
-                    return ExitCode::from(EXIT_UNREACHABLE);
+                    return AttachEnd::Exit(EXIT_UNREACHABLE);
                 };
                 let f = match holdfast_core::attach::decode_server_frame(&body) {
                     Ok(f) => f,
                     Err(e) => {
                         diag!("holdfast attach: undecodable frame: {e}");
-                        return ExitCode::from(EXIT_FAILED);
+                        return AttachEnd::Exit(EXIT_FAILED);
                     }
                 };
                 match f {
@@ -1829,8 +1948,19 @@ pub async fn attach(session: &str, allow_echo: bool) -> ExitCode {
                     ServerFrame::SessionExited { code } => {
                         diag!("holdfast attach: the session exited ({code})");
                     }
+                    // **`slow_consumer` is not an ending for `attach`**
+                    // (GH #210). The human is still at this keyboard,
+                    // typing at a session they cannot see, and the two
+                    // things this client could do next both deliver
+                    // those keystrokes somewhere they were not meant for
+                    // — the local shell if it exits, or the session, blind,
+                    // if it reconnects. `attach` holds the terminal
+                    // instead and asks; see `hold_after_stall`.
+                    ServerFrame::Detached { reason } if reason == "slow_consumer" => {
+                        return AttachEnd::Stalled;
+                    }
                     ServerFrame::Detached { reason } => {
-                        return finish("attach", &reason, truncated);
+                        return AttachEnd::Exit(finish("attach", &reason, *truncated));
                     }
                     ServerFrame::AwaitingSecret { request_id, prompt_text } => {
                         // On its own line, so it cannot be mistaken for
@@ -1955,7 +2085,7 @@ pub async fn attach(session: &str, allow_echo: bool) -> ExitCode {
                     // Local stdin closed. Leave without killing the
                     // session, exactly as the detach key does.
                     let _ = frame::write_frame(&mut wr, &ClientFrame::Detach).await;
-                    return left_cleanly("attach", truncated);
+                    return AttachEnd::Exit(left_cleanly("attach", *truncated));
                 };
                 // **§6.1's grammar runs first, and it runs during a
                 // secret prompt too.** The order is the whole point: a
@@ -2000,7 +2130,7 @@ pub async fn attach(session: &str, allow_echo: bool) -> ExitCode {
                                 secret = None;
                                 render(b"\r\n");
                                 if sent.is_err() {
-                                    return ExitCode::from(EXIT_UNREACHABLE);
+                                    return AttachEnd::Exit(EXIT_UNREACHABLE);
                                 }
                             }
                             // REQ-SEC-019's abandon, spelled the way the
@@ -2024,14 +2154,14 @@ pub async fn attach(session: &str, allow_echo: bool) -> ExitCode {
                                 diag!("holdfast attach: secret entry abandoned");
                                 let f = ClientFrame::Input { bytes };
                                 if frame::write_frame(&mut wr, &f).await.is_err() {
-                                    return ExitCode::from(EXIT_UNREACHABLE);
+                                    return AttachEnd::Exit(EXIT_UNREACHABLE);
                                 }
                             }
                         },
                         None => {
                             let f = ClientFrame::Input { bytes: forward };
                             if frame::write_frame(&mut wr, &f).await.is_err() {
-                                return ExitCode::from(EXIT_UNREACHABLE);
+                                return AttachEnd::Exit(EXIT_UNREACHABLE);
                             }
                         }
                     }
@@ -2039,7 +2169,7 @@ pub async fn attach(session: &str, allow_echo: bool) -> ExitCode {
                 if detached {
                     let _ = frame::write_frame(&mut wr, &ClientFrame::Detach).await;
                     render(b"\r\n");
-                    return left_cleanly("attach", truncated);
+                    return AttachEnd::Exit(left_cleanly("attach", *truncated));
                 }
             }
             // Returning, not re-raising: the `return` is what runs
@@ -2053,7 +2183,7 @@ pub async fn attach(session: &str, allow_echo: bool) -> ExitCode {
                 let _ = frame::write_frame(&mut wr, &ClientFrame::Detach).await;
                 render(b"\r\n");
                 diag!("holdfast attach: SIGTERM — detaching; the session keeps running");
-                return ExitCode::from(EXIT_SIGTERM);
+                return AttachEnd::Exit(EXIT_SIGTERM);
             }
             _ = sighup.recv() => {
                 // No `render`: `SIGHUP` says this terminal has already
@@ -2062,7 +2192,7 @@ pub async fn attach(session: &str, allow_echo: bool) -> ExitCode {
                 // whoever inherits the fd.
                 let _ = frame::write_frame(&mut wr, &ClientFrame::Detach).await;
                 diag!("holdfast attach: SIGHUP — detaching; the session keeps running");
-                return ExitCode::from(EXIT_SIGHUP);
+                return AttachEnd::Exit(EXIT_SIGHUP);
             }
             // A child that met `SIGWINCH` with silence still gets to
             // tell the operator they are attached.
@@ -2086,9 +2216,111 @@ pub async fn attach(session: &str, allow_echo: bool) -> ExitCode {
                         .await
                         .is_err()
                     {
-                        return ExitCode::from(EXIT_UNREACHABLE);
+                        return AttachEnd::Exit(EXIT_UNREACHABLE);
                     }
                 }
+            }
+        }
+    }
+}
+
+/// What the human chose after a stall — see [`hold_after_stall`].
+#[cfg(unix)]
+enum Held {
+    Reattach,
+    Leave,
+    Signalled(u8),
+}
+
+/// **Hold the terminal after a `slow_consumer` detach, and let the human
+/// say what happens next** (GH #210).
+///
+/// The dogfood pass found the hazard: *"a detach mid-takeover sends the
+/// human's next keystrokes to their local shell"*. `holdfast attach` put
+/// the terminal back and exited, so whatever the human was typing into the
+/// session — a command, an answer to a prompt, a password — went to the
+/// shell they had attached from instead.
+///
+/// **Held, rather than reconnected, and the choice is about keystrokes
+/// in flight.** A client that reconnected by itself would deliver the
+/// same keystrokes to the session instead — typed against a screen the
+/// human has not seen for as long as the client was stalled, at a prompt
+/// that may since have been replaced by another. A client that exits
+/// delivers them to the local shell. Holding is the only one of the
+/// three where nothing typed before the human has seen the current state
+/// reaches either shell; the cost is one keypress, and `Enter` reattaches
+/// with the screen repainted from scratch (GH #235) so the choice to type
+/// again is an informed one.
+///
+/// Typed-ahead is discarded on the way in — both what the terminal had
+/// queued (`tcflush`) and what the reader thread had already read — so a
+/// key pressed before the notice was on screen is not taken as the
+/// answer to it. A key already in flight between the two can still land;
+/// the only keys that act are `Enter` and `Ctrl-B d`, and both are safe
+/// to have pressed by accident — see the loop below for why no letter
+/// does.
+///
+/// **Not done for `session_exit` or `daemon_shutdown`**: there is no
+/// session to go back to, and returning the human to their shell is what
+/// `ssh` and `tmux` do in the same position.
+#[cfg(unix)]
+async fn hold_after_stall(
+    tty: std::os::unix::io::RawFd,
+    keys: &mut tokio::sync::mpsc::Receiver<Vec<u8>>,
+    sigterm: &mut tokio::signal::unix::Signal,
+    sighup: &mut tokio::signal::unix::Signal,
+) -> Held {
+    // SAFETY: `tcflush` takes the fd and a queue selector and touches no
+    // memory of ours; a failure leaves typed-ahead in place, which the
+    // drain below and the narrow key set above both bound.
+    unsafe { libc::tcflush(tty, libc::TCIFLUSH) };
+    while keys.try_recv().is_ok() {}
+
+    // `\r` in front of each line: the terminal is still raw, so the
+    // newline `diag!` appends moves down without returning, and a second
+    // line would start where the first one ended.
+    render(b"\r\n");
+    diag!(
+        "\rholdfast attach: this client stopped reading, so the daemon detached it \
+         (slow_consumer). The session is still running."
+    );
+    diag!(
+        "\rholdfast attach: nothing you type goes anywhere now — press Enter to reattach, \
+         or Ctrl-B d to return to your shell."
+    );
+
+    // **Two keys act, and neither is a letter.** A human who has not read
+    // the notice is typing a command: a letter that reattached would send
+    // the rest of the word into the session, and one that left would
+    // send it into the local shell — the hazard this exists to remove,
+    // one keystroke late. `Enter` reattaches: the line it ends was typed
+    // while held and goes nowhere, and what follows is typed at a freshly
+    // painted screen. `Ctrl-B d` leaves, because it is how an attachment
+    // is left and cannot be typed by accident.
+    let mut detach = crate::attach_tty::DetachKey::default();
+    loop {
+        tokio::select! {
+            chunk = keys.recv() => {
+                let Some(chunk) = chunk else {
+                    return Held::Leave;
+                };
+                let (pressed, detached) = detach.feed(&chunk);
+                if detached {
+                    return Held::Leave;
+                }
+                if pressed.iter().any(|&b| b == b'\r' || b == b'\n') {
+                    diag!("\rholdfast attach: reattaching");
+                    return Held::Reattach;
+                }
+            }
+            _ = sigterm.recv() => {
+                render(b"\r\n");
+                diag!("\rholdfast attach: SIGTERM — leaving; the session keeps running");
+                return Held::Signalled(EXIT_SIGTERM);
+            }
+            _ = sighup.recv() => {
+                diag!("holdfast attach: SIGHUP — leaving; the session keeps running");
+                return Held::Signalled(EXIT_SIGHUP);
             }
         }
     }
@@ -2181,7 +2413,7 @@ pub async fn watch(session: &str) -> ExitCode {
                         diag!("holdfast watch: the session exited ({code})");
                     }
                     ServerFrame::Detached { reason } => {
-                        return finish("watch", &reason, truncated);
+                        return ExitCode::from(finish("watch", &reason, truncated));
                     }
                     // A watcher is told a secret is being asked for and
                     // **cannot answer it**: `SecretInput` is a write
@@ -2242,7 +2474,7 @@ pub async fn watch(session: &str) -> ExitCode {
                 // and it is a write frame: §7.5 would refuse it
                 // `read_only_attach` and the client would sit there.
                 let _ = frame::write_frame(&mut wr, &WatchOut::Detach.frame()).await;
-                return left_cleanly("watch", truncated);
+                return ExitCode::from(left_cleanly("watch", truncated));
             }
         }
     }

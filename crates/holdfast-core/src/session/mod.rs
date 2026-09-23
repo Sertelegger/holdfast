@@ -33,10 +33,20 @@ use tokio::sync::broadcast;
 pub type SessionId = String;
 
 /// How many frames the per-session output broadcast holds before a slow
-/// consumer starts losing them (§4.3's default). A consumer that lags gets
-/// `RecvError::Lagged` and resyncs from the ring buffer rather than from
-/// the frame it happened to be holding (REQ-C-006); the reader is never
-/// blocked, which is the property the bound exists to guarantee.
+/// consumer starts losing them — §4.2's `output_broadcast_capacity`
+/// default. A consumer that lags gets `RecvError::Lagged` and resyncs
+/// from the ring buffer rather than from the frame it happened to be
+/// holding (REQ-C-006); the reader is never blocked, which is the
+/// property the bound exists to guarantee.
+///
+/// **The default, not the value** (GH #210). [`SessionConfig`] carries
+/// the capacity, and `start_session` fills it from the operator's
+/// `[limits] output_broadcast_capacity` — a key that was accepted,
+/// validated and documented as a control for five releases while this
+/// constant sized every channel. It is also no longer a loss bound for
+/// attach clients: `attach::conn::forward_output` resyncs a lag from the
+/// ring buffer like every other offset-aware consumer, so for them the
+/// capacity decides only how often they take that path.
 pub const OUTPUT_BROADCAST_FRAMES: usize = 256;
 
 /// One chunk the reader appended, with the absolute span it occupies.
@@ -169,6 +179,16 @@ pub struct SessionConfig {
     /// `Session::new` call sites that predate this keep their
     /// `..Default::default()` and the behaviour they assert.
     pub rules: Option<Arc<RuleSet>>,
+    /// §4.2 `output_broadcast_capacity`: how many frames the live output
+    /// broadcast holds for a subscriber that has not read them.
+    /// [`OUTPUT_BROADCAST_FRAMES`] by default (GH #210).
+    ///
+    /// **Zero is clamped to one** rather than trusted, because
+    /// `tokio::sync::broadcast::channel(0)` panics — and a panic in
+    /// `Session::new` is a panic inside `start_session`. `Config::validate`
+    /// already refuses a zero from the file; the clamp is for the callers
+    /// that build a `SessionConfig` by hand.
+    pub output_broadcast_capacity: usize,
 }
 
 impl Default for SessionConfig {
@@ -190,6 +210,7 @@ impl Default for SessionConfig {
             // session with no operator config to honour, and the safe
             // default is every rule.
             rules: None,
+            output_broadcast_capacity: OUTPUT_BROADCAST_FRAMES,
         }
     }
 }
@@ -297,6 +318,9 @@ pub struct Session {
     /// it snapshots the buffer, which is the ordering that stops a fast
     /// command's output from landing in the gap between the two.
     output_tx: broadcast::Sender<OutputFrame>,
+    /// What `output_tx` was sized to — [`SessionConfig::output_broadcast_capacity`],
+    /// clamped (GH #210). Kept because the channel does not report it.
+    output_broadcast_capacity: usize,
     /// §7.5's non-output edges, on the same shape as `output_tx` and for
     /// the same reason: a connection converts them into frames, and the
     /// session never names one.
@@ -806,7 +830,8 @@ impl Session {
         // "effectively never" rather than a wrapped deadline in the past.
         let idle_timeout_ms = (config.idle_timeout_secs as i64).saturating_mul(1000);
         let idle_deadline_ms = Arc::new(AtomicI64::new(deadline_from(started_ms, idle_timeout_ms)));
-        let (output_tx, _) = broadcast::channel(OUTPUT_BROADCAST_FRAMES);
+        let output_broadcast_capacity = config.output_broadcast_capacity.max(1);
+        let (output_tx, _) = broadcast::channel(output_broadcast_capacity);
         let (events_tx, _) = broadcast::channel(SESSION_EVENT_FRAMES);
         let (write_tx, mut write_rx) = tokio::sync::mpsc::channel(WRITE_QUEUE_FRAMES);
         let awaiting_secret = Arc::new(std::sync::atomic::AtomicBool::new(false));
@@ -857,6 +882,7 @@ impl Session {
             redaction_stats: Mutex::new(BTreeMap::new()),
             binding_uses: Mutex::new(BTreeMap::new()),
             output_tx: output_tx.clone(),
+            output_broadcast_capacity,
             events_tx: events_tx.clone(),
             awaiting_secret: Arc::clone(&awaiting_secret),
             secret_episode: Arc::clone(&secret_episode),
@@ -1867,6 +1893,13 @@ impl Session {
         self.output_tx.subscribe()
     }
 
+    /// How many frames the live output broadcast holds for a subscriber
+    /// that has not read them — §4.2's `output_broadcast_capacity` as this
+    /// session was built with it (GH #210).
+    pub fn output_broadcast_capacity(&self) -> usize {
+        self.output_broadcast_capacity
+    }
+
     /// A handle on §4.3's write queue.
     ///
     /// Cloned per producer, so every attach connection on a session
@@ -2551,6 +2584,42 @@ mod tests {
     use crate::pty::{MockPty, MAX_COLS, MAX_ROWS, MIN_COLS, MIN_ROWS};
     use crate::screen::{ScreenCapture, ScreenGrid, ScreenTracking};
     use std::time::Instant;
+
+    /// **The broadcast holds what the config says, not a constant** (GH
+    /// #210). Measured by the lag a subscriber that reads nothing is told
+    /// about: `frames - capacity`, for two capacities, so neither the
+    /// config value nor the old constant can pass for the other.
+    #[test]
+    fn the_output_broadcast_holds_the_configured_number_of_frames() {
+        for capacity in [4usize, 32] {
+            let pty = Arc::new(MockPty::new());
+            let s = Session::new(
+                new_session_id(),
+                None,
+                "bash".into(),
+                vec![],
+                Arc::clone(&pty) as Arc<dyn PtyBackend>,
+                SessionConfig {
+                    output_broadcast_capacity: capacity,
+                    ..SessionConfig::with_buffer_capacity(64 * 1024)
+                },
+            );
+            assert_eq!(s.output_broadcast_capacity(), capacity);
+            let mut rx = s.subscribe();
+            let frames = capacity + 9;
+            for i in 0..frames {
+                pty.queue_output(b"x");
+                wait_for_bytes(&s, i as u64 + 1);
+            }
+            match rx.try_recv() {
+                Err(broadcast::error::TryRecvError::Lagged(n)) => assert_eq!(
+                    n, 9,
+                    "a broadcast of {capacity} frames dropped {n} of {frames}"
+                ),
+                other => panic!("expected a lag of 9 frames, got {other:?}"),
+            }
+        }
+    }
 
     fn mock_session() -> (Arc<Session>, Arc<MockPty>) {
         let pty = Arc::new(MockPty::new());
@@ -4085,6 +4154,10 @@ mod tests {
                 // The built-in §9.2 table, which is what a session with
                 // no server behind it gets.
                 rules: None,
+                // §4.2's default; this row is about the history and
+                // detection knobs, and a usize beside two usizes above is
+                // named rather than defaulted for the same reason.
+                output_broadcast_capacity: OUTPUT_BROADCAST_FRAMES,
             },
         );
         pty.queue_output(&bytes);

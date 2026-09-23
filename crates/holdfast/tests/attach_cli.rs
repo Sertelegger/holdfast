@@ -2437,8 +2437,13 @@ async fn a_truncated_attach_names_the_loss_and_does_not_exit_zero() {
             reason: "slow_consumer".into(),
         }),
     ];
-    let stub = StubDaemon::start("attachgap", replies, Duration::from_millis(900)).await;
+    let stub = StubDaemon::start("attachgap", replies, Duration::from_secs(15)).await;
     let mut term = Term::spawn(stub.paths.dir(), &["attach", "sess_a200"], 80, 24);
+    // Since GH #210 a `slow_consumer` holds the terminal and asks, rather
+    // than exiting — see `attach_holds_the_terminal_after_a_stall` — so
+    // the human's answer is what ends it here.
+    term.wait_for(b"press Enter to reattach", 15);
+    term.type_keys(&[0x02, b'd']);
     assert_eq!(
         term.wait_exit(15),
         3,
@@ -2461,9 +2466,9 @@ async fn a_truncated_attach_names_the_loss_and_does_not_exit_zero() {
     // on the code is green when only one of them works — which is what
     // reverting the ending's arm looks like.
     assert!(
-        contains(&seen, b"incomplete"),
-        "the ending must say the view is incomplete, not merely echo the \
-         reason token:\n{}",
+        contains(&seen, b"slow_consumer") && contains(&seen, b"left without reattaching"),
+        "the ending must say this client was detached and that the view missed \
+         output, not merely echo the reason token:\n{}",
         String::from_utf8_lossy(&seen)
     );
 }
@@ -2645,5 +2650,204 @@ async fn a_resize_flood_is_coalesced_for_watch_as_well() {
         notices[0].contains("104x55"),
         "watch must name where the drag landed, not where it started: {}",
         notices[0]
+    );
+}
+
+// --------------------------------------- GH #210: a stall is not an exit
+
+fn attached_stub(id: &str) -> Vec<u8> {
+    enc(&ServerFrame::Attached {
+        session_id: id.into(),
+        name: None,
+        cols: 80,
+        rows: 24,
+        state: "Running".into(),
+        exit_code: None,
+        protocol_major: PROTOCOL_MAJOR,
+        protocol_minor: PROTOCOL_MINOR,
+    })
+}
+
+/// **After a `slow_consumer` detach, `attach` holds the terminal and
+/// nothing typed goes anywhere until the human says so** (GH #210).
+///
+/// The dogfood pass: *"a detach mid-takeover sends the human's next
+/// keystrokes to their local shell"*. Three claims, each of which the old
+/// client failed or a plausible fix would:
+///
+/// * it does **not exit** on the frame, nor on ordinary typing —
+///   exiting is the defect, and a letter that left would be the defect
+///   one keystroke late;
+/// * what is typed while held is **not sent** to the session either —
+///   a client that quietly reconnected and forwarded would pass the
+///   first claim and put the keystrokes into a prompt the human has not
+///   seen;
+/// * `Ctrl-B d` leaves, with the status for a view that missed output.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn attach_holds_the_terminal_after_a_stall() {
+    let stub = StubDaemon::start(
+        "stallhold",
+        vec![
+            attached_stub("sess_hold"),
+            enc(&ServerFrame::Output {
+                session: "sess_hold".into(),
+                bytes: b"BEFORE-THE-STALL\r\n".to_vec(),
+            }),
+            enc(&ServerFrame::Detached {
+                reason: "slow_consumer".into(),
+            }),
+        ],
+        Duration::from_secs(15),
+    )
+    .await;
+    let mut term = Term::spawn(stub.paths.dir(), &["attach", "sess_hold"], 80, 24);
+    term.wait_for(b"press Enter to reattach, or Ctrl-B d", 15);
+
+    // Typed at a session the human can no longer see — every letter of
+    // it, including the ones a single-letter answer would have taken.
+    term.type_keys(b"rm -rf build; git squash");
+    std::thread::sleep(Duration::from_millis(500));
+    assert!(
+        matches!(term.child.try_wait(), Ok(None)),
+        "the client exited on keystrokes that were not an answer; the next ones go to \
+         the local shell"
+    );
+    assert!(
+        !stub
+            .frames()
+            .iter()
+            .any(|f| matches!(f, ClientFrame::Input { .. })),
+        "keystrokes typed while held reached the wire: {:?}",
+        stub.frames()
+    );
+
+    term.type_keys(&[0x02, b'd']);
+    assert_eq!(
+        term.wait_exit(10),
+        3,
+        "leaving after a stall is a view that missed output"
+    );
+}
+
+/// **A stopped `watch` is detached while it is still stopped, and says so
+/// when it resumes** (GH #210 — the brief's SIGSTOP proof).
+///
+/// The daemon side is the point: the detach happens with the client
+/// frozen, from the socket having accepted nothing for the stall bound,
+/// so nothing the client does is needed for it. The client side is the
+/// report — resumed inside the grace, it reads what was queued, then the
+/// reason, and exits with the truncated view's status.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_stopped_watch_is_detached_while_stopped_and_says_why_when_it_resumes() {
+    let d = TestDaemon::start("stopwatch").await;
+    d.daemon
+        .attach_hub()
+        .set_stall_timeout(Duration::from_secs(2));
+    let (s, pty) = d.session(None);
+    let mut term = Term::spawn(d.paths.dir(), &["watch", &s.id], 100, 30);
+    wait_until_attached(&term, &pty);
+
+    // SAFETY: a signal to our own child, by the pid we spawned it with.
+    assert_eq!(unsafe { libc::kill(term.pid(), libc::SIGSTOP) }, 0);
+    for _ in 0..200 {
+        pty.queue_output(&vec![b'z'; 16 * 1024]);
+        std::thread::sleep(Duration::from_millis(1));
+    }
+    let deadline = Instant::now() + Duration::from_secs(20);
+    while d.daemon.status().attach_clients != 0 && Instant::now() < deadline {
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    let still_stopped = matches!(term.child.try_wait(), Ok(None));
+    let detached = d.daemon.status().attach_clients == 0;
+    // SAFETY: as above.
+    assert_eq!(unsafe { libc::kill(term.pid(), libc::SIGCONT) }, 0);
+    assert!(
+        detached && still_stopped,
+        "a stopped watcher was not detached while stopped (detached={detached}, \
+         still stopped={still_stopped})"
+    );
+
+    assert_eq!(
+        term.wait_exit(20),
+        3,
+        "a stalled watch must exit with the truncated status"
+    );
+    let seen = term.snapshot();
+    assert!(
+        contains(&seen, b"slow_consumer") && contains(&seen, b"stopped reading"),
+        "the resumed watch did not say why its view ended:\n{}",
+        String::from_utf8_lossy(&seen[seen.len().saturating_sub(600)..])
+    );
+}
+
+/// **After a stall, `Enter` reattaches and typing reaches the session
+/// again** (GH #210).
+///
+/// The real daemon and a real client frozen with `SIGSTOP`, so every link
+/// the reattach needs is the one that ships: the stall bound detaching a
+/// frozen client, the `Detached` arriving inside the grace, the hold, a
+/// fresh handshake.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_stalled_attach_reattaches_on_enter() {
+    let d = TestDaemon::start("reattach").await;
+    d.daemon
+        .attach_hub()
+        .set_stall_timeout(Duration::from_secs(2));
+    let (s, pty) = d.session(None);
+    let mut term = Term::spawn(d.paths.dir(), &["attach", &s.id], 100, 30);
+    wait_until_attached(&term, &pty);
+
+    // SAFETY: a signal to our own child, by the pid we spawned it with.
+    assert_eq!(unsafe { libc::kill(term.pid(), libc::SIGSTOP) }, 0);
+    for _ in 0..200 {
+        pty.queue_output(&vec![b'z'; 16 * 1024]);
+        std::thread::sleep(Duration::from_millis(1));
+    }
+    let deadline = Instant::now() + Duration::from_secs(20);
+    while d.daemon.status().attach_clients != 0 && Instant::now() < deadline {
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    assert_eq!(
+        d.daemon.status().attach_clients,
+        0,
+        "the frozen client was never detached"
+    );
+    // SAFETY: as above.
+    assert_eq!(unsafe { libc::kill(term.pid(), libc::SIGCONT) }, 0);
+
+    term.wait_for(b"press Enter to reattach", 20);
+    let before = pty.written().len();
+    term.type_keys(b"\r");
+    let deadline = Instant::now() + Duration::from_secs(15);
+    while d.daemon.status().attach_clients != 1 && Instant::now() < deadline {
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    assert_eq!(
+        d.daemon.status().attach_clients,
+        1,
+        "`Enter` did not reattach"
+    );
+
+    assert_eq!(
+        pty.written().len(),
+        before,
+        "the key that answered the hold reached the session"
+    );
+
+    term.type_keys(b"echo back\r");
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while !contains(&pty.written(), b"echo back") && Instant::now() < deadline {
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    assert!(
+        contains(&pty.written(), b"echo back\r"),
+        "typing after the reattach did not reach the session"
+    );
+    term.type_keys(&[0x02, b'd']);
+    assert_eq!(
+        term.wait_exit(10),
+        3,
+        "a view that missed output during a stall exits with the truncated status, \
+         even after a clean detach"
     );
 }

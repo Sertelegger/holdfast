@@ -2,9 +2,10 @@
 //!
 //! **What this is not: the output fan-out.** Live bytes reach every
 //! attached client through `Session::subscribe()` — 0.0.3's
-//! `broadcast::Sender<OutputFrame>`, capacity
-//! `OUTPUT_BROADCAST_FRAMES = 256` — and each connection forwards from
-//! its own receiver into its own bounded `mpsc`. Keying *that* on a
+//! `broadcast::Sender<OutputFrame>`, whose capacity is §4.2's
+//! `output_broadcast_capacity` (live since GH #210) — and each connection
+//! forwards from its own receiver, and from the session's ring buffer
+//! when it falls behind, into its own bounded `mpsc`. Keying *that* on a
 //! session is the session's job and it already does it, which is why
 //! "output reached a client attached to a different session" is
 //! structurally impossible rather than a rule this file enforces.
@@ -26,49 +27,94 @@ use tokio::sync::mpsc;
 use super::frames::{AttachMode, AttachRole, ServerFrame};
 use crate::protocol::handshake::ClientKind;
 
-/// §4.3's per-connection outbound bound. **Not configurable in
-/// v0.1.0.** Overflow detaches this client and never blocks the reader.
+/// How many **frames** the per-connection queue holds (§4.3). **Not
+/// configurable in v0.1.0**, and since GH #210 not the bound that decides
+/// anything about a burst.
 ///
-/// **64 *frames*, and the unit is a known defect this change deliberately
-/// did not repair** (GH #200). A frame is one PTY `read`, so this is half
-/// a megabyte of 8 KiB chunks and about six kilobytes of the line-sized
-/// ones a `cat` through a PTY actually produces — a threshold that varies
-/// by four orders of magnitude with how chatty the child is, and that at
-/// the small end declares a client slow after a few kilobytes. Measured:
-/// `holdfast watch` on a 380 KB burst delivered 2.6%–23% of it, from a
-/// client that delivered 100% of the same burst the moment this stopped
-/// being the binding constraint.
+/// **The unit was the defect** (GH #200, GH #210). A frame is one PTY
+/// `read`, so 64 of them was anywhere from a few kilobytes of line-sized
+/// reads to half a megabyte of 8 KiB ones, and a burst of ordinary test
+/// output — 1,500 short lines — filled it and detached `holdfast watch`
+/// four runs in four on the dogfood pass. Three things changed together,
+/// and the reason they had to is that §4.3's two bounds are in series:
 ///
-/// **It was raised, measured, and put back.** §4.3's two bounds are in
-/// series and only this one detaches: a forwarder that is not scheduled
-/// lags on the 256-frame broadcast instead, and frames lost *there* never
-/// reach this queue to fill it. At 64 the queue wins that race
-/// essentially always; with a megabyte of headroom it stops winning, and
-/// a client that drains nothing is then never detached at all — it
-/// collects gaps forever while holding a socket and two tasks §4.3 says
-/// to reclaim. `a_slow_consumer_is_detached_and_the_reader_keeps_running`
-/// went red in 3 runs of 5 on a loaded machine, and stayed intermittent
-/// after the obvious repairs. Moving this bound safely means moving
-/// §4.2's `output_broadcast_capacity` with it, and that key is inert —
-/// `tests/config_surface.rs` records it as `Inert::NeverNamed` against
-/// the hardcoded `OUTPUT_BROADCAST_FRAMES` — so the two cannot currently
-/// be moved together at all. That is its own change with its own
-/// evidence, and GH #200's fix does not depend on it: what it needed was
-/// for the loss to stop being silent.
+/// * the stream is bounded in **bytes**, by [`ATTACH_QUEUE_BYTES`], and
+///   the forwarder batches a backlog into one `Output` rather than one
+///   per PTY read — so this frame count is a ceiling on *messages*, which
+///   a batching forwarder does not approach;
+/// * a full queue **pauses** the forwarder rather than detaching the
+///   client, and what it has not read yet stays in the session's ring
+///   buffer, which is where it resumes from (`conn::forward_output`) —
+///   so the broadcast's 256 frames stopped being a loss bound at all;
+/// * a client is detached for **making no progress**, not for occupancy:
+///   [`ATTACH_STALL_TIMEOUT`] without the socket accepting a byte.
+///
+/// The revert #209 recorded — a megabyte of queue headroom, after which a
+/// client that drained nothing was never detached — was the first bullet
+/// without the third. A bound that only ever detaches on occupancy cannot
+/// be raised without also raising how long a dead client is kept, because
+/// the two are the same number; separating them is the fix.
 pub const ATTACH_QUEUE_FRAMES: usize = 64;
+
+/// How many bytes of `Output` payload one connection may have queued and
+/// not yet written (GH #210).
+///
+/// **Not the headroom a slow client gets, and sizing it as though it were
+/// is the mistake to avoid.** The headroom is the session's ring buffer:
+/// a forwarder that finds this budget spent stops reading and resumes
+/// from the ring at the offset it had reached, so a client that is behind
+/// loses nothing until the ring itself evicts the bytes it has not been
+/// sent — and then it is told exactly how many (`OutputGap`). This
+/// number is only how much of that backlog is copied out of the ring
+/// into per-connection memory ahead of the socket, which is why it is
+/// small: a quarter of the ring's 1 MiB default, and four of the
+/// forwarder's largest batches.
+pub const ATTACH_QUEUE_BYTES: usize = 256 * 1024;
+
+/// How long a connection's socket may accept **no bytes at all**, while
+/// the daemon has bytes waiting for it, before the client is detached
+/// `slow_consumer` (§4.3, GH #210).
+///
+/// **Progress, not occupancy, and not a deadline on the whole write.** A
+/// client on a slow link that takes a minute to drain a burst is making
+/// progress the whole time and is never detached; one that has stopped
+/// reading — suspended, frozen, or a peer that simply never calls
+/// `read` — is detached this long after the socket filled, however much
+/// or little the session printed. That is the half #209's revert showed
+/// an occupancy bound cannot give: its bound had to be small to detach a
+/// dead client promptly and large to let a live one through a burst, and
+/// no number was both.
+///
+/// **Thirty seconds, and the direction of the error is the argument.**
+/// Too short detaches a human who pressed `Ctrl-S` on a `holdfast watch`
+/// to read a screen, or suspended it with `Ctrl-Z` for a moment. Too long
+/// costs one socket, two parked tasks and at most [`ATTACH_QUEUE_BYTES`]
+/// plus a socket buffer — memory that does not grow with the session's
+/// output, because a paused forwarder reads nothing. The second is cheap
+/// and the first is the defect this issue is about, so the number is
+/// long.
+///
+/// **A client with nothing waiting for it is not stalled.** A suspended
+/// watcher on an idle session holds its socket until output backs up
+/// behind it, exactly as a suspended `ssh` does; the clock starts when
+/// the daemon has something it cannot write.
+///
+/// Per daemon, through [`AttachHub::stall_timeout`], so a test can drive
+/// the detach without waiting half a minute; nothing in production sets
+/// it.
+pub const ATTACH_STALL_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
 
 /// How many slots of the per-connection queue the **stream** may never
 /// take, so that the attachment's ending always has somewhere to go.
 ///
-/// **Three, and each one is owed by a frame the ending sequence can
-/// still need.** §7.5's exit sequence is `SessionExited` then
-/// `Detached`, which is two; the third is `conn::send_exit`'s
-/// `OutputGap` for a redactor carry that did not fit, because a tail
-/// dropped in silence is the defect this whole change is about and it
-/// must not be reintroduced at the one moment the queue is fullest. The
-/// `slow_consumer` path needs only the `Detached`, so one would do
-/// there — reserving for the worst sequence removes the case analysis,
-/// and costs three frames of a **64**-frame queue.
+/// **Three, and the third is now spare rather than owed.** §7.5's exit
+/// sequence is `SessionExited` then `Detached`, which is two. The third
+/// was `conn::send_exit`'s `OutputGap` for a redactor carry that did not
+/// fit (GH #200); since GH #210 the stream waits for room instead of
+/// being refused, so the carry always fits and the gap is never sent.
+/// Kept at three rather than tightened, because the reserve is what the
+/// ending relies on and a margin on it costs three slots of a
+/// [`ATTACH_QUEUE_FRAMES`]-frame queue.
 ///
 /// **Three, not two, was measured rather than reasoned.** At two the
 /// exit path consumed the reserve exactly, so a single interloper — the
@@ -142,12 +188,13 @@ pub struct AttachConn {
     /// The peer's uid from `SO_PEERCRED`, checked against the daemon's
     /// owner **before a byte of this connection was parsed**.
     pub peer_uid: u32,
-    /// Bounded per-connection queue (§4.3: *"their own bounded mpsc,
-    /// default 64 frames"* — see [`ATTACH_QUEUE_FRAMES`] for why the
-    /// *number* is now derived and the quote is kept as a quote).
-    /// Overflow detaches this client and never blocks the reader task,
-    /// and the ending still fits: `conn::ENDING_SLOTS` keeps room for
-    /// it (GH #200).
+    /// Bounded per-connection queue (§4.3). Bounded in frames by
+    /// [`ATTACH_QUEUE_FRAMES`] and, for the output stream, in bytes by
+    /// [`ATTACH_QUEUE_BYTES`] (GH #210). **A full queue no longer detaches
+    /// anybody**: the forwarder waits for room and the session's reader
+    /// is never involved, and a client is detached only for making no
+    /// progress for [`ATTACH_STALL_TIMEOUT`]. The ending still fits:
+    /// `ENDING_SLOTS` keeps room for it (GH #200).
     pub tx: mpsc::Sender<ServerFrame>,
     pub connected_at: Instant,
     /// The geometry this client was last *sent*, so it is not sent again.
@@ -251,11 +298,42 @@ pub struct AttachHub {
     /// else's connection — the same reasoning that puts an `O_PATH` pin
     /// behind the socket identity, one scale down.
     next_id: AtomicU64,
+    /// [`ATTACH_STALL_TIMEOUT`] for this daemon, in milliseconds, or `0`
+    /// for the constant. See [`AttachHub::set_stall_timeout`].
+    stall_timeout_ms: AtomicU64,
 }
 
 impl AttachHub {
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// How long a connection may accept no bytes, with bytes waiting,
+    /// before it is detached `slow_consumer` — [`ATTACH_STALL_TIMEOUT`]
+    /// unless [`set_stall_timeout`](Self::set_stall_timeout) said
+    /// otherwise.
+    ///
+    /// Read once per connection, when its writer starts.
+    pub fn stall_timeout(&self) -> std::time::Duration {
+        match self.stall_timeout_ms.load(Ordering::Relaxed) {
+            0 => ATTACH_STALL_TIMEOUT,
+            ms => std::time::Duration::from_millis(ms),
+        }
+    }
+
+    /// Shorten (or lengthen) the stall bound for connections opened
+    /// **after** this call.
+    ///
+    /// **A test seam, and the only way to reach the detach without
+    /// sitting out half a minute per row.** Nothing in production calls
+    /// it: the bound is not an operator knob in v0.1.0, for the reason
+    /// §4.2 gives the queue's own bound — a number an operator can set is
+    /// a number the documentation has to promise something about. A
+    /// zero is refused by being the "unset" value, so no connection can
+    /// be given a stall bound that detaches it before its first write.
+    pub fn set_stall_timeout(&self, timeout: std::time::Duration) {
+        let ms = u64::try_from(timeout.as_millis()).unwrap_or(u64::MAX);
+        self.stall_timeout_ms.store(ms, Ordering::Relaxed);
     }
 
     /// A fresh client id. Taken **before** the connection is built, so

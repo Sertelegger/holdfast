@@ -219,6 +219,29 @@ is cut, named and published is in
 
 ### Changed
 
+- **A `slow_consumer` detach now means the client stopped reading, not that
+  it read too slowly** ([#210]). The daemon detaches a connection whose
+  socket has accepted no bytes for 30 seconds while bytes were waiting for
+  it (`ATTACH_STALL_TIMEOUT`); a client that drains, however slowly, is never
+  detached. A client that resumes within one more stall bound is told why
+  (`Detached`), and one that does not is closed on rather than waited for.
+  **A gap now means the ring evicted the bytes**, so `holdfast logs` no
+  longer has them either, and the client says so instead of sending the
+  operator there.
+- **`holdfast attach` holds the terminal after a `slow_consumer` detach
+  instead of exiting** ([#210]). Exiting sent whatever the human typed next —
+  into what they believed was the session — to their local shell. Nothing
+  typed while held goes anywhere; `Enter` reattaches, `Ctrl-B d` leaves. No
+  letter does either, because a human who has not read the notice is typing
+  a word. A view that missed output this
+  way exits 3 however the attachment later ends.
+- `limits.output_broadcast_capacity` **is live** ([#210]): `start_session`
+  sizes the output broadcast from it. It was accepted, validated and
+  documented as a control while the hardcoded `OUTPUT_BROADCAST_FRAMES` sized
+  every channel. It is no longer an attach client's loss bound either (see
+  *Fixed*), so it decides how often a lagging consumer takes the ring-buffer
+  path, not what it is shown.
+
 - **`scripts/ci-hygiene.sh`'s release-trigger gate is an allowlist.** It was a
   denylist of four triggers — `branches`, `schedule`, `pull_request`,
   `pull_request_target` — and `release.yml`'s header claimed on the strength of
@@ -647,6 +670,37 @@ is cut, named and published is in
   optimized both.
 
 ### Fixed
+
+- **Ordinary bursts no longer detach `holdfast watch`, or `attach`** ([#210]).
+  1,500 lines of test output detached `watch` four runs in four on the
+  dogfood pass, showing it between 4.5% and 32% of the lines; `ps`, `git
+  diff` and a build with warnings did the same. Two bounds in series did it,
+  and both stopped being loss bounds:
+  - **the per-connection queue is bounded in bytes and pauses instead of
+    detaching.** It was 64 *frames*, a frame being one PTY `read`, so a
+    line-at-a-time child filled it in 64 lines. The forwarder now batches a
+    backlog into one `Output` of up to `MAX_BATCH_BYTES` (64 KiB), stops
+    reading when `ATTACH_QUEUE_BYTES` (256 KiB) is queued, and resumes when
+    the writer drains;
+  - **a lagging connection resumes from the ring buffer**, like every other
+    offset-aware consumer (REQ-C-006). The 256-frame broadcast was a
+    connection's whole headroom; the ring holds a megabyte by default and
+    counts bytes. A connection now loses only what the ring has already
+    evicted, and is told the exact count as an `OutputGap`.
+
+  The revert [#200] recorded — a megabyte of queue headroom, after which a
+  client that drained nothing was never detached — was the first of these
+  without a way to detach a stopped client other than by occupancy. The
+  stall bound under *Changed* is that way, and it is what let the bound be
+  raised. §7.5's `Detached` still arrives for every ending that has a reader
+  to receive it.
+- **`a_slow_consumer_is_detached_and_the_reader_keeps_running`'s scenario is
+  now a row per claim** ([#210]): a stopped client detached in bounded time
+  with the reader and a draining client untouched; told why if it resumes
+  inside the grace; closed on if it does not; a slow reader never detached,
+  with shown-plus-reported equal to printed, byte for byte, across a ring it
+  falls behind; and the dogfood burst reaching an `interactive` and an
+  `observer` client whole.
 - **The guard that was supposed to refuse an empty release body could not
   fire, and the release procedure did not mention `Cargo.lock`.** Both are
   release-time defects that no test or check would have caught, because the
@@ -813,7 +867,9 @@ is cut, named and published is in
 
 - **Not fixed here, and measured rather than assumed: §4.3's
   per-connection bound is counted in *frames*, and a frame is one PTY
-  `read` ([#200]).** So 64 is half a megabyte of 8 KiB chunks and about six
+  `read` ([#200]).** *(Since fixed — see [#210] at the top of this
+  section. Kept as written: it is the measurement that fix answers.)* So 64
+  is half a megabyte of 8 KiB chunks and about six
   kilobytes of the line-sized ones a `cat` through a PTY actually produces
   — a threshold that varies by four orders of magnitude with how chatty the
   child is. That is why the loss is as large as it is, and the same client
@@ -1518,6 +1574,14 @@ is cut, named and published is in
 
 ### Known limitations
 
+- **A client is detached for making no progress, and on Linux progress
+  arrives in steps of most of a socket buffer** ([#210]). A Unix socket wakes
+  its writer only once the reader has drained most of the buffer, so a reader
+  slower than roughly one socket buffer per stall bound is indistinguishable
+  from a stopped one. At the 30-second bound that is far below any terminal.
+  A suspended viewer on an idle session is not detached at all — nothing is
+  waiting for it — until output backs up behind it, as with a suspended
+  `ssh`.
 - **The plugin's Windows entrypoint is unverified, and it is unverified in a
   way no amount of care on this side settles.** `.mcp.json` holds exactly one
   `command` string and the schema has no platform conditional, so §13.3's
@@ -2000,6 +2064,7 @@ residuals that are known and accepted.
 [#169]: https://github.com/Sertelegger/holdfast/issues/169
 [#163]: https://github.com/Sertelegger/holdfast/issues/163
 [#200]: https://github.com/Sertelegger/holdfast/issues/200
+[#210]: https://github.com/Sertelegger/holdfast/issues/210
 [#194]: https://github.com/Sertelegger/holdfast/issues/194
 [#217]: https://github.com/Sertelegger/holdfast/issues/217
 [#98]: https://github.com/Sertelegger/holdfast/issues/98

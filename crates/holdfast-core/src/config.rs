@@ -458,6 +458,17 @@ pub struct LimitsConfig {
     pub read_output_hard_max_bytes: usize,
     #[serde(default = "d_resource_read_max_bytes")]
     pub resource_read_max_bytes: usize,
+    /// §4.2: frames the per-session live output broadcast holds for a
+    /// subscriber that has not read them. **Live since GH #210** — it
+    /// sized nothing for five releases while the hardcoded
+    /// `session::OUTPUT_BROADCAST_FRAMES` did — and read by
+    /// `start_session` into `SessionConfig::output_broadcast_capacity`.
+    ///
+    /// **Not an attach client's loss bound.** An attach connection that
+    /// laps the broadcast resyncs from the ring buffer, so raising this
+    /// makes that path rarer and lowering it makes it commoner; neither
+    /// changes what a client is shown. `wait_for_pattern` resyncs the
+    /// same way (REQ-C-006).
     #[serde(default = "d_output_broadcast_capacity")]
     pub output_broadcast_capacity: usize,
     /// **Reserved and unread.** v0.1.0 ships one outstanding secret

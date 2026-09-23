@@ -1007,26 +1007,226 @@ async fn an_attach_client_receives_only_bytes_never_offsets() {
     );
 }
 
+/// A `MockPty` that hands the reader at most `.1` bytes per `read`, so a
+/// burst is published as many frames rather than one — the shape a
+/// line-at-a-time child produces through a real PTY, and the shape that
+/// filled a 64-frame queue in 64 lines (GH #210).
+#[derive(Debug)]
+struct ChunkedPty(Arc<MockPty>, usize);
+
+impl PtyBackend for ChunkedPty {
+    fn write(&self, data: &[u8]) -> holdfast_core::Result<()> {
+        self.0.write(data)
+    }
+    fn read(&self, buf: &mut [u8]) -> holdfast_core::Result<usize> {
+        let n = self.1.min(buf.len());
+        if n == 0 {
+            return Ok(0);
+        }
+        self.0.read(&mut buf[..n])
+    }
+    fn signal(&self, sig: Signal) -> holdfast_core::Result<()> {
+        self.0.signal(sig)
+    }
+    fn resize(&self, cols: u16, rows: u16) -> holdfast_core::Result<()> {
+        self.0.resize(cols, rows)
+    }
+    fn is_alive(&self) -> bool {
+        self.0.is_alive()
+    }
+    fn exit_code(&self) -> Option<i32> {
+        self.0.exit_code()
+    }
+    fn pid(&self) -> Option<u32> {
+        self.0.pid()
+    }
+}
+
+/// A registered session on `backend`, with a chosen ring and broadcast.
+fn session_with(
+    d: &TestDaemon,
+    backend: Arc<dyn PtyBackend>,
+    ring: usize,
+    broadcast: usize,
+) -> Arc<Session> {
+    let s = Session::new(
+        new_session_id(),
+        None,
+        "bash".into(),
+        vec![],
+        backend,
+        SessionConfig {
+            output_broadcast_capacity: broadcast,
+            ..SessionConfig::with_buffer_capacity(ring)
+        },
+    );
+    d.daemon
+        .server
+        .registry
+        .insert(Arc::clone(&s))
+        .expect("register");
+    s
+}
+
+/// What one draining client was shown: the `Output` bytes in order, every
+/// `OutputGap`, and every `Detached` reason.
+#[derive(Debug, Default)]
+struct Seen {
+    bytes: Vec<u8>,
+    gaps: Vec<u64>,
+    detached: Vec<String>,
+}
+
+/// Read a connection until `needle` has been rendered, or it ends, or
+/// `secs` pass — sleeping `per_64k` for every 64 KiB of output, so a row
+/// can be a reader of a chosen speed as well as a fast one. **Per byte
+/// and not per frame**, because the forwarder batches: a pause per frame
+/// reads faster the further behind the client falls.
+async fn drain_until(c: &mut UnixStream, needle: &[u8], secs: u64, per_64k: Duration) -> Seen {
+    let mut seen = Seen::default();
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(secs);
+    while tokio::time::Instant::now() < deadline {
+        let left = deadline - tokio::time::Instant::now();
+        let body = match tokio::time::timeout(left, frame::read_frame_body(&mut *c)).await {
+            Ok(Ok(b)) => b,
+            _ => break,
+        };
+        match decode_server_frame(&body).expect("a decodable server frame") {
+            ServerFrame::Output { bytes, .. } => {
+                seen.bytes.extend_from_slice(&bytes);
+                let tail = seen.bytes.len().saturating_sub(bytes.len() + needle.len());
+                if contains(&seen.bytes[tail..], needle) {
+                    return seen;
+                }
+                if !per_64k.is_zero() {
+                    tokio::time::sleep(per_64k.mul_f64(bytes.len() as f64 / 65536.0)).await;
+                }
+            }
+            ServerFrame::OutputGap { bytes, .. } => seen.gaps.push(bytes),
+            ServerFrame::Detached { reason } => {
+                seen.detached.push(reason);
+                break;
+            }
+            _ => {}
+        }
+    }
+    seen
+}
+
+/// Until `attach_clients` reads `want`, or `secs` pass. Returns how long
+/// it took, or `None`.
+async fn clients_reach(d: &TestDaemon, want: u64, secs: u64) -> Option<Duration> {
+    let started = tokio::time::Instant::now();
+    let deadline = started + Duration::from_secs(secs);
+    while tokio::time::Instant::now() < deadline {
+        if d.daemon.status().attach_clients == want {
+            return Some(started.elapsed());
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    None
+}
+
+/// **The dogfood repro, in process: a burst of ordinary test output
+/// reaches every draining client whole** (GH #210).
+///
+/// 1,500 lines of `cargo test`-shaped output detached `holdfast watch`
+/// four runs in four on the dogfood pass, having shown it between 4.5%
+/// and 32% of the lines. Two bounds in series did it: a 64-frame queue
+/// that a line-at-a-time child fills in 64 lines, and a 256-frame
+/// broadcast that a forwarder descheduled for a moment laps. The fix
+/// removes both as loss bounds, and this row holds both to it.
+///
+/// **The broadcast here is sixteen frames, deliberately**, so the ring
+/// path is exercised on every run rather than only on a loaded machine:
+/// a forwarder that treated a lag as a loss, or that re-sent what it had
+/// already sent, fails the equality below. And the child writes one line
+/// per `read`, which is the shape that made the frame count the binding
+/// constraint.
+///
+/// **Both roles, because they failed differently**: `observer` runs a
+/// redactor per frame and lost far more often than `interactive`, whose
+/// forwarder is a memcpy — 7 in 8 against 1 in 8 on the dogfood box.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_burst_of_short_lines_reaches_every_draining_client_whole() {
+    let d = TestDaemon::start("burst").await;
+    let pty = Arc::new(MockPty::new());
+    let s = session_with(
+        &d,
+        Arc::new(ChunkedPty(Arc::clone(&pty), 48)) as Arc<dyn PtyBackend>,
+        1024 * 1024,
+        16,
+    );
+
+    let mut clients = Vec::new();
+    for (mode, role) in [
+        (AttachMode::ReadWrite, AttachRole::Interactive),
+        (AttachMode::ReadOnly, AttachRole::Observer),
+    ] {
+        let mut c = d.dial().await;
+        send(&mut c, &attach_as(&s.id, mode, role)).await;
+        assert!(matches!(recv(&mut c).await, ServerFrame::Attached { .. }));
+        clients.push(tokio::spawn(async move {
+            drain_until(&mut c, b"case_1499 ... ok\r\n", 60, Duration::ZERO).await
+        }));
+    }
+
+    let mut expected = Vec::new();
+    for i in 0..1500 {
+        let line = format!("test module::tests::case_{i} ... ok\r\n");
+        pty.queue_output(line.as_bytes());
+        expected.extend_from_slice(line.as_bytes());
+    }
+
+    for (client, role) in clients.into_iter().zip(["interactive", "observer"]) {
+        let seen = client.await.expect("reader task");
+        assert_eq!(
+            seen.detached,
+            Vec::<String>::new(),
+            "{role}: detached mid-burst"
+        );
+        assert_eq!(
+            seen.gaps,
+            Vec::<u64>::new(),
+            "{role}: told it had lost output"
+        );
+        assert!(
+            seen.bytes == expected,
+            "{role}: the burst did not arrive whole, once, in order — {} of {} bytes",
+            seen.bytes.len(),
+            expected.len()
+        );
+    }
+}
+
+/// **A client that stops reading is detached in bounded time, and the
+/// session's reader and every other client are untouched** (§4.3,
+/// §11.2, GH #210).
+///
+/// This is the row #209's revert was about: with a large enough queue a
+/// client that drained nothing was never detached at all. The stall
+/// bound is the fix — the socket accepted nothing for that long, while
+/// the daemon had bytes for it — and it detaches however much or little
+/// the queue holds. Shortened through the hub's seam so the row does not
+/// sit out thirty seconds.
+///
+/// (b) and (c) are what make it able to fail in the other direction:
+/// detaching the whole *session*, or blocking the reader, both satisfy
+/// (a) on their own.
 #[tokio::test]
-async fn a_slow_consumer_is_detached_and_the_reader_keeps_running() {
-    // §4.3, §11.2. Four assertions, and (b) and (c) are what make this
-    // able to fail: detaching the whole *session*, or blocking the
-    // reader, both satisfy (a) on its own.
-    //
-    // **(d) is GH #200's and lives here rather than in a sibling row.**
-    // It needs the same 6.4 MB burst and the same non-draining client,
-    // and a second row building them is a second row whose timing can
-    // drift from this one's — measured: a standalone copy without this
-    // row's *draining* client went red under `nextest`'s own parallelism
-    // while this one passed beside it. One fixture, two questions: was
-    // the client detached, and was it told why.
-    let d = TestDaemon::start("slow").await;
+async fn a_client_that_stops_reading_is_detached_in_bounded_time() {
+    let d = TestDaemon::start("stall").await;
+    // Two seconds and not less: the *draining* client in this row shares
+    // the machine with the whole suite, and a bound it could be
+    // descheduled for would detach it too.
+    d.daemon
+        .attach_hub()
+        .set_stall_timeout(Duration::from_secs(2));
     let (s, pty) = d.session(None);
 
-    // The client that never reads.
+    // The client that never reads — not even its own `Attached`.
     let mut slow = d.dial().await;
     send(&mut slow, &attach_to(&s.id)).await;
-    // Deliberately does **not** read its own `Attached`.
 
     // A second client that drains everything.
     let mut fast = d.dial().await;
@@ -1035,26 +1235,14 @@ async fn a_slow_consumer_is_detached_and_the_reader_keeps_running() {
         recv(&mut fast).await,
         ServerFrame::Attached { .. }
     ));
-    let fast_reader = tokio::spawn(async move {
-        let mut seen = 0usize;
-        loop {
-            match tokio::time::timeout(Duration::from_secs(10), frame::read_frame_body(&mut fast))
-                .await
-            {
-                Ok(Ok(body)) => {
-                    if let Ok(ServerFrame::Output { bytes, .. }) = decode_server_frame(&body) {
-                        seen += bytes.len();
-                        if bytes.windows(4).any(|w| w == b"LAST") {
-                            return (seen, true);
-                        }
-                    }
-                }
-                _ => return (seen, false),
-            }
-        }
-    });
+    assert!(
+        clients_reach(&d, 2, 5).await.is_some(),
+        "both clients never registered"
+    );
+    let fast_reader =
+        tokio::spawn(async move { drain_until(&mut fast, b"LAST", 30, Duration::ZERO).await });
 
-    // Far more than 64 frames, and far more than any socket buffer.
+    // Far more than any socket buffer plus the per-connection budget.
     let head_before = s.buffer_head();
     for _ in 0..400 {
         pty.queue_output(&vec![b'z'; 16 * 1024]);
@@ -1062,10 +1250,72 @@ async fn a_slow_consumer_is_detached_and_the_reader_keeps_running() {
     }
     pty.queue_output(b"LAST");
 
-    // (a) the slow client is detached. It reads now, drains whatever the
-    // socket buffered, and must reach EOF — bounded, so a daemon that
-    // kept it attached is a red row rather than a hang. The frames are
-    // decoded on the way past so (d) can ask what it was told.
+    // (a) detached — **while it still has not read a byte**, which is the
+    // whole point: nothing the client does is needed for this.
+    let took = clients_reach(&d, 1, 20).await;
+    assert!(
+        took.is_some(),
+        "a client that stopped reading was never detached; the socket and two tasks \
+         are held for as long as it stays stopped"
+    );
+    let rows = audit_entries(&d, "attach_disconnect", 1).await;
+    assert_eq!(rows.len(), 1, "{rows:?}");
+    assert_eq!(rows[0]["reason"].as_str(), Some("slow_consumer"));
+
+    // (b) the draining client still receives every byte.
+    let seen = fast_reader.await.expect("reader task");
+    assert!(
+        contains(&seen.bytes, b"LAST"),
+        "the draining client stopped receiving when the stalled one was detached \
+         ({} bytes seen, {:?})",
+        seen.bytes.len(),
+        seen.detached
+    );
+    assert!(
+        seen.detached.is_empty(),
+        "the draining client was detached too"
+    );
+
+    // (c) the session's reader kept running.
+    assert!(
+        s.buffer_head() >= head_before + 400 * 16 * 1024,
+        "the PTY reader stalled behind a stalled attach client (head {} -> {})",
+        head_before,
+        s.buffer_head()
+    );
+    drop(slow);
+}
+
+/// **A stalled client that comes back inside the grace is told why, once**
+/// (§7.5, REQ-D-009, GH #200).
+///
+/// Detached for not reading, the client's `Detached` sits behind the
+/// socket it was not reading; the daemon keeps the connection one more
+/// stall bound so a client that resumes — a `watch` brought back from
+/// `Ctrl-Z` — reads everything queued and then the reason, rather than
+/// the bare EOF its own message calls *"the daemon closed the
+/// connection"*.
+#[tokio::test]
+async fn a_stalled_client_that_resumes_inside_the_grace_is_told_why_once() {
+    let d = TestDaemon::start("stallgrace").await;
+    d.daemon
+        .attach_hub()
+        .set_stall_timeout(Duration::from_secs(3));
+    let (s, pty) = d.session(None);
+    let mut slow = d.dial().await;
+    send(&mut slow, &attach_to(&s.id)).await;
+    assert!(clients_reach(&d, 1, 5).await.is_some());
+
+    for _ in 0..200 {
+        pty.queue_output(&vec![b'z'; 16 * 1024]);
+        tokio::time::sleep(Duration::from_millis(1)).await;
+    }
+    assert!(
+        clients_reach(&d, 0, 20).await.is_some(),
+        "the stalled client was never detached"
+    );
+
+    // Resume now — inside the second bound.
     let ending = tokio::time::timeout(Duration::from_secs(20), async {
         let mut endings: Vec<String> = Vec::new();
         loop {
@@ -1080,48 +1330,205 @@ async fn a_slow_consumer_is_detached_and_the_reader_keeps_running() {
             }
         }
     })
-    .await;
-    let ending = ending.expect("a client that stopped draining was never detached");
-    let ending = ending.expect("the connection failed rather than closing");
-
-    // (b) the draining client still receives every byte afterwards.
-    let (seen, saw_last) = fast_reader.await.expect("reader task");
-    assert!(
-        saw_last,
-        "the draining client stopped receiving when the slow one was detached ({seen} bytes seen)"
-    );
-
-    // (c) the session's reader kept running: the ring buffer advanced by
-    // everything that was queued.
-    assert!(
-        s.buffer_head() >= head_before + 400 * 16 * 1024,
-        "the PTY reader stalled behind a slow attach client (head {} -> {})",
-        head_before,
-        s.buffer_head()
-    );
-
-    // (d) **and it was told why** (GH #200). §7.5: after a successful
-    // handshake every close the daemon initiates is preceded by exactly
-    // one `Detached { reason }` unless a connection-level fault forced
-    // it, and it names this case on the attachment side — *"this client
-    // could not keep up"*. The frame was written with a `try_send` onto
-    // the very queue whose overflow caused the ending, so it was dropped
-    // in the one situation it exists to describe, and what a `holdfast
-    // watch` saw was a bare EOF that its own message calls *"the daemon
-    // closed the connection"* — the sentence for a daemon that went
-    // away.
-    //
-    // **Exactly one**, which is the half a `contains` would miss: a
-    // forwarder that queued the ending on every refused chunk would
-    // satisfy "it arrived" while putting a teardown frame in the middle
-    // of a live stream.
+    .await
+    .expect("the resumed client never reached the end of the connection")
+    .expect("the connection failed rather than closing");
+    // **Exactly one**, which is the half a `contains` would miss.
     assert_eq!(
         ending,
         vec!["slow_consumer".to_string()],
-        "a slow consumer must be told exactly once why its view ended; a bare \
-         EOF is indistinguishable from the daemon dying, which is what the \
-         client reports it as"
+        "a stalled client must be told exactly once why its view ended"
     );
+}
+
+/// **A stalled client that never comes back is closed on, not waited
+/// for** (GH #210).
+///
+/// The other half of the grace: two stall bounds after the socket
+/// filled, the daemon stops trying and closes, `Detached` unwritten. The
+/// witness is that `Detached` never arrives — a daemon that kept the
+/// socket open would still deliver it the moment the client read, which
+/// is exactly the unbounded hold #209's revert measured.
+#[tokio::test]
+async fn a_stalled_client_that_never_resumes_is_closed_on() {
+    let d = TestDaemon::start("stallgone").await;
+    d.daemon
+        .attach_hub()
+        .set_stall_timeout(Duration::from_millis(300));
+    let (s, pty) = d.session(None);
+    let mut slow = d.dial().await;
+    send(&mut slow, &attach_to(&s.id)).await;
+    assert!(clients_reach(&d, 1, 5).await.is_some());
+    for _ in 0..200 {
+        pty.queue_output(&vec![b'z'; 16 * 1024]);
+        tokio::time::sleep(Duration::from_millis(1)).await;
+    }
+    assert!(clients_reach(&d, 0, 20).await.is_some());
+    // Well past the grace.
+    tokio::time::sleep(Duration::from_secs(2)).await;
+
+    let outcome = tokio::time::timeout(Duration::from_secs(20), async {
+        let mut detached = 0usize;
+        loop {
+            match frame::read_frame_body(&mut slow).await {
+                Ok(body) => {
+                    if let Ok(ServerFrame::Detached { .. }) = decode_server_frame(&body) {
+                        detached += 1;
+                    }
+                }
+                Err(_) => return detached,
+            }
+        }
+    })
+    .await
+    .expect("the connection was held open for a client that never came back");
+    assert_eq!(
+        outcome, 0,
+        "Detached arrived, so the daemon was still holding the socket long after the \
+         grace — a client that never resumes would keep it forever"
+    );
+}
+
+/// **A client that falls behind is never detached, and every byte the
+/// session printed is either shown or counted** (GH #210).
+///
+/// The half of the requirement an occupancy bound could not meet: this
+/// client pauses while the session prints and then reads slowly, never
+/// stopped for as long as the stall bound, so it must never be detached
+/// however far behind it falls. It falls behind a 64 KiB ring, so it
+/// loses bytes — and each loss is an `OutputGap` naming exactly how many,
+/// which makes the accounting an identity: shown plus reported equals
+/// printed. `interactive`, so there is no redactor between the two
+/// numbers.
+///
+/// **The pause is waited out on the session, not on a clock.** The first
+/// version read at a fixed rate from the start and relied on the reader
+/// thread printing faster than that; under the full suite's load, with
+/// the join having switched VT100 tracking on for a debug build, the
+/// reader was the slower of the two and the row's own control fired —
+/// the client never fell a ring behind. The client now starts reading
+/// only once the ring's head says everything has been printed, so it is
+/// behind by construction.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_client_that_falls_behind_is_never_detached_and_loses_nothing_silently() {
+    let d = TestDaemon::start("slowreader").await;
+    // Longer than any pause below could plausibly take, so a detach here
+    // is the product's and not the scheduler's.
+    d.daemon
+        .attach_hub()
+        .set_stall_timeout(Duration::from_secs(20));
+    let pty = Arc::new(MockPty::new());
+    let s = session_with(&d, Arc::clone(&pty) as Arc<dyn PtyBackend>, 64 * 1024, 16);
+    // **Output from before the join, far past the ring.** It is the
+    // opening picture's business and not the stream's, so none of it may
+    // count as shown or as lost — which pins the stream's origin to where
+    // the join found the session: an origin of zero reports all of it as a
+    // gap and breaks the identity below by exactly this much.
+    let before = 200 * 1024;
+    pty.queue_output(&vec![b'p'; before]);
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+    while s.buffer_head() < before as u64 && tokio::time::Instant::now() < deadline {
+        tokio::time::sleep(Duration::from_millis(5)).await;
+    }
+    assert_eq!(
+        s.buffer_head(),
+        before as u64,
+        "the pre-join output never landed"
+    );
+
+    let mut c = d.dial().await;
+    send(&mut c, &attach_to(&s.id)).await;
+    assert!(matches!(recv(&mut c).await, ServerFrame::Attached { .. }));
+
+    let (go_tx, go_rx) = tokio::sync::oneshot::channel::<()>();
+    let reader = tokio::spawn(async move {
+        let _ = go_rx.await;
+        // Then slowly — a pause per 64 KiB of output, so the client stays
+        // behind for the whole drain as well as the burst.
+        drain_until(&mut c, b"LAST", 120, Duration::from_millis(50)).await
+    });
+    let mut printed = 0usize;
+    for _ in 0..64 {
+        pty.queue_output(&vec![b'z'; 16 * 1024]);
+        printed += 16 * 1024;
+    }
+    pty.queue_output(b"LAST");
+    printed += 4;
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
+    while s.buffer_head() < (before + printed) as u64 && tokio::time::Instant::now() < deadline {
+        tokio::time::sleep(Duration::from_millis(5)).await;
+    }
+    assert_eq!(
+        s.buffer_head(),
+        (before + printed) as u64,
+        "the burst never landed"
+    );
+    let _ = go_tx.send(());
+
+    let seen = reader.await.expect("reader task");
+    assert_eq!(
+        seen.detached,
+        Vec::<String>::new(),
+        "a client that paused for less than the stall bound was detached"
+    );
+    assert!(
+        contains(&seen.bytes, b"LAST"),
+        "the stream never reached its end"
+    );
+    // The fixture's own control: without a gap the identity below is
+    // `shown == printed`, which is the easy half.
+    assert!(
+        !seen.gaps.is_empty(),
+        "the reader never fell a whole ring behind, so nothing here tested a gap"
+    );
+    let reported: u64 = seen.gaps.iter().sum();
+    assert_eq!(
+        seen.bytes.len() as u64 + reported,
+        printed as u64,
+        "shown ({}) plus reported lost ({reported}, over {} gaps) is not what the session \
+         printed ({printed}) — bytes went missing without a gap, or a gap over-counted",
+        seen.bytes.len(),
+        seen.gaps.len()
+    );
+}
+
+/// **An operator's `output_broadcast_capacity` reaches the session**
+/// (GH #210, GH #128's family).
+///
+/// The key was accepted, validated and documented as a control while a
+/// hardcoded constant sized every channel. Driven through the tool an
+/// agent calls and the config a daemon loads, so the row fails if either
+/// end of the wiring is cut; `session::tests::the_output_broadcast_holds_the_configured_number_of_frames`
+/// is the half that says the number is the channel's, not only a field's.
+#[tokio::test]
+async fn the_operators_broadcast_capacity_reaches_the_session() {
+    use holdfast_core::mcp::tools::StartSessionArgs;
+    let mut config = holdfast_core::config::Config::default();
+    config.limits.output_broadcast_capacity = 7;
+    let dir = scratch_dir("bcast");
+    let daemon = Daemon::with_config(RuntimePaths::with_dir(dir.clone()), config);
+    let r = daemon
+        .server
+        .start_session(Parameters(StartSessionArgs {
+            command: Some("sh".into()),
+            ..Default::default()
+        }))
+        .await
+        .expect("start_session");
+    let body = r.structured_content.clone().expect("structured content");
+    let id = body["data"]["session_id"]
+        .as_str()
+        .expect("session_id")
+        .to_string();
+    let s = daemon.server.registry.get(&id).expect("the session");
+    assert_eq!(
+        s.output_broadcast_capacity(),
+        7,
+        "the configured capacity never reached the session's broadcast"
+    );
+    let _ = s.signal(Signal::Kill);
+    daemon.shutdown();
+    let _ = std::fs::remove_dir_all(dir);
 }
 
 #[tokio::test]
@@ -2442,6 +2849,7 @@ async fn next_awaiting_secret(c: &mut UnixStream, secs: u64) -> (String, String)
             ServerFrame::AwaitingSecret {
                 request_id,
                 prompt_text,
+                ..
             } => return (request_id, prompt_text),
             ServerFrame::Output { .. } | ServerFrame::Resize { .. } => {}
             other => panic!("expected AwaitingSecret, got {other:?}"),
@@ -3220,9 +3628,13 @@ async fn each_disconnect_reason_is_recorded_once() {
     }
 
     // 4. slow_consumer — Task 6's teardown, which had no audit row at
-    // all until this task.
+    // all until this task. A stall since GH #210, so the bound is
+    // shortened through the hub's seam rather than sat out.
     {
         let d = TestDaemon::start("reasonslow").await;
+        d.daemon
+            .attach_hub()
+            .set_stall_timeout(Duration::from_millis(300));
         let (_s, pty) = d.session(None);
         let mut slow = d.dial().await;
         send(&mut slow, &attach_to(&_s.id)).await;
