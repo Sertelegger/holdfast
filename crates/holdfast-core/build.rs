@@ -45,12 +45,16 @@
 //! **Rerun precision is the correctness property, not a nicety.** A sha that
 //! goes stale across commits in an incremental build prints a wrong id with
 //! confidence. So the script watches the checkout's `HEAD`, the ref `HEAD`
-//! names, and `packed-refs` — and nothing broader, because any rerun of this
-//! script recompiles `holdfast-core` and everything above it, and a watch on
-//! all of `refs/` would rebuild the world whenever *another* worktree of the
-//! same repository committed. The git plumbing it reads is resolved for a
+//! names — or, for a packed branch, the nearest directory its next commit
+//! will write the ref under — and `packed-refs`, and nothing broader, because
+//! any rerun of this script recompiles `holdfast-core` and everything above
+//! it, and a watch on all of `refs/` would rebuild the world whenever
+//! *another* worktree of the same repository committed. The git plumbing it reads is resolved for a
 //! linked worktree too, where `.git` is a file pointing into the main
 //! repository's `worktrees/<name>/` and refs live in the common directory.
+
+// The functions `tests/build_script.rs` drives are `pub`, because that file
+// compiles this one as a module with `#[path]`.
 
 use std::path::{Path, PathBuf};
 
@@ -104,7 +108,7 @@ fn from_env() -> Option<String> {
 /// looking for the one key rather than by a JSON parser, because a build
 /// script's dependencies are compiled for every build of this crate and this
 /// is the only JSON it reads.
-fn from_vcs_info(manifest: &Path) -> Option<String> {
+pub fn from_vcs_info(manifest: &Path) -> Option<String> {
     let text = std::fs::read_to_string(manifest.join(".cargo_vcs_info.json")).ok()?;
     let after = text.split("\"sha1\"").nth(1)?;
     let value = after.split('"').nth(1)?;
@@ -113,13 +117,13 @@ fn from_vcs_info(manifest: &Path) -> Option<String> {
 
 /// What step 3 found: the id if it could resolve one, and the files whose
 /// change means it has to be resolved again.
-struct Checkout {
-    id: Option<String>,
-    watch: Vec<PathBuf>,
+pub struct Checkout {
+    pub id: Option<String>,
+    pub watch: Vec<PathBuf>,
 }
 
 /// Step 3.
-fn from_checkout(manifest: &Path) -> Option<Checkout> {
+pub fn from_checkout(manifest: &Path) -> Option<Checkout> {
     let crates = manifest.parent()?;
     if crates.file_name()? != "crates" {
         return None;
@@ -180,12 +184,21 @@ fn from_checkout(manifest: &Path) -> Option<Checkout> {
                 // *creates* the loose file, which a watch on a file that does
                 // not exist would miss — and cargo treats a missing watched
                 // path as always stale, which would recompile this crate on
-                // every build. So the directory the file would appear in is
-                // watched instead. Only in this case: it also changes when a
-                // sibling branch moves, which is a spurious rebuild and not a
-                // wrong answer.
-                if let Some(dir) = loose.parent().filter(|d| d.is_dir()) {
-                    watch.push(dir.to_path_buf());
+                // every build. So the nearest directory the file would appear
+                // under is watched instead, and cargo scans a watched
+                // directory's whole tree. Only in this case: it also changes
+                // when a sibling branch moves, which is a spurious rebuild and
+                // not a wrong answer.
+                //
+                // **The nearest that exists, not the parent.** `pack-refs
+                // --prune` (and so `git gc`) removes a branch's directory once
+                // it is empty, so for `feature/x` the parent is usually gone,
+                // and the commit that recreates it touched nothing this used
+                // to watch — the id went stale, which is the failure this file
+                // exists to prevent. Bounded at `refs/`, which every
+                // repository has.
+                if let Some(dir) = nearest_existing_dir(&loose, &common.join("refs")) {
+                    watch.push(dir);
                 }
                 std::fs::read_to_string(&packed)
                     .ok()
@@ -207,6 +220,16 @@ fn from_checkout(manifest: &Path) -> Option<Checkout> {
     });
 
     Some(Checkout { id: sha, watch })
+}
+
+/// The nearest ancestor directory of `path` that exists, no higher than
+/// `bound` — the directory a file created at `path` will appear under.
+fn nearest_existing_dir(path: &Path, bound: &Path) -> Option<PathBuf> {
+    path.ancestors()
+        .skip(1)
+        .take_while(|d| d.starts_with(bound))
+        .find(|d| d.is_dir())
+        .map(Path::to_path_buf)
 }
 
 /// `<sha> <refname>` lines, after an optional `# pack-refs with:` header;
@@ -236,7 +259,7 @@ fn rev_parse(root: &Path) -> Option<String> {
 /// A full object name — 40 hex for SHA-1, 64 for SHA-256 repositories —
 /// shortened to [`SHORT`]. Anything else is not a sha and is not reported as
 /// one.
-fn short_sha(s: &str) -> Option<String> {
+pub fn short_sha(s: &str) -> Option<String> {
     let ok = (s.len() == 40 || s.len() == 64) && s.bytes().all(|b| b.is_ascii_hexdigit());
     ok.then(|| s[..SHORT].to_ascii_lowercase())
 }
