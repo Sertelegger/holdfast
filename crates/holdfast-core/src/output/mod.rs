@@ -1264,7 +1264,18 @@ impl OutputProcessor {
             }
         }
 
-        let (bytes, redactions) = self.render(w, &spans, read_end, opts);
+        // **A redraw a terminal erased is not text the caller is shown
+        // (GH #247).** See `erased_redraws`; the ranges it returns are
+        // skipped by `render` exactly as a span is, minus the marker.
+        let erased = if opts.ansi == AnsiMode::Strip {
+            erased_redraws(w, &spans, read_end)
+        } else {
+            Vec::new()
+        };
+        let (mut bytes, mut redactions) = self.render(w, &spans, &erased, read_end, opts);
+        if !erased.is_empty() {
+            self.judge_collapsed(&mut bytes, &mut redactions);
+        }
 
         ProcessedRead {
             output: encoding::encode(&bytes, opts.text_encoding),
@@ -1286,10 +1297,14 @@ impl OutputProcessor {
     /// the lookbehind portion — that is what makes a secret split across
     /// two reads redact from both sides (§4.1). Its bytes are still fed to
     /// the stripper so escape state stays accurate.
+    ///
+    /// Bytes inside an `erased` range are fed to the stripper and emitted
+    /// nowhere (GH #247).
     fn render(
         &self,
         w: &WindowSnapshot<'_>,
         spans: &[Span],
+        erased: &[(u64, u64)],
         read_end: u64,
         opts: &ReadOptions,
     ) -> (Vec<u8>, BTreeMap<String, usize>) {
@@ -1299,6 +1314,7 @@ impl OutputProcessor {
         let mut stripper = AnsiStripper::new();
         let mut off = w.window_start;
         let mut next_span = 0usize;
+        let mut next_erased = 0usize;
 
         while off < read_end {
             while next_span < spans.len() && spans[next_span].end <= off {
@@ -1327,7 +1343,11 @@ impl OutputProcessor {
                 AnsiMode::Strip => stripper.feed(off, byte),
                 AnsiMode::Raw => Some(byte),
             };
-            if off >= w.req_start {
+            while next_erased < erased.len() && erased[next_erased].1 <= off {
+                next_erased += 1;
+            }
+            let is_erased = erased.get(next_erased).is_some_and(|e| e.0 <= off);
+            if off >= w.req_start && !is_erased {
                 if let Some(b) = emitted {
                     out.push(b);
                 }
@@ -1335,6 +1355,40 @@ impl OutputProcessor {
             off += 1;
         }
         (out, redactions)
+    }
+
+    /// Judge a page `erased_redraws` shortened, **as the caller receives
+    /// it**, and marker whatever it newly carries (GH #247).
+    ///
+    /// Dropping a redraw joins the text in front of its line to the text
+    /// that replaced it — a stream no view in `normalise` enumerates,
+    /// because none of them deletes a range. A rule that reaches across a
+    /// line break (`\s` in a label rule's separator does) can match there
+    /// and nowhere else: `PASSWORD:\n` then an erased ` x` then the value
+    /// matches only once ` x` is gone. So the payload itself is matched —
+    /// by `all_spans`, whose views are what `encode`'s filters can derive
+    /// from it — and a match is replaced exactly as `render` replaces one.
+    /// A match over a marker's own text replaces it with another marker,
+    /// which shows nothing either did not.
+    ///
+    /// Only reached when something was erased, so an ordinary page pays
+    /// nothing for it.
+    fn judge_collapsed(&self, out: &mut Vec<u8>, redactions: &mut BTreeMap<String, usize>) {
+        let spans = self.all_spans(out, 0);
+        if spans.is_empty() {
+            return;
+        }
+        let mut judged = Vec::with_capacity(out.len());
+        let mut at = 0usize;
+        for span in spans {
+            let kind = redact::span_kind(&self.rules, &span);
+            judged.extend_from_slice(&out[at..span.start as usize]);
+            judged.extend_from_slice(redact::marker(kind).as_bytes());
+            *redactions.entry(kind.to_string()).or_insert(0) += 1;
+            at = span.end as usize;
+        }
+        judged.extend_from_slice(&out[at..]);
+        *out = judged;
     }
 }
 
@@ -1419,6 +1473,152 @@ fn utf8_read_end(w: &WindowSnapshot<'_>, read_end: u64) -> u64 {
         return char_end;
     }
     read_end
+}
+
+/// The ranges of `[req_start, read_end)` holding a redraw a terminal has
+/// already erased (GH #247) — what a progress bar leaves behind in the
+/// byte stream: every frame of `Building [==>  ] 12/400`, each one
+/// returned to column 0 by `\r` and wiped by the next.
+///
+/// **Only a line the stream itself erases, and only in two spellings a
+/// terminal cannot read any other way.** Both start at a `\r` that is not
+/// the first half of `\r\n`, and both drop everything on that line in
+/// front of it:
+///
+/// * `\r`, then SGR or mode changes only, then **erase-in-line** —
+///   `\x1b[K`, `\x1b[0K` or `\x1b[2K`. From column 0 all three clear the
+///   whole row, so nothing written on it before survives. This is how
+///   cargo clears its bar before printing a `Compiling` line, and how
+///   most progress bars redraw.
+/// * `\r`, then a redraw of printable text and SGR only, **ending in
+///   `\x1b[K`** before the next `\r` or `\n`. It overwrote the row from
+///   column 0 and erased the rest, so again nothing older survives —
+///   whatever the widths, wide characters included.
+///
+/// Anything else is left exactly as it was: a `\r` followed by a shorter
+/// line with no erase (the old tail is still on screen), a redraw with a
+/// tab, a backspace or a cursor movement in it, a redraw that has not
+/// finished inside this page, and every byte under `ansi: raw`, which
+/// promises the bytes. **Nothing that a terminal still shows is dropped.**
+///
+/// **It never touches what redaction sees.** Spans are found on the whole
+/// window before this runs and a range overlapping any of them is not
+/// dropped, so no marker disappears; the cursor, `bytes_returned` and
+/// every flag are unchanged, because the bytes were read — they are only
+/// not shown. And a line with nothing printable in front of its `\r` —
+/// bash's `\x1b[?2004l\r` before every command's output — is not
+/// "collapsed" into a page that differs only by that `\r`.
+fn erased_redraws(w: &WindowSnapshot<'_>, spans: &[Span], read_end: u64) -> Vec<(u64, u64)> {
+    let window_end = w.window_start + w.window.len() as u64;
+    let end = read_end.min(window_end);
+    if end <= w.req_start {
+        return Vec::new();
+    }
+    let at = |off: u64| w.window[(off - w.window_start) as usize];
+    // A CSI sequence at `off`: where it ends and its final byte.
+    let csi = |off: u64| -> Option<(u64, u8)> {
+        if off + 1 >= end || at(off) != 0x1b || at(off + 1) != b'[' {
+            return None;
+        }
+        let mut i = off + 2;
+        while i < end {
+            match at(i) {
+                0x20..=0x3f => i += 1,
+                f @ 0x40..=0x7e => return Some((i + 1, f)),
+                _ => return None,
+            }
+        }
+        None
+    };
+    // Erase-in-line from the cursor or of the whole line: `\x1b[K`,
+    // `\x1b[0K`, `\x1b[2K`. Returns the byte after it and whether it was
+    // the whole-line form.
+    let erase = |off: u64| -> Option<(u64, bool)> {
+        let (next, fin) = csi(off)?;
+        let params =
+            &w.window[(off + 2 - w.window_start) as usize..(next - 1 - w.window_start) as usize];
+        (fin == b'K' && matches!(params, b"" | b"0" | b"2")).then_some((next, params == b"2"))
+    };
+    let mut out: Vec<(u64, u64)> = Vec::new();
+    let mut line_start = w.req_start;
+    let mut printable = false;
+    let mut off = w.req_start;
+    while off < end {
+        let b = at(off);
+        if b == b'\n' {
+            line_start = off + 1;
+            printable = false;
+            off += 1;
+            continue;
+        }
+        if b == 0x1b {
+            off = csi(off).map_or(off + 1, |(next, _)| next);
+            continue;
+        }
+        if b != b'\r' {
+            printable |= b >= 0x20 && b != 0x7f;
+            off += 1;
+            continue;
+        }
+        // The first half of `\r\n` needs no arm of its own: the `\n` after
+        // it is neither an erase nor a redraw ending in one, so both
+        // spellings below decline it.
+        let cr = off;
+        // Spelling 1: SGR and mode changes only, then an erase.
+        let mut i = cr + 1;
+        let mut erased = false;
+        while let Some((next, fin)) = csi(i) {
+            if erase(i).is_some() {
+                erased = true;
+                break;
+            }
+            if !matches!(fin, b'm' | b'h' | b'l') {
+                break;
+            }
+            i = next;
+        }
+        // Spelling 2: a redraw of text and SGR from column 0, ending in an
+        // erase-to-end before the next `\r` or `\n` — both inside this
+        // page, or it has not finished and nothing is decided.
+        if !erased {
+            let mut j = cr + 1;
+            let mut last_was_erase = false;
+            while j < end {
+                let c = at(j);
+                if c == b'\r' || c == b'\n' {
+                    erased = last_was_erase;
+                    break;
+                }
+                if c == 0x1b {
+                    match (csi(j), erase(j)) {
+                        (_, Some((next, false))) => {
+                            last_was_erase = true;
+                            j = next;
+                        }
+                        (Some((next, b'm')), _) => j = next,
+                        _ => break,
+                    }
+                    continue;
+                }
+                if c < 0x20 || c == 0x7f {
+                    break;
+                }
+                last_was_erase = false;
+                j += 1;
+            }
+        }
+        let drop = (line_start, cr + 1);
+        let overlaps_span = spans.iter().any(|s| s.start < drop.1 && drop.0 < s.end);
+        if erased && printable && !overlaps_span {
+            out.push(drop);
+        }
+        if erased {
+            line_start = cr + 1;
+            printable = false;
+        }
+        off = cr + 1;
+    }
+    out
 }
 
 /// Move `read_end` past any span it would otherwise end *inside*, so the
@@ -4575,5 +4775,207 @@ mod tests {
                 );
             }
         }
+    }
+
+    // ---------------------------------------- GH #247: erased redraws
+
+    /// The bytes `cargo build` writes through a pty, in the shape measured
+    /// on cargo 1.97 at 120 columns: each `Building` frame padded to the
+    /// width and ended by `\r`, followed either by the next frame or by
+    /// `\r\x1b[K` and a `Compiling` line, and the last frame erased before
+    /// `Finished`.
+    fn cargo_progress(crates: &[&str]) -> (String, Vec<String>) {
+        const BOLD_GREEN: &str = "\x1b[1m\x1b[92m";
+        const BOLD_CYAN: &str = "\x1b[1m\x1b[96m";
+        const RESET: &str = "\x1b[0m";
+        let total = crates.len() * 2;
+        let frame = |n: usize, what: &str| {
+            let bar = format!("[{:<28}]", "=".repeat(n * 28 / total) + ">");
+            let text = format!(" {bar} {n}/{total}: {what}");
+            format!("{BOLD_CYAN}    Building{RESET}{text:<100}\r")
+        };
+        let mut out = String::new();
+        let mut shown = Vec::new();
+        for (i, name) in crates.iter().enumerate() {
+            let line = format!("   Compiling {name} v1.0.{i}");
+            out.push_str(&format!(
+                "{BOLD_GREEN}   Compiling{RESET} {name} v1.0.{i}\r\n"
+            ));
+            shown.push(line);
+            out.push_str(&frame(2 * i, name));
+            out.push_str(&frame(2 * i + 1, name));
+            out.push_str("\x1b[K");
+        }
+        out.push_str(&frame(total - 1, "demo(bin)"));
+        out.push_str(&format!(
+            "\x1b[K{BOLD_GREEN}    Finished{RESET} `dev` profile in 8.47s\r\n"
+        ));
+        shown.push("    Finished `dev` profile in 8.47s".to_string());
+        (out, shown)
+    }
+
+    /// **A build's progress bar costs the caller its last frame, not
+    /// every frame** (GH #247).
+    ///
+    /// Measured on `main` at `a81b02d`: a nine-second `cargo build` read
+    /// back as mostly `Building [...]` redraws, and a synthetic 400-step
+    /// bar returned 32 KB of progress to a `tail_lines: 3` read because
+    /// the redraws are one "line". A terminal shows none of those frames
+    /// — each is returned to column 0 and wiped — so the stripped page
+    /// now carries exactly what a terminal shows: every `Compiling` line,
+    /// `Finished`, and nothing of the bar.
+    ///
+    /// **The cursor does not move for it.** The frames were read; they
+    /// are only not shown. So `bytes_returned` and `cursor` are asserted
+    /// to be the whole buffer, exactly as before.
+    #[test]
+    fn a_build_progress_bar_reads_back_as_what_a_terminal_shows() {
+        let p = processor();
+        let (text, shown) = cargo_progress(&["proc-macro2", "quote", "syn", "serde", "regex"]);
+        let buf = text.as_bytes();
+        let r = p.process(
+            &snapshot(&p, buf, 0, 1 << 20, true, false),
+            &ReadOptions::default(),
+        );
+        let expected: String = shown.iter().map(|l| format!("{l}\r\n")).collect();
+        assert_eq!(r.output, expected);
+        assert_eq!(r.cursor, buf.len() as u64);
+        assert_eq!(r.bytes_returned, buf.len());
+        assert!(!r.output.contains("Building"));
+
+        // The synthetic one from the issue: 400 frames of `\r\x1b[K`
+        // then text, and nothing after the last.
+        let mut bar = String::new();
+        for n in 1..=400 {
+            bar.push_str(&format!(
+                "\r\x1b[K Building [{}] {n}/400",
+                "#".repeat(n / 10)
+            ));
+        }
+        let r = p.process(
+            &snapshot(&p, bar.as_bytes(), 0, 1 << 20, true, false),
+            &ReadOptions::default(),
+        );
+        // The first `\r` stays: nothing printable is in front of it, so it
+        // erased nothing, and the rule drops only what was erased.
+        assert_eq!(
+            r.output,
+            format!("\r Building [{}] 400/400", "#".repeat(40))
+        );
+
+        // The second spelling: a redraw from column 0 that ends in an
+        // erase-to-end, with no erase in front of it.
+        let r = p.process(
+            &snapshot(
+                &p,
+                b"a much longer old line\rnew\x1b[K\r\n",
+                0,
+                4096,
+                true,
+                false,
+            ),
+            &ReadOptions::default(),
+        );
+        assert_eq!(r.output, "new\r\n");
+
+        // `ansi: raw` promises the bytes, and gets them.
+        let raw = p.process(
+            &snapshot(&p, buf, 0, 1 << 20, true, false),
+            &ReadOptions {
+                ansi: AnsiMode::Raw,
+                ..ReadOptions::default()
+            },
+        );
+        assert_eq!(raw.output, text);
+    }
+
+    /// **Nothing a terminal still shows is dropped** — the half that makes
+    /// the row above safe to have. Each case is a `\r` that does *not*
+    /// erase its line, and each comes back byte for byte.
+    #[test]
+    fn a_redraw_that_leaves_text_on_screen_is_not_collapsed() {
+        let p = processor();
+        for text in [
+            // Shorter, no erase: the old tail is still visible.
+            "downloading 100%\rdone\n",
+            // A tab moves the cursor without writing; the old text under
+            // the gap survives.
+            "old text here\r\tnew\x1b[K\n",
+            // Cursor movement inside the redraw.
+            "0123456789\rab\x1b[3Ccd\x1b[K\n",
+            // Not finished inside the page: nothing is decided.
+            "frame one\rframe two",
+            // A `\r\n` is a line end and erases nothing.
+            "line one\r\nline two\x1b[K\r\n",
+            // bash's `\x1b[?2004l\r` before a command's output: nothing
+            // printable precedes it, so there is nothing to erase.
+            "$ ls\r\n\x1b[?2004l\rCargo.toml\r\n",
+        ] {
+            let r = p.process(
+                &snapshot(&p, text.as_bytes(), 0, 1 << 20, true, false),
+                &ReadOptions::default(),
+            );
+            assert_eq!(
+                r.output,
+                ansi::strip(text.as_bytes())
+                    .iter()
+                    .map(|b| *b as char)
+                    .collect::<String>(),
+                "{text:?}"
+            );
+        }
+    }
+
+    /// **Dropping a redraw never removes a marker, and never lets the text
+    /// it joins carry a credential out** (GH #247's "must not change what
+    /// redaction sees").
+    ///
+    /// Two arrangements. A secret *inside* an erased frame keeps its
+    /// marker, because a frame a span touches is not dropped — the agent
+    /// is told something was redacted there, which is what REQ-O-012's
+    /// count says. And a value that only becomes a match *once* the frame
+    /// is gone — a label on one line, an erased frame, the value on the
+    /// next — is judged on the page the caller receives and replaced.
+    #[test]
+    fn collapsing_a_redraw_keeps_every_marker_and_hides_every_join() {
+        let p = processor();
+        let text = format!("progress {GITHUB}\r\x1b[Kdone\n");
+        let r = p.process(
+            &snapshot(&p, text.as_bytes(), 0, 1 << 20, true, false),
+            &ReadOptions::default(),
+        );
+        assert_eq!(r.redactions.get("github"), Some(&1));
+        assert_eq!(
+            r.output, "progress [REDACTED:github]\rdone\n",
+            "a frame a redaction touches is kept whole, text and marker"
+        );
+
+        // `PASSWORD:` then a frame of ` x` then the value. Uncollapsed, the
+        // value rule sees ` x` and nothing it can use; collapsed, the value
+        // follows the label directly.
+        let value = "hunter2hunter2hunter2";
+        let text = format!("PASSWORD:\n x\r\x1b[K{value}\n");
+        let uncollapsed = p.process(
+            &snapshot(&p, text.as_bytes(), 0, 1 << 20, true, false),
+            &ReadOptions {
+                ansi: AnsiMode::Raw,
+                ..ReadOptions::default()
+            },
+        );
+        assert!(
+            uncollapsed.redactions.is_empty(),
+            "the premise: no stream the old pipeline judged matches here: {:?}",
+            uncollapsed.redactions
+        );
+        let r = p.process(
+            &snapshot(&p, text.as_bytes(), 0, 1 << 20, true, false),
+            &ReadOptions::default(),
+        );
+        assert!(
+            !r.output.contains(value),
+            "the join carried the value out: {:?}",
+            r.output
+        );
+        assert!(!r.redactions.is_empty(), "{:?}", r.redactions);
     }
 }
