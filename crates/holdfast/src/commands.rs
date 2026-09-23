@@ -230,9 +230,15 @@ pub(crate) enum WatchBanner {
 /// * **The cursor goes where the child left it**, because the child's
 ///   next write lands there — a picture with the cursor anywhere else
 ///   has the live stream start in the wrong column.
-/// * **The alternate screen is entered when the child is on it**, so a
-///   full-screen program's own exit from it returns the terminal to the
-///   screen the human had, as it would have without Holdfast in between.
+/// * **The terminal's modes are left alone** — no alternate screen, no
+///   hidden cursor — although the frame says whether the child is using
+///   either. This client is a pass-through and restores nothing on the
+///   way out but `termios`, so a mode it switched on at the join is a
+///   mode `Ctrl-B d` leaves switched on: a human detaching from `vim`
+///   would be returned to their shell inside the alternate screen, or
+///   with no cursor. The fields are on the wire for a renderer that owns
+///   its terminal — the web UI's — and a pass-through paints the picture
+///   into whatever screen the human already has.
 ///
 /// Plain text: the tool's grid has no attributes, and the child's own
 /// repaints bring colour back as it redraws.
@@ -240,16 +246,10 @@ pub(crate) enum WatchBanner {
 pub(crate) fn paint_snapshot(
     lines: &[String],
     cursor: (u16, u16),
-    cursor_visible: bool,
-    alt_screen: bool,
     local: Option<(u16, u16)>,
 ) -> Vec<u8> {
     let (cursor_row, cursor_col) = (cursor.0 as usize, cursor.1 as usize);
-    let mut out = String::from("\x1b[0m");
-    if alt_screen {
-        out.push_str("\x1b[?1049h");
-    }
-    out.push_str("\x1b[H\x1b[2J");
+    let mut out = String::from("\x1b[0m\x1b[H\x1b[2J");
     let (width, height) = match local {
         Some((cols, rows)) if cols > 0 && rows > 0 => (Some(cols as usize), Some(rows as usize)),
         _ => (None, None),
@@ -286,11 +286,6 @@ pub(crate) fn paint_snapshot(
         };
         out.push_str(&format!("\x1b[{};{}H", row + 1, col + 1));
     }
-    out.push_str(if cursor_visible {
-        "\x1b[?25h"
-    } else {
-        "\x1b[?25l"
-    });
     out.into_bytes()
 }
 
@@ -2181,15 +2176,11 @@ async fn attach_connected(
                         lines,
                         cursor_row,
                         cursor_col,
-                        cursor_visible,
-                        alt_screen,
                         ..
                     } => {
                         render(&paint_snapshot(
                             &lines,
                             (cursor_row, cursor_col),
-                            cursor_visible,
-                            alt_screen,
                             crate::attach_tty::window_size(tty).ok(),
                         ));
                     }
@@ -2662,16 +2653,12 @@ pub async fn watch(session: &str) -> ExitCode {
                         lines,
                         cursor_row,
                         cursor_col,
-                        cursor_visible,
-                        alt_screen,
                         ..
                     } => {
                         if stdout_is_terminal {
                             render(&paint_snapshot(
                                 &lines,
                                 (cursor_row, cursor_col),
-                                cursor_visible,
-                                alt_screen,
                                 local_size(),
                             ));
                         }
@@ -3483,13 +3470,7 @@ mod tests {
         let mut p = vt100::Parser::new(24, 80, 0);
         p.process(b"the human's own shell history\r\nmore of it\r\n$ ");
         let lines = grid(&["build output", "user@box $ "], 24);
-        p.process(&paint_snapshot(
-            &lines,
-            (1, 11),
-            true,
-            false,
-            Some((80, 24)),
-        ));
+        p.process(&paint_snapshot(&lines, (1, 11), Some((80, 24))));
 
         assert_eq!(row(&p, 0).trim_end(), "build output");
         assert_eq!(row(&p, 1).trim_end(), "user@box $");
@@ -3525,13 +3506,7 @@ mod tests {
             .collect();
         rows[35] = format!("{}PROMPT$ ", "端".repeat(50));
         let mut p = vt100::Parser::new(24, 80, 0);
-        p.process(&paint_snapshot(
-            &rows,
-            (35, 108),
-            true,
-            false,
-            Some((80, 24)),
-        ));
+        p.process(&paint_snapshot(&rows, (35, 108), Some((80, 24))));
         let bottom = row(&p, 23);
         assert!(
             bottom.starts_with('端'),
@@ -3552,23 +3527,22 @@ mod tests {
         );
     }
 
-    /// A hidden cursor stays hidden, and a child on the alternate screen
-    /// is painted there — so its own exit from it returns the human to the
-    /// screen they had.
+    /// **The picture changes no terminal mode**, whatever the child's
+    /// are: a pass-through that entered the alternate screen or hid the
+    /// cursor at the join would leave both behind on `Ctrl-B d`, and the
+    /// human back at their shell inside a screen with no scrollback, or
+    /// with no cursor.
     #[test]
-    fn the_cursor_state_and_the_alternate_screen_follow_the_child() {
+    fn the_picture_changes_no_terminal_mode() {
         let lines = grid(&["vim"], 24);
-        let bytes = paint_snapshot(&lines, (0, 0), false, true, Some((80, 24)));
         let mut p = vt100::Parser::new(24, 80, 0);
-        p.process(b"MAIN SCREEN");
-        p.process(&bytes);
-        assert!(p.screen().hide_cursor());
-        assert!(p.screen().alternate_screen());
-        p.process(b"\x1b[?1049l");
+        p.process(&paint_snapshot(&lines, (0, 0), Some((80, 24))));
         assert!(
-            p.screen().contents().contains("MAIN SCREEN"),
-            "leaving the alternate screen did not return to what the human had"
+            !p.screen().alternate_screen(),
+            "the join entered the alternate screen"
         );
+        assert!(!p.screen().hide_cursor(), "the join hid the human's cursor");
+        assert_eq!(row(&p, 0).trim_end(), "vim");
     }
 
     /// **`watch` on a terminal inserts its notice above the cursor's row

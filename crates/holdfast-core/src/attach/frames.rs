@@ -361,8 +361,11 @@ pub enum ServerFrame {
         cursor_col: u16,
         cursor_visible: bool,
         /// Whether the child is on the alternate screen (a full-screen
-        /// program), so a renderer can enter it too and have the child's
-        /// own exit from it land where the child expects.
+        /// program). For a renderer that owns its terminal — the web UI's —
+        /// which can enter it too and have the child's own exit from it
+        /// land where the child expects. `holdfast attach` and `watch`
+        /// deliberately do not: a pass-through that switched a mode on at
+        /// the join would leave it on after `Ctrl-B d`.
         alt_screen: bool,
         lines: Vec<String>,
         /// Some cells were masked because §4.1 is withholding the bytes
