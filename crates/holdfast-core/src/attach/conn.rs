@@ -2777,8 +2777,23 @@ mod tests {
                 start,
                 Arc::clone(&budget),
             ));
+            // **The marker only once the forwarder has read the ring.**
+            // With a 1000-byte ring, the marker's own byte evicts one more
+            // at the tail, so a marker pushed before the forwarder's first
+            // read makes the hole one byte wider — correctly, since the
+            // ring really had evicted it — and the row's exact figure
+            // wrong. It failed that way once in a full contended run. The
+            // first frame is queued after the ring read that measures the
+            // hole (`Stream::read_ring` reads, then queues), so it is the
+            // positive fact to wait on, not a sleep.
+            let first = tokio::time::timeout(std::time::Duration::from_secs(10), out.recv())
+                .await
+                .expect("the forwarder queued nothing")
+                .expect("the queue closed");
+            budget.release(stream_bytes(&first));
             inner.queue_output(b"Z");
-            let frames = drain_until(&mut out, &budget, b'Z').await;
+            let mut frames = vec![first];
+            frames.extend(drain_until(&mut out, &budget, b'Z').await);
             forwarder.abort();
             (gaps_of(&frames), output_of(&frames), printed)
         }
@@ -2846,6 +2861,15 @@ mod tests {
             inner.queue_output(&line);
             printed.extend_from_slice(&line);
             wait_head(&session, printed.len() as u64).await;
+        }
+        // Until the stream has taken its share — a positive fact, polled,
+        // rather than a sleep a loaded machine can outlast — and then a
+        // moment more, so a forwarder that kept going past its share, or
+        // gave up, has the chance to.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        while tx.capacity() > ENDING_SLOTS + ANCILLARY_SLOTS && std::time::Instant::now() < deadline
+        {
+            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
         }
         tokio::time::sleep(std::time::Duration::from_millis(100)).await;
 
