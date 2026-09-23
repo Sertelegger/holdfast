@@ -2423,9 +2423,19 @@ async fn dispatch_tool(
     // parameter to pass them in. Removed whether or not it parses, so a
     // malformed context is refused here rather than handed to a tool as
     // an argument; see `session::launch`.
-    let client = match crate::session::launch::take_client_param(&mut args) {
-        Ok(client) => client,
-        Err(e) => return Response::error(req.id, ErrorCode::BadParams, e),
+    //
+    // **From `start_session` alone** (`launch::CLIENT_PARAM_TOOL`). It is
+    // the only call a shim tags and the only handler that reads the
+    // context; on any other tool the key stays in the arguments and is
+    // refused there as the unknown argument it is (GH #219), exactly as
+    // `--no-daemon` refuses it.
+    let client = if tool == crate::session::launch::CLIENT_PARAM_TOOL {
+        match crate::session::launch::take_client_param(&mut args) {
+            Ok(client) => client,
+            Err(e) => return Response::error(req.id, ErrorCode::BadParams, e),
+        }
+    } else {
+        None
     };
     // Scope the call to the caller derived from the connection, so the
     // §9.4 audit write inside the read path records who asked without

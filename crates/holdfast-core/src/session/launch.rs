@@ -91,6 +91,18 @@ use std::future::Future;
 /// nothing reads it at all.
 pub const CLIENT_PARAM: &str = "@client";
 
+/// The one tool whose control-protocol params may carry [`CLIENT_PARAM`].
+///
+/// The shim tags `tool/start_session` alone, and `start_session` is the
+/// only handler that reads the context, so the daemon takes the key from
+/// that call and no other. **On every other tool it is left in the
+/// arguments**, where GH #219's closed argument types refuse it by name —
+/// the answer `--no-daemon` gives, where nothing strips it. Taken from
+/// every call, it was the one key the daemon path accepted in silence on
+/// eleven tools whose advertised schemas say `additionalProperties:
+/// false`.
+pub const CLIENT_PARAM_TOOL: &str = "start_session";
+
 /// What the calling `holdfast mcp` process knows about itself that a
 /// shared daemon cannot: where it is, and what its environment is.
 ///

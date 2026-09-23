@@ -3064,3 +3064,117 @@ async fn a_pattern_wait_in_flight_does_not_stall_an_unrelated_control_call() {
         "the wait's context read skipped the redaction pipeline"
     );
 }
+
+/// **`@client` is `start_session`'s alone, on the daemon path too**
+/// (GH #229 × GH #219).
+///
+/// The daemon takes the shim's launch context out of a call's arguments
+/// before the tool sees them. Taken from *every* call, it was the one key
+/// the daemon path accepted in silence on the eleven other tools, whose
+/// advertised schemas say `additionalProperties: false` — while
+/// `--no-daemon`, which strips nothing, refused the same call by name.
+///
+/// Paired per tool, as `tests/tool_arguments.rs` pairs its rows: the call
+/// without the key reaches the tool's body, and the same call with it is
+/// `bad_params` naming it. `start_session` is the control, and a positive
+/// one: its context is still taken — the call is not refused — and the
+/// session starts in the directory the context names.
+#[tokio::test]
+async fn only_start_session_takes_the_launch_context_every_other_tool_refuses_it() {
+    use holdfast_core::session::launch::CLIENT_PARAM;
+    const NOPE: &str = "sess_nope229";
+    let d = TestDaemon::start("clientkey").await;
+    let client = d.client().await.unwrap();
+    let project = scratch_dir("clientkey-project");
+    std::fs::create_dir_all(&project).unwrap();
+    let project = project.canonicalize().unwrap();
+    let context = json!({ "cwd": project.to_str().unwrap(), "env": { "PATH": "/usr/bin:/bin" } });
+
+    let tools = holdfast_core::mcp::passthrough::tool_manifest();
+    assert!(
+        tools.len() >= 12,
+        "the router lost tools; this loop would pass over nothing"
+    );
+    let mut refused = 0;
+    for tool in tools {
+        let name = tool.name.to_string();
+        if name == "start_session" {
+            continue;
+        }
+        let mut args = match name.as_str() {
+            "list_sessions" => json!({}),
+            "read_output" => json!({ "session": NOPE, "since_cursor": 0 }),
+            "send_input" => json!({ "session": NOPE, "data": "x" }),
+            "resize" => json!({ "session": NOPE, "cols": 80, "rows": 24 }),
+            "request_secret_input" => json!({ "session": NOPE, "prompt_text": "x" }),
+            _ => json!({ "session": NOPE }),
+        };
+        let method_name = format!("tool/{name}");
+
+        // ---- the pairing: without the key, the call reaches the body.
+        let base = client
+            .call_raw(&method_name, method::to_cbor(&args).unwrap())
+            .await
+            .unwrap();
+        assert!(
+            base.control_error().is_none(),
+            "`{name}` with {args} did not reach its body — fix this row's arguments: {}",
+            base.details
+        );
+
+        // ---- with it, refused before the body runs, and by name.
+        args.as_object_mut()
+            .unwrap()
+            .insert(CLIENT_PARAM.into(), context.clone());
+        let resp = client
+            .call_raw(&method_name, method::to_cbor(&args).unwrap())
+            .await
+            .unwrap();
+        let e = resp.control_error().unwrap_or_else(|| {
+            panic!(
+                "`{name}` accepted `{CLIENT_PARAM}` and ran (status {:?}) — the daemon \
+                 took the launch context from a call no shim tags, and served a key the \
+                 tool's schema says it refuses: {}",
+                resp.status, resp.details
+            )
+        });
+        assert_eq!(
+            e.code,
+            ErrorCode::BadParams.as_str(),
+            "`{name}`: {}",
+            e.message
+        );
+        assert!(
+            e.message
+                .contains(&format!("unknown field `{CLIENT_PARAM}`")),
+            "`{name}`'s refusal does not name the key: {}",
+            e.message
+        );
+        refused += 1;
+    }
+    assert!(refused >= 11, "only {refused} tools were asked");
+
+    // ---- the control: start_session still takes the context.
+    let params = method::to_cbor(&json!({
+        "command": "sh",
+        "args": ["-c", "sleep 30"],
+        CLIENT_PARAM: context,
+    }))
+    .unwrap();
+    let resp = client.call_raw("tool/start_session", params).await.unwrap();
+    assert_eq!(
+        resp.status, "ok",
+        "start_session refused its own context: {}",
+        resp.details
+    );
+    let data: Value = method::from_cbor(&resp.data).unwrap();
+    assert_eq!(
+        data["cwd"].as_str(),
+        project.to_str(),
+        "start_session did not start where the context says: {data}"
+    );
+    let id = data["session_id"].as_str().unwrap().to_string();
+    let params = method::to_cbor(&json!({ "session": id, "force": true })).unwrap();
+    client.call_raw("tool/terminate", params).await.unwrap();
+    let _ = std::fs::remove_dir_all(&project);
+}

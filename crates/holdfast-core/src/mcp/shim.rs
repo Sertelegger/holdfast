@@ -49,8 +49,9 @@ use std::pin::Pin;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 
-/// The one tool whose call carries the shim's own launch context.
-const START_SESSION: &str = "start_session";
+/// The one tool whose call carries the shim's own launch context — the
+/// same constant the daemon takes it by, so the two cannot drift apart.
+const START_SESSION: &str = crate::session::launch::CLIENT_PARAM_TOOL;
 
 /// What a response carries when the call that produced it had to start a
 /// new daemon first (GH #231). Put in front of `details`, or of the
