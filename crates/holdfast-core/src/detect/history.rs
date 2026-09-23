@@ -184,8 +184,9 @@ impl CommandHistory {
                     // truncating to its tail at the terminal width — so
                     // `ends_with` is the right test and equality would
                     // silently stop matching at narrow widths.
-                    let matched =
-                        !command.is_empty() && line.trim_end().ends_with(command.as_str());
+                    let matched = !event.holdfast
+                        && !command.is_empty()
+                        && line.trim_end().ends_with(command.as_str());
                     // **The suffix test alone is not enough, and this is
                     // measured rather than anticipated.** On a foreign
                     // emitter that supplies no `B` — fish 4.0.2, measured
@@ -213,7 +214,25 @@ impl CommandHistory {
                     // to install *and* a `B`-less foreign emitter is
                     // present, the user's first command is suppressed. That
                     // is a session whose integration is already broken.
-                    let never_had_a_span = command.is_empty() && !self.seen_command_start;
+                    //
+                    // **Both clauses apply to a *foreign* `C` only (GH
+                    // #220), and that is structure, not a heuristic.**
+                    // Holdfast's own `C` cannot mark the line that
+                    // installed it: the snippet defines its `C` emitter
+                    // while that line executes, after `PS0` was expanded
+                    // and after `preexec` ran (see `Osc133Event::holdfast`).
+                    // Without the tag test, "snippet installed but its `B`
+                    // never arrives" — starship regenerating `PS1` at every
+                    // prompt — read as "B-less foreign emitter", and the
+                    // session's **first real command** was suppressed as
+                    // if it were the snippet: every starship session lost
+                    // it, and an agent matching entries to commands by
+                    // count was off by one from the start. The suffix
+                    // clause had the same hole in miniature: a first
+                    // command that happens to end the way the snippet does
+                    // (`fi`) was dropped too.
+                    let never_had_a_span =
+                        !event.holdfast && command.is_empty() && !self.seen_command_start;
                     if matched || never_had_a_span {
                         self.suppress_next_done = true;
                         return;
@@ -941,6 +960,71 @@ mod tests {
             e.iter().map(|x| x.exit_code).collect::<Vec<_>>(),
             vec![Some(0), Some(2)]
         );
+    }
+
+    /// GH #220, and the half of it that was not the prompt: the session's
+    /// **first real command** vanished from the history whenever Holdfast's
+    /// snippet installed but its `B` never arrived.
+    ///
+    /// The marker shape is the one the dogfood pass measured under
+    /// starship: the injection line's bare `D`, prompts carrying no marker
+    /// at all, and Holdfast's own tagged `C`/`D` around each command. The
+    /// first `C` has an empty capture and no `B` has ever been seen, which
+    /// is exactly what `never_had_a_span` was written to recognise — in a
+    /// *foreign* emitter. Measured before the fix: 3 entries for 4
+    /// commands, the first command's exit code 3 gone, every later entry
+    /// shifted one place against the commands an agent sent.
+    #[test]
+    fn the_first_command_survives_a_session_whose_prompt_markers_never_arrive() {
+        let mut sc = ModeScanner::new();
+        let mut h = CommandHistory::new(100);
+        h.set_injection_line(
+            "if [ -z \"${HOLDFAST_SHELL_INTEGRATION-}\" ]; then HOLDFAST_SHELL_INTEGRATION=1; fi"
+                .to_string(),
+        );
+        let raw = b"\x1b]133;D;0;holdfast=1\x07host ~ $ echo FIRST\r\n\
+                    \x1b]133;C;holdfast=1\x07FIRST\r\n\x1b]133;D;3;holdfast=1\x07\
+                    host ~ $ echo SECOND\r\n\x1b]133;C;holdfast=1\x07SECOND\r\n\
+                    \x1b]133;D;0;holdfast=1\x07";
+        let mut t = 1_000i64;
+        for ev in sc.feed(raw, 0, None) {
+            h.apply(&ev, t);
+            t += 10;
+        }
+        let e = h.entries(0, 50);
+        assert_eq!(
+            e.iter().map(|x| x.exit_code).collect::<Vec<_>>(),
+            vec![Some(3), Some(0)],
+            "the first command was suppressed as if it were the snippet: {e:?}"
+        );
+        // `command` is empty — with no `B` there is nothing to capture, and
+        // `osc133_source` now says so (`holdfast_degraded`). The entry is
+        // still the command's: its span holds its own output.
+        let span = &raw
+            [e[0].output_start_cursor as usize..e[0].output_end_cursor.expect("closed") as usize];
+        assert_eq!(span, b"FIRST\r\n");
+    }
+
+    /// The suffix clause's hole in miniature: with no foreign emitter the
+    /// first `OutputStart` is always a real command, so one that happens to
+    /// end the way every POSIX snippet ends is still an entry.
+    #[test]
+    fn a_first_command_that_ends_like_the_snippet_is_still_an_entry() {
+        let mut sc = ModeScanner::new();
+        let mut h = CommandHistory::new(100);
+        h.set_injection_line("if true; then :; fi".to_string());
+        let raw = b"\x1b]133;D;0;holdfast=1\x07\x1b]133;A;holdfast=1\x07$ \
+                    \x1b]133;B;holdfast=1\x07fi\r\n\x1b]133;C;holdfast=1\x07\
+                    \x1b]133;D;2;holdfast=1\x07";
+        let mut t = 1_000i64;
+        for ev in sc.feed(raw, 0, None) {
+            h.apply(&ev, t);
+            t += 10;
+        }
+        let e = h.entries(0, 50);
+        assert_eq!(e.len(), 1, "a tagged `C` was taken for the snippet: {e:?}");
+        assert_eq!(e[0].command, "fi");
+        assert_eq!(e[0].exit_code, Some(2));
     }
 
     #[test]

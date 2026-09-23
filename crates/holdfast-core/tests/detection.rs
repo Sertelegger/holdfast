@@ -184,6 +184,10 @@ const HOST_DEPENDENT_ROWS: &[(&str, &[Need])] = &[
         &[Need::Program("zsh")],
     ),
     (
+        "a_zsh_precmd_that_regenerates_its_prompt_keeps_the_marker_stream_and_the_history",
+        &[Need::Program("zsh")],
+    ),
+    (
         "fish_integration_emits_the_measured_marker_stream_and_exact_exit_codes",
         &[Need::Program("fish")],
     ),
@@ -2616,5 +2620,219 @@ async fn a_program_that_fakes_bracketed_paste_fools_tier_2() {
         "the corroborating signal disagrees, and T2 answers anyway: {s}"
     );
     assert_eq!(s["prompt"]["last_line"], "");
+    kill(&server, &id).await;
+}
+
+// ---------------------------------------------------------------------
+// GH #220 — a prompt regenerated at every prompt
+// ---------------------------------------------------------------------
+
+/// A stock bash whose `PROMPT_COMMAND` assigns `PS1` at every prompt —
+/// starship's shape (`starship_precmd` runs `PS1="$(starship prompt …)"`),
+/// with no starship, so CI needs nothing installed.
+///
+/// Through the environment rather than an rc file, which bash reads
+/// before it draws its first prompt (measured, and relied on by
+/// `already_marking_bash` too); `--norc` keeps the rest of the host's
+/// configuration out of it.
+fn regenerating_bash(ps1: &str) -> StartSessionArgs {
+    let mut env = term().expect("TERM");
+    env.insert("PROMPT_COMMAND".into(), format!("PS1={ps1:?}"));
+    StartSessionArgs {
+        command: Some("bash".into()),
+        args: vec!["--norc".into(), "--noprofile".into()],
+        env: Some(env),
+        ..Default::default()
+    }
+}
+
+/// GH #220's reproduction, minus starship: every entry of
+/// `get_command_history` came back `command: ""`, the session's first
+/// command was missing outright, and `osc133_source` still said
+/// `holdfast`. Measured on this row's shape before the fix: three entries
+/// for four commands, all empty, at `terminal_mode`.
+///
+/// `assert_marker_stream_and_exit_codes` is the whole assertion, and
+/// that is the point: a regenerated prompt must produce **the identical
+/// stream and history** a static one does — `D;0`, `A`, `B`, then `C`,
+/// `D;<code>`, `A`, `B` per command, three entries with text and codes,
+/// source `holdfast`.
+///
+/// Two arms. The scalar `PROMPT_COMMAND` is starship's own shape. The
+/// array arm puts the regenerator at **index 1**, which runs after
+/// anything composed into index 0, so the re-wrap has to be its own last
+/// element there. bash < 5.1 runs only index 0 of an array, so on such a
+/// host the array arm's regenerator never fires and the arm passes without
+/// testing anything; it is exercised wherever bash ≥ 5.1 is — which
+/// includes `ubuntu-24.04`'s 5.2.
+#[tokio::test]
+async fn a_prompt_regenerated_at_every_prompt_keeps_the_marker_stream_and_the_history() {
+    let rc = std::env::temp_dir().join(format!(
+        "holdfast-detection-array-pc-{}.bashrc",
+        std::process::id()
+    ));
+    std::fs::write(&rc, "PROMPT_COMMAND=(':' 'PS1=\"regen\\$ \"')\n").expect("write rc");
+    let array = StartSessionArgs {
+        command: Some("bash".into()),
+        args: vec![
+            "--noprofile".into(),
+            "--rcfile".into(),
+            rc.to_string_lossy().into_owned(),
+        ],
+        env: term(),
+        ..Default::default()
+    };
+    for (arm, args) in [("scalar", regenerating_bash("regen$ ")), ("array", array)] {
+        let server = HoldfastServer::new();
+        let id = start(&server, args).await;
+        assert_marker_stream_and_exit_codes(&server, &id, "bash").await;
+        // Without this the row could pass against a shell that never
+        // regenerated anything: only a live regenerator prints this prompt.
+        assert!(
+            raw(&server, &id).await.contains("regen$ "),
+            "{arm}: the regenerating PROMPT_COMMAND never ran"
+        );
+        kill(&server, &id).await;
+    }
+    let _ = std::fs::remove_file(&rc);
+}
+
+/// The **human** half of GH #220: what a person types during an `attach`
+/// takeover goes into the same PTY by the same write path, key by key, and
+/// was lost the same way. It adds one thing the agent's whole-line writes
+/// never exercise — a line edit — and at the owner's prompt that was lost
+/// a second time: starship's last row there is `⬢ [Docker] ❯ `, whose
+/// glyphs are three bytes each, and the repaint after a Ctrl-U stepped past
+/// it in *columns* while the scanner measured it in *bytes*. A complete
+/// command came back `[REDACTED:unresolved]`.
+///
+/// `LC_ALL=C.UTF-8` is what makes readline measure the prompt in columns.
+/// On a host without that locale readline falls back to bytes, the two
+/// counts agree, and the width half of this row passes without testing
+/// anything — the regeneration half still runs.
+#[tokio::test]
+async fn a_line_typed_and_edited_key_by_key_at_a_regenerated_prompt_is_recorded() {
+    let mut args = regenerating_bash("⬢ [x] ❯ ");
+    let env = args.env.as_mut().expect("env");
+    env.insert("LC_ALL".into(), "C.UTF-8".into());
+    let server = HoldfastServer::new();
+    let id = start(&server, args).await;
+    await_markers(&server, &id, 3).await;
+
+    // One key per write, as a terminal sends them, and each edit waits for
+    // the line editor to have drawn the last: readline skips a redisplay
+    // while input is pending, and a repaint it never drew tests nothing.
+    for key in "echo this is a long command".chars() {
+        keypress(&server, &id, &key.to_string()).await;
+    }
+    await_status(&server, &id, "the long line drawn", |s| {
+        s["prompt"]["last_line"]
+            .as_str()
+            .is_some_and(|l| l.ends_with("long command"))
+    })
+    .await;
+    keypress(&server, &id, "\u{15}").await; // Ctrl-U
+    await_status(&server, &id, "the line killed", |s| {
+        s["prompt"]["last_line"]
+            .as_str()
+            .is_some_and(|l| !l.contains("long command"))
+    })
+    .await;
+    for key in "echo HOLDFAST''_TYPED".chars() {
+        keypress(&server, &id, &key.to_string()).await;
+    }
+    keypress(&server, &id, "\r").await;
+
+    let h = await_closed_history(&server, &id, 1).await;
+    let entries = h["data"]["entries"].as_array().expect("entries");
+    assert_eq!(entries.len(), 1, "{h}");
+    assert_eq!(
+        entries[0]["command"], "echo HOLDFAST''_TYPED",
+        "the typed, edited line did not reach the history: {h}"
+    );
+    assert_eq!(entries[0]["exit_code"], 0, "{h}");
+    kill(&server, &id).await;
+}
+
+/// zsh's arm of GH #220. starship's own zsh integration sets `PROMPT` once
+/// with `promptsubst` and was never affected (measured); a configuration
+/// that assigns `PS1` from `precmd` was, exactly as bash was.
+///
+/// `ZDOTDIR` points at a directory holding only that `.zshrc`, and
+/// `--no-globalrcs` keeps the host's `/etc/zsh*` out of it — macOS ships
+/// an `/etc/zshrc` that sets its own prompt.
+#[tokio::test]
+async fn a_zsh_precmd_that_regenerates_its_prompt_keeps_the_marker_stream_and_the_history() {
+    if !have(Need::Program("zsh")) {
+        eprintln!("skipping: zsh not installed");
+        return;
+    }
+    let dir = std::env::temp_dir().join(format!("holdfast-detection-zdot-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).expect("mkdir");
+    std::fs::write(dir.join(".zshrc"), "precmd() { PS1='regen%# ' }\n").expect("write .zshrc");
+    let mut env = term().expect("TERM");
+    env.insert("ZDOTDIR".into(), dir.to_string_lossy().into_owned());
+    let server = HoldfastServer::new();
+    let id = start(
+        &server,
+        StartSessionArgs {
+            command: Some("zsh".into()),
+            args: vec!["--no-globalrcs".into()],
+            env: Some(env),
+            ..Default::default()
+        },
+    )
+    .await;
+    assert_marker_stream_and_exit_codes(&server, &id, "zsh").await;
+    assert!(
+        raw(&server, &id).await.contains("regen% "),
+        "the regenerating precmd never ran"
+    );
+    kill(&server, &id).await;
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// The regenerator Holdfast cannot outrun, and the wire saying so.
+///
+/// A hook appended to `PROMPT_COMMAND` *after* the snippet ran — what
+/// `eval "$(starship init bash)"` typed into a live session does — runs
+/// after the re-wrap, so the prompt markers stop for good. Exit codes
+/// still arrive, command text cannot, and until GH #220 `osc133_source`
+/// went on saying `holdfast`: the one field a caller checks before
+/// trusting that history.
+#[tokio::test]
+async fn a_prompt_regenerated_after_the_snippet_is_reported_as_degraded() {
+    let server = HoldfastServer::new();
+    let id = start(&server, bash()).await;
+    await_markers(&server, &id, 3).await;
+    send(
+        &server,
+        &id,
+        r#"PROMPT_COMMAND="$PROMPT_COMMAND"'; PS1="late\$ "'"#,
+    )
+    .await;
+    // `C` and `D;0` for that line, and then no `A`/`B` ever again.
+    await_markers(&server, &id, 5).await;
+    let s = status(&server, &id).await;
+    assert_eq!(
+        s["osc133_source"], "holdfast",
+        "nothing is known to be missing until a command is submitted: {s}"
+    );
+    send(&server, &id, "(exit 7)").await;
+    await_markers(&server, &id, 7).await;
+
+    let h = await_closed_history(&server, &id, 2).await;
+    let entries = h["data"]["entries"].as_array().expect("entries");
+    assert_eq!(entries.len(), 2, "{h}");
+    // The exit code survives the lost prompt; the text cannot, since no
+    // `B` ever armed the capture.
+    assert_eq!(entries[1]["exit_code"], 7, "{h}");
+    assert_eq!(entries[1]["command"], "", "{h}");
+    let s = status(&server, &id).await;
+    assert_eq!(
+        s["osc133_source"], "holdfast_degraded",
+        "a session whose history has lost its command text still claims \
+         Holdfast's integration is whole: {s}"
+    );
     kill(&server, &id).await;
 }

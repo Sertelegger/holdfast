@@ -70,6 +70,32 @@ pub fn detect_shell(command: &str, args: &[String]) -> Option<Shell> {
 /// - The `PS1` test makes the snippet a no-op when the user's own
 ///   configuration already emits OSC 133.
 ///
+/// **The prompt is re-wrapped at every prompt, not once (GH #220).** Until
+/// then the snippet wrapped `PS1` a single time, and anything that
+/// *regenerates* `PS1` erased the wrapping at the next prompt. starship is
+/// the measured case — `starship_precmd` assigns `PS1="$(starship prompt
+/// …)"` from `PROMPT_COMMAND` at every prompt — and the cost was the whole
+/// of `get_command_history`'s command text: `C` and `D` still arrived,
+/// so every entry had a correct exit code beside `command: ""`, and the
+/// session's first command was dropped outright (see `history`'s
+/// injection-line rule). `__holdfast_p` restores whichever wrapping is
+/// missing and does nothing when both survive, so a static `PS1` is
+/// untouched after the first call. It checks `PS0` as well; no framework
+/// measured regenerates it (starship sets it once at init), and the check
+/// is what keeps the next one from costing the `C`.
+///
+/// **It runs last**, which is the whole of the fix: after the user's
+/// hooks, so after whatever regenerated the prompt. For a scalar — or a
+/// one-element array — that is the end of the command list. For an array
+/// of more than one element it is a new last element, because a
+/// regenerator at index ≥ 1 runs after anything composed into index 0; the
+/// array form also gets bash's per-element `$?` restore, and it is last
+/// anyway, so no hook reads a status it left. **Residual:** a hook
+/// appended to `PROMPT_COMMAND` *after* the snippet ran — `eval "$(starship
+/// init bash)"` typed into a live session — runs after `__holdfast_p` and
+/// defeats it again. That is what `osc133_source: "holdfast_degraded"`
+/// exists to report.
+///
 /// Array `PROMPT_COMMAND` (bash ≥ 5.1) survives intact. Assigning a
 /// scalar to an existing array writes index 0, and `${PROMPT_COMMAND:+…}`
 /// reads index 0, so index 0 becomes `__holdfast_d "$?"; <user index 0>` and
@@ -115,16 +141,27 @@ pub fn detect_shell(command: &str, args: &[String]) -> Option<Shell> {
 const BASH_INTEGRATION: &str = concat!(
     r#"if [ -z "${HOLDFAST_SHELL_INTEGRATION-}" ] && [[ "${PS1-}" != *"133;A"* ]]; then "#,
     r#"HOLDFAST_SHELL_INTEGRATION=1; "#,
-    r#"PS0='\e]133;C;holdfast=1\a'"${PS0-}"; "#,
-    r#"PS1='\[\e]133;A;holdfast=1\a\]'"${PS1-}"'\[\e]133;B;holdfast=1\a\]'; "#,
+    r#"__holdfast_p() { [[ "${PS0-}" == *"133;C;holdfast=1"* ]] || PS0='\e]133;C;holdfast=1\a'"${PS0-}"; "#,
+    r#"[[ "${PS1-}" == *"133;B;holdfast=1"* ]] || PS1='\[\e]133;A;holdfast=1\a\]'"${PS1-}"'\[\e]133;B;holdfast=1\a\]'; }; "#,
+    r#"__holdfast_p; "#,
     r#"__holdfast_d() { printf '\033]133;D;%s;holdfast=1\007' "${1:-0}"; return "${1:-0}"; }; "#,
     r#"PROMPT_COMMAND='__holdfast_d "$?"'"${PROMPT_COMMAND:+; $PROMPT_COMMAND}"; "#,
+    r#"(( ${#PROMPT_COMMAND[@]} > 1 )) && PROMPT_COMMAND+=(__holdfast_p) || PROMPT_COMMAND+='; __holdfast_p'; "#,
     r#"fi"#,
 );
 
 /// zsh: `precmd` carries `D;<code>`, `preexec` carries `C`, and `PS1`
 /// carries `A`/`B` inside `%{…%}` so the markers are zero-width.
 /// `local s=$?` must be the first statement in `precmd`.
+///
+/// **`precmd` re-wraps `PS1` when a hook regenerated it**, for bash's
+/// reason (GH #220; see `BASH_INTEGRATION`). starship's zsh integration does
+/// not need it — it sets `PROMPT` once, with `promptsubst`, and the wrapping
+/// survives (measured) — but a configuration that assigns `PS1` from a
+/// `precmd` does, and lost every command's text exactly as bash did.
+/// Holdfast's hook is appended at injection, after every hook the rc file
+/// registered, and zsh runs the bare `precmd` function before any
+/// `precmd_functions` entry, so it is last for both.
 ///
 /// **The bash `$?` defect has no zsh mirror. Measured before anything here
 /// was changed, on zsh 5.9, through a real PTY, and *not* inferred from
@@ -150,17 +187,22 @@ const BASH_INTEGRATION: &str = concat!(
 /// **no test in this workspace can distinguish its presence from its
 /// absence on zsh 5.9** and none pretends to. It is kept as the mirror of
 /// bash's, where the same line is load-bearing, and because a shell that
-/// did *not* restore independently would need it. Also measured: zsh runs
-/// `precmd_functions` entries **before** the bare `precmd` function, so a
-/// user hook typed into a live session always lands after Holdfast's — the
-/// arrangement in which the `return` would matter is not reachable from
-/// inside a session at all.
+/// did *not* restore independently would need it.
+///
+/// **Corrected by re-measurement (GH #220): zsh 5.9 runs the bare `precmd`
+/// function *first*, then `precmd_functions` in order** — whichever was
+/// defined first. This comment said the reverse. Nothing depended on it
+/// for `$?`, which zsh restores before every hook either way, but the
+/// re-wrap above depends on the true order, and it was measured rather
+/// than taken from here.
 const ZSH_INTEGRATION: &str = concat!(
     r#"if [ -z "${HOLDFAST_SHELL_INTEGRATION-}" ] && [[ "${PS1-}" != *"133;A"* ]]; then "#,
     r#"HOLDFAST_SHELL_INTEGRATION=1; "#,
     r#"__holdfast_preexec() { printf '\033]133;C;holdfast=1\007' }; "#,
-    r#"__holdfast_precmd() { local s=$?; printf '\033]133;D;%s;holdfast=1\007' "$s"; return $s }; "#,
-    "PS1=$'%{\\e]133;A;holdfast=1\\a%}'\"${PS1-}\"$'%{\\e]133;B;holdfast=1\\a%}'; ",
+    r#"__holdfast_p() { [[ "${PS1-}" == *"133;B;holdfast=1"* ]] || "#,
+    "PS1=$'%{\\e]133;A;holdfast=1\\a%}'\"${PS1-}\"$'%{\\e]133;B;holdfast=1\\a%}'; }; ",
+    r#"__holdfast_precmd() { local s=$?; printf '\033]133;D;%s;holdfast=1\007' "$s"; __holdfast_p; return $s }; "#,
+    r#"__holdfast_p; "#,
     r#"autoload -Uz add-zsh-hook; "#,
     r#"add-zsh-hook precmd __holdfast_precmd; "#,
     r#"add-zsh-hook preexec __holdfast_preexec; "#,

@@ -104,6 +104,23 @@ pub enum Osc133Source {
     /// *partial* foreign integration. Reachable only because §8.5.1's rule
     /// yields per letter rather than per source.
     Mixed,
+    /// Every marker seen carries `holdfast=1` — but the **most recent
+    /// command's `C` arrived with no `B` in front of it** since the marker
+    /// that closed the one before. Holdfast's snippet is installed and its
+    /// `C`/`D` fire; its prompt markers are not reaching the terminal,
+    /// because something regenerates the prompt after Holdfast wrapped it
+    /// (GH #220: starship rewrites `PS1` at every prompt).
+    ///
+    /// **What it costs, which is why it is not `holdfast`.** With no `B`
+    /// the echo capture never arms, so every `get_command_history` entry
+    /// reports `command: ""` beside an exit code that is still correct —
+    /// a well-formed history an agent cannot match to its commands. Before
+    /// this value existed the session said `holdfast`, the one answer a
+    /// caller checks to decide to trust that history. The snippet now
+    /// re-wraps the prompt every cycle, so reaching this means a prompt
+    /// framework has defeated *that* too, and this is what makes the next
+    /// one visible rather than silent.
+    HoldfastDegraded,
 }
 
 impl Osc133Source {
@@ -112,6 +129,7 @@ impl Osc133Source {
             Self::Holdfast => "holdfast",
             Self::External => "external",
             Self::Mixed => "mixed",
+            Self::HoldfastDegraded => "holdfast_degraded",
         }
     }
 }
@@ -126,6 +144,16 @@ pub struct Osc133Event {
     /// Offset just past the sequence's terminator.
     pub end: u64,
     pub marker: Osc133,
+    /// Whether the marker carried §8.5.1's `holdfast=1` tag — i.e. it was
+    /// emitted by Holdfast's own snippet rather than by a foreign emitter.
+    ///
+    /// Read by the history ring's injection-line rule (§8.5.1 rule 5),
+    /// which needs it for a structural reason: **Holdfast's own `C` can
+    /// never mark the line that installed it**, because the snippet
+    /// defines its `C` emitter while that line is executing — after `PS0`
+    /// was expanded, after `preexec` ran. So only a *foreign* `C` can be
+    /// the injection line, and a tagged one is always a real command.
+    pub holdfast: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -191,9 +219,30 @@ impl TailLine {
         self.truncated = false;
     }
 
-    /// How many printable bytes the current line holds.
-    fn len(&self) -> usize {
-        self.buf.len()
+    /// How many **characters** the current line holds: every byte that is
+    /// not a UTF-8 continuation byte (`0x80..=0xBF`) starts one.
+    ///
+    /// **This, and not `len`, is the width a line editor steps past**, and
+    /// the difference was measured on a real prompt (GH #220). starship's
+    /// last row on the owner's machine is `⬢ [Docker] ❯ ` — 13 columns and
+    /// 17 bytes, because `⬢` and `❯` are three bytes each. readline's
+    /// Ctrl-U repaint steps past it with thirteen `CSI C`, so a byte count
+    /// said the repaint had resumed four columns *inside* the prompt, the
+    /// debt stayed unpaid, and a complete `echo short` typed after the
+    /// kill came back as `[REDACTED:unresolved]` — while
+    /// `bash --norc`'s all-ASCII `bash-5.2$ ` recorded it correctly.
+    ///
+    /// A character is not a column either: a double-width glyph (CJK, most
+    /// emoji) is one character and two columns. That errs **low**, which is
+    /// the safe side of `settle_capture_debt`'s test — a wrap redraw
+    /// repaints its continuation row from column 0 with no cursor-forward,
+    /// and zero never reaches a positive width however low it is counted.
+    /// A byte count errs high, which refuses a complete command.
+    fn columns(&self) -> usize {
+        self.buf
+            .iter()
+            .filter(|b| !(0x80..=0xbf).contains(*b))
+            .count()
     }
 
     /// A backspace un-draws the last cell; it does not un-evict the front,
@@ -318,6 +367,16 @@ pub struct ModeScanner {
     /// is decided by the reader thread, which is the only place that knows
     /// (§8.3, REQ-PD-025).
     foreground: Option<i32>,
+    /// Whether a `B` has been used since the last `C` or `D` — the span a
+    /// command's `C` should find a `B` in. See `prompt_markers_missing`.
+    b_since_boundary: bool,
+    /// The most recent **Holdfast-tagged** `C` arrived with no `B` in
+    /// front of it (GH #220). What `Osc133Source::HoldfastDegraded` reports.
+    ///
+    /// The most recent, not sticky: a prompt framework that defeats the
+    /// wrapping does so at every prompt, and a session that recovers — the
+    /// user resets `PS1` by hand — should stop saying it is degraded.
+    prompt_markers_missing: bool,
 }
 
 impl Default for ModeScanner {
@@ -349,6 +408,8 @@ impl ModeScanner {
             holdfast_letters: [false; 4],
             pending_cr: false,
             foreground: None,
+            b_since_boundary: false,
+            prompt_markers_missing: false,
         }
     }
 
@@ -377,6 +438,7 @@ impl ModeScanner {
         let any_holdfast = (0..4).any(|i| self.holdfast_letters[i] && !self.foreign_letters[i]);
         match (any_holdfast, any_foreign) {
             (false, false) => None,
+            (true, false) if self.prompt_markers_missing => Some(Osc133Source::HoldfastDegraded),
             (true, false) => Some(Osc133Source::Holdfast),
             (false, true) => Some(Osc133Source::External),
             (true, true) => Some(Osc133Source::Mixed),
@@ -921,11 +983,12 @@ impl ModeScanner {
             return;
         };
         if let Some(rest) = payload.strip_prefix("133;") {
-            if let Some(marker) = self.osc133(rest) {
+            if let Some((marker, holdfast)) = self.osc133(rest) {
                 events.push(Osc133Event {
                     start: self.seq_start,
                     end,
                     marker,
+                    holdfast,
                 });
             }
             return;
@@ -969,7 +1032,7 @@ impl ModeScanner {
     /// fish emits its own `A` before calling `fish_prompt` and its own `C`
     /// before Holdfast's; that ordering is a property of one emitter and is
     /// not guaranteed.
-    fn osc133(&mut self, rest: &str) -> Option<Osc133> {
+    fn osc133(&mut self, rest: &str) -> Option<(Osc133, bool)> {
         let kind = rest.as_bytes().first().copied()?;
         // Letters Holdfast models. `P`, `L` and anything else stay inert:
         // they are not evidence about whether a command is running and
@@ -1014,6 +1077,7 @@ impl ModeScanner {
             b'B' => {
                 self.capture = Some(String::new());
                 self.capture_debt = 0;
+                self.b_since_boundary = true;
                 // **The column the command starts at.** `tail` holds the
                 // printable bytes since the last `\r`/`\n`, which at `B`
                 // is the prompt's final row — exactly the width a repaint
@@ -1026,7 +1090,7 @@ impl ModeScanner {
                 self.prompt_columns = if self.tail.truncated {
                     0
                 } else {
-                    self.tail.len()
+                    self.tail.columns()
                 };
                 Osc133::CommandStart
             }
@@ -1036,11 +1100,19 @@ impl ModeScanner {
                 // to a `\r` and is not in `command`.
                 let truncated = self.capture_debt > 0;
                 self.capture_debt = 0;
+                // GH #220: Holdfast's own `C` with no `B` since the last
+                // boundary means its prompt wrapping is being overwritten.
+                // A *foreign* `C` says nothing about Holdfast's snippet.
+                if is_holdfast {
+                    self.prompt_markers_missing = !self.b_since_boundary;
+                }
+                self.b_since_boundary = false;
                 Osc133::OutputStart { command, truncated }
             }
             b'D' => {
                 self.capture = None;
                 self.capture_debt = 0;
+                self.b_since_boundary = false;
                 // `D` alone means "finished, status unknown"; `D;<n>`
                 // carries it.
                 let exit_code = rest[1..]
@@ -1064,7 +1136,13 @@ impl ModeScanner {
         // `D`/`A` arrive in the burst in which it regains the terminal.
         self.modes.osc133_owner = self.foreground;
         self.last_marker = Some(kind);
-        Some(marker)
+        Some((marker, is_holdfast))
+    }
+
+    /// Whether the most recent Holdfast-tagged `C` arrived with no `B` in
+    /// front of it (GH #220). See `prompt_markers_missing`.
+    pub fn prompt_markers_missing(&self) -> bool {
+        self.prompt_markers_missing
     }
 }
 
@@ -2067,5 +2145,128 @@ mod tests {
         let ev = s.feed(b"\x1b]133;A\x07", 1005, None);
         assert_eq!(ev[0].start, 1005);
         assert_eq!(ev[0].end, 1013);
+    }
+
+    /// GH #220: `osc133_source` said `holdfast` for a session whose history
+    /// was all `command: ""`, because Holdfast's `C` and `D` kept arriving
+    /// after starship had regenerated `PS1` out from under its `A`/`B`.
+    mod prompt_markers_missing {
+        use super::*;
+
+        /// The shape the dogfood pass measured, reduced to its markers:
+        /// the injection line's own `D`, a prompt with no markers at all,
+        /// then Holdfast's `C` and `D` for a real command.
+        const REGENERATED: &[u8] = b"\x1b]133;D;0;holdfast=1\x07user@host ~ \xe2\x9d\xaf \
+            echo hi\r\n\x1b]133;C;holdfast=1\x07hi\r\n\x1b]133;D;0;holdfast=1\x07";
+
+        #[test]
+        fn a_holdfast_c_with_no_b_before_it_degrades_the_source() {
+            let mut s = ModeScanner::new();
+            s.feed(b"\x1b]133;D;0;holdfast=1\x07", 0, None);
+            assert_eq!(
+                s.osc133_source(),
+                Some(Osc133Source::Holdfast),
+                "nothing is known to be missing until a command is submitted"
+            );
+            s.feed(&REGENERATED[21..], 21, None);
+            assert_eq!(s.osc133_source(), Some(Osc133Source::HoldfastDegraded));
+            assert_eq!(Osc133Source::HoldfastDegraded.as_str(), "holdfast_degraded");
+        }
+
+        /// The negative that keeps this from reading every session as
+        /// degraded, and the recovery: the next command with a `B` in
+        /// front of it says `holdfast` again.
+        #[test]
+        fn a_c_with_its_b_is_not_degraded_and_a_session_that_recovers_says_so() {
+            let mut s = ModeScanner::new();
+            s.feed(REGENERATED, 0, None);
+            assert_eq!(s.osc133_source(), Some(Osc133Source::HoldfastDegraded));
+            s.feed(
+                b"\x1b]133;A;holdfast=1\x07$ \x1b]133;B;holdfast=1\x07ls\r\n\x1b]133;C;holdfast=1\x07",
+                500,
+                None,
+            );
+            assert_eq!(s.osc133_source(), Some(Osc133Source::Holdfast));
+            assert!(!s.prompt_markers_missing());
+        }
+
+        /// A foreign `C` with no `B` says nothing about Holdfast's snippet —
+        /// fish 4.0.2 marks with `A`, `C`, `D` and never `B` — so it cannot
+        /// set the flag. (The source is `mixed` there for its own reason.)
+        #[test]
+        fn a_foreign_c_with_no_b_does_not_set_the_flag() {
+            let mut s = ModeScanner::new();
+            s.feed(b"\x1b]133;D;0;holdfast=1\x07\x1b]133;C\x07", 0, None);
+            assert!(!s.prompt_markers_missing());
+        }
+
+        /// The `D` boundary is load-bearing: a `B` from the *previous*
+        /// prompt cycle must not vouch for a `C` after the `D` that closed
+        /// it.
+        #[test]
+        fn a_b_from_an_earlier_cycle_does_not_vouch_for_a_later_c() {
+            let mut s = ModeScanner::new();
+            s.feed(
+                b"\x1b]133;B;holdfast=1\x07\x1b]133;D;0;holdfast=1\x07\x1b]133;C;holdfast=1\x07",
+                0,
+                None,
+            );
+            assert!(s.prompt_markers_missing());
+        }
+
+        #[test]
+        fn every_event_says_whether_it_carried_the_tag() {
+            let mut s = ModeScanner::new();
+            let ev = s.feed(
+                b"\x1b]133;C;holdfast=1\x07\x1b]133;D;0\x07\x1b]133;A;x=holdfast=1\x07",
+                0,
+                None,
+            );
+            assert_eq!(
+                ev.iter().map(|e| e.holdfast).collect::<Vec<_>>(),
+                vec![true, false, false]
+            );
+        }
+    }
+
+    /// The owner's starship prompt, measured (GH #220): the last row is
+    /// `⬢ [Docker] ❯ `, 13 columns in 17 bytes, and readline's Ctrl-U
+    /// repaint steps past it with thirteen `CSI C` before painting the
+    /// shorter line. The colour escapes are the measured ones; the rows
+    /// above it are omitted because the tail line restarts at `\r\n`.
+    #[test]
+    fn a_repaint_past_a_prompt_with_multibyte_glyphs_keeps_its_command() {
+        let mut raw = b"\x1b]133;A;holdfast=1\x07\r\n\x1b[1;2;31m\xe2\xac\xa2 [Docker]\x1b[0m \
+                        \x1b[1;32m\xe2\x9d\xaf\x1b[0m \x1b]133;B;holdfast=1\x07\
+                        echo this is a long command\r"
+            .to_vec();
+        for _ in 0..13 {
+            raw.extend_from_slice(b"\x1b[C");
+        }
+        raw.extend_from_slice(b"\x1b[Kecho short\r\n\x1b[?2004l\r\x1b]133;C;holdfast=1\x07");
+        let (_, ev) = scan(&raw);
+        assert_eq!(
+            ev.last().unwrap().marker,
+            Osc133::OutputStart {
+                command: "echo short".into(),
+                truncated: false,
+            },
+            "a complete command was refused because the prompt was measured in bytes"
+        );
+
+        // The paired arm: the same prompt, and a wrap redraw that repaints
+        // a continuation row from column 0 — the front really is gone, and
+        // counting characters must not change that.
+        let raw = b"\x1b]133;A;holdfast=1\x07\xe2\xac\xa2 [Docker] \xe2\x9d\xaf \
+                    \x1b]133;B;holdfast=1\x07export K=AKIAIOSF\rODNN7EXAMPLE\r\n\
+                    \x1b]133;C;holdfast=1\x07";
+        let (_, ev) = scan(raw);
+        assert_eq!(
+            ev.last().unwrap().marker,
+            Osc133::OutputStart {
+                command: "ODNN7EXAMPLE".into(),
+                truncated: true,
+            }
+        );
     }
 }

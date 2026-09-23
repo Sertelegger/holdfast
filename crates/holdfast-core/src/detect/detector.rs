@@ -313,6 +313,24 @@ impl PromptDetector {
             DetectionTier::Heuristic
         };
         let at_marker = matches!(self.scanner.last_marker(), Some(b'A') | Some(b'B'));
+        // **The T1 executing rung does not stand on a `D` in a session
+        // whose prompt markers are known not to arrive** (GH #220).
+        //
+        // Between `D` and the next `A` a shell is drawing its prompt, and
+        // answering `Executing` there is right because it is momentary —
+        // `a_completed_command_is_not_yet_a_prompt`. When the prompt is
+        // being regenerated over Holdfast's wrapping, `A` never comes, so
+        // "momentary" becomes "for the rest of the session": every idle
+        // prompt reads `Executing` / `semantic` / 0.00 and a pattern-less
+        // wait runs out its deadline. bash ≥ 5.1 hides it behind the
+        // bracketed-paste rung above; a shell with the paste off does not.
+        //
+        // Scoped as narrowly as the evidence: a `D` alone still means
+        // "between commands", and only a session that has already shown a
+        // `B`-less `C` loses the rung — to T2 and T3, which is where a
+        // session with no working T1 prompt signal belongs.
+        let t1_executing = t1
+            && !(self.scanner.last_marker() == Some(b'D') && self.scanner.prompt_markers_missing());
 
         // §8.3's echo rung, and the two flags are tri-state independently.
         //
@@ -386,7 +404,7 @@ impl PromptDetector {
                 0.95,
                 "bracketed paste is enabled".to_string(),
             )
-        } else if t1 {
+        } else if t1_executing {
             (
                 InteractionMode::Executing,
                 DetectionTier::Semantic,
@@ -1475,6 +1493,50 @@ mod tests {
             s.detection_tier,
             DetectionTier::TerminalMode,
             "the REPL drove the signal itself and still holds the terminal"
+        );
+    }
+
+    /// GH #220's classifier half. In a session whose prompt is regenerated
+    /// over Holdfast's wrapping no `A` ever follows a `D`, so the momentary
+    /// "between commands" answer became the answer at every idle prompt:
+    /// `Executing` / `semantic` / 0.00, and a pattern-less wait that runs
+    /// out its deadline. bash ≥ 5.1's bracketed paste hides it; this row
+    /// drives no paste, which is a user with it disabled or an older bash.
+    #[test]
+    fn a_session_whose_prompt_markers_never_arrive_is_not_executing_at_its_prompt() {
+        let (mut d, start, now) = detector();
+        d.feed_at(
+            b"\x1b]133;D;0;holdfast=1\x07user@host:~$ ls\r\n\x1b]133;C;holdfast=1\x07\
+              out\r\n\x1b]133;D;0;holdfast=1\x07user@host:~$ ",
+            0,
+            None,
+            start,
+        );
+        assert!(d.scanner.prompt_markers_missing(), "fixture: no `B`");
+        let s = d.snapshot_at(true, ld(false, false), None, None, now);
+        assert_eq!(
+            (s.interaction_mode, s.detection_tier),
+            (InteractionMode::AtPrompt, DetectionTier::Heuristic),
+            "{s:?}"
+        );
+
+        // The healthy session between the same `D` and its `A` — the state
+        // `a_completed_command_is_not_yet_a_prompt` pins — is unchanged:
+        // there the `D` is momentary, and a `B` in front of the `C` is
+        // what says so.
+        let (mut d, start, now) = detector();
+        d.feed_at(
+            b"\x1b]133;A;holdfast=1\x07$ \x1b]133;B;holdfast=1\x07ls\r\n\
+              \x1b]133;C;holdfast=1\x07out\r\n\x1b]133;D;0;holdfast=1\x07",
+            0,
+            None,
+            start,
+        );
+        let s = d.snapshot_at(true, ld(false, false), None, None, now);
+        assert_eq!(
+            (s.interaction_mode, s.detection_tier),
+            (InteractionMode::Executing, DetectionTier::Semantic),
+            "{s:?}"
         );
     }
 

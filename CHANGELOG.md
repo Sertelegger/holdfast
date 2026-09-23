@@ -13,6 +13,13 @@ is cut, named and published is in
 
 ### Added
 
+- `osc133_source` gains a fourth value, **`holdfast_degraded`**: every marker
+  is Holdfast's own, but the latest command's `C` arrived with no `B` in
+  front of it — the prompt is being regenerated over Holdfast's wrapping, so
+  exit codes are real and `command` text cannot be captured. It used to say
+  `holdfast` there, the one answer a caller checks before trusting the
+  history ([#220]).
+
 - A `windows-2022` CI job: native MSVC clippy over `--all-targets`, the source
   guards, the `#[cfg(windows)]` CLI arms executed, and a filtered `--lib` over
   the modules whose Windows arm differs from its Unix one. The full `--lib` is
@@ -647,6 +654,45 @@ is cut, named and published is in
   optimized both.
 
 ### Fixed
+
+- **A prompt that regenerates `PS1` at every prompt — starship, the owner's —
+  emptied `get_command_history` and dropped the session's first command**
+  ([#220]). Holdfast wrapped `PS1` with its `A`/`B` markers once; starship's
+  `PROMPT_COMMAND` hook assigns `PS1` afresh before every prompt, so from the
+  first prompt on no `B` arrived, the echo capture never armed, and every
+  entry was `command: ""` beside a correct exit code. Worse, the first command
+  was suppressed outright: its `C` looked like Holdfast's own injection line
+  to the history ring, which took any first `C` with no `B` before it for
+  one. Measured on this machine's starship bash before the fix: three entries
+  for four commands, all empty, at `terminal_mode`, while `osc133_source`
+  said `holdfast`. Now:
+
+  - the bash snippet re-wraps the prompt (and `PS0`) from the **end** of
+    `PROMPT_COMMAND`, after whatever regenerated it — as its own element
+    when `PROMPT_COMMAND` is an array, so a regenerator at index ≥ 1 cannot
+    run after it — and zsh's `precmd` does the same for a configuration that
+    assigns `PS1` there (starship's zsh integration sets `PROMPT` once and
+    was measured unaffected);
+  - the injection-line rule applies only to a *foreign* `C`: Holdfast's own
+    `C` cannot mark the line that installed it, because the snippet defines
+    that emitter while the line runs;
+  - a prompt width is counted in characters, not bytes. The owner's starship
+    prompt ends `⬢ [Docker] ❯ ` — 13 columns, 17 bytes — so a human's Ctrl-U
+    at it came back as `[REDACTED:unresolved]` for a command that was whole;
+  - when the prompt markers still do not arrive (a hook appended *after*
+    the snippet ran, such as `eval "$(starship init bash)"` typed into a live
+    session) `osc133_source` says `holdfast_degraded`, and the T1 rung no
+    longer holds such a session at `Executing` / `semantic` on the `D` that
+    no `A` will ever follow.
+
+  Re-measured against the real starship: 4 of 4 entries with their text and
+  exit codes, at `semantic`, in bash and in zsh. The CI rows need no
+  starship — they drive a `PROMPT_COMMAND` (and a zsh `precmd`) that
+  regenerates the prompt every cycle.
+
+  Also corrected in passing: `shell.rs` said zsh runs `precmd_functions`
+  before the bare `precmd`. zsh 5.9 does the reverse, measured.
+
 - **The guard that was supposed to refuse an empty release body could not
   fire, and the release procedure did not mention `Cargo.lock`.** Both are
   release-time defects that no test or check would have caught, because the
@@ -2011,3 +2057,4 @@ residuals that are known and accepted.
 [#203]: https://github.com/Sertelegger/holdfast/issues/203
 [#202]: https://github.com/Sertelegger/holdfast/issues/202
 [#206]: https://github.com/Sertelegger/holdfast/issues/206
+[#220]: https://github.com/Sertelegger/holdfast/issues/220
