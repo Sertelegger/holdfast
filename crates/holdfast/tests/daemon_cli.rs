@@ -1915,11 +1915,13 @@ fn version_reports_the_protocol_version() {
     // → 1.1 for `Attach.terminal` (GH #66), and 1.1 → 1.2 for
     // `holdfast/cancel` and `Request.cancel_token` (GH #127), and 1.2 →
     // 1.3 for `SecretInput.allow_echo` (GH #137), and 1.3 → 1.4 for
-    // `ServerFrame::OutputGap` (GH #200), each alongside a new
+    // `ServerFrame::OutputGap` (GH #200), and 1.4 → 1.5 for
+    // `ServerFrame::ScreenSnapshot` and `AwaitingSecret.raised_by` (GH
+    // #235, GH #236), each alongside a new
     // golden — the version and the recorded shape move together or the
     // wire-shape guard fails, which is the pairing that makes this
     // literal safe to update rather than a rubber stamp.
-    assert!(out.contains("protocol 1.4"), "{out}");
+    assert!(out.contains("protocol 1.5"), "{out}");
     assert!(out.contains(env!("CARGO_PKG_VERSION")), "{out}");
 }
 

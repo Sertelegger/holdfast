@@ -335,6 +335,14 @@ impl ScreenTracker {
         self.parsed_bytes
     }
 
+    /// The stream offset the live grid reflects — every byte before it
+    /// parsed, none after — or `None` while Tier B is not running.
+    /// `Session::stream_floor` reads it so an attach can resume its
+    /// stream where its opening screen ends (GH #235).
+    pub fn tracked_head(&self) -> Option<u64> {
+        self.parser.as_ref().map(|_| self.consumed_head)
+    }
+
     /// One PTY chunk, straight off the reader thread.
     ///
     /// `start` is the chunk's absolute offset in the raw stream. **The

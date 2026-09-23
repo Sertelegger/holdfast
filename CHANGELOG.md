@@ -20,6 +20,14 @@ is cut, named and published is in
   `holdfast` there, the one answer a caller checks before trusting the
   history ([#220]).
 
+- Attach protocol **1.5**: `ServerFrame::ScreenSnapshot`, the session's
+  screen as it stands when a client joins — sent once, after `Attached` and
+  before the first `Output`, and built from `get_screen_state`'s own capture
+  and mask rather than from a second rendering of the ring buffer; and an
+  optional `AwaitingSecret.raised_by` (`echo_drop` | `tool_call`, §9.4's
+  spelling) saying whose words `prompt_text` is. Additive both ways: a 1.4
+  client skips the frame as `Unknown` and ignores the key ([#235], [#236]).
+
 - A `windows-2022` CI job: native MSVC clippy over `--all-targets`, the source
   guards, the `#[cfg(windows)]` CLI arms executed, and a filtered `--lib` over
   the modules whose Windows arm differs from its Unix one. The full `--lib` is
@@ -287,6 +295,69 @@ is cut, named and published is in
   `scripts/mcp-smoke.sh` carries one paired row per tool, and
   `tests/tool_arguments.rs` drives both transports from the router's own
   tool list.
+
+- **`holdfast attach` and `holdfast watch` open with the session's current
+  screen** ([#235]). Attaching to a session idling at its prompt rendered the
+  banner and nothing else until somebody pressed Enter, and `watch` rendered
+  nothing at all. The screen is painted over the terminal with the cursor
+  where the child left it and the join notice on its top row — not
+  inserted above the prompt, which over a painted screen pushed a prompt on
+  the last row off the bottom — and without touching the terminal's modes,
+  so a detach from `vim` does not leave the human inside the alternate
+  screen. A full-screen program's rows are never moved to make room for the
+  notice, which lies over its blank last row or its top row instead: `vim`
+  addresses rows absolutely, and a picture one row low put every edit after
+  the join on the wrong line. Then the live stream resumes where the picture ends — or a few
+  bytes before it, never after: the resume point is read
+  before the capture, so the error a busy session can produce is a few bytes
+  drawn twice rather than a few bytes never drawn. `watch` into a file paints
+  nothing, because a picture in a capture is bytes the session never printed,
+  and says it is watching on stderr instead. The picture is masked for both
+  roles — it is a re-rendering of history, not the live stream `interactive`
+  is entitled to raw — and plain text: colour returns as the child redraws.
+  **It is exactly as masked as `get_screen_state`'s grid, because it is that
+  grid**, and so it needs [#224]'s key mask on the grid: without it a late
+  `watch` was shown the body of a private key cut short (`head -n 20
+  key.pem`), or of one whose header had scrolled off, that an observer
+  attached during the print never saw — a leak new to the observer surface,
+  since a late `watch` was shown nothing from before its join.
+  `a_client_joining_after_a_key_was_printed_is_shown_none_of_its_body` is red
+  on any tree without that fix.
+- **A `slow_consumer` detach now means the client stopped reading, not that
+  it read too slowly** ([#210]). The daemon detaches a connection whose
+  socket has accepted no bytes for 30 seconds while bytes were waiting for
+  it (`ATTACH_STALL_TIMEOUT`); a client that drains, however slowly, is never
+  detached. A client that resumes within one more stall bound is told why
+  (`Detached`), and one that does not is closed on rather than waited for.
+  **A gap now means the ring evicted the bytes**, so `holdfast logs` no
+  longer has them either, and the client says so instead of sending the
+  operator there.
+- **`holdfast attach` holds the terminal after a `slow_consumer` detach
+  instead of exiting** ([#210]). Exiting sent whatever the human typed next —
+  into what they believed was the session — to their local shell. Nothing
+  typed while held goes anywhere; `Enter` reattaches with the screen
+  repainted, `Ctrl-B d` leaves. No letter does either, because a human who
+  has not read the notice is typing a word. A view that missed output this
+  way never exits 0: a clean detach later exits 3, and any other ending keeps
+  its own status.
+- **The attach secret prompt is labelled, says whose words it quotes, and no
+  longer prints the child's prompt a second time** ([#236]). An echo-drop
+  request's text is the line the child already drew and is not repeated; a
+  tool call's is shown as the agent's. An *adopting* call's text is still not
+  shown — §5.2 keeps it off the wire so an agent cannot relabel a prompt a
+  human may already be typing into.
+- `limits.output_broadcast_capacity` **is live** ([#210]): `start_session`
+  sizes the output broadcast from it. It was accepted, validated and
+  documented as a control while the hardcoded `OUTPUT_BROADCAST_FRAMES` sized
+  every channel. It is no longer an attach client's loss bound either (see
+  *Fixed*), so it decides how often a lagging consumer takes the ring-buffer
+  path, not what it is shown. **It has a ceiling now that it is live**,
+  `MAX_OUTPUT_BROADCAST_FRAMES` (sixteen times the default), and a larger
+  value is refused at load: every slot is allocated when a session starts,
+  and at 4,194,304 each `start_session` cost about 230 MB of daemon RSS while
+  1,000,000,000 aborted the daemon with every session in it. A `config.toml`
+  that set it past the ceiling while it was inert now fails to load and says
+  why.
 
 - **`scripts/ci-hygiene.sh`'s release-trigger gate is an allowlist.** It was a
   denylist of four triggers — `branches`, `schedule`, `pull_request`,
@@ -1157,6 +1228,55 @@ is cut, named and published is in
   it. How much the marker masks is the other half of GH #242 and is not
   changed here.
 
+- **Ordinary bursts no longer detach `holdfast watch`, or `attach`** ([#210]).
+  1,500 lines of test output detached `watch` four runs in four on the
+  dogfood pass, showing it between 4.5% and 32% of the lines; `ps`, `git
+  diff` and a build with warnings did the same. Two bounds in series did it,
+  and both stopped being loss bounds:
+  - **the per-connection queue is bounded in bytes and pauses instead of
+    detaching.** It was 64 *frames*, a frame being one PTY `read`, so a
+    line-at-a-time child filled it in 64 lines. The forwarder now batches a
+    backlog into one `Output` of up to `MAX_BATCH_BYTES` (64 KiB), stops
+    reading when `ATTACH_QUEUE_BYTES` (256 KiB) is queued, and resumes when
+    the writer drains;
+  - **a lagging connection resumes from the ring buffer**, like every other
+    offset-aware consumer (REQ-C-006). The 256-frame broadcast was a
+    connection's whole headroom; the ring holds a megabyte by default and
+    counts bytes. A connection now loses only what the ring has already
+    evicted, and is told the exact count as an `OutputGap`.
+
+  The revert [#200] recorded — a megabyte of queue headroom, after which a
+  client that drained nothing was never detached — was the first of these
+  without a way to detach a stopped client other than by occupancy. The
+  stall bound under *Changed* is that way, and it is what let the bound be
+  raised. §7.5's `Detached` still arrives for every ending that has a reader
+  to receive it.
+- **`a_slow_consumer_is_detached_and_the_reader_keeps_running`'s scenario is
+  now a row per claim** ([#210]): a stopped client detached in bounded time
+  with the reader and a draining client untouched; told why if it resumes
+  inside the grace; closed on if it does not; a slow reader never detached,
+  with shown-plus-reported equal to printed, byte for byte, across a ring it
+  falls behind; and the dogfood burst reaching an `interactive` and an
+  `observer` client whole.
+- **A secret the agent asked for before the child read it reaches the child
+  whole** ([#236]'s review). When `request_secret_input` raised the request
+  and the child reached `read -s` afterwards, the echo-drop edge announced
+  the same request again, and `holdfast attach` took the second announcement
+  as a new prompt: it printed the label twice and emptied what the human had
+  typed, so `ab`, the announcement, then `c` + Enter sent the child `c` —
+  and the tool reported success. An announcement of the request being typed,
+  or of one just answered, now changes nothing; a request the human abandoned
+  with `Ctrl-C` is still drawn again, because that is how they learn the
+  child is now reading. `holdfast watch` reports each request once.
+- **`holdfast watch` no longer ignores a `Ctrl-C` that lands while it is
+  drawing** ([#210]'s review). Its listener was rebuilt on every pass of the
+  loop, and a `SIGINT` delivered between two of them did nothing at all — the
+  watch's own handler had already replaced the default action. The opening
+  screen, a synchronous paint of the whole terminal, made that window easy to
+  hit: a `SIGINT` sent the moment it appeared was sometimes ignored, and one
+  watch sat for eleven minutes after it. The listener is now built once, as
+  `attach`'s are.
+
 - **The guard that was supposed to refuse an empty release body could not
   fire, and the release procedure did not mention `Cargo.lock`.** Both are
   release-time defects that no test or check would have caught, because the
@@ -1323,7 +1443,9 @@ is cut, named and published is in
 
 - **Not fixed here, and measured rather than assumed: §4.3's
   per-connection bound is counted in *frames*, and a frame is one PTY
-  `read` ([#200]).** So 64 is half a megabyte of 8 KiB chunks and about six
+  `read` ([#200]).** *(Since fixed — see [#210] at the top of this
+  section. Kept as written: it is the measurement that fix answers.)* So 64
+  is half a megabyte of 8 KiB chunks and about six
   kilobytes of the line-sized ones a `cat` through a PTY actually produces
   — a threshold that varies by four orders of magnitude with how chatty the
   child is. That is why the loss is as large as it is, and the same client
@@ -2086,6 +2208,21 @@ is cut, named and published is in
   lower-case letters mixing `.` and `_` (`correct.horse_battery`). One digit
   anywhere brings either back.
 
+- **A client is detached for making no progress, and on Linux progress
+  arrives in steps of most of a socket buffer** ([#210]). A Unix socket wakes
+  its writer only once the reader has drained most of the buffer, so a reader
+  slower than roughly one socket buffer per stall bound is indistinguishable
+  from a stopped one. At the 30-second bound that is far below any terminal.
+  A suspended viewer on an idle session is not detached at all — nothing is
+  waiting for it — until output backs up behind it, as with a suspended
+  `ssh`.
+- **Joining a session is a screen-state consumer** ([#235]). The opening
+  picture is `get_screen_state`'s capture, which in `adaptive` mode switches
+  the session's VT100 tracking on until `screen_tracking_idle_disable_secs`
+  pass with no consumer — the cost §4.2a measures, and the `cursor_score`
+  sub-signal becoming available to prompt detection meanwhile, exactly as an
+  agent's own `get_screen_state` call does.
+
 - **The plugin's Windows entrypoint is unverified, and it is unverified in a
   way no amount of care on this side settles.** `.mcp.json` holds exactly one
   `command` string and the schema has no platform conditional, so §13.3's
@@ -2568,6 +2705,9 @@ residuals that are known and accepted.
 [#169]: https://github.com/Sertelegger/holdfast/issues/169
 [#163]: https://github.com/Sertelegger/holdfast/issues/163
 [#200]: https://github.com/Sertelegger/holdfast/issues/200
+[#210]: https://github.com/Sertelegger/holdfast/issues/210
+[#235]: https://github.com/Sertelegger/holdfast/issues/235
+[#236]: https://github.com/Sertelegger/holdfast/issues/236
 [#194]: https://github.com/Sertelegger/holdfast/issues/194
 [#217]: https://github.com/Sertelegger/holdfast/issues/217
 [#98]: https://github.com/Sertelegger/holdfast/issues/98

@@ -181,11 +181,46 @@ mod interactive_shell_tests {
 }
 
 /// How many frames the per-session output broadcast holds before a slow
-/// consumer starts losing them (§4.3's default). A consumer that lags gets
-/// `RecvError::Lagged` and resyncs from the ring buffer rather than from
-/// the frame it happened to be holding (REQ-C-006); the reader is never
-/// blocked, which is the property the bound exists to guarantee.
+/// consumer starts losing them — §4.2's `output_broadcast_capacity`
+/// default. A consumer that lags gets `RecvError::Lagged` and resyncs
+/// from the ring buffer rather than from the frame it happened to be
+/// holding (REQ-C-006); the reader is never blocked, which is the
+/// property the bound exists to guarantee.
+///
+/// **The default, not the value** (GH #210). [`SessionConfig`] carries
+/// the capacity, and `start_session` fills it from the operator's
+/// `[limits] output_broadcast_capacity` — a key that was accepted,
+/// validated and documented as a control for five releases while this
+/// constant sized every channel. It is also no longer a loss bound for
+/// attach clients: `attach::conn::forward_output` resyncs a lag from the
+/// ring buffer like every other offset-aware consumer, so for them the
+/// capacity decides only how often they take that path.
 pub const OUTPUT_BROADCAST_FRAMES: usize = 256;
+
+/// The most frames an operator may give the output broadcast: sixteen
+/// times [`OUTPUT_BROADCAST_FRAMES`] (GH #210's review).
+///
+/// **A ceiling because the key became live, and a live key with none is
+/// an allocation an operator can make by accident.** `tokio`'s broadcast
+/// allocates every slot when it is built — per session, rounded up to a
+/// power of two. The review measured a key of 4,194,304, the knob GH #210
+/// itself pointed operators at, costing about 230 MB of daemon RSS per
+/// `start_session`; 1,000,000,000 asked for 60 GB and aborted the daemon
+/// with every session in it. While the key was inert the same
+/// `config.toml` was harmless.
+///
+/// **Past this the memory grows and nothing is bought.** Since GH #210 a
+/// lagging consumer resyncs from the ring buffer, so the capacity decides
+/// how often that path is taken, not what anybody is shown — while a
+/// subscriber that stops reading (a paused attach forwarder whose client
+/// the stall bound has not yet detached) keeps alive every frame it has
+/// not read, each up to one reader `read`. That is already a multiple of
+/// the default ring at this ceiling.
+///
+/// `Config::validate` **refuses** a larger value, for the reason that file
+/// refuses rather than clamps everywhere else; `Session::new` clamps to
+/// it too, for the callers that build a `SessionConfig` by hand.
+pub const MAX_OUTPUT_BROADCAST_FRAMES: usize = 16 * OUTPUT_BROADCAST_FRAMES;
 
 /// One chunk the reader appended, with the absolute span it occupies.
 ///
@@ -317,6 +352,17 @@ pub struct SessionConfig {
     /// `Session::new` call sites that predate this keep their
     /// `..Default::default()` and the behaviour they assert.
     pub rules: Option<Arc<RuleSet>>,
+    /// §4.2 `output_broadcast_capacity`: how many frames the live output
+    /// broadcast holds for a subscriber that has not read them.
+    /// [`OUTPUT_BROADCAST_FRAMES`] by default (GH #210).
+    ///
+    /// **Clamped to `1..=`[`MAX_OUTPUT_BROADCAST_FRAMES`]** rather than
+    /// trusted: `tokio::sync::broadcast::channel(0)` panics, a huge one
+    /// allocates every slot up front and can abort the daemon, and either
+    /// happens inside `start_session`. `Config::validate` already refuses
+    /// both from the file; the clamp is for the callers that build a
+    /// `SessionConfig` by hand.
+    pub output_broadcast_capacity: usize,
 }
 
 impl Default for SessionConfig {
@@ -338,6 +384,7 @@ impl Default for SessionConfig {
             // session with no operator config to honour, and the safe
             // default is every rule.
             rules: None,
+            output_broadcast_capacity: OUTPUT_BROADCAST_FRAMES,
         }
     }
 }
@@ -445,6 +492,9 @@ pub struct Session {
     /// it snapshots the buffer, which is the ordering that stops a fast
     /// command's output from landing in the gap between the two.
     output_tx: broadcast::Sender<OutputFrame>,
+    /// What `output_tx` was sized to — [`SessionConfig::output_broadcast_capacity`],
+    /// clamped (GH #210). Kept because the channel does not report it.
+    output_broadcast_capacity: usize,
     /// §7.5's non-output edges, on the same shape as `output_tx` and for
     /// the same reason: a connection converts them into frames, and the
     /// session never names one.
@@ -958,7 +1008,10 @@ impl Session {
         // "effectively never" rather than a wrapped deadline in the past.
         let idle_timeout_ms = (config.idle_timeout_secs as i64).saturating_mul(1000);
         let idle_deadline_ms = Arc::new(AtomicI64::new(deadline_from(started_ms, idle_timeout_ms)));
-        let (output_tx, _) = broadcast::channel(OUTPUT_BROADCAST_FRAMES);
+        let output_broadcast_capacity = config
+            .output_broadcast_capacity
+            .clamp(1, MAX_OUTPUT_BROADCAST_FRAMES);
+        let (output_tx, _) = broadcast::channel(output_broadcast_capacity);
         let (events_tx, _) = broadcast::channel(SESSION_EVENT_FRAMES);
         let (write_tx, mut write_rx) = tokio::sync::mpsc::channel(WRITE_QUEUE_FRAMES);
         let awaiting_secret = Arc::new(std::sync::atomic::AtomicBool::new(false));
@@ -1009,6 +1062,7 @@ impl Session {
             redaction_stats: Mutex::new(BTreeMap::new()),
             binding_uses: Mutex::new(BTreeMap::new()),
             output_tx: output_tx.clone(),
+            output_broadcast_capacity,
             events_tx: events_tx.clone(),
             awaiting_secret: Arc::clone(&awaiting_secret),
             secret_episode: Arc::clone(&secret_episode),
@@ -2039,6 +2093,49 @@ impl Session {
         self.output_tx.subscribe()
     }
 
+    /// How many frames the live output broadcast holds for a subscriber
+    /// that has not read them — §4.2's `output_broadcast_capacity` as this
+    /// session was built with it (GH #210).
+    pub fn output_broadcast_capacity(&self) -> usize {
+        self.output_broadcast_capacity
+    }
+
+    /// An offset **at or before** the one any [`screen_state`] capture
+    /// started after this call returns will reflect (GH #235).
+    ///
+    /// `holdfast attach` and `holdfast watch` now open with the current
+    /// screen, and the live stream has to resume where that picture
+    /// ends. The picture is the screen tracker's, and the tracker lags
+    /// the ring buffer by whatever chunk the reader thread has pushed and
+    /// not yet fed it — so the buffer's head is *not* a safe place to
+    /// resume: a chunk in that window is in neither the picture nor a
+    /// stream that starts after it, and it vanishes without a gap to say
+    /// so.
+    ///
+    /// **A lower bound, deliberately, and the error it permits is the
+    /// visible one.** A stream started here may repeat the few bytes that
+    /// reached the tracker between this call and the capture; it can
+    /// never skip one. Both halves of the argument are monotonicity: the
+    /// tracker's consumed offset only moves forward (a re-seed restarts
+    /// it at the buffer's head, which is ahead of it), and a tracker that
+    /// is not running when this is read will be seeded, by the capture,
+    /// from a buffer whose head has not moved backwards. The screen lock
+    /// is held across both reads so the tracker cannot be switched on
+    /// between them — the order is `screen → buffer`, the one the
+    /// tracker documents.
+    ///
+    /// For an idle session — the case GH #235 is about — the two numbers
+    /// are equal and the resume is exact.
+    ///
+    /// [`screen_state`]: Self::screen_state
+    pub fn stream_floor(&self) -> u64 {
+        let screen = self.screen.lock();
+        match screen.tracked_head() {
+            Some(head) => head,
+            None => self.buffer.lock().head(),
+        }
+    }
+
     /// A handle on §4.3's write queue.
     ///
     /// Cloned per producer, so every attach connection on a session
@@ -2811,6 +2908,118 @@ mod tests {
     use crate::pty::{MockPty, MAX_COLS, MAX_ROWS, MIN_COLS, MIN_ROWS};
     use crate::screen::{ScreenCapture, ScreenGrid, ScreenTracking};
     use std::time::Instant;
+
+    /// **A join resumes the stream from what the screen shows, not from
+    /// the buffer's head** (GH #235).
+    ///
+    /// The two differ whenever bytes reached the ring without reaching
+    /// the screen tracker yet — ordinarily the one chunk the reader is
+    /// between pushing and feeding, a window no test can hold open. §9.5's
+    /// buffer notice is the deterministic case: `inject_notice` pushes to
+    /// the ring and publishes, and never feeds the tracker. A floor at the
+    /// buffer's head would put the notice in neither the opening picture
+    /// nor the stream; at the tracker's offset it is streamed after the
+    /// picture, which is where it belongs.
+    ///
+    /// The negative: with no tracker running, the floor is the buffer's
+    /// head, because the capture that follows will seed from there.
+    #[test]
+    fn the_stream_floor_is_the_screens_offset_not_the_buffers() {
+        let (s, pty) = mock_session();
+        pty.queue_output(b"a prompt$ ");
+        wait_for_bytes(&s, 10);
+        assert_eq!(
+            s.stream_floor(),
+            s.buffer_head(),
+            "with no tracker running the floor is the head the capture will seed from"
+        );
+
+        // Switch the tracker on the way a join does, then put bytes in the
+        // ring that it has not parsed.
+        let _ = s.screen_state(None, true, &OutputProcessor::builtin().unwrap());
+        let shown = s.buffer_head();
+        s.inject_notice(b"[holdfast] a notice\r\n");
+        assert!(
+            s.buffer_head() > shown,
+            "the fixture's notice never reached the ring"
+        );
+        assert_eq!(
+            s.stream_floor(),
+            shown,
+            "the floor ran ahead of what the screen shows; the bytes in between would be \
+             in neither the opening picture nor the stream"
+        );
+    }
+
+    /// **A hand-built capacity is clamped into `1..=`the ceiling** (GH
+    /// #210's review). `Config::validate` refuses a file's value past
+    /// [`MAX_OUTPUT_BROADCAST_FRAMES`]; this is the half for a caller that
+    /// builds a `SessionConfig` itself. The values past the ceiling are
+    /// kept small enough that an unclamped build allocates them without
+    /// incident, so a removed clamp fails the assertion instead of taking
+    /// the test process with it.
+    #[test]
+    fn a_capacity_outside_the_bounds_is_clamped_into_them() {
+        for (asked, held) in [
+            (0, 1),
+            (MAX_OUTPUT_BROADCAST_FRAMES, MAX_OUTPUT_BROADCAST_FRAMES),
+            (MAX_OUTPUT_BROADCAST_FRAMES + 1, MAX_OUTPUT_BROADCAST_FRAMES),
+            (4 * MAX_OUTPUT_BROADCAST_FRAMES, MAX_OUTPUT_BROADCAST_FRAMES),
+        ] {
+            let s = Session::new(
+                new_session_id(),
+                None,
+                "bash".into(),
+                vec![],
+                Arc::new(MockPty::new()) as Arc<dyn PtyBackend>,
+                SessionConfig {
+                    output_broadcast_capacity: asked,
+                    ..SessionConfig::with_buffer_capacity(4096)
+                },
+            );
+            assert_eq!(
+                s.output_broadcast_capacity(),
+                held,
+                "a hand-built capacity of {asked} was not clamped to {held}"
+            );
+        }
+    }
+
+    /// **The broadcast holds what the config says, not a constant** (GH
+    /// #210). Measured by the lag a subscriber that reads nothing is told
+    /// about: `frames - capacity`, for two capacities, so neither the
+    /// config value nor the old constant can pass for the other.
+    #[test]
+    fn the_output_broadcast_holds_the_configured_number_of_frames() {
+        for capacity in [4usize, 32] {
+            let pty = Arc::new(MockPty::new());
+            let s = Session::new(
+                new_session_id(),
+                None,
+                "bash".into(),
+                vec![],
+                Arc::clone(&pty) as Arc<dyn PtyBackend>,
+                SessionConfig {
+                    output_broadcast_capacity: capacity,
+                    ..SessionConfig::with_buffer_capacity(64 * 1024)
+                },
+            );
+            assert_eq!(s.output_broadcast_capacity(), capacity);
+            let mut rx = s.subscribe();
+            let frames = capacity + 9;
+            for i in 0..frames {
+                pty.queue_output(b"x");
+                wait_for_bytes(&s, i as u64 + 1);
+            }
+            match rx.try_recv() {
+                Err(broadcast::error::TryRecvError::Lagged(n)) => assert_eq!(
+                    n, 9,
+                    "a broadcast of {capacity} frames dropped {n} of {frames}"
+                ),
+                other => panic!("expected a lag of 9 frames, got {other:?}"),
+            }
+        }
+    }
 
     fn mock_session() -> (Arc<Session>, Arc<MockPty>) {
         let pty = Arc::new(MockPty::new());
@@ -4402,6 +4611,10 @@ mod tests {
                 // The built-in §9.2 table, which is what a session with
                 // no server behind it gets.
                 rules: None,
+                // §4.2's default; this row is about the history and
+                // detection knobs, and a usize beside two usizes above is
+                // named rather than defaulted for the same reason.
+                output_broadcast_capacity: OUTPUT_BROADCAST_FRAMES,
             },
         );
         pty.queue_output(&bytes);

@@ -54,7 +54,15 @@ pub const PROTOCOL_MAJOR: u32 = 1;
 /// today's behaviour and not a regression. **Neither direction can
 /// mistake the frame for something else**, which is the only property a
 /// minor has to carry.
-pub const PROTOCOL_MINOR: u32 = 4;
+///
+/// 1.5 adds `ServerFrame::ScreenSnapshot` (GH #235) and the optional
+/// `AwaitingSecret.raised_by` (GH #236). Additive in both directions for
+/// 1.4's reason: a 1.4 client maps the unknown frame to `Unknown` and
+/// skips it, and ignores the unknown key, so it joins a session exactly
+/// as blind as it always did; a 1.5 client against a 1.4 daemon receives
+/// no snapshot and no key, and renders a secret prompt's text without
+/// claiming to know who wrote it.
+pub const PROTOCOL_MINOR: u32 = 5;
 
 /// How long either peer waits for the **first** frame of the handshake
 /// before giving up on the connection.

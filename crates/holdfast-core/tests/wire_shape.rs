@@ -295,6 +295,20 @@ const RECORDED_VERSIONS: &[(u32, u32)] = &[
     // under REQ-D-009; a gap is not an ending, and the attachment it
     // happens on is still healthy.
     (1, 4),
+    // 1.5 — `ServerFrame::ScreenSnapshot` (GH #235) and the optional
+    // `AwaitingSecret.raised_by` (GH #236). Both additive for 1.4's
+    // reason: a 1.4 client maps the frame onto `Unknown` and skips it,
+    // and ignores the key, so it joins a session exactly as blind as it
+    // always did; a 1.5 client against a 1.4 daemon receives neither and
+    // renders a secret prompt without claiming to know who wrote it.
+    //
+    // The snapshot is the second new *server* frame in this log and
+    // sits between the handshake and `Output` because that is when it is
+    // sent — once, after `Attached`, before the first byte of the
+    // stream. `raised_by` is `Option<String>` with §9.4's spelling
+    // (`echo_drop` | `tool_call`), a free string like `outcome` one frame
+    // down, so a later third provenance is not a wire-shape change.
+    (1, 5),
 ];
 
 /// The placeholder every opaque string field carries in this file.
@@ -666,6 +680,17 @@ fn server_frames() -> Vec<ServerFrame> {
             reason: STR.into(),
             message: STR.into(),
         },
+        ServerFrame::ScreenSnapshot {
+            session: STR.into(),
+            cols: 1,
+            rows: 1,
+            cursor_row: 0,
+            cursor_col: 0,
+            cursor_visible: true,
+            alt_screen: false,
+            lines: vec![STR.into()],
+            held_back: false,
+        },
         ServerFrame::Output {
             session: STR.into(),
             bytes: vec![0x1b],
@@ -686,6 +711,7 @@ fn server_frames() -> Vec<ServerFrame> {
         ServerFrame::AwaitingSecret {
             request_id: STR.into(),
             prompt_text: STR.into(),
+            raised_by: Some(STR.into()),
         },
         ServerFrame::SecretRequestClosed {
             request_id: STR.into(),

@@ -260,6 +260,10 @@ const EFFECTIVE: &[(&str, &str)] = &[
         "crates/holdfast-core/src/mcp/tools.rs:393 — start_session falls back to it when the call omits idle_timeout_secs; reaches SessionConfig at tools.rs:416.",
     ),
     (
+        "limits.output_broadcast_capacity",
+        "crates/holdfast-core/src/mcp/tools.rs:440 — start_session copies it into SessionConfig::output_broadcast_capacity, which sizes the live output broadcast at crates/holdfast-core/src/session/mod.rs:862, clamped to MAX_OUTPUT_BROADCAST_FRAMES — which Config::validate also refuses past (GH #210; inert until then).",
+    ),
+    (
         "limits.resource_read_max_bytes",
         "crates/holdfast-core/src/mcp/mod.rs:817 (MCP resources/read) and crates/holdfast-core/src/daemon/server.rs:2245 (control protocol) — both pass it as read_prepared's ceiling.",
     ),
@@ -416,11 +420,6 @@ const INERT: &[(&str, Inert, &str)] = &[
         "limits.read_output_hard_max_bytes",
         Inert::NeverNamed,
         "GH #128's repro. The hardcoded twin MAX_READ_MAX_BYTES (crates/holdfast-core/src/mcp/tools.rs:88) is the cap applied at tools.rs:853.",
-    ),
-    (
-        "limits.output_broadcast_capacity",
-        Inert::NeverNamed,
-        "The hardcoded twin session::OUTPUT_BROADCAST_FRAMES (crates/holdfast-core/src/session/mod.rs:40) sizes the channel at session/mod.rs:703. VALIDATE-ONLY otherwise.",
     ),
     (
         "limits.max_outstanding_secret_requests_per_session",
