@@ -102,8 +102,7 @@ pub fn find_spans(rules: &RuleSet, window: &[u8], window_start: u64) -> Vec<Span
                     // an assignment, and `value_must_not_match` is where
                     // it gets to say the bytes after the separator are
                     // not a credential. `value_admissible` is `true` for
-                    // every rule that declares no refusal, which is
-                    // forty-nine of the fifty-one shipped.
+                    // every rule that declares no refusal.
                     if !rule.value_admissible(m.as_bytes()) {
                         continue;
                     }
@@ -116,6 +115,11 @@ pub fn find_spans(rules: &RuleSet, window: &[u8], window_start: u64) -> Vec<Span
             }
         } else {
             for m in rule.regex.find_iter(window) {
+                // GH #245: with no `value` group the whole match is what
+                // gets redacted, so it is what the refusal judges.
+                if !rule.value_admissible(m.as_bytes()) {
+                    continue;
+                }
                 spans.push(Span {
                     start: window_start + m.start() as u64,
                     end: window_start + m.end() as u64,

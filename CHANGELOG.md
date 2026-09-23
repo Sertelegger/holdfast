@@ -219,6 +219,16 @@ is cut, named and published is in
 
 ### Changed
 
+- **`value_must_not_match` works on a rule with no `value` group, and judges
+  its whole match** ([#245]). #202 made that a load error, on the ground that
+  such a rule had no value to judge; but a rule without a `value` group
+  redacts its whole match, so its whole match is what a refusal must look at.
+  `openai-api-key` is the first shipped rule to use it. §4.1's partial-secret
+  scan asks the same question of the whole match, so a refused match still
+  arriving at the buffer head is held until the rule dies rather than released
+  on the ground that a marker covers it. `RuleError::ValueConstraintWithoutValue`
+  is gone with the error it named.
+
 - **`scripts/ci-hygiene.sh`'s release-trigger gate is an allowlist.** It was a
   denylist of four triggers — `branches`, `schedule`, `pull_request`,
   `pull_request_target` — and `release.yml`'s header claimed on the strength of
@@ -335,6 +345,47 @@ is cut, named and published is in
   fallback lives in is dead code against the built-in fifty-one ([#163]).
 
 ### Security
+
+- **Database URLs outside the old scheme list, and several common credential
+  spellings, went out raw; they are redacted now** ([#244]).
+  `database-connection-password` takes the TLS schemes (`rediss://`,
+  `amqps://`), `mariadb`, `mssql`, `sqlserver`, `oracle`, `cockroachdb`,
+  `clickhouse`, `snowflake`, `valkey`, `neo4j` and `bolt`; a `+driver` suffix
+  (SQLAlchemy's `postgresql+psycopg2://`, `mysql+pymysql://`, and
+  `mongodb+srv://`); an empty user (`redis://:<password>@host`); and a `/` or
+  an `@` inside the password — while a `'`, `"` or backtick inside it is still
+  redacted, as it was in 0.0.7. Four rules are new: `url-userinfo-password`
+  (`https://user:<password>@host`, a `git clone` with a token in it, a proxy
+  URL, an RTSP camera), `basic-authorization` (`Authorization: Basic <base64>`
+  as curl `-v`, a `requests` dict, a JSON body or an nginx `proxy_set_header`
+  spell it), `mysql-cli-password` (`mysql -u root -p<password>`, the spelling
+  §9.2's own table names) and `registry-login-password` (`docker login -p
+  <password>`, `-p<password>` and `--password=<password>`, and its
+  `podman`/`nerdctl`/`buildah`/`skopeo`/`oras`/`helm registry` siblings). A
+  quoted command-line password is redacted to its closing quote, so a `&`,
+  `|`, `;` or space inside `-p'…'` is covered with the rest.
+  `generic-secret-assignment` takes `_PASS`, `_PWD` and `PASSPHRASE` labels —
+  behind a separator, so `bypass=` and the shell's own `PWD=` and `OLDPWD=` are
+  not labels — and `secret-key-assignment` takes Laravel's `APP_KEY`.
+  Measured over the credential-free corpora #245 used (49.5 MB), the new
+  rules and labels add **seven** spans, every one of them a credential-shaped
+  example: `mysql -ppassword` in the design doc, `http://letme:in@yo.local` in
+  `reqwest`'s proxy tests.
+
+- `basic-authorization`, every `database-connection-password` scheme,
+  `mysql-cli-password` as a command's first argument and a token-carrying
+  `https://x-access-token:`/`oauth2:`/`gitlab-ci-token:`/`x-token-auth:` URL are
+  **held back while still arriving** at the buffer head: each rule's
+  prefix-index entries are the literal where its credential begins, so no byte
+  of one is handed out raw one read before the rest arrives (§4.1). For
+  `basic-authorization` that is one entry per header spelling — the HTTP header
+  with and without its space, a YAML or TOML value in either quote, JSON pretty
+  and compact, a Python dict pretty and compact, nginx's `proxy_set_header`,
+  and an `=` assignment; `no_byte_of_a_credential_still_arriving_is_handed_out_raw`
+  drives each one a byte at a time. An entry at the program name or the scheme
+  would instead hold `mysqldump`, `docker-compose`, curl's `Authorization:` and
+  every URL a program prints — `ordinary_command_heads_are_not_held_back` pins
+  that it does not.
 
 - **A read window that cannot vouch for a region now emits one
   `[REDACTED:unresolved]` over it and completes, instead of choosing between
@@ -647,6 +698,49 @@ is cut, named and published is in
   optimized both.
 
 ### Fixed
+- **A label at the end of a line no longer swallows the next line's first
+  word** ([#245]). Every label-keyed rule separated its label from its value
+  with `\s*`, which crosses line breaks, so ssh's `password: ` followed by
+  `Permission denied, please try again.` came back `[REDACTED:generic]
+  denied`, and so did `Vault token:` over `Successfully authenticated!` and a
+  line of prose ending in `token:` over the `rg -n` hit printed under it. The
+  separator is now horizontal whitespace, with one exception: an `=` may be
+  followed by a line break into an **indented** line, which is how rustfmt and
+  prettier wrap `let token = "<long literal>";` — a shape a hard-coded secret
+  has, and one the old separator caught. A `:` never crosses: over the corpora
+  measured, every `:` that crossed into an indented line was a Python block
+  (`if not have_password:` and the statement under it) — seven of the CPython
+  standard library's 22 `generic` spans. `bearer-authorization`'s
+  `\s+` became `[ \t]+` for the same reason. What that gives up is under
+  Known limitations.
+
+- **`generic-secret-assignment` and `secret-key-assignment` refuse two more
+  code shapes, which were most of what #202 left** ([#245]). A digit-free
+  `::` path (`pub paren_token: token::Paren`, `token: mio::Token`,
+  `secret_key: &crate::SecretKey`) and a digit-free lower-case field access
+  carrying an `_` (`semi_token: node.semi_token`,
+  `self.add_password = self.passwd.add_password`) are no longer redacted.
+  Both branches are digit-free on purpose: allowing digits in the `::` branch
+  also refuses `uuid::Uuid::new_v4(` and a human's `Summer2024::Beach`, and the
+  digit is the one thing in a value that says a person chose it. The
+  field-access branch needs an `_` so that `correct.horse.battery.staple`
+  stays redacted, and lower case so that a Doppler token under a config named
+  `dev_personal` does. Measured over the same credential-free corpora at
+  REQ-O-007's default 41,472 B window: third-party Rust (`syn`, `tokio`,
+  `hyper`, `serde`, `regex`, `rmcp`, `reqwest`, `mio`; 12.2 MB) **342 → 96**
+  label-keyed spans; `rustls`/`jsonwebtoken`/`sqlx` **45 → 43**; every other
+  corpus unchanged or lower, and **every removed span is code** — the list is
+  in the pull request. None of the real-shaped credentials in
+  `tests/redaction_prose.rs` is dropped, and the seven rows this change adds
+  sit one on each side of every new branch.
+
+- **OpenSSH's `sk-ecdsa-sha2-nistp256-cert-v01@openssh.com` is no longer
+  reported as an OpenAI key** ([#245]). `ssh -G`, `ssh -vvv` and any
+  `sshd_config` listing algorithms carried three markers. `openai-api-key`
+  now refuses exactly that family — lower-case letters, digits and hyphens
+  after `sk-ecdsa-` or `sk-ssh-` — and a real key beside the name on the same
+  line is still redacted.
+
 - **The guard that was supposed to refuse an empty release body could not
   fire, and the release procedure did not mention `Cargo.lock`.** Both are
   release-time defects that no test or check would have caught, because the
@@ -1518,6 +1612,64 @@ is cut, named and published is in
 
 ### Known limitations
 
+- **A URL password behind an ordinary username is not held back while it is
+  still arriving** ([#244]). `url-userinfo-password` indexes only the
+  token-carrying usernames, because an entry at `https://` would hold every URL
+  a program prints. Such a password is redacted as soon as its `@` arrives; a
+  read that lands before then hands out the part that has.
+
+- `bearer-authorization`, `registry-login-password` and a `mysql -p` that is
+  not the first argument keep GH #152's gap: a context rule's candidate is
+  held only while every byte after its prefix is printable, and each of these
+  has a space before its value.
+
+- **`mysql-cli-password` does not reach a `-p` the shell quoted as a whole
+  word** ([#244]). `set -x` prints `mysql -u root '-pXk9#mP&2qLzQ'` when the
+  password carries a shell metacharacter, and the rule wants `-p` after a
+  space. A password with none is traced unquoted and is redacted.
+
+- **A Basic credential on a header spelling `basic-authorization` does not
+  index can hand out the start of its base64 while it arrives** ([#244]) —
+  two spaces or a tab before `Basic`, say. The first three bytes go out
+  because the value is not yet a match; after that it is covered, except
+  that the rule's refusal still declines a partial value while every byte of
+  it is a lower-case letter. Those bytes encode the user name:
+  `a_refused_basic_partial_never_decodes_into_the_password` measures that
+  a refused partial of a real `user:password` never decodes past the colon,
+  and `an_unindexed_basic_spelling_hands_out_no_more_than_the_value_floor`
+  that the leak on the spellings it drives is exactly the three bytes. A
+  length-only refusal released up to every byte but the last. The rule does
+  not reach `HTTP_AUTHORIZATION` (CGI's spelling, whose `_` defeats the word
+  boundary) or a header escaped inside a JSON string (`\"Authorization\":
+  \"Basic …`) at all.
+
+- **A value on the line after a `:` is not reached by a label-keyed rule**
+  ([#245]): YAML's plain scalar on the line after its key, and a credential a
+  prompt echoes on the line after it. The second is the same bytes as ssh's
+  retry prompt with a credential where `Permission` was; the first is legal
+  and rare beside `key: value`. The `=` spelling of the same value is still
+  redacted.
+
+- **An `=` reaches the next line only as a formatter wraps it** ([#245]): at
+  the end of the label's own line, into one indented line. A label with its
+  `=` on the next line (`password\n    = "…"`) and an `=` with a blank line
+  before its value were both redacted by 0.0.7's `\s*` and are not now;
+  neither is what rustfmt or prettier produce.
+
+- **The new rules and labels mark some things that are not credentials**
+  ([#244]). `mysql-cli-password` reads any `-p…` after the word `mysql` or
+  `mariadb` on a line as a password flag, so `docker run --name mysql
+  -p3306:3306`, `find / -name mysql -prune` and a compiler line carrying
+  `-I/usr/include/mysql … -pipe` each get a marker. The `_PWD` and `_PASS`
+  labels reach `OLD_PWD=/home/…` and `self.render_pass = render_pass`, and
+  four lower-case letters after `Authorization: Basic` (`auth`) pass the length
+  test. Each is a marker over ordinary text, not a leak.
+
+- **A digit-free credential shaped like code is not redacted by the
+  label-keyed rules** ([#245]): letters joined by `::` (`Hello::World`), or
+  lower-case letters mixing `.` and `_` (`correct.horse_battery`). One digit
+  anywhere brings either back.
+
 - **The plugin's Windows entrypoint is unverified, and it is unverified in a
   way no amount of care on this side settles.** `.mcp.json` holds exactly one
   `command` string and the schema has no platform conditional, so §13.3's
@@ -2011,3 +2163,5 @@ residuals that are known and accepted.
 [#203]: https://github.com/Sertelegger/holdfast/issues/203
 [#202]: https://github.com/Sertelegger/holdfast/issues/202
 [#206]: https://github.com/Sertelegger/holdfast/issues/206
+[#245]: https://github.com/Sertelegger/holdfast/issues/245
+[#244]: https://github.com/Sertelegger/holdfast/issues/244
