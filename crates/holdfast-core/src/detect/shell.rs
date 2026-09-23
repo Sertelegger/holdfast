@@ -90,11 +90,45 @@ pub fn detect_shell(command: &str, args: &[String]) -> Option<Shell> {
 /// of more than one element it is a new last element, because a
 /// regenerator at index ≥ 1 runs after anything composed into index 0; the
 /// array form also gets bash's per-element `$?` restore, and it is last
-/// anyway, so no hook reads a status it left. **Residual:** a hook
+/// anyway, so no hook reads a status it left. Only bash ≥ 5.1 runs the
+/// elements past index 0, so an older bash takes the scalar arm, which
+/// appends to index 0 — the one element it does run. **Residual:** a hook
 /// appended to `PROMPT_COMMAND` *after* the snippet ran — `eval "$(starship
 /// init bash)"` typed into a live session — runs after `__holdfast_p` and
 /// defeats it again. That is what `osc133_source: "holdfast_degraded"`
 /// exists to report.
+///
+/// **Joined with a newline, never `; `** (review of GH #220). The call is
+/// appended to text the user wrote, and a separator has to be valid after
+/// anything that text can end in. `; ` is not: after a trailing `;` it
+/// makes `;;`, after a trailing `; ` or newline a line that starts with
+/// `;`, and after a trailing `# comment` it is swallowed by the comment.
+/// Each of those is a working `PROMPT_COMMAND` by itself — the
+/// history-sharing idiom `PROMPT_COMMAND="history -a; $PROMPT_COMMAND"`
+/// leaves the `; ` whenever it began empty — and the first three made bash
+/// print a syntax error at every prompt and run none of the line, `D`
+/// included, while the fourth silently disabled the re-wrap. A newline
+/// ends a comment and follows a `;` legally, and `$'\n'` keeps the typed
+/// snippet on one line.
+///
+/// **Except bash-preexec's `__bp_interactive_mode`, which must stay last**
+/// (review of GH #220). bash-preexec — what atuin, iTerm2's integration and
+/// starship-under-bash-preexec hook through — arms its `DEBUG` trap in that
+/// call and takes the next simple command bash runs to be the user's. With
+/// `__holdfast_p` after it, the trap fired for `__holdfast_p`, recognised a
+/// `PROMPT_COMMAND` member, disarmed, and **no `preexec` hook ran for any
+/// command**: measured on bash-preexec 0.5.0 and 0.6.0 (and every command
+/// but the first on master, which moves its call back to the end at each
+/// prompt), with starship's `took 2s` lost the same way. So when the list
+/// already ends in `__bp_interactive_mode` — bash-preexec's array element,
+/// or the `\n__bp_interactive_mode` its scalar form ends in — the re-wrap
+/// goes immediately before it: still after every hook bash-preexec runs,
+/// `precmd_functions` included, and bash-preexec's trap is disarmed when it
+/// runs, so the call is invisible to it. Measured with all three versions:
+/// every command reaches `preexec`, and master's own re-ordering leaves
+/// the pair in place. The `DEBUG`-trap timer starship installs only on
+/// bash < 4.4 has the same shape and no such marker to find; that bash has
+/// no `PS0` either, so no `C` marker, and it is not measured.
 ///
 /// Array `PROMPT_COMMAND` (bash ≥ 5.1) survives intact. Assigning a
 /// scalar to an existing array writes index 0, and `${PROMPT_COMMAND:+…}`
@@ -146,7 +180,13 @@ const BASH_INTEGRATION: &str = concat!(
     r#"__holdfast_p; "#,
     r#"__holdfast_d() { printf '\033]133;D;%s;holdfast=1\007' "${1:-0}"; return "${1:-0}"; }; "#,
     r#"PROMPT_COMMAND='__holdfast_d "$?"'"${PROMPT_COMMAND:+; $PROMPT_COMMAND}"; "#,
-    r#"(( ${#PROMPT_COMMAND[@]} > 1 )) && PROMPT_COMMAND+=(__holdfast_p) || PROMPT_COMMAND+='; __holdfast_p'; "#,
+    r#"if (( BASH_VERSINFO[0] * 100 + BASH_VERSINFO[1] >= 501 && ${#PROMPT_COMMAND[@]} > 1 )); then "#,
+    r#"if [[ ${PROMPT_COMMAND[-1]} == __bp_interactive_mode ]]; then "#,
+    r#"unset 'PROMPT_COMMAND[-1]'; PROMPT_COMMAND+=(__holdfast_p __bp_interactive_mode); "#,
+    r#"else PROMPT_COMMAND+=(__holdfast_p); fi; "#,
+    r#"elif [[ $PROMPT_COMMAND == *$'\n'__bp_interactive_mode ]]; then "#,
+    r#"PROMPT_COMMAND=${PROMPT_COMMAND%__bp_interactive_mode}$'__holdfast_p\n__bp_interactive_mode'; "#,
+    r#"else PROMPT_COMMAND+=$'\n__holdfast_p'; fi; "#,
     r#"fi"#,
 );
 

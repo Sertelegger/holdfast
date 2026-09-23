@@ -2640,8 +2640,13 @@ async fn a_program_that_fakes_bracketed_paste_fools_tier_2() {
 /// `already_marking_bash` too); `--norc` keeps the rest of the host's
 /// configuration out of it.
 fn regenerating_bash(ps1: &str) -> StartSessionArgs {
+    bash_with_prompt_command(&format!("PS1={ps1:?}"))
+}
+
+/// `bash --norc --noprofile` with `PROMPT_COMMAND` inherited verbatim.
+fn bash_with_prompt_command(prompt_command: &str) -> StartSessionArgs {
     let mut env = term().expect("TERM");
-    env.insert("PROMPT_COMMAND".into(), format!("PS1={ps1:?}"));
+    env.insert("PROMPT_COMMAND".into(), prompt_command.into());
     StartSessionArgs {
         command: Some("bash".into()),
         args: vec!["--norc".into(), "--noprofile".into()],
@@ -2686,7 +2691,16 @@ async fn a_prompt_regenerated_at_every_prompt_keeps_the_marker_stream_and_the_hi
         env: term(),
         ..Default::default()
     };
-    for (arm, args) in [("scalar", regenerating_bash("regen$ ")), ("array", array)] {
+    // The third arm regenerates `PS0` as well, which no framework measured
+    // does today (starship sets it once): without `__holdfast_p`'s `PS0`
+    // check every `C` after the first prompt is lost, and with it
+    // `Executing`, the command count and the history's entries.
+    let ps0 = bash_with_prompt_command(r#"PS1="regen\$ "; PS0="""#);
+    for (arm, args) in [
+        ("scalar", regenerating_bash("regen$ ")),
+        ("array", array),
+        ("ps0", ps0),
+    ] {
         let server = HoldfastServer::new();
         let id = start(&server, args).await;
         assert_marker_stream_and_exit_codes(&server, &id, "bash").await;
@@ -2699,6 +2713,134 @@ async fn a_prompt_regenerated_at_every_prompt_keeps_the_marker_stream_and_the_hi
         kill(&server, &id).await;
     }
     let _ = std::fs::remove_file(&rc);
+}
+
+/// The re-wrap is appended to the user's `PROMPT_COMMAND`, so it has to
+/// survive whatever that text ends in — and the first form of it did not
+/// (review of GH #220). It was joined with `; `, which turned a trailing
+/// `;` into `;;`, a trailing `; ` or newline into a line that starts with
+/// `;`, and a trailing comment into one that swallowed the call. Every one
+/// of those is a working `PROMPT_COMMAND` on its own; the common
+/// history-sharing idiom `PROMPT_COMMAND="history -a; $PROMPT_COMMAND"`
+/// leaves the `; ` whenever it started empty. The first three made bash
+/// print `syntax error near unexpected token` at every prompt and run none
+/// of the line — no `D`, so every entry stayed open with `exit_code: null`,
+/// and the user's own hooks stopped — and the fourth silently disabled the
+/// re-wrap.
+///
+/// Each arm's hook regenerates the prompt, so the re-wrap has to have run
+/// *after* it at every prompt for the marker stream to come out whole, and
+/// `regen$ ` shows that the user's hook still ran.
+#[tokio::test]
+async fn a_prompt_command_that_ends_in_a_separator_or_a_comment_keeps_working() {
+    for (arm, prompt_command) in [
+        ("trailing `; `", "PS1=\"regen\\$ \"; "),
+        ("trailing `;`", "PS1=\"regen\\$ \";"),
+        ("trailing newline", "PS1=\"regen\\$ \"\n"),
+        ("trailing comment", "PS1=\"regen\\$ \" # the prompt"),
+    ] {
+        let server = HoldfastServer::new();
+        let id = start(&server, bash_with_prompt_command(prompt_command)).await;
+        assert_marker_stream_and_exit_codes(&server, &id, "bash").await;
+        let all = raw(&server, &id).await;
+        assert!(
+            !all.contains("syntax error"),
+            "{arm}: the snippet broke the user's PROMPT_COMMAND: {all:?}"
+        );
+        assert!(
+            all.contains("regen$ "),
+            "{arm}: the user's own hook stopped running"
+        );
+        kill(&server, &id).await;
+    }
+}
+
+/// bash-preexec's contract, which the re-wrap must not break (review of
+/// GH #220). bash-preexec — what atuin, iTerm2's integration and starship
+/// (when it finds it loaded) hook through — needs `__bp_interactive_mode`
+/// to be the **last** thing `PROMPT_COMMAND` runs: that call arms its
+/// `DEBUG` trap, and the next simple command bash runs is taken to be the
+/// user's. The re-wrap first went in *after* it, so the trap fired for
+/// `__holdfast_p`, recognised a `PROMPT_COMMAND` member, disarmed, and the
+/// user's real command then ran with no `preexec` at all. Measured with the
+/// real bash-preexec 0.5.0, 0.6.0 and master: no `preexec` for any command
+/// on the first two, and every one but the first on master, which moves
+/// its own call back to the end at each prompt; starship's `took 2s` under
+/// bash-preexec went with them.
+///
+/// **This is a model of bash-preexec, not bash-preexec**, which nothing in
+/// CI installs. It keeps the two properties the defect turns on, in
+/// bash-preexec's own names: `__bp_interactive_mode` arms the trap, and the
+/// first command the trap sees after that disarms it and is reported only
+/// if it is not a `PROMPT_COMMAND` member. Its `precmd` regenerates the
+/// prompt, as starship's does when it runs as a bash-preexec hook, so the
+/// marker stream also shows the re-wrap still runs after it.
+///
+/// Two arms, bash-preexec's two installed shapes: 0.5.0 always writes a
+/// newline-separated scalar; 0.6.0 and later write an array on bash ≥ 5.1
+/// and the scalar below that, which the rc decides exactly as 0.6.0 does.
+#[tokio::test]
+async fn bash_preexec_still_sees_every_command_after_the_snippet_joins_prompt_command() {
+    let scalar = r#"PROMPT_COMMAND=$'__bp_precmd_invoke_cmd\n__bp_interactive_mode'"#;
+    let versioned = r#"if (( BASH_VERSINFO[0] > 5 || (BASH_VERSINFO[0] == 5 && BASH_VERSINFO[1] >= 1) )); then PROMPT_COMMAND=(__bp_precmd_invoke_cmd __bp_interactive_mode); else PROMPT_COMMAND=$'__bp_precmd_invoke_cmd\n__bp_interactive_mode'; fi"#;
+    for (arm, install) in [("0.5.0", scalar), ("0.6.0", versioned)] {
+        let dir = std::env::temp_dir().join(format!(
+            "holdfast-detection-bp-{}-{}",
+            arm.replace('.', "_"),
+            std::process::id()
+        ));
+        std::fs::create_dir_all(&dir).expect("mkdir");
+        let log = dir.join("preexec.log");
+        let rc = dir.join("bashrc");
+        std::fs::write(
+            &rc,
+            format!(
+                "PS1='$ '\n\
+                 __bp_precmd_invoke_cmd() {{ PS1='regen\\$ '; }}\n\
+                 __bp_interactive_mode() {{ __bp_armed=on; }}\n\
+                 __bp_debug() {{\n\
+                 \x20   [[ -n ${{__bp_armed-}} ]] || return 0\n\
+                 \x20   __bp_armed=\n\
+                 \x20   case $BASH_COMMAND in __bp_*|__holdfast_*) return 0 ;; esac\n\
+                 \x20   printf '%s\\n' \"$BASH_COMMAND\" >> '{log}'\n\
+                 }}\n\
+                 trap '__bp_debug' DEBUG\n\
+                 {install}\n",
+                log = log.display(),
+            ),
+        )
+        .expect("write rc");
+        let server = HoldfastServer::new();
+        let id = start(
+            &server,
+            StartSessionArgs {
+                command: Some("bash".into()),
+                args: vec![
+                    "--noprofile".into(),
+                    "--rcfile".into(),
+                    rc.to_string_lossy().into_owned(),
+                ],
+                env: term(),
+                ..Default::default()
+            },
+        )
+        .await;
+        assert_marker_stream_and_exit_codes(&server, &id, "bash").await;
+        assert!(
+            raw(&server, &id).await.contains("regen$ "),
+            "{arm}: the model's precmd never ran"
+        );
+        let seen = std::fs::read_to_string(&log).unwrap_or_default();
+        let seen: Vec<&str> = seen.lines().collect();
+        for command in ["echo hello", "false", EXITS_42] {
+            assert!(
+                seen.contains(&command),
+                "{arm}: preexec never fired for `{command}`; it saw {seen:?}"
+            );
+        }
+        kill(&server, &id).await;
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 }
 
 /// The **human** half of GH #220: what a person types during an `attach`
