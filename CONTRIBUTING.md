@@ -43,11 +43,13 @@ cargo install --locked --path crates/holdfast
 claude mcp add --scope user holdfast -- "$HOME/.cargo/bin/holdfast" mcp
 ```
 
-After each reinstall, `holdfast daemon stop` then `holdfast daemon start`: the
-daemon keeps running the binary it was started from until it is restarted, and
-stopping it ends every session it holds.
-[README.md](./README.md#build-and-try-it) covers that, the one registration
-each Claude Code config directory needs, and the plugin route.
+After each reinstall, `holdfast daemon stop` then `(cd ~ && holdfast daemon
+start)`: the daemon keeps running the binary it was started from until it is
+restarted, stopping it ends every session it holds, and one started from this
+checkout would be the directory a session with no `cwd` starts in on a build
+without GH #229's fix. [README.md](./README.md#build-and-try-it) covers that,
+the one registration each Claude Code config directory needs, and the plugin
+route.
 
 `holdfast mcp [--no-daemon]` speaks MCP over stdio. By default it runs in
 **hybrid mode**: it auto-spawns a background `holdfast daemon` that owns the

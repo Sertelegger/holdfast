@@ -735,7 +735,10 @@ is cut, named and published is in
   by every session, and keeps running the binary it started from until
   `holdfast daemon stop`, which ends every session it holds. It now installs
   with `cargo install --path`, gives the stop-and-start upgrade and the reason
-  for the start (GH #231), and says that each `CLAUDE_CONFIG_DIR` needs its own
+  for starting it yourself and from `~` (GH #231, GH #229: before their fixes,
+  an open session does not restart the daemon, and a daemon started in the
+  checkout is where every session without a `cwd` begins), and says that each
+  `CLAUDE_CONFIG_DIR` needs its own
   registration and that the plugin and `claude mcp add` should not both be
   used. `CONTRIBUTING.md`'s setup had the same `target/debug` line and still
   said *"milestones 0.0.1 through 0.0.5 have landed … nothing is released"*.

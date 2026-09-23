@@ -192,20 +192,24 @@ restarts:
 
 ```bash
 cargo install --locked --path crates/holdfast
-holdfast daemon stop    # ends every session it holds
-holdfast daemon start
+holdfast daemon stop               # ends every session it holds
+(cd ~ && holdfast daemon start)    # from ~, not from this checkout
 ```
 
 `daemon stop` is the only way to put new code into the daemon, and it ends
-every live session, so choose the moment. `daemon start` is there because of
-a defect, GH #231: until it is fixed, a Claude Code session whose
-`holdfast mcp` is already running does not start a daemon when its daemon goes
-away — its tools answer `daemon_unreachable` — though it does reconnect as soon
-as one exists again (measured). Those `holdfast mcp` processes are still the
-old binary until each Claude Code session restarts; a different protocol
-*minor* between them and the daemon is allowed, and a different major is
-refused with a message saying which side to restart. `holdfast daemon status`
-shows what is running.
+every live session, so choose the moment. **Start the new one yourself, and
+from `~`.** Each half answers a defect, and costs nothing on a build that has
+the fix. Without GH #231's fix, a Claude Code session whose `holdfast mcp` is
+already running does not start a daemon when its daemon goes away: its tools
+answer `daemon_unreachable` until one exists, and then reconnect (measured).
+Without GH #229's fix, a session started with no `cwd` begins in the daemon's
+working directory, with the daemon's environment — and `cargo install --path`
+runs in this checkout, so a daemon started from the same shell would point
+every such session, in every project, at the Holdfast repository. Those
+`holdfast mcp` processes are still the old binary until each Claude Code
+session restarts; a different protocol *minor* between them and the daemon is
+allowed, and a different major is refused with a message saying which side to
+restart. `holdfast daemon status` shows what is running.
 
 **One registration per Claude Code config directory.** `claude mcp add
 --scope user` writes to the config directory in effect — `~/.claude.json`, or
