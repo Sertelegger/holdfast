@@ -59,7 +59,17 @@ hf_mcp_error() {
     # forever. The diagnosis is already on stderr, so the watchdog loses
     # nothing. Its own stdio is /dev/null so it cannot hold the client's pipe
     # open after we are gone.
-    ( sleep 5; kill -TERM $$ ) < /dev/null > /dev/null 2>&1 &
+    #
+    # **The signal must be one nothing traps.** It was TERM, which the
+    # download phase traps to clean up; dash and busybox then abandon the
+    # `read`, and bash -- macOS's /bin/sh -- runs the trap and goes back to
+    # reading. Measured: 5 s under dash and busybox, the writer's full 30 s
+    # under bash. ALRM is trapped by nobody here and terminates outright in
+    # every shell; KILL a second later covers a caller that started us with
+    # ALRM ignored, which a non-interactive shell cannot undo. Neither runs
+    # the EXIT trap, so its cleanup happens here first.
+    [ -n "${HF_TMP:-}" ] && rm -rf "$HF_TMP"
+    ( sleep 5; kill -ALRM $$; sleep 1; kill -KILL $$ ) < /dev/null > /dev/null 2>&1 &
     _wd=$!
     _req=
     IFS= read -r _req
@@ -327,7 +337,7 @@ if [ -n "${HOLDFAST_BOOTSTRAP_ALLOW_PATH:-}" ]; then
         esac
         HF_NOTE="HOLDFAST_BOOTSTRAP_ALLOW_PATH is set but $hf_path_bin reports '$hf_path_says', not holdfast $HF_VERSION"
     fi
-    echo "holdfast bootstrap: $HF_NOTE; falling back to the release download" >&2
+    echo "holdfast bootstrap: $HF_NOTE; falling back to the plugin's own cached or downloaded binary" >&2
 fi
 
 # --- 1. cache hit ----------------------------------------------------------

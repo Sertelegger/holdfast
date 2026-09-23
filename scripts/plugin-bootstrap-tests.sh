@@ -346,6 +346,25 @@ kill "$quiet" 2> /dev/null
 chk "T12 silent stdin: bounded"  "$([ $((t1 - t0)) -lt 20 ] && echo yes || echo "no, $((t1 - t0))s")" yes
 chk "T12 silent stdin: said why" "$(grep -c 'no holdfast v9.9.9 binary to download' "$S/t12q.err")" 1
 chk "T12 silent stdin: no reply" "$(wc -c < "$S/t12q.out" | tr -d ' ')" 0
+chk "T12 silent stdin: no temp dir" "$(count_matching "$CACHE/bin" '.dl.*')" 0
+# **And under bash**, which is /bin/sh on macOS and which, unlike dash,
+# resumes a `read` after running a trap -- so a watchdog signal the download
+# phase traps (it was TERM) bounded the wait everywhere but there.
+if command -v bash > /dev/null 2>&1; then
+    rm -rf "$CACHE"
+    sleep 60 > "$S/quiet" &
+    quiet=$!
+    t0=$(date +%s)
+    env -i PATH="$PATH" HOME="$S/fakehome" CLAUDE_PLUGIN_DATA="$CACHE" \
+        HOLDFAST_BOOTSTRAP_BASE_URL="$BASE" HOLDFAST_BOOTSTRAP_INSECURE=1 \
+        bash "$PLUG/bootstrap" mcp < "$S/quiet" > /dev/null 2> "$S/t12b.err"
+    t1=$(date +%s)
+    kill "$quiet" 2> /dev/null
+    chk "T12 silent stdin, bash: bounded" "$([ $((t1 - t0)) -lt 20 ] && echo yes || echo "no, $((t1 - t0))s")" yes
+    chk "T12 silent stdin, bash: said why" "$(grep -c 'no holdfast v9.9.9 binary to download' "$S/t12b.err")" 1
+else
+    echo "  skip  T12 silent stdin under bash -- no bash on this host"
+fi
 # Only under `mcp`: `bootstrap version` run by a person must not print JSON.
 printf '%s\n' "$INIT" | env -i PATH="$PATH" HOME="$S/fakehome" CLAUDE_PLUGIN_DATA="$CACHE" \
     HOLDFAST_BOOTSTRAP_BASE_URL="$BASE" HOLDFAST_BOOTSTRAP_INSECURE=1 \
