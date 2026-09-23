@@ -2570,6 +2570,10 @@ pub async fn watch(session: &str) -> ExitCode {
     use holdfast_core::attach::{AttachMode, AttachRole, ServerFrame};
     use holdfast_core::protocol::frame;
 
+    // Its stdout is the one this process exists for, so a reader that
+    // leaves ends it — at once, not at the session's next output (GH #218).
+    crate::out::end_when_reader_leaves();
+
     let (rd, mut wr) =
         match dial_attach(session, AttachMode::ReadOnly, AttachRole::Observer, "watch").await {
             Dialled::Ok(rd, wr) => (rd, wr),

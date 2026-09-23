@@ -2351,6 +2351,119 @@ fn watch_ends_when_its_reader_does() {
     shim.kill();
 }
 
+/// **A watcher of a session that has gone quiet ends when its reader
+/// does**, not at the session's next output — `holdfast watch s | grep -m1
+/// READY` against a server that logged `READY` and then waited used to
+/// keep the watcher, and the pipeline, up until something else was
+/// printed.
+///
+/// The reader reads until the session has printed a marker *and* stopped
+/// printing, then closes; nothing is sent to the session after that, and
+/// its buffer head is checked afterwards — so the watcher cannot have been
+/// ended by a write, which is what [`watch_ends_when_its_reader_does`]
+/// already covers.
+#[test]
+fn watch_ends_when_its_reader_does_even_when_the_session_is_quiet() {
+    use std::os::unix::process::ExitStatusExt;
+
+    let env = TestEnv::new("watchquiet");
+    let mut shim = Shim::start(&env);
+    let started = shim.call_tool(
+        "start_session",
+        json!({ "command": "bash", "args": ["--norc", "--noprofile"], "name": "quiet" }),
+    );
+    let session_id = started["result"]["structuredContent"]["data"]["session_id"]
+        .as_str()
+        .expect("session id")
+        .to_string();
+
+    let (mut reader, writer) = std::io::pipe().expect("pipe");
+    let mut watch = env
+        .cmd()
+        .args(["watch", "quiet"])
+        .stdin(Stdio::null())
+        .stdout(writer)
+        .stderr(Stdio::null())
+        .spawn()
+        .expect("spawn holdfast watch");
+    let watch_pid = watch.id();
+
+    // Read what the watcher writes until it has shown the marker and then
+    // half a second of nothing — the marker is re-sent until it shows,
+    // because the watcher may not be attached when the first is printed.
+    // One owner of the read end, polled rather than read blindly, so that
+    // dropping it below really is the last reader leaving.
+    let mut seen = Vec::new();
+    let mut marked = false;
+    let mut quiet_since = Instant::now();
+    let mut last_sent: Option<Instant> = None;
+    let deadline = Instant::now() + Duration::from_secs(30);
+    loop {
+        assert!(
+            Instant::now() < deadline,
+            "the watcher never showed the session's output: {:?}",
+            String::from_utf8_lossy(&seen)
+        );
+        if !marked && last_sent.is_none_or(|t| t.elapsed() > Duration::from_secs(2)) {
+            shim.call_tool(
+                "send_input",
+                json!({ "session": session_id, "data": "echo QUIET''_MARK" }),
+            );
+            last_sent = Some(Instant::now());
+        }
+        let mut fd = libc::pollfd {
+            fd: std::os::unix::io::AsRawFd::as_raw_fd(&reader),
+            events: libc::POLLIN,
+            revents: 0,
+        };
+        // SAFETY: one `pollfd`, owned by this frame, and a count of 1.
+        let ready = unsafe { libc::poll(&mut fd, 1, 100) };
+        if ready > 0 {
+            let mut buf = [0u8; 4096];
+            let n = reader.read(&mut buf).expect("read the watcher's output");
+            assert!(n > 0, "the watcher closed its stdout");
+            seen.extend_from_slice(&buf[..n]);
+            marked |= String::from_utf8_lossy(&seen).contains("QUIET_MARK");
+            quiet_since = Instant::now();
+        } else if marked && quiet_since.elapsed() > Duration::from_millis(500) {
+            break;
+        }
+    }
+    drop(reader);
+    let head = {
+        let st = shim.call_tool("status", json!({ "session": session_id }));
+        st["result"]["structuredContent"]["data"]["buffer"]["head"].clone()
+    };
+
+    let deadline = Instant::now() + Duration::from_secs(10);
+    let status = loop {
+        if let Some(status) = watch.try_wait().expect("wait for watch") {
+            break status;
+        }
+        if Instant::now() >= deadline {
+            let _ = watch.kill();
+            let _ = watch.wait();
+            panic!(
+                "`holdfast watch` (pid {watch_pid}) outlived its reader by 10s on a quiet session"
+            );
+        }
+        std::thread::sleep(Duration::from_millis(20));
+    };
+    assert_eq!(
+        status.signal(),
+        Some(libc::SIGPIPE),
+        "`holdfast watch` must end as `cat` would when its reader has gone: {status}"
+    );
+    let st = shim.call_tool("status", json!({ "session": session_id }));
+    assert_eq!(
+        st["result"]["structuredContent"]["data"]["buffer"]["head"], head,
+        "the session printed after the reader left, so a write may have ended the watcher"
+    );
+
+    shim.call_tool("terminate", json!({ "session": session_id, "force": true }));
+    shim.kill();
+}
+
 /// Poll `read_output`'s tail until `needle` is in it. The cursor-0 read
 /// `Shim::read_until` makes cannot see past the first 256 KiB, which is
 /// the whole point of the rows that use this.

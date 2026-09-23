@@ -219,6 +219,56 @@ pub(crate) mod out {
         }
     }
 
+    /// End this process as [`bytes`] would on its next write, as soon as
+    /// stdout's reader has gone — without waiting for that write.
+    ///
+    /// **For `holdfast watch`, whose next write may never come.** It writes
+    /// only when the session prints, so `holdfast watch s | grep -m1 READY`
+    /// against a server that logged `READY` and then waited kept the
+    /// watcher, and the shell pipeline behind it, up until the session
+    /// happened to print again. `tail -f` has the same problem and the same
+    /// answer: ask the kernel about the descriptor instead of the next
+    /// write.
+    ///
+    /// A thread in `poll(2)` on stdout with no events requested, which
+    /// still reports `POLLERR` — Linux's answer for a pipe whose reader has
+    /// closed — and `POLLHUP`, FreeBSD's for the same and everyone's for a
+    /// hung-up terminal or a socket whose peer has gone. A second's timeout
+    /// is what reaches a kernel that computes those at call time without
+    /// waking a sleeper for them; where a kernel reports neither for an
+    /// empty event set, the thread only ever times out, and the next write
+    /// decides, as it always did. `POLLNVAL` — a descriptor `poll` cannot
+    /// wait on — ends the thread, not the process, for the same reason.
+    #[cfg(unix)]
+    pub(crate) fn end_when_reader_leaves() {
+        let spawned = std::thread::Builder::new()
+            .name("stdout-reader-gone".into())
+            .spawn(|| loop {
+                let mut fd = libc::pollfd {
+                    fd: libc::STDOUT_FILENO,
+                    events: 0,
+                    revents: 0,
+                };
+                // SAFETY: one `pollfd`, owned by this frame, and a count of 1.
+                let rc = unsafe { libc::poll(&mut fd, 1, 1000) };
+                if rc < 0 {
+                    if std::io::Error::last_os_error().kind() == std::io::ErrorKind::Interrupted {
+                        continue;
+                    }
+                    return;
+                }
+                if fd.revents & libc::POLLNVAL != 0 {
+                    return;
+                }
+                if fd.revents & (libc::POLLERR | libc::POLLHUP) != 0 {
+                    reader_gone();
+                }
+            });
+        // A thread that could not be started costs only the early exit;
+        // the write path still ends the process on its next write.
+        drop(spawned);
+    }
+
     fn failed(e: &std::io::Error) -> ! {
         if e.kind() == std::io::ErrorKind::BrokenPipe {
             reader_gone();
