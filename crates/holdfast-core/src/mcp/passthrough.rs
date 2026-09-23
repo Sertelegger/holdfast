@@ -21,7 +21,7 @@ use super::envelope;
 // `every_router_tool_is_dispatchable` names whichever tool is
 // unreachable.
 use super::tools::{
-    GetCommandHistoryArgs, GetScreenStateArgs, InterruptArgs, ReadOutputArgs,
+    GetCommandHistoryArgs, GetScreenStateArgs, InterruptArgs, ListSessionsArgs, ReadOutputArgs,
     RequestSecretInputArgs, ResizeArgs, SendInputArgs, StartSessionArgs, StatusArgs, TerminateArgs,
     WaitForPatternArgs,
 };
@@ -117,9 +117,9 @@ pub async fn call_tool(
         // the shape that works — but the shim's read side must not impose
         // a deadline shorter than the tool's.
         "request_secret_input" => run!(request_secret_input, RequestSecretInputArgs),
-        // No arguments: the router still passes an (empty) object, and
-        // the macro above is arg-shaped, so this arm is written out.
-        "list_sessions" => Some(server.list_sessions().await),
+        // No arguments, and an empty struct that says so: a key here is
+        // refused like any other tool's unknown argument (GH #219).
+        "list_sessions" => run!(list_sessions_tool, ListSessionsArgs),
         _ => None,
     }
 }
