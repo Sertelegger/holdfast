@@ -673,9 +673,9 @@ is cut, named and published is in
   ok"` used its whole deadline and answered `timeout` on a run that had
   succeeded — with the matching text in the same response's
   `output_since_start`. The scan window now carries an escape-free view
-  beside the raw bytes, built by the read path's own stripper with each text
-  byte's raw offset kept, and the pattern is searched in both; the earlier
-  match wins. A pattern that spells an escape still matches the raw bytes,
+  beside the raw bytes, built by the read path's own stripper with a map
+  back to raw offsets (one entry per escape, not per byte), and the pattern
+  is searched in both; the earlier match wins. A pattern that spells an escape still matches the raw bytes,
   and `match.offset` is still a raw byte offset, as §5.2 requires.
 
 - **A program stopped at a `[Y/n] ` confirmation could read `Executing` for

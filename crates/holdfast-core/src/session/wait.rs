@@ -25,9 +25,9 @@
 //! run that succeeded, with the matching text sitting in the same
 //! response's `output_since_start`. So the window carries an escape-free
 //! view beside the raw bytes, built by the read path's own
-//! [`AnsiStripper`] with every text byte's raw offset recorded, and the
-//! pattern is searched in both. The earlier match wins, by raw offset;
-//! a tie goes to the raw one, whose span is exact.
+//! [`AnsiStripper`] with a map from every text byte back to its raw
+//! offset, and the pattern is searched in both. The earlier match wins,
+//! by raw offset; a tie goes to the raw one, whose span is exact.
 //!
 //! Both, rather than the text alone, because a pattern that spells an
 //! escape (`\x1b\[32mok`) is a thing callers were told they could write —
