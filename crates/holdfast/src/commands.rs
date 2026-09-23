@@ -3744,6 +3744,37 @@ mod tests {
         assert_eq!(row(&p, 23).trim_end(), "user@box $");
     }
 
+    /// **A shell whose screen fits below the notice keeps every row**, one
+    /// row down (GH #235's review). A freshly started shell has its prompt
+    /// on the top row; a notice laid over that row would hide the one line
+    /// the human attached to see. A shell moves its cursor relative to
+    /// where it is, so drawing the picture a row lower costs it nothing —
+    /// which is why only a full-screen program's picture is held in place.
+    #[test]
+    fn a_shell_that_fits_below_the_notice_is_drawn_whole_one_row_down() {
+        let lines = grid(&["last login: today", "user@box $ "], 24);
+        let mut p = vt100::Parser::new(24, 80, 0);
+        p.process(&paint_snapshot(
+            &lines,
+            (1, 11),
+            Some((80, 24)),
+            Some(" holdfast: attached to sess (80x24) — Ctrl-B d to detach "),
+            false,
+        ));
+        assert!(row(&p, 0).contains("attached to sess"), "{:?}", row(&p, 0));
+        assert_eq!(
+            row(&p, 1).trim_end(),
+            "last login: today",
+            "the shell's first row was hidden under the notice"
+        );
+        assert_eq!(row(&p, 2).trim_end(), "user@box $");
+        assert_eq!(
+            p.screen().cursor_position(),
+            (2, 11),
+            "the cursor must follow its prompt down"
+        );
+    }
+
     /// **A full-screen program's rows stay on their own rows under the
     /// notice** (GH #235's review). `vim` joined from a terminal of its own
     /// size, its command line blank: shifting the picture down one row for
