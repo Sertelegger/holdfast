@@ -2590,6 +2590,18 @@ fn an_unknown_flag_is_a_usage_error_and_changes_nothing() {
         assert!(out.is_empty(), "{args:?} ran anyway: {out}");
     }
 
+    // A group with its verb missing or wrong names the verbs it has — read
+    // off the banner, so this is the banner's list and not a second copy.
+    let (code, _, err) = env.run(&["daemon"]);
+    assert_eq!(code, 64, "{err}");
+    assert!(err.contains("run|start|stop|status"), "{err}");
+    let (code, _, err) = env.run(&["daemon", "frobnicate"]);
+    assert_eq!(code, 64, "{err}");
+    assert!(err.contains("frobnicate"), "{err}");
+    let (code, _, err) = env.run(&["--jsn"]);
+    assert_eq!(code, 64, "{err}");
+    assert!(err.contains("--jsn"), "{err}");
+
     // Flags before the session are flags, not a missing session: with no
     // daemon this reaches the connect and fails *there*, exit 2.
     let (code, _, err) = env.run(&["logs", "--raw", "big"]);
