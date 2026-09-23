@@ -1744,7 +1744,7 @@ async fn handle_connection(daemon: Arc<Daemon>, mut stream: UnixStream) {
     // The kind the peer declared in its handshake, on a connection whose
     // uid we just checked. This is the *only* source of caller identity
     // for the §9.4 audit record — see `mcp::caller`.
-    let Some(client_kind) = do_handshake(&mut stream).await else {
+    let Some(peer) = do_handshake(&mut stream).await else {
         return;
     };
 
@@ -1836,7 +1836,7 @@ async fn handle_connection(daemon: Arc<Daemon>, mut stream: UnixStream) {
         // its response is written into a socket nobody reads, exactly as
         // today.
         let (resp, stop_after) = {
-            let call = dispatch(&daemon, &req, client_kind, &cancel);
+            let call = dispatch(&daemon, &req, peer, &cancel);
             tokio::pin!(call);
             let gone = peer_gone(&stream);
             tokio::pin!(gone);
@@ -2016,12 +2016,62 @@ fn response_closes_connection(resp: &Response) -> bool {
     }
 }
 
+/// Who is on the other end of a connection, as its accepted handshake
+/// declared it.
+///
+/// **Both halves are self-declared, and each is used only where that is
+/// enough.** `kind` is the §9.4 caller identity, which `mcp::caller`
+/// argues for. `minor` answers one question: whether this peer can be
+/// the shim that sends [`CLIENT_PARAM`] — and that is not a check a
+/// same-uid process could not pass by lying, but one an *honest older
+/// shim* cannot, which is the route it closes (GH #229's review; see
+/// [`Peer::sends_launch_context`]).
+///
+/// [`CLIENT_PARAM`]: crate::session::launch::CLIENT_PARAM
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct Peer {
+    pub kind: ClientKind,
+    pub minor: u32,
+}
+
+impl Peer {
+    /// A peer of this build's own protocol.
+    #[cfg(test)]
+    fn current(kind: ClientKind) -> Self {
+        Self {
+            kind,
+            minor: handshake::PROTOCOL_MINOR,
+        }
+    }
+
+    /// Whether this peer's protocol has `tool/start_session`'s
+    /// [`CLIENT_PARAM`] — so that one it sends is its own launch context,
+    /// and not a tool argument it is passing on.
+    ///
+    /// **A shim older than the key forwards the agent's arguments
+    /// verbatim**, and a daemon outlives such shims by design (README's
+    /// upgrade window). Taken from one, `@client` is whatever the agent
+    /// typed: it replaced the session's whole environment and directory,
+    /// and `session_start`'s `env_keys` — which records the call's own
+    /// `env` — recorded none of it. Measured through an `a81b02d` shim
+    /// against this daemon before the gate: the shell saw the agent's
+    /// `HOME` and lost `CLAUDE_PROJECT_DIR`, and the audit row read
+    /// `"env_keys":[]`. From such a peer the key is left in the arguments,
+    /// where `start_session`'s closed schema refuses it by name — the
+    /// answer `--no-daemon` gives.
+    ///
+    /// [`CLIENT_PARAM`]: crate::session::launch::CLIENT_PARAM
+    pub fn sends_launch_context(self) -> bool {
+        self.minor >= handshake::LAUNCH_CONTEXT_MINOR
+    }
+}
+
 /// Exchange the handshake.
 ///
-/// `Some(kind)` is the peer's declared [`ClientKind`], which becomes the
-/// connection's caller identity for §9.4. `None` means the connection
-/// must close.
-async fn do_handshake(stream: &mut UnixStream) -> Option<ClientKind> {
+/// `Some(peer)` is what the peer declared: its [`ClientKind`], which
+/// becomes the connection's caller identity for §9.4, and its protocol
+/// minor. `None` means the connection must close.
+async fn do_handshake(stream: &mut UnixStream) -> Option<Peer> {
     do_handshake_within(stream, handshake::HANDSHAKE_TIMEOUT).await
 }
 
@@ -2030,7 +2080,7 @@ async fn do_handshake(stream: &mut UnixStream) -> Option<ClientKind> {
 async fn do_handshake_within(
     stream: &mut UnixStream,
     deadline: std::time::Duration,
-) -> Option<ClientKind> {
+) -> Option<Peer> {
     // **The daemon's only deadline on this protocol.** `serve` spawns an
     // uncapped task per accepted connection, so without this a peer that
     // connects and sends nothing holds a task and a file descriptor
@@ -2085,7 +2135,10 @@ async fn do_handshake_within(
         return None;
     }
     if accepted {
-        Some(params.client_kind)
+        Some(Peer {
+            kind: params.client_kind,
+            minor: params.protocol_minor,
+        })
     } else {
         None
     }
@@ -2113,15 +2166,13 @@ fn caller_for(connection: ClientKind, _req: &Request) -> Caller {
 async fn dispatch(
     daemon: &Arc<Daemon>,
     req: &Request,
-    client_kind: ClientKind,
+    peer: Peer,
     cancel: &CancelSignal,
 ) -> (Response, bool) {
     match req.method.as_str() {
         method::METHOD_RESOURCE_LIST
         | method::METHOD_RESOURCE_TEMPLATES_LIST
-        | method::METHOD_RESOURCE_READ => {
-            (dispatch_resource(daemon, req, client_kind).await, false)
-        }
+        | method::METHOD_RESOURCE_READ => (dispatch_resource(daemon, req, peer.kind).await, false),
         method::METHOD_CANCEL => (dispatch_cancel(daemon, req), false),
         method::METHOD_HANDSHAKE => (
             Response::error(
@@ -2191,10 +2242,7 @@ async fn dispatch(
                     false,
                 );
             };
-            (
-                dispatch_tool(daemon, req, tool, client_kind, cancel).await,
-                false,
-            )
+            (dispatch_tool(daemon, req, tool, peer, cancel).await, false)
         }
     }
 }
@@ -2403,7 +2451,7 @@ async fn dispatch_tool(
     daemon: &Arc<Daemon>,
     req: &Request,
     tool: &str,
-    client_kind: ClientKind,
+    peer: Peer,
     cancel: &CancelSignal,
 ) -> Response {
     let mut args: serde_json::Value = match method::from_cbor(&req.params) {
@@ -2429,7 +2477,13 @@ async fn dispatch_tool(
     // context; on any other tool the key stays in the arguments and is
     // refused there as the unknown argument it is (GH #219), exactly as
     // `--no-daemon` refuses it.
-    let client = if tool == crate::session::launch::CLIENT_PARAM_TOOL {
+    //
+    // **And from a peer whose protocol has it** (`Peer::sends_launch_context`).
+    // A shim older than the key passes the agent's arguments through
+    // unchanged, so from one it is the agent's text, not a launch context,
+    // and it is left for the tool to refuse in the same way.
+    let client = if tool == crate::session::launch::CLIENT_PARAM_TOOL && peer.sends_launch_context()
+    {
         match crate::session::launch::take_client_param(&mut args) {
             Ok(client) => client,
             Err(e) => return Response::error(req.id, ErrorCode::BadParams, e),
@@ -2440,7 +2494,7 @@ async fn dispatch_tool(
     // Scope the call to the caller derived from the connection, so the
     // §9.4 audit write inside the read path records who asked without
     // any tool handler having to pass it down.
-    let who = caller_for(client_kind, req);
+    let who = caller_for(peer.kind, req);
     // **GH #127: the same move, for the same reason, one field over.**
     // `#[tool]` generates the handler signatures and
     // `passthrough::call_tool` builds no context of its own, so a
@@ -2633,7 +2687,8 @@ mod tests {
         paths.ensure_dir().unwrap();
         let daemon = Daemon::new(paths);
         let req = forged_read_output("cli");
-        let (_resp, _stop) = dispatch(&daemon, &req, kind, &CancelSignal::new()).await;
+        let (_resp, _stop) =
+            dispatch(&daemon, &req, Peer::current(kind), &CancelSignal::new()).await;
         let _ = std::fs::remove_dir_all(&dir);
         OBSERVED.with(|o| o.get())
     }
@@ -3095,7 +3150,13 @@ mod tests {
             req.cancel_token.is_none(),
             "the fixture carries a token, so this row cannot see the difference"
         );
-        let (_resp, _stop) = dispatch(&daemon, &req, ClientKind::Cli, &CancelSignal::new()).await;
+        let (_resp, _stop) = dispatch(
+            &daemon,
+            &req,
+            Peer::current(ClientKind::Cli),
+            &CancelSignal::new(),
+        )
+        .await;
         assert_eq!(
             daemon.cancellable_calls_in_flight(),
             0,
@@ -3126,7 +3187,13 @@ mod tests {
             },
         )
         .unwrap();
-        let (resp, stop) = dispatch(&daemon, &miss, ClientKind::Shim, &CancelSignal::new()).await;
+        let (resp, stop) = dispatch(
+            &daemon,
+            &miss,
+            Peer::current(ClientKind::Shim),
+            &CancelSignal::new(),
+        )
+        .await;
         assert!(!stop, "a cancel must not stop the daemon");
         assert!(
             !resp.is_error(),
@@ -3145,7 +3212,13 @@ mod tests {
             },
         )
         .unwrap();
-        let (resp, _) = dispatch(&daemon, &hit, ClientKind::Shim, &CancelSignal::new()).await;
+        let (resp, _) = dispatch(
+            &daemon,
+            &hit,
+            Peer::current(ClientKind::Shim),
+            &CancelSignal::new(),
+        )
+        .await;
         let outcome: method::CancelOutcome = resp.data_as().unwrap();
         assert!(
             outcome.cancelled,
@@ -3157,7 +3230,13 @@ mod tests {
         // `ok` — `daemon/stop` was the method that answered `ok` to
         // structurally garbage params, and this one does not inherit it.
         let junk = Request::new(3, method::METHOD_CANCEL, &json!({ "nope": 1 })).unwrap();
-        let (resp, _) = dispatch(&daemon, &junk, ClientKind::Shim, &CancelSignal::new()).await;
+        let (resp, _) = dispatch(
+            &daemon,
+            &junk,
+            Peer::current(ClientKind::Shim),
+            &CancelSignal::new(),
+        )
+        .await;
         assert!(
             resp.is_error(),
             "garbage cancel params were accepted: {resp:?}"

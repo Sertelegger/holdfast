@@ -1311,6 +1311,18 @@ is cut, named and published is in
   daemon of this release nothing but that field — because a daemon
   outlives the shims that talk to it.
 
+  **And it is taken only from a shim that sends one.** A shim older than
+  the key forwards an agent's arguments verbatim, and keeps running against
+  the upgraded daemon until its Claude Code session restarts; through one, an
+  agent that typed `@client` into `start_session` had its own `env` replace
+  the session's whole environment — measured with an `a81b02d` shim: the
+  shell saw the agent's `HOME` and variables and no `CLAUDE_PROJECT_DIR` —
+  and `session_start.env_keys` recorded none of it. The key is part of
+  control protocol 1.5, and the daemon now takes it only from a peer whose
+  handshake declared 1.5 or later; an older shim's is left in the arguments,
+  where `start_session` refuses it as the unknown argument it is, as
+  `--no-daemon` does (integration review of [#229]).
+
 - **The server instructions lead with the password-prompt rule, and all of
   them now reach the model (GH #230).** Claude Code passes the first 2048
   characters of a server's instructions to the model and drops the rest

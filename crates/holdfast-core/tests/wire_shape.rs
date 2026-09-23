@@ -308,6 +308,17 @@ const RECORDED_VERSIONS: &[(u32, u32)] = &[
     // stream. `raised_by` is `Option<String>` with §9.4's spelling
     // (`echo_drop` | `tool_call`), a free string like `outcome` one frame
     // down, so a later third provenance is not a wire-shape change.
+    //
+    // **And `CLIENT_PARAM`, `@client`** — the shim's launch context on
+    // `tool/start_session` (GH #229) — which reached this record after
+    // the two above and in the same release, and is folded into 1.5
+    // rather than given a 1.6 because no 1.5 had yet left the branch that
+    // introduced it: `main` was at 1.4, and this document did not exist
+    // there. It is also the one addition in this log a daemon gates on
+    // the peer's minor (`handshake::LAUNCH_CONTEXT_MINOR`), which is why
+    // the version it belongs to has to be written down at all: a shim
+    // that declares less than 1.5 cannot be sending one of its own, and
+    // is passing on an agent's argument if it sends one.
     (1, 5),
 ];
 

@@ -59,6 +59,14 @@
 //! under [`CLIENT_PARAM`] — so a profile session ignores it and keeps the
 //! daemon's own environment and directory, as before.
 //!
+//! **Not agent-typed is a property the daemon enforces, not one it
+//! assumes.** A shim older than the key forwards an agent's `arguments`
+//! verbatim, so an agent that typed `@client` into `start_session` had
+//! it read as a launch context: its `env` replaced the session's, and
+//! `session_start`'s `env_keys` recorded none of it. The daemon now takes
+//! the key only from a peer whose protocol has it (1.5), and an older
+//! shim's is refused as the unknown argument it is.
+//!
 //! ## What is still scrubbed, and why that is a fallback
 //!
 //! A daemon-hosted session that has **no** client environment — a
@@ -87,9 +95,17 @@ use std::future::Future;
 /// **Not a tool argument**: the daemon removes it before the arguments
 /// reach the handler (`daemon::server::dispatch_tool`), and `@` makes it a
 /// name no `StartSessionArgs` field can ever have. An MCP client that
-/// supplies it gets it overwritten by the shim, and under `--no-daemon`
-/// nothing reads it at all.
-pub const CLIENT_PARAM: &str = "@client";
+/// supplies it gets it overwritten by the shim, and under `--no-daemon`,
+/// where nothing removes it, `start_session`'s closed arguments refuse it.
+///
+/// **Taken only from a shim that sends one.** A shim older than protocol
+/// 1.5 forwards the agent's arguments verbatim, so from one the key is
+/// the agent's text; the daemon leaves it in the arguments and the tool
+/// refuses it the same way (`daemon::server::Peer::sends_launch_context`).
+///
+/// Declared in `protocol::method`, which is where the wire-shape record
+/// reads the control protocol's tokens from.
+pub const CLIENT_PARAM: &str = crate::protocol::method::CLIENT_PARAM;
 
 /// The one tool whose control-protocol params may carry [`CLIENT_PARAM`].
 ///

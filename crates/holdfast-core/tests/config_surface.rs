@@ -543,7 +543,7 @@ const INERT: &[(&str, Inert, &str)] = &[
     (
         "ui.max_bridge_sessions",
         Inert::NamedElsewhere,
-        "0.0.10. VALIDATE-ONLY. The one mention is crates/holdfast-core/src/protocol/method.rs:179, a doc comment saying its only producer, bridge/register, is 0.0.10's.",
+        "0.0.10. VALIDATE-ONLY. The one mention is crates/holdfast-core/src/protocol/method.rs:190, a doc comment saying its only producer, bridge/register, is 0.0.10's.",
     ),
     // ---- [notifications]
     (

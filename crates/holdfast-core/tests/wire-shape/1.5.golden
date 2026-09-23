@@ -15,6 +15,7 @@ LENGTH_PREFIX_BYTES = 4
 MAX_FRAME_BYTES = 16777216
 
 [tokens]
+CLIENT_PARAM = "@client"
 METHOD_CANCEL = "holdfast/cancel"
 METHOD_DAEMON_STATUS = "daemon/status"
 METHOD_DAEMON_STOP = "daemon/stop"

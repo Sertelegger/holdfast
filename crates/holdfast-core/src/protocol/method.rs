@@ -12,6 +12,17 @@ pub type CborValue = ciborium::Value;
 /// Namespace prefix for MCP-tool-passthrough methods (§7.4.1).
 pub const TOOL_METHOD_PREFIX: &str = "tool/";
 
+/// The key a shim carries its own launch context under, in
+/// `tool/start_session`'s params (GH #229, protocol 1.5).
+///
+/// **The one thing the shim adds to a tool's arguments**, so it is a
+/// control-protocol token and is declared here, where the wire-shape
+/// record reads its tokens from; `session::launch` owns what it means.
+/// The daemon takes it only from a peer of
+/// [`LAUNCH_CONTEXT_MINOR`](super::handshake::LAUNCH_CONTEXT_MINOR) or
+/// later.
+pub const CLIENT_PARAM: &str = "@client";
+
 /// The connect handshake. Must be the first method on every connection.
 pub const METHOD_HANDSHAKE: &str = "holdfast/handshake";
 /// Daemon introspection, behind `holdfast daemon status`.
