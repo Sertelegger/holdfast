@@ -36,8 +36,10 @@ command -v curl > /dev/null 2>&1 || { echo "curl is required" >&2; exit 2; }
 
 S=$(mktemp -d "${TMPDIR:-/tmp}/hf-boot.XXXXXX") || exit 2
 SRV=""
+SRV2=""
 cleanup() {
     [ -n "$SRV" ] && kill "$SRV" 2> /dev/null
+    [ -n "$SRV2" ] && kill "$SRV2" 2> /dev/null
     rm -rf "$S"
 }
 trap cleanup EXIT HUP INT TERM
@@ -89,6 +91,43 @@ while [ "$i" -lt 100 ]; do
 done
 [ "$i" -lt 100 ] || { echo "fixture server never came up on $PORT" >&2; exit 2; }
 BASE="http://127.0.0.1:$PORT"
+
+# **A second server for the answers the first cannot give.** `http.server`
+# serves 200, 404 and a directory's 301, and nothing else -- so the bootstrap's
+# "answered HTTP <other>" arm had no row that reached it, and "the LAST status
+# of a redirect chain is the answer" had none either. Under `/to404/` every
+# path is a 302 to the same path under `/gone/`, which is a 404; under
+# `/drop/` the connection is closed with no answer at all; everything else is
+# a 503.
+PORT2=$((PORT + 1))
+python3 - "$PORT2" > "$S/http2.log" 2>&1 <<'EOF' &
+import http.server, sys
+class H(http.server.BaseHTTPRequestHandler):
+    def do_GET(self):
+        if self.path.startswith("/to404/"):
+            self.send_response(302)
+            self.send_header("Location", "/gone/" + self.path[len("/to404/"):])
+        elif self.path.startswith("/gone/"):
+            self.send_response(404)
+        elif self.path.startswith("/drop/"):
+            return
+        else:
+            self.send_response(503)
+        self.send_header("Content-Length", "0")
+        self.end_headers()
+http.server.HTTPServer(("127.0.0.1", int(sys.argv[1])), H).serve_forever()
+EOF
+SRV2=$!
+i=0
+while [ "$i" -lt 100 ]; do
+    [ "$(curl -s -o /dev/null -w '%{http_code}' "http://127.0.0.1:$PORT2/" 2> /dev/null)" = 503 ] && break
+    i=$((i + 1))
+    sleep 0.1
+done
+[ "$i" -lt 100 ] || { echo "second fixture server never came up on $PORT2" >&2; exit 2; }
+BASE503="http://127.0.0.1:$PORT2"
+BASE302="http://127.0.0.1:$PORT2/to404"
+BASEDROP="http://127.0.0.1:$PORT2/drop"
 CACHE="$S/data"
 BIN="$CACHE/bin/holdfast-v0.1.0-linux-x86_64"
 SUMS="$CACHE/bin/SHA256SUMS-v0.1.0.txt"
@@ -161,6 +200,21 @@ chk "T4b places the binary"  "$(printf '%s' "$out" | grep -c 'place the extracte
 # cache miss (step 1), so following the old advice re-downloaded forever.
 chk "T4b places the manifest" "$(printf '%s' "$out" | grep -c 'beside it as [^ ]*/SHA256SUMS-v9.9.9.txt')" 1
 chk "T4b names BOOTSTRAP_BIN" "$(printf '%s' "$out" | grep -c 'set HOLDFAST_BOOTSTRAP_BIN to')" 1
+
+# The third arm: a server answered, and not with 404. It is neither "not
+# published" nor "cannot reach", and says neither.
+echo "--- T4c a server that answers something else, and a 404 at the end of a redirect ---"
+rm -rf "$CACHE"
+out=$(RUN_BASE=$BASE503 run mcp); rc=$?
+chk "T4c 503 exit nonzero"       "$(yn $rc)" yes
+chk "T4c 503 is said as such"    "$(printf '%s' "$out" | grep -c 'SHA256SUMS.txt answered HTTP 503 -- retry later, or build it')" 1
+chk "T4c 503 is not 'not published'" "$(printf '%s' "$out" | grep -c 'binary to download')" 0
+chk "T4c 503 is not 'cannot reach'"  "$(printf '%s' "$out" | grep -c 'cannot reach')" 0
+# A release asset is a redirect on GitHub; the answer is the last hop's.
+out=$(RUN_BASE=$BASE302 run mcp)
+chk "T4c 302 then 404: not published" "$(printf '%s' "$out" | grep -c 'no holdfast v9.9.9 binary to download.*answered 404')" 1
+out=$(RUN_BASE=$BASEDROP run mcp)
+chk "T4c no answer: cannot reach" "$(printf '%s' "$out" | grep -c 'cannot reach http://127.0.0.1:[0-9]*/drop/v9.9.9/SHA256SUMS.txt')" 1
 printf '0.1.0\n' > "$PLUG/version.txt"
 
 echo "--- T5 manifest has no line for this target ---"
@@ -248,7 +302,7 @@ printf '0.1.0\n' > "$PLUG/version.txt"
 # the bootstrap uses, because the host's own PATH may well hold a holdfast --
 # the owner's does, once they have followed the README.
 mkdir -p "$S/minpath"
-for t in tr sed uname curl mkdir mktemp chmod rm cut sha256sum tar gzip head ls wc mv dirname; do
+for t in tr sed uname curl mkdir mktemp chmod rm cut sha256sum tar gzip head ls wc mv dirname sleep; do
     tp=$(command -v "$t") || { echo "the minimal PATH needs $t" >&2; exit 2; }
     ln -sf "$tp" "$S/minpath/$t"
 done
@@ -493,8 +547,165 @@ else
     out=$(ps HOLDFAST_BOOTSTRAP_BASE_URL=http://127.0.0.1:1 -- mcp)
     chk "T14 unreachable says so"    "$(printf '%s' "$out" | grep -c 'cannot reach http://127.0.0.1:1/v9.9.9/SHA256SUMS.txt')" 1
     chk "T14 unreachable places both" "$(printf '%s' "$out" | grep -c 'holdfast-v9.9.9-windows-x86_64.exe with SHA256SUMS.txt beside it as [^ ]*SHA256SUMS-v9.9.9.txt')" 1
+    out=$(ps HOLDFAST_BOOTSTRAP_BASE_URL="$BASE503" -- mcp)
+    chk "T14 503 is said as such"    "$(printf '%s' "$out" | grep -c 'SHA256SUMS.txt answered HTTP 503 -- retry later, or build it')" 1
+    out=$(ps HOLDFAST_BOOTSTRAP_BASE_URL="$BASE302" -- mcp)
+    chk "T14 302 then 404: not published" "$(printf '%s' "$out" | grep -c 'no holdfast v9.9.9 binary to download.*answered 404')" 1
+
+    # **The initialize answer, as T12 checks it for `bootstrap`.** It is what
+    # makes CHANGELOG's "says why in Claude Code" true of this file at all;
+    # before, it said so of the Unix half only and read as both.
+    psio() { # psio <extra env...> -- <args...>; stdio is the caller's
+        _e=
+        while [ "$1" != -- ]; do _e="$_e $1"; shift; done
+        shift
+        # shellcheck disable=SC2086
+        env -i PATH="$PATH" HOME="$S/fakehome" CLAUDE_PLUGIN_DATA="$CACHE" \
+            PROCESSOR_ARCHITECTURE=AMD64 HOLDFAST_BOOTSTRAP_INSECURE=1 $_e \
+            "$PWSH" -NoProfile -NonInteractive -File "$PLUG/bootstrap.ps1" "$@"
+    }
+    printf '%s\n' "$INIT" | psio HOLDFAST_BOOTSTRAP_BASE_URL="$BASE" -- mcp \
+        > "$S/t14.out" 2> "$S/t14.err"; rc=$?
+    chk "T14 init: exit nonzero"     "$(yn $rc)" yes
+    chk "T14 init: one JSON-RPC line" "$(jfield "$S/t14.out" 'j["jsonrpc"]')" 2.0
+    chk "T14 init: answers id 0"     "$(jfield "$S/t14.out" 'repr(j["id"])')" 0
+    chk "T14 init: is an error"      "$(jfield "$S/t14.out" 'j["error"]["code"]')" -32603
+    chk "T14 init: message == stderr line" "$(jfield "$S/t14.out" 'j["error"]["message"] == open(sys.argv[1][:-4]+".err").read().splitlines()[-1]')" True
+    chk "T14 init: message says why" "$(jfield "$S/t14.out" '"no holdfast v9.9.9 binary to download" in j["error"]["message"]')" True
+    printf '%s\n' '{"jsonrpc":"2.0","id":"req-7","method":"initialize","params":{}}' \
+        | psio HOLDFAST_BOOTSTRAP_BASE_URL="$BASE" -- mcp > "$S/t14s.out" 2> /dev/null
+    chk "T14 init: string id echoed" "$(jfield "$S/t14s.out" 'repr(j["id"])')" "'req-7'"
+    printf '%s\n' 'not json' \
+        | psio HOLDFAST_BOOTSTRAP_BASE_URL="$BASE" -- mcp > "$S/t14n.out" 2> /dev/null
+    chk "T14 init: unreadable id is null" "$(jfield "$S/t14n.out" 'repr(j["id"])')" None
+    printf '%s\n' "$INIT" | psio HOLDFAST_BOOTSTRAP_BASE_URL="$BASE" -- version \
+        > "$S/t14v.out" 2> /dev/null
+    chk "T14 init: not under 'version'" "$(wc -c < "$S/t14v.out" | tr -d ' ')" 0
+    psio HOLDFAST_BOOTSTRAP_BASE_URL="$BASE" -- mcp < /dev/null > "$S/t14z.out" 2> /dev/null
+    chk "T14 init: no request, no reply" "$(wc -c < "$S/t14z.out" | tr -d ' ')" 0
+    # Quote, backslash, tab and a non-ASCII letter, echoed from a relative
+    # HOLDFAST_BOOTSTRAP_BIN into the message: the reply must parse, and say
+    # `q"b\s té` -- the tab a space, the rest intact.
+    # Not through psio, which word-splits its env arguments -- on the tab.
+    printf '%s\n' "$INIT" | env -i PATH="$PATH" HOME="$S/fakehome" \
+        HOLDFAST_BOOTSTRAP_BIN="$(printf 'q"b\\s\tt\303\251')" \
+        "$PWSH" -NoProfile -NonInteractive -File "$PLUG/bootstrap.ps1" mcp \
+        > "$S/t14e.out" 2> /dev/null
+    chk "T14 init: escaping survives" "$(jfield "$S/t14e.out" '"q\"b\\s té" in j["error"]["message"]')" True
+    chk "T14 init: reply is ASCII"   "$(LC_ALL=C grep -c '[^ -~]' "$S/t14e.out")" 0
+    sleep 60 > "$S/quiet" &
+    quiet=$!
+    t0=$(date +%s)
+    psio HOLDFAST_BOOTSTRAP_BASE_URL="$BASE" -- mcp < "$S/quiet" > "$S/t14q.out" 2> "$S/t14q.err"
+    t1=$(date +%s)
+    kill "$quiet" 2> /dev/null
+    chk "T14 init: silent stdin bounded" "$([ $((t1 - t0)) -lt 20 ] && echo yes || echo "no, $((t1 - t0))s")" yes
+    chk "T14 init: silent stdin said why" "$(grep -c 'no holdfast v9.9.9 binary to download' "$S/t14q.err")" 1
+    chk "T14 init: silent stdin no reply" "$(wc -c < "$S/t14q.out" | tr -d ' ')" 0
     printf '0.1.0\n' > "$PLUG/version.txt"
 fi
+
+echo "--- T15 wget as the only fetcher: the same answers as curl ---"
+# Every row above runs curl, which the bootstrap prefers. A host without it
+# -- a slim container, Alpine -- falls back to wget, and the two wgets there
+# report a failure differently from curl and from each other: busybox
+# exits 1 for a 404 and for a refused connection alike, GNU wget exits 8 for
+# a 404 and a 503 alike. Before GH #237's review this path read only the
+# exit status, and a 404 under busybox got the "cannot reach" advice -- the
+# dead end the issue is about. Each wget runs here on a $PATH that has it
+# and no curl, the real binary under the name `wget`, as Alpine installs it.
+wget_path() { # wget_path <dir> <binary to call wget>
+    mkdir -p "$1"
+    # `sleep` because the initialize watchdog needs it: without it the ALRM
+    # comes at once, and races the read it is meant to bound.
+    for t in tr sed uname mkdir mktemp chmod rm cut sha256sum tar gzip head ls wc mv dirname sleep; do
+        ln -sf "$(command -v "$t")" "$1/$t"
+    done
+    ln -sf "$2" "$1/wget"
+}
+wrun() { # wrun <PATH> <base url> <args...>
+    _p=$1; _b=$2; shift 2
+    env -i PATH="$_p" HOME="$S/fakehome" CLAUDE_PLUGIN_DATA="$CACHE" \
+        HOLDFAST_BOOTSTRAP_BASE_URL="$_b" HOLDFAST_BOOTSTRAP_INSECURE=1 \
+        /bin/sh "$PLUG/bootstrap" "$@" 2>&1 < /dev/null
+}
+FLAVOURS=
+gnu_wget=$(command -v wget 2> /dev/null || true)
+if [ -n "$gnu_wget" ] && "$gnu_wget" --version 2> /dev/null | head -n 1 | grep -q '^GNU Wget'; then
+    wget_path "$S/wget-gnu" "$gnu_wget"
+    FLAVOURS="$FLAVOURS gnu"
+elif [ -n "${CI:-}" ]; then
+    chk "T15 GNU wget is available in CI" no yes
+else
+    skipped=$((skipped + 1))
+    echo "  skip  T15 GNU wget -- none on this host; that wget path was NOT exercised"
+fi
+bb=$(command -v busybox 2> /dev/null || true)
+if [ -n "$bb" ] && "$bb" --list 2> /dev/null | grep -qx wget; then
+    wget_path "$S/wget-busybox" "$bb"
+    FLAVOURS="$FLAVOURS busybox"
+elif [ -n "${CI:-}" ]; then
+    chk "T15 busybox is available in CI" no yes
+else
+    skipped=$((skipped + 1))
+    echo "  skip  T15 busybox wget -- no busybox on this host; that wget path was NOT exercised"
+fi
+for f in $FLAVOURS; do
+    P="$S/wget-$f"
+    rm -rf "$CACHE"
+    out=$(wrun "$P" "$BASE" mcp --flag); rc=$?
+    chk "T15 $f: downloads and runs"  "$(printf '%s' "$out" | grep -c 'HOLDFAST-FAKE-BINARY argv=\[mcp --flag\]')" 1
+    chk "T15 $f: binary cached"       "$([ -x "$BIN" ] && echo yes || echo no)" yes
+    chk "T15 $f: exit 0"              "$rc" 0
+    printf '9.9.9\n' > "$PLUG/version.txt"
+    rm -rf "$CACHE"
+    out=$(wrun "$P" "$BASE" mcp)
+    chk "T15 $f: 404 is not published" "$(printf '%s' "$out" | grep -c 'no holdfast v9.9.9 binary to download.*answered 404')" 1
+    chk "T15 $f: 404 is not 'cannot reach'" "$(printf '%s' "$out" | grep -c 'cannot reach')" 0
+    # wget's own words pass through to stderr as curl's do; the header lines
+    # `-S` adds do not.
+    chk "T15 $f: no header lines"     "$(printf '%s\n' "$out" | grep -c '^ *HTTP/')" 0
+    out=$(wrun "$P" "$BASE302" mcp)
+    chk "T15 $f: 302 then 404 is not published" "$(printf '%s' "$out" | grep -c 'no holdfast v9.9.9 binary to download.*answered 404')" 1
+    out=$(wrun "$P" "$BASE503" mcp)
+    chk "T15 $f: 503 is said as such" "$(printf '%s' "$out" | grep -c 'SHA256SUMS.txt answered HTTP 503 -- retry later, or build it')" 1
+    # A connection closed with no answer: GNU wget's default is to retry
+    # that twenty times with a growing wait, minutes in all.
+    t0=$(date +%s)
+    out=$(wrun "$P" "$BASEDROP" mcp)
+    t1=$(date +%s)
+    chk "T15 $f: no answer is 'cannot reach'" "$(printf '%s' "$out" | grep -c 'cannot reach http://127.0.0.1:[0-9]*/drop/v9.9.9/SHA256SUMS.txt')" 1
+    chk "T15 $f: no answer is not retried" "$([ $((t1 - t0)) -lt 20 ] && echo yes || echo "no, $((t1 - t0))s")" yes
+    out=$(wrun "$P" http://127.0.0.1:1 mcp)
+    chk "T15 $f: unreachable says so" "$(printf '%s' "$out" | grep -c 'cannot reach http://127.0.0.1:1/v9.9.9/SHA256SUMS.txt')" 1
+    printf '0.1.0\n' > "$PLUG/version.txt"
+done
+# **A wget that says it did not check the certificate is refused.** busybox
+# with no `openssl` on $PATH -- as here -- uses its own TLS, which validates
+# nothing and says so before the handshake. An https URL at the plain-HTTP
+# fixture is enough to make it say so; nothing it fetches may be used.
+case "$FLAVOURS" in
+    *busybox*)
+        # The control first: that this busybox says so at all. One built to
+        # hand TLS to a validating helper -- Alpine's is -- does not, and
+        # there the row has nothing to test.
+        said=$(env -i PATH="$S/wget-busybox" "$S/wget-busybox/wget" -q -O /dev/null "https://127.0.0.1:$PORT/" 2>&1 < /dev/null \
+            | grep -c 'certificate validation not implemented')
+        if [ "$said" -ge 1 ]; then
+            rm -rf "$CACHE"
+            out=$(wrun "$S/wget-busybox" "https://127.0.0.1:$PORT" mcp); rc=$?
+            chk "T15 busybox TLS: refused"    "$(printf '%s' "$out" | grep -c 'does not verify TLS certificates')" 1
+            # The whole line inside the 500 characters `claude mcp list`
+            # shows after `-32603: ` (T12), build route and link included.
+            chk "T15 busybox TLS: fits the 500 shown" "$(printf '%s\n' "$out" | grep 'does not verify TLS' | awk '{ print (length("-32603: " $0) <= 500) ? "yes" : "no, " length("-32603: " $0) }')" yes
+            chk "T15 busybox TLS: exit nonzero" "$(yn $rc)" yes
+            chk "T15 busybox TLS: nothing cached" "$(cached_bins)" 0
+            chk "T15 busybox TLS: no temp dir" "$(count_matching "$CACHE/bin" '.dl.*')" 0
+        else
+            echo "  skip  T15 busybox TLS -- this busybox does not say it skips validation, so there is nothing to refuse"
+        fi
+        ;;
+esac
 
 echo ""
 echo "pass=$pass fail=$fail skipped-sections=$skipped   http requests served=$(reqs)"

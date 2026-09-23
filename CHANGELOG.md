@@ -30,11 +30,15 @@ is cut, named and published is in
   jsonl log under `~/.cache` and shows as `Failed to connect — CONNECTION_CLOSED`
   (measured, 2.1.280). Under `mcp` it now reads the `initialize` request
   already waiting on stdin and answers it with a JSON-RPC error carrying the
-  diagnosis, which `claude mcp list` shows as `-32603: <the reason>`. It reads
+  diagnosis, which `claude mcp list` shows as `-32603: <the reason>`
+  (measured on Linux; the interactive `/mcp` panel was not checked). It reads
   nothing on any success path, nothing when stdin is a terminal, and waits at
   most five seconds for a request that never comes. The not-published message
   is written to fit the 500 characters `claude mcp list` shows before it cuts
-  the line, and a harness row holds it there ([#237]).
+  the line, and a harness row holds it there. `bootstrap.ps1` answers the same
+  way, and the harness runs it under `pwsh` on Linux; **on Windows itself that
+  is unverified**, as the Windows entrypoint that would reach it is, so a
+  Windows install may still see `CONNECTION_CLOSED` ([#237]).
 
 - A `windows-2022` CI job: native MSVC clippy over `--all-targets`, the source
   guards, the `#[cfg(windows)]` CLI arms executed, and a filtered `--lib` over
@@ -385,6 +389,28 @@ is cut, named and published is in
 
 ### Security
 
+- **The plugin bootstrap refuses a wget that says it did not verify the TLS
+  certificate.** busybox's built-in TLS validates no certificate and says so on
+  stderr — *"TLS certificate validation not implemented"*, `-q` or not — and
+  busybox falls back to it whenever no `openssl` is on `$PATH`. On a host whose
+  only fetcher was that, the release manifest and the archive it vouches for
+  arrived over the same unauthenticated connection, and TLS to GitHub is the
+  bootstrap's entire trust root (spec A-4). What such a wget fetched is now
+  discarded and the bootstrap stops, naming curl, `openssl` or a build from
+  source as the way on. A busybox that hands TLS to `openssl s_client
+  -verify_return_error` — Ubuntu's does, when `openssl` is present (measured) —
+  says nothing and is unaffected. A busybox built to use `openssl s_client`
+  *without* that flag would validate nothing and say nothing; none was found
+  to test against, and this does not catch it (review of [#237]).
+- **`/holdfast:install` and `/holdfast:attach` pre-approve only the commands
+  they run.** `/holdfast:install` pre-approved `Bash(command:*)` and
+  `Bash(printenv:*)`, and `/holdfast:attach` had copied both: the first
+  matches `command <any program>`, which runs it, and the second a bare
+  `printenv`, which puts every environment variable — including any token in
+  `settings.json`'s `env` block — into the transcript without a prompt. They
+  are now `Bash(command -v:*)` and `printenv` of the named variables only. How
+  Claude Code's matcher treats `command` was not measured; the narrowing does
+  not depend on it (review of [#237]).
 - **A read window that cannot vouch for a region now emits one
   `[REDACTED:unresolved]` over it and completes, instead of choosing between
   withholding it for ever and releasing it raw** ([#195], [#14]). GH #14's
@@ -732,6 +758,22 @@ is cut, named and published is in
   from-source route instead. `bootstrap.ps1` matches, and its `Die` writes one
   plain stderr line rather than a `Write-Error` record that pwsh wraps at the
   console width and colours ([#237]).
+- **On a host with wget and no curl, an unpublished release still got the
+  "cannot reach" advice.** The bootstrap's wget fallback read only wget's exit
+  status, which cannot tell a 404 from anything else: busybox wget exits 1 for
+  every failure and GNU wget exits 8 for every HTTP error (both measured). So
+  under busybox — Alpine, slim containers — a 404 got the air-gapped placement
+  advice, the dead end the entry above removes for curl, and under GNU wget a
+  403 or a 503 was called "unpublished, a draft, or without binaries". The
+  bootstrap now reads the status line wget prints under `-S` — the last one,
+  since a release asset is a redirect — so 404, any other status and no answer
+  at all get the same three messages under curl, GNU wget and busybox wget. It
+  also runs wget with one try, as curl runs: GNU wget's default retries a
+  dropped or silent connection twenty times with a growing wait — minutes for
+  a dropped one (measured), and up to twenty 120-second read timeouts for a
+  silent one. `scripts/plugin-bootstrap-tests.sh`
+  runs every wget it finds on a `$PATH` with no curl, and CI now installs both
+  (review of [#237]).
 - **The guard that was supposed to refuse an empty release body could not
   fire, and the release procedure did not mention `Cargo.lock`.** Both are
   release-time defects that no test or check would have caught, because the

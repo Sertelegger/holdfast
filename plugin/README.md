@@ -20,7 +20,7 @@ file-existence check.
 draft, and a draft's assets are not served until a person promotes it
 ([CONTRIBUTING.md](../CONTRIBUTING.md#releases)); `v0.0.5` to `v0.0.7` were
 published with no binaries at all. Against either, the server fails to start,
-and `claude mcp list` or `/mcp` says why in one line: *no holdfast vX.Y.Z
+and `claude mcp list` says why in one line: *no holdfast vX.Y.Z
 binary to download … To run Holdfast now, build it*. That line is the way in:
 [Using a binary you built yourself](#using-a-binary-you-built-yourself).
 
@@ -97,7 +97,10 @@ in-place route.
 5. otherwise fetches `SHA256SUMS.txt` and `holdfast-<target>.tar.gz` from the
    matching GitHub Release over TLS, verifies the archive against the freshly
    fetched manifest, extracts exactly one member under the safe-extraction
-   rules below, installs it into the cache and execs it.
+   rules below, installs it into the cache and execs it. It fetches with
+   curl, or with wget when there is no curl, and it refuses a wget that says
+   it did not verify the certificate — busybox's, with no `openssl` on
+   `$PATH` — because TLS is the only thing vouching for both files.
 
 **When it cannot start the server, it says so where you are looking.** A
 stdio server that exits before answering shows in Claude Code as
@@ -105,10 +108,16 @@ stdio server that exits before answering shows in Claude Code as
 failing bootstrap answers the `initialize` request Claude Code has already
 sent with a JSON-RPC error carrying its diagnosis, and `claude mcp list` shows
 `Failed to connect — -32603: holdfast bootstrap: <the reason>` (both shapes
-measured with Claude Code 2.1.280). The same line is on stderr, which Claude
-Code keeps in its MCP log, and
+measured with Claude Code 2.1.280 on Linux, through `claude mcp list`; the
+interactive `/mcp` panel was not checked). The same line is on stderr, which
+Claude Code keeps in its MCP log, and
 `HOLDFAST_BOOTSTRAP_DEBUG=1 "${CLAUDE_PLUGIN_ROOT}/bootstrap" version`
 reproduces it by hand. Nothing is read from stdin on a success path.
+`bootstrap.ps1` answers the same way, and `scripts/plugin-bootstrap-tests.sh`
+runs that under `pwsh` on Linux — **but on Windows itself it is exactly as
+unverified as the entrypoint that would reach it**
+([below](#the-windows-entrypoint-is-an-open-question)), so there a failure
+may still read `CONNECTION_CLOSED`.
 
 **Cache location.** `$CLAUDE_PLUGIN_DATA/bin/` when the loader exports it —
 which it does — else `$XDG_CACHE_HOME/holdfast/bin/`, else
@@ -249,6 +258,8 @@ CI step:
   MCP is JSON-RPC over stdio; if PowerShell re-encodes it the server will
   appear to connect and then talk nonsense.
 - whether `bootstrap.cmd` is reached at all.
+- whether `bootstrap.ps1`'s answer to `initialize` on failure reaches Claude
+  Code through `bootstrap.cmd`. It is exercised under `pwsh` on Linux only.
 
 If PATHEXT does not resolve, the fallback is two MCP server entries with the
 wrong-platform one failing closed. That is ugly enough to be worth recording

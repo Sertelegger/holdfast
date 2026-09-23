@@ -1,7 +1,7 @@
 ---
 description: Explain how to watch or drive a Holdfast session from your own terminal
 argument-hint: "[session name or id substring]"
-allowed-tools: Bash(holdfast:*), Bash(tmux:*), Bash(command:*), Bash(printenv:*)
+allowed-tools: Bash(holdfast:*), Bash(tmux:*), Bash(command -v holdfast), Bash(printenv HOLDFAST_BOOTSTRAP_BIN)
 ---
 
 Help the user get eyes on a Holdfast session from *their* terminal. Filter to

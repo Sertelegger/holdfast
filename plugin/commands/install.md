@@ -1,6 +1,6 @@
 ---
 description: Install or repair the Holdfast binary the plugin bootstrap runs
-allowed-tools: Bash(command:*), Bash(uname:*), Bash(ls:*), Bash(sha256sum:*), Bash(shasum:*), Bash(cargo:*), Bash(printenv:*), Bash(holdfast:*)
+allowed-tools: Bash(command -v:*), Bash(uname:*), Bash(ls:*), Bash(sha256sum:*), Bash(shasum:*), Bash(cargo:*), Bash(printenv HOLDFAST_BOOTSTRAP_BIN), Bash(printenv CLAUDE_PLUGIN_ROOT), Bash(printenv CLAUDE_PLUGIN_DATA), Bash(holdfast:*)
 ---
 
 Get the user a working `holdfast` binary. The plugin does not ship one: its
@@ -10,9 +10,11 @@ names if that is set, and otherwise downloads the binary matching
 release's `SHA256SUMS.txt`, and caches it. **Find out which of those failed
 before suggesting a fix.**
 
-The reason is usually already on screen: `claude mcp list` and `/mcp` show a
-failing bootstrap as `Failed to connect — -32603: holdfast bootstrap: <reason>`.
-To reproduce it, run the bootstrap by hand — it names its own cause:
+The reason is usually already on screen: `claude mcp list` shows a failing
+bootstrap as `Failed to connect — -32603: holdfast bootstrap: <reason>`
+(measured on Linux; the `/mcp` panel was not checked, and on Windows the
+entrypoint that would get that far is itself unverified). To reproduce it, run
+the bootstrap by hand — it names its own cause:
 
 ```sh
 HOLDFAST_BOOTSTRAP_DEBUG=1 "${CLAUDE_PLUGIN_ROOT}/bootstrap" version
@@ -31,6 +33,11 @@ The failures it distinguishes, and what each one actually means:
   usable: a relative path, a `~` or `$` that nothing expands (Claude Code
   passes `settings.json` values literally), or not an executable file. The
   bootstrap refuses rather than downloading something else. Fix the path.
+- **"does not verify TLS certificates"** — the only downloader on this host is
+  a busybox wget with no `openssl` to hand TLS to, so nothing it fetched could
+  be trusted and nothing was used. Installing curl, or `openssl`, fixes it; a
+  build from source (below) avoids it. Do not suggest
+  `--no-check-certificate` or any other way around the check.
 - **"checksum mismatch"** — the download did not match the release manifest.
   Nothing was installed and nothing was cached. Retry once; if it repeats,
   stop and report it rather than working around it.

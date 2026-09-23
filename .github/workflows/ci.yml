@@ -970,8 +970,13 @@ jobs:
           sudo rm -f /etc/apt/sources.list.d/google-chrome.list \
                      /etc/apt/sources.list.d/google-chrome.sources
           sudo apt-get update -qq
-          sudo apt-get install -y -qq --no-install-recommends libarchive-tools
+          # wget and busybox are for the bootstrap harness's wget rows (T15),
+          # which require both under CI: each wget reports a 404 unlike curl
+          # and unlike the other, and that difference was GH #237's dead end.
+          sudo apt-get install -y -qq --no-install-recommends libarchive-tools wget busybox
           bsdtar --version
+          wget --version | sed -n 1p
+          command -v busybox
       - name: Hostile archives under bash, with GNU tar and then with bsdtar
         run: |
           set -eux

@@ -16,12 +16,96 @@ $UrlSource = 'https://github.com/Sertelegger/holdfast#build-and-try-it'
 $UrlOwnBin = 'https://github.com/Sertelegger/holdfast/tree/main/plugin#using-a-binary-you-built-yourself'
 $RepoGit = 'https://github.com/Sertelegger/holdfast'
 
+# Captured here because inside a function `$args` is that function's own.
+$HfArg1 = if ($args.Count -gt 0) { [string]$args[0] } else { '' }
+
+# --- how a failure reaches the person looking at Claude Code --------------
+# As in `bootstrap`, whose header has the measurement: a server that exits
+# before answering shows as `CONNECTION_CLOSED`, and one that answers
+# `initialize` with a JSON-RPC error shows the error's message. So under
+# `mcp`, a dying bootstrap reads the request the client has already sent and
+# answers it with the diagnosis. Nothing reads stdin on a success path, and
+# nothing does when stdin is a console.
+#
+# **The wait is bounded, and by the read itself** rather than by a signal,
+# which PowerShell has no portable way to send itself: the stream read runs
+# as a task, and a task not done in five seconds is abandoned. `exit` does
+# not wait for it.
+#
+# The reply is built by hand, not by ConvertTo-Json, whose escaping differs
+# between Windows PowerShell 5.1 and pwsh 7. Quote and backslash are escaped,
+# control characters become spaces as `bootstrap` makes them, and anything
+# outside printable ASCII becomes \uXXXX, so no console code page can alter
+# a byte of it.
+#
+# Exercised under pwsh on Linux by scripts/plugin-bootstrap-tests.sh (T14).
+# On Windows itself it is exactly as unverified as the entrypoint that would
+# reach it: see the header of this file.
+function JsonStr([string]$s) {
+    $b = New-Object System.Text.StringBuilder
+    [void]$b.Append('"')
+    foreach ($c in $s.ToCharArray()) {
+        $n = [int]$c
+        if ($n -eq 0x22) { [void]$b.Append('\"') }
+        elseif ($n -eq 0x5C) { [void]$b.Append('\\') }
+        elseif ($n -lt 0x20) { [void]$b.Append(' ') }
+        elseif ($n -gt 0x7E) { [void]$b.Append(('\u{0:x4}' -f $n)) }
+        else { [void]$b.Append($c) }
+    }
+    [void]$b.Append('"')
+    $b.ToString()
+}
+function Send-McpError([string]$msg) {
+    if ($HfArg1 -ne 'mcp') { return }
+    try { if (-not [Console]::IsInputRedirected) { return } } catch { return }
+    $line = $null
+    try {
+        $in = [Console]::OpenStandardInput()
+        $buf = New-Object byte[] 4096
+        $acc = New-Object System.IO.MemoryStream
+        $deadline = [DateTime]::UtcNow.AddSeconds(5)
+        $whole = $false
+        while ($true) {
+            $left = [int]($deadline - [DateTime]::UtcNow).TotalMilliseconds
+            if ($left -le 0) { break }
+            $task = $in.ReadAsync($buf, 0, $buf.Length)
+            if (-not $task.Wait($left)) { break }
+            $n = $task.Result
+            # End of input: a partial line still counts, as `read` counts it.
+            if ($n -le 0) { $whole = $acc.Length -gt 0; break }
+            $acc.Write($buf, 0, $n)
+            if ([Array]::IndexOf($buf, [byte]10, 0, $n) -ge 0) { $whole = $true; break }
+        }
+        if (-not $whole) { return }
+        $line = [Text.Encoding]::UTF8.GetString($acc.ToArray()).Split([char]10)[0]
+    } catch { return }
+    # The id is echoed back whatever its JSON type, as long as it is a string
+    # or an integer; anything else gets `null`, which is what JSON-RPC
+    # prescribes for an id it could not read.
+    $id = 'null'
+    try {
+        $o = $line | ConvertFrom-Json
+        $p = if ($null -ne $o) { $o.PSObject.Properties['id'] } else { $null }
+        if ($null -ne $p) {
+            if ($p.Value -is [string]) { $id = JsonStr $p.Value }
+            elseif ($p.Value -is [int] -or $p.Value -is [long]) { $id = [string]$p.Value }
+        }
+    } catch { }
+    [Console]::Out.Write('{"jsonrpc":"2.0","id":' + $id + ',"error":{"code":-32603,"message":' + (JsonStr $msg) + '}}' + [char]10)
+    [Console]::Out.Flush()
+}
+
 # One plain line on stderr, the same shape `bootstrap` writes. Not
 # Write-Error: under `$ErrorActionPreference = 'Stop'` that throws a
 # formatted error record instead, which pwsh 7 wraps at the console width and
 # decorates with ANSI colour, so the MCP log holds a word-wrapped box rather
 # than the sentence, and the `exit 1` after it never runs.
-function Die([string]$msg) { [Console]::Error.WriteLine("holdfast bootstrap: $msg"); exit 1 }
+function Die([string]$msg) {
+    $m = "holdfast bootstrap: $msg"
+    [Console]::Error.WriteLine($m)
+    Send-McpError $m
+    exit 1
+}
 
 # --- 0. an explicitly named binary ----------------------------------------
 # HOLDFAST_BOOTSTRAP_BIN, exactly as the Unix `bootstrap` treats it: exec that

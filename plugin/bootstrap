@@ -292,9 +292,46 @@ hf_fetch() {
         [ "$HF_FETCH_HTTP" = 000 ] && HF_FETCH_HTTP=
         return 1
     elif command -v wget > /dev/null 2>&1; then
-        wget --quiet --timeout=120 --output-document="$2" "$1" && return 0
-        # 8 is wget's "Server issued an error response".
-        [ "$?" -eq 8 ] && HF_FETCH_HTTP=error
+        # **The status is read, not inferred from the exit code**, which
+        # cannot tell a 404 from anything else: busybox wget exits 1 for
+        # every failure, 404 and refused connection alike, and GNU wget exits
+        # 8 for every HTTP error, 404 and 503 alike (measured: busybox 1.36.1,
+        # GNU Wget 1.21.4). Under `-S` both print each response's status line
+        # on stderr, indented, one per redirect hop -- so the LAST one is the
+        # answer -- and both still do under `-q`. Short options only: busybox
+        # can be built without the long ones. Only stderr is captured; the
+        # body goes to the file.
+        #
+        # `-t 1`, as curl does not retry either. GNU wget's default is 20
+        # tries with a growing wait whenever the connection fails rather than
+        # the server answering -- dropped, reset, or silent past the read
+        # timeout -- which is minutes for a dropped one (measured) and up to
+        # twenty 120-second timeouts for a silent one; Claude Code has given
+        # up long before either. An HTTP error is not retried: measured, a
+        # 503 comes back at once with or without it.
+        _wout=$(wget -q -S -t 1 -T 120 -O "$2" "$1" 2>&1 > /dev/null)
+        _wrc=$?
+        # **A wget that says it did not check the certificate is refused.**
+        # busybox's built-in TLS does no certificate validation and says so
+        # on stderr, `-q` or not; it is what busybox falls back to when no
+        # `openssl` is on $PATH (with one, it runs `openssl s_client
+        # -verify_return_error`, which does check). TLS to GitHub is the
+        # whole trust root here -- the manifest that vouches for the archive
+        # arrives over the same connection -- so whatever it fetched is
+        # discarded, success or not.
+        case "$_wout" in
+            *'certificate validation not implemented'*)
+                rm -f "$2"
+                # Short on purpose: with the build route it has to fit the
+                # 500 characters `claude mcp list` shows, as T15 checks.
+                hf_die "this wget says it does not verify TLS certificates, and TLS is all that vouches for the download -- install curl, or openssl for busybox, or $HF_BUILD_IT" ;;
+        esac
+        [ "$_wrc" -eq 0 ] && return 0
+        HF_FETCH_HTTP=$(printf '%s\n' "$_wout" \
+            | sed -n 's/^ *HTTP\/[0-9.]* \([0-9][0-9][0-9]\).*/\1/p' | sed -n '$p')
+        # wget's own words, as `curl --show-error` gives curl's; the header
+        # lines `-S` added are the indented ones.
+        printf '%s\n' "$_wout" | sed -e '/^ /d' -e '/^$/d' >&2
         return 1
     else
         hf_die "neither curl nor wget is available, so the binary cannot be fetched -- install one, or $HF_BUILD_IT"
@@ -376,8 +413,8 @@ trap 'rm -rf "$HF_TMP"' EXIT HUP INT TERM
 HF_SUMS_URL="$HF_BASE_URL/v$HF_VERSION/SHA256SUMS.txt"
 if ! hf_fetch "$HF_SUMS_URL" "$HF_TMP/SHA256SUMS.txt"; then
     case "$HF_FETCH_HTTP" in
-        404 | error)
-            hf_die "no holdfast v$HF_VERSION binary to download: the v$HF_VERSION release answered $(echo "$HF_FETCH_HTTP" | sed 's/^error$/with an HTTP error/') -- unpublished, a draft, or without binaries. To run Holdfast now, $HF_BUILD_IT" ;;
+        404)
+            hf_die "no holdfast v$HF_VERSION binary to download: the v$HF_VERSION release answered 404 -- unpublished, a draft, or without binaries. To run Holdfast now, $HF_BUILD_IT" ;;
         '')
             hf_die "cannot reach $HF_SUMS_URL -- is this host online? On an air-gapped or firewalled host, fetch $HF_ARCHIVE and SHA256SUMS.txt from $HF_URL_RELEASES/tag/v$HF_VERSION on a connected machine, verify the checksum yourself, and place the extracted binary at $HF_CACHED with SHA256SUMS.txt beside it as $HF_SUMS_CACHED -- both files, or it is a cache miss. Or $HF_BUILD_IT" ;;
         *)
