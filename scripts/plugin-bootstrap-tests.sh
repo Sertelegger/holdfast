@@ -83,9 +83,14 @@ cp "$REL/SHA256SUMS.txt" "$S/orig.sums"
 PORT=${HOLDFAST_TEST_PORT:-8731}
 python3 -m http.server "$PORT" --bind 127.0.0.1 --directory "$S/release" > "$S/http.log" 2>&1 &
 SRV=$!
+# **Ready means OUR server answers**, not that something on $PORT does. A
+# server left there by an earlier run answers `/` as well, this one's bind
+# then fails, and every row below tests the stranger -- which is what
+# happened while this check read `/`. The fixture's own manifest, byte for
+# byte, is something no other server serves.
 i=0
 while [ "$i" -lt 100 ]; do
-    curl -sf "http://127.0.0.1:$PORT/" > /dev/null 2>&1 && break
+    curl -sf "http://127.0.0.1:$PORT/v0.1.0/SHA256SUMS.txt" 2> /dev/null | cmp -s - "$S/orig.sums" && break
     i=$((i + 1))
     sleep 0.1
 done
@@ -120,7 +125,8 @@ EOF
 SRV2=$!
 i=0
 while [ "$i" -lt 100 ]; do
-    [ "$(curl -s -o /dev/null -w '%{http_code}' "http://127.0.0.1:$PORT2/" 2> /dev/null)" = 503 ] && break
+    [ "$(curl -s -o /dev/null -w '%{http_code} %{redirect_url}' "http://127.0.0.1:$PORT2/to404/probe" 2> /dev/null)" \
+        = "302 http://127.0.0.1:$PORT2/gone/probe" ] && break
     i=$((i + 1))
     sleep 0.1
 done
