@@ -178,6 +178,7 @@ fn unix_secs(t: std::time::SystemTime) -> u64 {
 /// here, and struct literals that must be updated in a dozen places
 /// each time are pure churn.
 #[derive(Debug, Default, Deserialize, Serialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
 pub struct StartSessionArgs {
     /// Program to run, e.g. "bash". Mutually exclusive with `profile`;
     /// supply exactly one.
@@ -255,6 +256,7 @@ pub struct StartSessionArgs {
 }
 
 #[derive(Debug, Deserialize, Serialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
 pub struct PromptPatternArg {
     /// Rust regex matched against the session's last logical line.
     pub regex: String,
@@ -903,7 +905,24 @@ impl HoldfastServer {
 
     /// Read output from a session. Supply exactly one of since_cursor,
     /// tail_lines, or tail_bytes. Output is ANSI-stripped and
-    /// secret-redacted by default.
+    /// secret-redacted by default: a secret becomes `[REDACTED:<kind>]`,
+    /// naming the rule that matched it.
+    ///
+    /// `[REDACTED:unresolved]` is different: it covers bytes this read
+    /// could not vouch for. They start at something that began like a
+    /// secret (a private-key header, or a token-shaped run of characters)
+    /// whose end the read could not see. That is often ordinary text, but
+    /// it can hide a real secret: the one that began there, or one a rule
+    /// did match inside the region, which is then counted as `unresolved`
+    /// and not under its own kind. A re-read — later, once more output has
+    /// arrived, or with a different `max_bytes` — sometimes clears it, but
+    /// neither is guaranteed. `redact: false` returns the raw text, any
+    /// secret in it included, and is recorded in the audit log: use it
+    /// only when you already know the region is not a credential (source
+    /// or documentation that quotes a key header, say), not to find out
+    /// whether it is. `redactions` counts only the markers this response
+    /// substituted, so marker-shaped text that was already in the output
+    /// is not counted.
     #[tool(
         annotations(
             title = "Read session output",
@@ -1442,6 +1461,14 @@ impl HoldfastServer {
     /// call is in flight is not missed. match.text and
     /// output_since_start are secret-redacted; match.offset is the raw
     /// byte offset.
+    ///
+    /// With no pattern it waits for the session to stop executing, so
+    /// `Fullscreen`, `AwaitingSecret` and `Exited` come back promptly
+    /// rather than at the deadline: read `interaction_mode`, because each
+    /// needs a different action. `detection_tier` and `prompt.reason` tell
+    /// a measured prompt from a guessed one. A wait that ends unmatched
+    /// against a session already back at a measured prompt says so in
+    /// `warning`.
     #[tool(
         annotations(
             title = "Wait for a regex to match output",
@@ -1541,6 +1568,10 @@ impl HoldfastServer {
     }
 
     /// Send keystrokes to a session's stdin.
+    ///
+    /// Not for a password: when `interaction_mode` is `AwaitingSecret`, use
+    /// `request_secret_input`, so the secret is typed by a human and never
+    /// passes through you.
     #[tool(
         annotations(
             title = "Send keystrokes to a session",
@@ -1847,6 +1878,7 @@ impl HoldfastServer {
     /// shell is gone; read `state` to tell the two apart rather than
     /// assuming everything returned here is running.
     #[tool(
+        name = "list_sessions",
         annotations(
             title = "List all sessions",
             read_only_hint = true,
@@ -1854,6 +1886,21 @@ impl HoldfastServer {
         ),
         output_schema = schema::envelope_schema::<schema::ListSessions>()
     )]
+    pub async fn list_sessions_tool(
+        &self,
+        Parameters(ListSessionsArgs {}): Parameters<ListSessionsArgs>,
+    ) -> Result<CallToolResult, ErrorData> {
+        self.list_sessions().await
+    }
+
+    /// `list_sessions`'s answer, for a caller with no MCP `arguments` to
+    /// refuse — the tests, and anything in-process.
+    ///
+    /// The tool is [`list_sessions_tool`](Self::list_sessions_tool), and
+    /// it exists only to take a [`ListSessionsArgs`]: a tool that takes no
+    /// `Parameters` is handed no `arguments`, so it cannot refuse a key it
+    /// never sees (GH #219). Both transports reach it through that wrapper
+    /// — rmcp's router in-process, `passthrough::call_tool` in the daemon.
     pub async fn list_sessions(&self) -> Result<CallToolResult, ErrorData> {
         let sessions: Vec<serde_json::Value> = self
             .registry
@@ -4298,6 +4345,7 @@ fn session_record(session: &Session, rules: &RuleSet) -> serde_json::Value {
 }
 
 #[derive(Debug, Default, Deserialize, Serialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
 pub struct ReadOutputArgs {
     /// Session id or live session name.
     pub session: String,
@@ -4336,6 +4384,7 @@ pub struct ReadOutputArgs {
 }
 
 #[derive(Debug, Default, Deserialize, Serialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
 pub struct SendInputArgs {
     /// Session id or live session name.
     pub session: String,
@@ -4356,6 +4405,7 @@ pub struct SendInputArgs {
 }
 
 #[derive(Debug, Default, Deserialize, Serialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
 pub struct WaitForPatternArgs {
     /// Session id or live session name.
     pub session: String,
@@ -4388,6 +4438,7 @@ pub struct WaitForPatternArgs {
 }
 
 #[derive(Debug, Deserialize, Serialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
 pub struct TerminateArgs {
     /// Session id or live session name.
     pub session: String,
@@ -4400,6 +4451,7 @@ pub struct TerminateArgs {
 }
 
 #[derive(Debug, Deserialize, Serialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
 pub struct StatusArgs {
     /// Session id or live session name.
     pub session: String,
@@ -4407,22 +4459,25 @@ pub struct StatusArgs {
 
 /// `request_secret_input`'s arguments.
 ///
-/// **The only `*Args` struct in the tree that denies unknown fields, and
-/// deliberately so.** Every other one accepts an extra key silently, so
-/// without this line REQ-SEC-010a's *"the tool accepts `session` and
-/// never a `request_id`"* would rest on a schema a client is free to
-/// ignore: a smuggled `request_id` would be swallowed rather than
-/// refused, and the agent's inability to *name* a secret request would be
-/// documentation instead of a control. Two consequences, both
-/// load-bearing: the rejection surfaces as `invalid_params`, the same
-/// shape as every other input-schema violation here; and `schemars` emits
-/// `"additionalProperties": false` on this tool's input schema and no
-/// other's.
+/// **The first `*Args` struct in the tree to deny unknown fields, and the
+/// reason the rest now do (GH #219).** Without that line REQ-SEC-010a's
+/// *"the tool accepts `session` and never a `request_id`"* would rest on
+/// a schema a client is free to ignore: a smuggled `request_id` would be
+/// swallowed rather than refused, and the agent's inability to *name* a
+/// secret request would be documentation instead of a control. Two
+/// consequences, both load-bearing: the rejection surfaces as
+/// `invalid_params` on the daemon path, the same shape as every other
+/// input-schema violation there (in-process, rmcp 3 reports a failure of
+/// its own argument extractor as an `isError` result carrying the same
+/// text); and `schemars` emits `"additionalProperties": false` on the
+/// input schema.
 ///
-/// It is **not** extended to the other ten args structs in this
-/// milestone. Widening a deserialiser's strictness across the whole tool
-/// surface is a client-compatibility decision, and it is not a secrets
-/// decision.
+/// 0.0.7 kept it to this one struct as a client-compatibility question.
+/// GH #219 answered the question: a typo on any other tool was *honoured
+/// as its default* — `wait_for_pattern { patern }` became a pattern-less
+/// wait and answered `ok`, `send_input { apend_newline: false }` appended
+/// the newline — so the silent acceptance was the incompatibility. See
+/// [`ListSessionsArgs`] for why no MCP client is broken by the refusal.
 #[derive(Debug, Default, Deserialize, Serialize, schemars::JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct RequestSecretInputArgs {
@@ -4884,6 +4939,7 @@ async fn session_exit(
 /// later milestone adds arguments here, and an exhaustive literal repaired
 /// by naming the new field breaks again next milestone.
 #[derive(Debug, Default, Deserialize, Serialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
 pub struct GetScreenStateArgs {
     /// Session id or live session name.
     pub session: String,
@@ -4901,6 +4957,7 @@ pub struct GetScreenStateArgs {
 }
 
 #[derive(Debug, Default, Deserialize, Serialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
 pub struct ResizeArgs {
     /// Session id or live session name.
     pub session: String,
@@ -4913,12 +4970,14 @@ pub struct ResizeArgs {
 }
 
 #[derive(Debug, Default, Deserialize, Serialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
 pub struct InterruptArgs {
     /// Session id or live session name.
     pub session: String,
 }
 
 #[derive(Debug, Deserialize, Serialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
 pub struct GetCommandHistoryArgs {
     /// Session id or live session name.
     pub session: String,
@@ -4928,6 +4987,60 @@ pub struct GetCommandHistoryArgs {
     /// Only entries with `index >= since_index`.
     #[serde(default)]
     pub since_index: Option<u64>,
+}
+
+/// `list_sessions` takes no arguments, and **says so by refusing any**
+/// (GH #219).
+///
+/// A tool with no `Parameters` never looks at `arguments`, so before this
+/// type `list_sessions { session: "x" }` answered every session with
+/// `ok`, and an agent that believed it had filtered the list had no way
+/// to learn otherwise. Every `*Args` struct in this file carries
+/// `deny_unknown_fields` for the same reason. That puts
+/// `"additionalProperties": false` on all twelve input schemas, so the
+/// advertised schema and the deserialiser say the same thing, and it
+/// makes the refusal name the key and list the valid ones — serde's own
+/// *"unknown field \`patern\`, expected one of \`session\`, \`pattern\`,
+/// …"*, which `request_secret_input` already gave.
+///
+/// **Why no MCP client breaks.** Protocol metadata travels in
+/// `params._meta`, beside `arguments` rather than inside it — rmcp
+/// deserialises it into `CallToolRequestParams::meta` and hands the tool
+/// `arguments` alone — and the shim forwards `arguments` and nothing else
+/// (§7.4.1). The one in-tree caller that builds arguments by hand,
+/// `holdfast logs`, sends only keys `ReadOutputArgs` declares.
+///
+/// **Skew is the one real cost, and it is the right way round.** A shim a
+/// minor ahead forwards an argument its own `tools/list` advertised to a
+/// daemon that predates the argument; from this release on, that daemon
+/// refuses the call naming the argument where it used to run the call
+/// without it. GH #169's `apply_holdback` is what the old behaviour
+/// costs: a 0.0.7 daemon, which has neither the field nor this attribute,
+/// drops it without a word and serves the bypassing tail read the caller
+/// declined.
+///
+/// **`properties: {}` is written in by hand.** schemars omits the key for
+/// a struct with no fields, and rmcp's own schema for an argument-free
+/// tool — what this tool advertised before — carries it. It is optional
+/// in JSON Schema and in MCP; keeping it means the only change a client
+/// sees on this schema is the refusal, and not a key going missing.
+#[derive(Debug, Default, Deserialize, Serialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
+#[schemars(extend("properties" = {}))]
+pub struct ListSessionsArgs {}
+
+impl HoldfastServer {
+    /// `list_sessions`' advertised [`Tool`](rmcp::model::Tool), under the
+    /// `<tool>_tool_attr` name every other tool's has.
+    ///
+    /// rmcp names the generated function after the Rust method, and the
+    /// method is `list_sessions_tool` so that `list_sessions()` could stay
+    /// argument-free for its callers. Without this the one tool that took
+    /// no arguments would also be the one whose metadata is spelled
+    /// differently, at every site that maps a tool name to its `Tool`.
+    pub fn list_sessions_tool_attr() -> rmcp::model::Tool {
+        Self::list_sessions_tool_tool_attr()
+    }
 }
 
 #[cfg(test)]

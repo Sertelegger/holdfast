@@ -260,6 +260,34 @@ is cut, named and published is in
   marker; and the shortened page is itself judged, because removing a frame
   joins the text either side of it.
 
+- **Every tool refuses an argument it does not declare, and names it (GH
+  #219).** Eleven of the twelve dropped an unknown key without a word, so a
+  typo was honoured as the default it meant to override:
+  `wait_for_pattern { patern: … }` became a pattern-less wait and answered
+  `ok, session is AtPrompt`, `send_input { apend_newline: false }` wrote the
+  newline anyway, and `list_sessions { session: … }` returned every session.
+  The refusal is serde's, and it is the one `request_secret_input` already
+  gave — *unknown field \`patern\`, expected one of \`session\`,
+  \`pattern\`, …* — so it names the key and lists the valid ones. The
+  advertised `inputSchema` of all twelve now says `additionalProperties:
+  false`, so the schema and the deserialiser agree; before, they agreed only
+  by both being open. `list_sessions`, which takes no arguments and so was
+  never handed any, now takes an empty argument type in order to refuse them.
+
+  **What a client sees depends on the transport, and that is rmcp's, not
+  this change's.** The daemon path — the default — answers JSON-RPC
+  `-32602`; `--no-daemon` and Windows answer a tool result with
+  `isError: true` carrying the same text, because rmcp 3 reports a failure
+  of its own argument extractor that way. `request_secret_input`'s refusal
+  already took both shapes before this change. **Nothing an MCP client sends is refused
+  that was not an argument:** `_meta` travels beside `arguments`, not inside
+  it, and a row pins that it is still served. The one real cost is skew — a
+  newer shim forwarding an argument an older daemon does not know is now
+  refused by name instead of run without it, which is the same trade.
+  `scripts/mcp-smoke.sh` carries one paired row per tool, and
+  `tests/tool_arguments.rs` drives both transports from the router's own
+  tool list.
+
 - **`scripts/ci-hygiene.sh`'s release-trigger gate is an allowlist.** It was a
   denylist of four triggers — `branches`, `schedule`, `pull_request`,
   `pull_request_target` — and `release.yml`'s header claimed on the strength of
@@ -1063,6 +1091,71 @@ is cut, named and published is in
   The context's fields are read leniently — one a later shim adds costs a
   daemon of this release nothing but that field — because a daemon
   outlives the shims that talk to it.
+
+- **The server instructions lead with the password-prompt rule, and all of
+  them now reach the model (GH #230).** Claude Code passes the first 2048
+  characters of a server's instructions to the model and drops the rest
+  (2.1.280: `CLAUDE_CODE_MAX_MCP_DESCRIPTION_LENGTH ?? 2048`, counted in
+  UTF-16 units). Holdfast's ran past that, and the one rule whose absence
+  costs a credential — *at a password prompt use `request_secret_input`,
+  never `send_input`* — was the last thing in them, so on the default
+  transport no agent ever read it; the likely failure is an agent asking the
+  user to paste the password into the chat. The text is rewritten in
+  priority order — secrets, then how to wait for a command without guessing
+  at `$PS1`, then what `interaction_mode` and `detection_tier` mean, then
+  output handling, then a one-line map of the rest — and now also says
+  never to ask for a secret in chat, and what to do when nobody answers.
+  That comes back two ways: under `--no-daemon` no client can attach, so
+  the request ends `secret_cancelled` at its timeout, and on Windows it is
+  refused at once as `not_supported_on_platform`. On either, the agent is
+  told to name the command that needs the credential rather than ask for
+  it. `send_input`'s own description carries the password rule, the hybrid
+  transport's suffix says how a human answers (`holdfast attach
+  <session>`), and what the old text said about `wait_for_pattern` alone —
+  that a pattern-less wait ends promptly for `Fullscreen`, `AwaitingSecret`
+  and `Exited`, that
+  `prompt.reason` tells a measured prompt from a guessed one, and the
+  `warning` on an unmatched wait at a measured prompt — moved into that
+  tool's description.
+
+  **Both strings a client can receive are held to the budget, through
+  `get_info`:** the shim's — the shared text plus its suffix, which is what
+  the plugin serves on Unix and what the dogfood log measured — and the
+  in-process one for `--no-daemon` and Windows. Each must fit, and must
+  carry the secret rule within its first quarter, so a later edit that
+  grows the text loses the map at the end rather than the rule at the top.
+  The rule is pinned as whole clauses rather than as its words, because
+  the words survive deleting the chat prohibition, deleting the fallback,
+  and inverting `send_input`'s rule. `scripts/mcp-smoke.sh` asserts the
+  same on the wire. To see the served text and its length, run `holdfast
+  mcp` and read `initialize`'s `instructions`.
+
+- **`[REDACTED:unresolved]` is explained to the agent (GH #242, the
+  explanation half).** It is the one marker that names no rule, and agents
+  were told nothing about it. `read_output`'s description now says it
+  covers bytes the read could not vouch for, starting at something that
+  began like a secret whose end the read could not see; that this is often
+  ordinary text but **can hide a real secret** — the one that began there,
+  or a token a rule did match inside the region, which `merge_spans` then
+  counts as `unresolved` and not under its own kind; that a re-read — later,
+  or with a different `max_bytes` — sometimes clears it but is not
+  guaranteed to (`output/mod.rs` records protection as non-monotonic in
+  `max_bytes`); that `redact: false` returns the text with any secret in it,
+  is audit-logged, and is for a region the agent already knows is not a
+  credential, not for finding out; and that `redactions` counts only the
+  markers a response substituted, which is how a real marker is told from
+  marker-shaped text already in the output. The server instructions carry
+  the short form.
+
+  **It does not say *nothing matched*, which is how the marker is usually
+  glossed and is false.** An unterminated private-key header followed a
+  few lines later by a GitHub token comes back as one
+  `[REDACTED:unresolved]` with `redactions: {unresolved: 1}` and no
+  `github` count, so a text that called the bytes unmatched and then
+  offered `redact: false` would send an agent to read a live token raw. A
+  row holds the instructions and every tool description to never saying
+  it. How much the marker masks is the other half of GH #242 and is not
+  changed here.
 
 - **The guard that was supposed to refuse an empty release body could not
   fire, and the release procedure did not mention `Cargo.lock`.** Both are

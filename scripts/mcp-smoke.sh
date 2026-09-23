@@ -226,6 +226,36 @@ OUT="$(
     req '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-06-18","capabilities":{},"clientInfo":{"name":"smoke","version":"0"}}}'
     req '{"jsonrpc":"2.0","method":"notifications/initialized"}'
     req '{"jsonrpc":"2.0","id":2,"method":"tools/list","params":{}}'
+    # GH #219: one misspelt or invented argument per tool (101-112), each
+    # the kind an agent actually sends, and each paired (122-132) with the
+    # same call minus that key -- a refusal alone passes against a server
+    # that refuses everything. Every one names `no-such-219`, a session
+    # that does not exist: a server that regressed to ignoring the key
+    # answers `session_not_found` and touches nothing, so a red row here
+    # cannot cascade into the `smoke` session's rows below. `start_session`
+    # and `list_sessions` pair with ids 3 and 13, which already reach them.
+    req '{"jsonrpc":"2.0","id":101,"method":"tools/call","params":{"name":"start_session","arguments":{"comand":"bash"}}}'
+    req '{"jsonrpc":"2.0","id":102,"method":"tools/call","params":{"name":"read_output","arguments":{"session":"no-such-219","cursor":0}}}'
+    req '{"jsonrpc":"2.0","id":122,"method":"tools/call","params":{"name":"read_output","arguments":{"session":"no-such-219","since_cursor":0}}}'
+    req '{"jsonrpc":"2.0","id":103,"method":"tools/call","params":{"name":"send_input","arguments":{"session":"no-such-219","data":"echo B","apend_newline":false}}}'
+    req '{"jsonrpc":"2.0","id":123,"method":"tools/call","params":{"name":"send_input","arguments":{"session":"no-such-219","data":"echo B","append_newline":false}}}'
+    req '{"jsonrpc":"2.0","id":104,"method":"tools/call","params":{"name":"wait_for_pattern","arguments":{"session":"no-such-219","patern":"never","timeout_secs":2}}}'
+    req '{"jsonrpc":"2.0","id":124,"method":"tools/call","params":{"name":"wait_for_pattern","arguments":{"session":"no-such-219","pattern":"never","timeout_secs":2}}}'
+    req '{"jsonrpc":"2.0","id":105,"method":"tools/call","params":{"name":"terminate","arguments":{"session":"no-such-219","forse":true}}}'
+    req '{"jsonrpc":"2.0","id":125,"method":"tools/call","params":{"name":"terminate","arguments":{"session":"no-such-219","force":true}}}'
+    req '{"jsonrpc":"2.0","id":106,"method":"tools/call","params":{"name":"status","arguments":{"session":"no-such-219","verbose":true}}}'
+    req '{"jsonrpc":"2.0","id":126,"method":"tools/call","params":{"name":"status","arguments":{"session":"no-such-219"}}}'
+    req '{"jsonrpc":"2.0","id":107,"method":"tools/call","params":{"name":"list_sessions","arguments":{"session":"smoke"}}}'
+    req '{"jsonrpc":"2.0","id":108,"method":"tools/call","params":{"name":"get_command_history","arguments":{"session":"no-such-219","limt":5}}}'
+    req '{"jsonrpc":"2.0","id":128,"method":"tools/call","params":{"name":"get_command_history","arguments":{"session":"no-such-219","limit":5}}}'
+    req '{"jsonrpc":"2.0","id":109,"method":"tools/call","params":{"name":"get_screen_state","arguments":{"session":"no-such-219","diff_form":3}}}'
+    req '{"jsonrpc":"2.0","id":129,"method":"tools/call","params":{"name":"get_screen_state","arguments":{"session":"no-such-219","diff_from":3}}}'
+    req '{"jsonrpc":"2.0","id":110,"method":"tools/call","params":{"name":"resize","arguments":{"session":"no-such-219","cols":80,"rows":24,"colums":100}}}'
+    req '{"jsonrpc":"2.0","id":130,"method":"tools/call","params":{"name":"resize","arguments":{"session":"no-such-219","cols":80,"rows":24}}}'
+    req '{"jsonrpc":"2.0","id":111,"method":"tools/call","params":{"name":"interrupt","arguments":{"session":"no-such-219","signal":"SIGTERM"}}}'
+    req '{"jsonrpc":"2.0","id":131,"method":"tools/call","params":{"name":"interrupt","arguments":{"session":"no-such-219"}}}'
+    req '{"jsonrpc":"2.0","id":112,"method":"tools/call","params":{"name":"request_secret_input","arguments":{"session":"no-such-219","prompt":"sudo password"}}}'
+    req '{"jsonrpc":"2.0","id":132,"method":"tools/call","params":{"name":"request_secret_input","arguments":{"session":"no-such-219","prompt_text":"sudo password"}}}'
     req '{"jsonrpc":"2.0","id":3,"method":"tools/call","params":{"name":"start_session","arguments":{"command":"bash","args":["--norc","--noprofile"],"name":"smoke"}}}'
     # Long enough for the §8.5 integration snippet to have been typed AND
     # run. While it runs, readline holds ECHO off with bracketed paste
@@ -511,6 +541,48 @@ jcheck "initialize's instructions name every tool" \
       "resize","interrupt","request_secret_input"]
    | map(. as $n | select(($i | contains($n)) | not))' \
   '[]'
+# GH #230: Claude Code keeps the first 2048 characters of a server's
+# instructions (2.1.280: `CLAUDE_CODE_MAX_MCP_DESCRIPTION_LENGTH ?? 2048`)
+# and this text used to run past that with its password-prompt rule last,
+# so the one rule that costs a credential when missed was the one cut.
+# Asserted on THIS transport's string because it is the one the plugin
+# serves: the shim appends to the shared text, and a check on the shared
+# constant alone would pass while the suffix pushed the served string
+# over. jq's `length` counts codepoints where the client counts UTF-16
+# units; the Rust row counts units, and this text is ASCII. `type` first,
+# so a response that never arrived is `"null"` rather than a `null` that
+# jq happily measures as short. 2048 is `mcp::CLIENT_INSTRUCTIONS_BUDGET`
+# and 512 its first quarter, the Rust row's `SAFETY_RULES_WITHIN`; the
+# needles are that row's `SECRET_RULE_CLAUSES`, and each must END inside
+# the quarter, as there, rather than merely start in it. Clauses, not
+# words: the words `AwaitingSecret`, `request_secret_input` and `NEVER
+# send_input` all survived deleting the chat prohibition and the fallback
+# for a request nobody answers, which is what GH #230's review measured.
+# The last element is the claim the text must NOT make about
+# `[REDACTED:unresolved]` (GH #242's review): a real match folded into the
+# region means something did match, and the text points at `redact:false`.
+jcheck "initialize's instructions fit the client's budget with the secret rule first (GH #230)" \
+  'resp(1).result.instructions as $i
+   | [($i | type), ($i | length <= 2048),
+      (["when interaction_mode is AwaitingSecret",
+        "Use request_secret_input, NEVER send_input",
+        "never ask the user to paste a secret into chat",
+        "If it returns secret_cancelled or not_supported_on_platform, tell the user which command needs a credential; never ask for it in chat"]
+       | map(. as $n | ($i | index($n)) as $x | ($x != null and $x + ($n | length) <= 512))
+       | all),
+      ($i | ascii_downcase | (contains("no rule matched") or contains("nothing matched")) | not)]' \
+  '["string",true,true,true]'
+# And the two tool descriptions the short instructions now lean on: what
+# `[REDACTED:unresolved]` is, that it can still hide a real secret, and the
+# audited way past it (GH #242); and the password prohibition on the tool
+# an agent would misuse, as the prohibition rather than its vocabulary.
+jcheck "read_output explains [REDACTED:unresolved]; send_input says it is not for a password" \
+  '[(tool("read_output").description | gsub("\\s+";" ")
+     | contains("[REDACTED:unresolved]") and contains("`redact: false`")
+       and contains("it can hide a real secret")),
+    (tool("send_input").description | gsub("\\s+";" ")
+     | contains("Not for a password: when `interaction_mode` is `AwaitingSecret`, use `request_secret_input`"))]' \
+  '[true,true]'
 
 # ------------------------------------------------- the advertised surface
 
@@ -621,6 +693,63 @@ jcheck "get_command_history warns that command is truncated" \
    | ["truncated to its tail","80 columns","Latin-1"]
    | map(. as $n | select(($d | contains($n)) | not))' \
   '[]'
+
+# ------------------------------------------- unknown arguments (GH #219)
+
+# Eleven of twelve tools used to drop a key they did not declare, so a typo
+# was honoured as the default it meant to override: `wait_for_pattern
+# {patern}` answered `ok, session is AtPrompt` and `send_input
+# {apend_newline: false}` wrote the newline. The advertised schema and the
+# deserialiser now both say closed, and this pins the advertised half for
+# all twelve -- the table, not a count, so a tool that reopens is named.
+jcheck "every tool's inputSchema is closed (GH #219)" \
+  'tools | sort_by(.name) | map([.name, .inputSchema.additionalProperties])' \
+  '[["get_command_history",false],["get_screen_state",false],["interrupt",false],["list_sessions",false],["read_output",false],["request_secret_input",false],["resize",false],["send_input",false],["start_session",false],["status",false],["terminate",false],["wait_for_pattern",false]]'
+
+# One row per tool for the behaviour half. `refused` is the refusal the
+# agent reads: `-32602` on this transport, the unknown key named, and one
+# key the tool DOES take named beside it -- serde lists them all, and one
+# is enough to show the list is there. The second element is the pairing:
+# the same call without the key reached the tool (a session that does not
+# exist answers `session_not_found` from the tool's body, which a
+# deserialiser refusal cannot produce). Against a server that ignored
+# unknown keys the first element is `[null,false]` and against one that
+# refused everything the second is not a status, so each row fails both
+# ways.
+JQ_HELPERS="$JQ_HELPERS"'
+def refused($id; $key; $valid):
+  [resp($id).error.code,
+   ((resp($id).error.message // "")
+    | contains("unknown field `" + $key + "`") and contains("`" + $valid + "`"))];
+def reached($id): resp($id).result.structuredContent.status;
+'
+jcheck "start_session refuses a misspelt argument by name (GH #219)" \
+  '[refused(101; "comand"; "command"), reached(3)]' '[[-32602,true],"ok"]'
+jcheck "read_output refuses a misspelt argument by name (GH #219)" \
+  '[refused(102; "cursor"; "since_cursor"), reached(122)]' '[[-32602,true],"session_not_found"]'
+jcheck "send_input refuses a misspelt argument by name (GH #219)" \
+  '[refused(103; "apend_newline"; "append_newline"), reached(123)]' '[[-32602,true],"session_not_found"]'
+jcheck "wait_for_pattern refuses a misspelt argument by name (GH #219)" \
+  '[refused(104; "patern"; "pattern"), reached(124)]' '[[-32602,true],"session_not_found"]'
+jcheck "terminate refuses a misspelt argument by name (GH #219)" \
+  '[refused(105; "forse"; "force"), reached(125)]' '[[-32602,true],"session_not_found"]'
+jcheck "status refuses an argument it does not take (GH #219)" \
+  '[refused(106; "verbose"; "session"), reached(126)]' '[[-32602,true],"session_not_found"]'
+# The one tool with no arguments: there is no valid key to name, so the
+# `$valid` slot repeats the unknown one. Before GH #219 this tool could not
+# refuse at all -- rmcp hands a tool with no `Parameters` no `arguments`.
+jcheck "list_sessions refuses an argument it does not take (GH #219)" \
+  '[refused(107; "session"; "session"), reached(13)]' '[[-32602,true],"ok"]'
+jcheck "get_command_history refuses a misspelt argument by name (GH #219)" \
+  '[refused(108; "limt"; "limit"), reached(128)]' '[[-32602,true],"session_not_found"]'
+jcheck "get_screen_state refuses a misspelt argument by name (GH #219)" \
+  '[refused(109; "diff_form"; "diff_from"), reached(129)]' '[[-32602,true],"session_not_found"]'
+jcheck "resize refuses a misspelt argument by name (GH #219)" \
+  '[refused(110; "colums"; "cols"), reached(130)]' '[[-32602,true],"session_not_found"]'
+jcheck "interrupt refuses an argument it does not take (GH #219)" \
+  '[refused(111; "signal"; "session"), reached(131)]' '[[-32602,true],"session_not_found"]'
+jcheck "request_secret_input refuses a misspelt argument by name (GH #219)" \
+  '[refused(112; "prompt"; "prompt_text"), reached(132)]' '[[-32602,true],"session_not_found"]'
 
 # ------------------------------------------------------ real behaviour
 

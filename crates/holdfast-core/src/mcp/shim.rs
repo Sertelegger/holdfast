@@ -560,9 +560,16 @@ fn decode_resource_envelope(message: &str) -> Option<(String, Option<Value>)> {
 /// "returned raw and unredacted" to the redaction contract — neither
 /// edit would have reached a copy living here, and hybrid mode is the
 /// *default* transport, so the copy is the text most agents would read.
+///
+/// **This is the string the plugin's clients receive** on Unix, so it is
+/// the one GH #230's budget binds hardest: the shared text plus this
+/// suffix. The suffix carries the second fact that is true only here —
+/// `holdfast attach` is how a human answers `request_secret_input`, and
+/// under `--no-daemon` there is no `attach.sock` for it to reach.
 fn instructions() -> String {
     format!(
-        "{} Sessions live in a background daemon and survive this connection.",
+        "{}\n\nSessions live in a background daemon and survive this connection; \
+         a human answers request_secret_input with holdfast attach <session>.",
         super::INSTRUCTIONS
     )
 }
@@ -886,6 +893,50 @@ mod tests {
             "`--no-daemon` holds the MCP peer in `on_initialized` and does \
              deliver the notification; withdrawing it there too would be a \
              regression, and would satisfy the assertion above"
+        );
+    }
+
+    /// **GH #230, on the string the plugin's clients actually receive.**
+    ///
+    /// The dogfood log's `Server instructions truncated from 3165 to 2048`
+    /// was this transport's text — the shared constant plus this file's
+    /// suffix — so it is read here through `get_info`, from a real
+    /// `ShimServer`, and put through the same assertion as the in-process
+    /// text. A row over `INSTRUCTIONS` alone would stay green while the
+    /// suffix carried the served string over the cut.
+    #[tokio::test]
+    async fn the_hybrid_instructions_fit_the_client_budget_with_the_secret_rule_first() {
+        let dir = scratch_dir("instr");
+        let _scoped = Scoped(dir.clone());
+        std::fs::create_dir_all(&dir).unwrap();
+        let sock = dir.join("control.sock");
+        // No request is issued; the stand-in only completes the handshake.
+        let _captured = stand_in_daemon(sock.clone(), CborValue::Map(vec![]));
+        // Bounded, unlike the loops above it: a stand-in that failed to
+        // bind is a failure with a message, not a row that spins until
+        // nextest's kill names it.
+        let mut client = None;
+        for _ in 0..500 {
+            match ControlClient::connect(&sock, ClientKind::Shim).await {
+                Ok(c) => {
+                    client = Some(c);
+                    break;
+                }
+                Err(_) => tokio::time::sleep(std::time::Duration::from_millis(10)).await,
+            }
+        }
+        let client = client.expect("the stand-in daemon never accepted a connection");
+        let text = ShimServer::new(Arc::new(client))
+            .get_info()
+            .instructions
+            .expect("the shim sends instructions");
+        crate::mcp::tests::assert_instructions_survive_the_client("hybrid", &text);
+        // And the transport-specific half is still there to be kept: the
+        // one way a human answers a secret request on this transport.
+        assert!(
+            text.contains("holdfast attach"),
+            "the hybrid instructions no longer say how a human answers \
+             request_secret_input: {text}"
         );
     }
 
