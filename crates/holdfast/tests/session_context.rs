@@ -545,6 +545,69 @@ fn a_client_whose_daemon_stopped_starts_another_and_says_its_sessions_are_gone()
     shim.kill();
 }
 
+/// **The restart note reaches an error too.** A call re-sent to a new
+/// daemon can be refused there, and the refusal is then the only answer
+/// the agent reads — so it must carry the note that every earlier session
+/// is gone, at the front, exactly as a successful answer's `details`
+/// does. Found by review: deleting the error half of the note left every
+/// row green.
+///
+/// A `cwd` that does not exist is the refusal: an `invalid_params` from
+/// the handler, which crosses the control protocol as an error rather
+/// than as an envelope.
+#[test]
+fn a_re_sent_call_that_is_refused_still_says_the_daemon_restarted() {
+    let inst = Instance::new("refused");
+    let here = Project::new(&inst, "proj");
+    let mut shim = Shim::launch(&inst, &here.0, &[], &["mcp"]);
+    assert_eq!(
+        envelope(&shim.call("list_sessions", json!({})))["status"],
+        "ok"
+    );
+    let old = inst.daemon_pid().expect("a daemon");
+    let (code, _, err) = inst.run(&["daemon", "stop"]);
+    assert_eq!(code, 0, "{err}");
+    // `daemon stop` answers before the old process has exited (issue
+    // #20). Once it has, the kernel has closed the shim's parked
+    // connection, so the call below fails on its write and is re-sent —
+    // the path under test — rather than racing a daemon still tearing
+    // down into the answered-not-re-sent path.
+    let deadline = Instant::now() + Duration::from_secs(15);
+    while unsafe { libc::kill(old as i32, 0) } == 0 {
+        assert!(
+            Instant::now() < deadline,
+            "the old daemon {old} never exited"
+        );
+        std::thread::sleep(Duration::from_millis(25));
+    }
+
+    let missing = here.0.join("no-such-directory");
+    let refused = shim.call(
+        "start_session",
+        json!({ "command": "/bin/sh", "cwd": missing.to_str().unwrap() }),
+    );
+    assert_eq!(refused["error"]["code"], -32602, "{refused}");
+    let message = refused["error"]["message"].as_str().unwrap_or_default();
+    assert!(
+        message.starts_with("The Holdfast daemon had stopped")
+            && message.contains("every session from the previous daemon is gone")
+            && message.contains("cwd is not an existing directory"),
+        "the refusal must lead with the restart and still say why it refused: {message:?}"
+    );
+
+    // Once: the next refusal is only a refusal.
+    let again = shim.call(
+        "start_session",
+        json!({ "command": "/bin/sh", "cwd": missing.to_str().unwrap() }),
+    );
+    let message = again["error"]["message"].as_str().unwrap_or_default();
+    assert!(
+        message.starts_with("cwd is not an existing directory"),
+        "{message:?}"
+    );
+    shim.kill();
+}
+
 /// Every running `holdfast daemon run` serving `dir`. Linux reads it off
 /// `/proc`; elsewhere this answers `None` and the row relies on its
 /// load-bearing half, which is platform-free.
