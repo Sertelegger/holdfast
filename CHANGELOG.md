@@ -257,9 +257,11 @@ is cut, named and published is in
   or exactly that shape — this repository's URL, `path: "plugin"`, a `vX.Y.Z`
   ref no newer than `Cargo.toml`, a full sha — and, in a clone that has the
   tag, checks the sha against it and the pinned tree's `plugin.json` against
-  the ref. Each refusal has a breakage fixture, and the self-test gains its
-  first *acceptance* fixture, so a rule that refused every pin — the rule as
-  it stood — now fails it. The listing
+  the ref. Each refusal has a breakage fixture — the tag half's in a fixture
+  made a git clone with the tag in it, so they run in CI, whose own checkout
+  has no tags — and the self-test gains its first *acceptance* fixtures, so a
+  rule that refused every pin — the rule as it stood — now fails it. The
+  listing
   itself stays `"./plugin"` until a release whose tag contains `plugin/` is
   promoted: `v0.0.7`'s does not, and the check refuses that pin.
   `release.yml`'s post-draft checklist names the step ([#237]).

@@ -394,10 +394,15 @@ quiet=$!
 t0=$(date +%s)
 env -i PATH="$PATH" HOME="$S/fakehome" CLAUDE_PLUGIN_DATA="$CACHE" \
     HOLDFAST_BOOTSTRAP_BASE_URL="$BASE" HOLDFAST_BOOTSTRAP_INSECURE=1 \
-    /bin/sh "$PLUG/bootstrap" mcp < "$S/quiet" > "$S/t12q.out" 2> "$S/t12q.err"
+    /bin/sh "$PLUG/bootstrap" mcp < "$S/quiet" > "$S/t12q.out" 2> "$S/t12q.err"; rc=$?
 t1=$(date +%s)
 kill "$quiet" 2> /dev/null
 chk "T12 silent stdin: bounded"  "$([ $((t1 - t0)) -lt 20 ] && echo yes || echo "no, $((t1 - t0))s")" yes
+# **Which signal ended it, by its status, not by the clock.** ALRM is 142;
+# the KILL a second later is 137, and a watchdog whose first signal is
+# trapped -- TERM was, and bash then resumed the `read` -- still ends by that
+# KILL, a second later, which no wall-clock bound here can tell apart.
+chk "T12 silent stdin: ended by ALRM" "$rc" 142
 chk "T12 silent stdin: said why" "$(grep -c 'no holdfast v9.9.9 binary to download' "$S/t12q.err")" 1
 chk "T12 silent stdin: no reply" "$(wc -c < "$S/t12q.out" | tr -d ' ')" 0
 chk "T12 silent stdin: no temp dir" "$(count_matching "$CACHE/bin" '.dl.*')" 0
@@ -411,14 +416,32 @@ if command -v bash > /dev/null 2>&1; then
     t0=$(date +%s)
     env -i PATH="$PATH" HOME="$S/fakehome" CLAUDE_PLUGIN_DATA="$CACHE" \
         HOLDFAST_BOOTSTRAP_BASE_URL="$BASE" HOLDFAST_BOOTSTRAP_INSECURE=1 \
-        bash "$PLUG/bootstrap" mcp < "$S/quiet" > /dev/null 2> "$S/t12b.err"
+        bash "$PLUG/bootstrap" mcp < "$S/quiet" > /dev/null 2> "$S/t12b.err"; rc=$?
     t1=$(date +%s)
     kill "$quiet" 2> /dev/null
     chk "T12 silent stdin, bash: bounded" "$([ $((t1 - t0)) -lt 20 ] && echo yes || echo "no, $((t1 - t0))s")" yes
+    chk "T12 silent stdin, bash: ended by ALRM" "$rc" 142
     chk "T12 silent stdin, bash: said why" "$(grep -c 'no holdfast v9.9.9 binary to download' "$S/t12b.err")" 1
 else
     echo "  skip  T12 silent stdin under bash -- no bash on this host"
 fi
+# **And the backstop.** A caller that started us with ALRM ignored -- which a
+# non-interactive shell inherits and cannot undo -- is ended by the KILL.
+rm -rf "$CACHE"
+sleep 60 > "$S/quiet" &
+quiet=$!
+t0=$(date +%s)
+# shellcheck disable=SC2016
+# Literal: `$0` is the inner shell's, which is the bootstrap's path.
+env -i PATH="$PATH" HOME="$S/fakehome" CLAUDE_PLUGIN_DATA="$CACHE" \
+    HOLDFAST_BOOTSTRAP_BASE_URL="$BASE" HOLDFAST_BOOTSTRAP_INSECURE=1 \
+    /bin/sh -c 'trap "" ALRM; exec /bin/sh "$0" mcp' "$PLUG/bootstrap" \
+    < "$S/quiet" > /dev/null 2> "$S/t12k.err"; rc=$?
+t1=$(date +%s)
+kill "$quiet" 2> /dev/null
+chk "T12 ALRM ignored: bounded"  "$([ $((t1 - t0)) -lt 20 ] && echo yes || echo "no, $((t1 - t0))s")" yes
+chk "T12 ALRM ignored: KILL ends it" "$rc" 137
+chk "T12 ALRM ignored: said why" "$(grep -c 'no holdfast v9.9.9 binary to download' "$S/t12k.err")" 1
 # Only under `mcp`: `bootstrap version` run by a person must not print JSON.
 printf '%s\n' "$INIT" | env -i PATH="$PATH" HOME="$S/fakehome" CLAUDE_PLUGIN_DATA="$CACHE" \
     HOLDFAST_BOOTSTRAP_BASE_URL="$BASE" HOLDFAST_BOOTSTRAP_INSECURE=1 \

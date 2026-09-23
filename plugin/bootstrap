@@ -63,11 +63,14 @@ hf_mcp_error() {
     # **The signal must be one nothing traps.** It was TERM, which the
     # download phase traps to clean up; dash and busybox then abandon the
     # `read`, and bash -- macOS's /bin/sh -- runs the trap and goes back to
-    # reading. Measured: 5 s under dash and busybox, the writer's full 30 s
-    # under bash. ALRM is trapped by nobody here and terminates outright in
-    # every shell; KILL a second later covers a caller that started us with
-    # ALRM ignored, which a non-interactive shell cannot undo. Neither runs
-    # the EXIT trap, so its cleanup happens here first.
+    # reading. Measured, with TERM alone: 5 s under dash and busybox, the
+    # writer's full 30 s under bash. ALRM is trapped by nobody here and ends
+    # every shell at 5 s with status 142. KILL a second later is the
+    # backstop, for a caller that started us with ALRM ignored -- which a
+    # non-interactive shell cannot undo -- and it would also bound a trapped
+    # signal, so the harness tells the two apart by the exit status (142,
+    # not KILL's 137), not by the time. Neither runs the EXIT trap, so its
+    # cleanup happens here first.
     [ -n "${HF_TMP:-}" ] && rm -rf "$HF_TMP"
     ( sleep 5; kill -ALRM $$; sleep 1; kill -KILL $$ ) < /dev/null > /dev/null 2>&1 &
     _wd=$!

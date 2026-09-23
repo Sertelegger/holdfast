@@ -250,9 +250,21 @@ def check_tree(root):
 
 
 REPO_GIT_URL = "https://github.com/Sertelegger/holdfast.git"
-RELEASE_TAG = re.compile(r"^v([0-9]+)\.([0-9]+)\.([0-9]+)$")
-FULL_SHA = re.compile(r"^[0-9a-f]{40}$")
+# Used with `fullmatch`, never `match`: `$` also matches before a trailing
+# newline, so `^...$` under `match` accepts `v0.0.8\n`.
+RELEASE_TAG = re.compile(r"v([0-9]+)\.([0-9]+)\.([0-9]+)")
+FULL_SHA = re.compile(r"[0-9a-f]{40}")
 PIN_KEYS = {"source", "url", "path", "ref", "sha"}
+
+
+def _git_out(root, *args):
+    """`git -C root ...`, stopped at root: a fixture that is not a clone must
+    not be answered by a clone it happens to sit inside -- a TMPDIR under a
+    checkout of this repository, whose tags are the real ones."""
+    root = os.path.abspath(root)
+    env = dict(os.environ, GIT_CEILING_DIRECTORIES=os.path.dirname(root))
+    return subprocess.check_output(["git", "-C", root] + list(args),
+                                   stderr=subprocess.DEVNULL, env=env).decode()
 
 
 def check_marketplace_source(r, root, src):
@@ -289,13 +301,13 @@ def check_marketplace_source(r, root, src):
             "the pin's path is plugin",
             "the pin's path is %r; the plugin tree is `plugin`" % src.get("path"))
     ref = src.get("ref")
-    m = RELEASE_TAG.match(ref) if isinstance(ref, str) else None
+    m = RELEASE_TAG.fullmatch(ref) if isinstance(ref, str) else None
     r.check(m is not None,
             "the pin's ref %r is a release tag" % ref,
             "the pin's ref is %r; it must be a release tag vX.Y.Z -- a branch "
             "moves without review, which is the thing the pin is for" % (ref,))
     sha = src.get("sha")
-    r.check(isinstance(sha, str) and bool(FULL_SHA.match(sha)),
+    r.check(isinstance(sha, str) and bool(FULL_SHA.fullmatch(sha)),
             "the pin carries a full commit sha",
             "the pin's sha is %r; a full 40-hex sha is required -- Claude Code "
             "takes the sha over the ref, and a tag without one can be moved"
@@ -308,15 +320,13 @@ def check_marketplace_source(r, root, src):
                 "the pin (%s) is not ahead of Cargo.toml (%s)" % (ref, cv),
                 "the pin names %s, which is ahead of Cargo.toml's %s -- a "
                 "release that does not exist yet" % (ref, cv))
-    if not (m and isinstance(sha, str) and FULL_SHA.match(sha)):
+    if not (m and isinstance(sha, str) and FULL_SHA.fullmatch(sha)):
         return
     # The tag, when this clone has it. CI's checkout fetches no tags, so
     # there this says it could not look rather than calling it a pass.
     try:
-        tagged = subprocess.check_output(
-            ["git", "-C", root, "rev-parse", "-q", "--verify",
-             "refs/tags/%s^{commit}" % ref],
-            stderr=subprocess.DEVNULL).decode().strip()
+        tagged = _git_out(root, "rev-parse", "-q", "--verify",
+                          "refs/tags/%s^{commit}" % ref).strip()
     except (OSError, subprocess.CalledProcessError):
         tagged = None
     if not tagged:
@@ -327,9 +337,8 @@ def check_marketplace_source(r, root, src):
             "the pin's sha is what %s points at" % ref,
             "the pin's sha %s is not %s's commit %s" % (sha, ref, tagged))
     try:
-        pj = json.loads(subprocess.check_output(
-            ["git", "-C", root, "show", "%s:plugin/.claude-plugin/plugin.json" % sha],
-            stderr=subprocess.DEVNULL).decode())
+        pj = json.loads(_git_out(root, "show",
+                                 "%s:plugin/.claude-plugin/plugin.json" % sha))
     except (OSError, subprocess.CalledProcessError, ValueError):
         pj = None
     r.check(isinstance(pj, dict) and pj.get("version") == ref[1:],
@@ -406,12 +415,30 @@ def self_test(root):
         # rule can be what refuses it.
         ("a pin whose source type is not git-subdir",
          lambda d: _pin(d, source="url")),
+        ("a pin with a key beyond the five", lambda d: _pin(d, branch="main")),
+        ("a pin to a pre-release tag", lambda d: _pin(d, ref="v0.0.1-rc1")),
+        ("a pin to a tag with a suffix", lambda d: _pin(d, ref="v0.0.1foo")),
+        ("a pin whose ref ends in a newline", lambda d: _pin(d, ref="v0.0.1\n")),
+        ("a pin whose sha ends in a newline", lambda d: _pin(d, sha="0" * 40 + "\n")),
+        # **The half that needs the tag.** The fixture is made a clone with
+        # the tag in it, so these run here -- and in CI, whose own checkout
+        # has no tags and skips that half against the real tree.
+        ("a pin whose sha is not its tag's commit",
+         lambda d: _git_pin(d, "sha-elsewhere")),
+        ("a pin to a tag whose plugin.json says another version",
+         lambda d: _git_pin(d, "tree-disagrees")),
     ]
     # **And the shape the release procedure tells people to write must PASS.**
     # Every case above is a rejection; without this, a check that refused
     # every pin -- the rule as it stood before GH #237 -- passes them all.
     acceptances = [
         ("a well-formed pin", lambda d: _pin(d)),
+        ("a pin that matches its tag, in a clone that has it",
+         lambda d: _git_pin(d, "good")),
+        # Not a clone, but inside one whose tag is somewhere else: the tag
+        # half must skip, not borrow the outer clone's tag and refuse.
+        ("a pin in a non-clone nested inside another clone",
+         lambda d: _nested_in_clone(d)),
     ]
     failures = 0
     print("=== self-test: the real tree must pass ===")
@@ -450,8 +477,9 @@ def self_test(root):
                     shutil.copytree(s, t)
                 elif os.path.isfile(s):
                     shutil.copy(s, t)
-            maker(d)
-            rep = _quiet(lambda: check_tree(d))
+            # A maker may move the tree and say where it put it.
+            at = maker(d) or d
+            rep = _quiet(lambda: check_tree(at))
             if rep.fails:
                 print("  FAIL  REJECTED: %s -- %s" % (label, "; ".join(rep.fails)))
                 failures += 1
@@ -498,6 +526,59 @@ def _pin(d, **over):
         else:
             pin[k] = v
     _patch_source(d, pin)
+
+
+def _git_pin(d, variant):
+    """Make the fixture a git clone with a release tag at the tree's own
+    version, and pin to it: `good` exactly, `sha-elsewhere` at a later
+    commit, `tree-disagrees` at a tag whose tree's plugin.json says another
+    version (the working tree's own stays right, so nothing else fails)."""
+    env = dict(os.environ, GIT_CONFIG_GLOBAL=os.devnull, GIT_CONFIG_NOSYSTEM="1",
+               GIT_CEILING_DIRECTORIES=os.path.dirname(os.path.abspath(d)))
+
+    def git(*args):
+        return subprocess.check_output(
+            ["git", "-C", d, "-c", "user.name=self-test", "-c",
+             "user.email=self-test@invalid", "-c", "commit.gpgsign=false",
+             "-c", "tag.gpgsign=false", "-c", "core.hooksPath=" + os.devnull]
+            + list(args), env=env, stderr=subprocess.STDOUT).decode().strip()
+
+    version = cargo_version(Report(), d)
+    pj = os.path.join(d, "plugin/.claude-plugin/plugin.json")
+    real = open(pj).read()
+    git("init", "-q")
+    if variant == "tree-disagrees":
+        _patch(d, "plugin/.claude-plugin/plugin.json", {"version": "0.0.0"})
+    git("add", "-A")
+    git("commit", "-q", "-m", "tagged")
+    git("tag", "v" + version)
+    sha = git("rev-parse", "HEAD")
+    open(pj, "w").write(real)
+    if variant == "sha-elsewhere":
+        git("commit", "-q", "--allow-empty", "-m", "after the tag")
+        sha = git("rev-parse", "HEAD")
+    _pin(d, ref="v" + version, sha=sha)
+
+
+def _nested_in_clone(d):
+    """The tree moved to d/inner, and d made a clone tagged v0.0.1 -- the
+    ref `_pin` writes -- at a commit that is not the pin's sha."""
+    inner = os.path.join(d, "inner")
+    os.makedirs(inner)
+    for item in os.listdir(d):
+        if item != "inner":
+            shutil.move(os.path.join(d, item), os.path.join(inner, item))
+    env = dict(os.environ, GIT_CONFIG_GLOBAL=os.devnull, GIT_CONFIG_NOSYSTEM="1")
+    for args in (["init", "-q"],
+                 ["commit", "-q", "--allow-empty", "-m", "outer"],
+                 ["tag", "v0.0.1"]):
+        subprocess.check_output(
+            ["git", "-C", d, "-c", "user.name=self-test", "-c",
+             "user.email=self-test@invalid", "-c", "commit.gpgsign=false",
+             "-c", "tag.gpgsign=false", "-c", "core.hooksPath=" + os.devnull]
+            + args, env=env, stderr=subprocess.STDOUT)
+    _pin(inner)
+    return inner
 
 
 def _write(d, rel, text):

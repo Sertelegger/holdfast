@@ -904,9 +904,9 @@ jobs:
           persist-credentials: false
 
       # **The self-test first**, for the reason the `hygiene` job gives: this
-      # script's twelve breakage fixtures are the only thing holding its
-      # twenty-five assertions honest, and a guard whose guard is unrun is a
-      # guard on trust.
+      # script's breakage and acceptance fixtures are the only thing holding
+      # its assertions honest, and a guard whose guard is unrun is a guard on
+      # trust. It prints its own totals.
       - run: ./scripts/plugin-manifest-check.py --self-test
       - run: ./scripts/plugin-manifest-check.py
 
