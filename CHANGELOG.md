@@ -664,26 +664,35 @@ is cut, named and published is in
   gone and whether the call took effect is unknown. A handshake reset by a
   dead daemon's listener that has not closed yet — measured after `SIGKILL`
   — is waited out for up to two seconds rather than reported; a handshake
-  that times out is still a wedged daemon and is still reported. With the
-  hang-up above, the stop half of an upgrade fell from 10.1 s to 0.1 s for
-  one idle shell.
+  that times out is still a wedged daemon and is still reported. If a
+  re-sent call is refused by the new daemon, the refusal's message carries
+  the same note at its front. With the hang-up in the next entry, the stop
+  half of an upgrade no longer sits out its whole grace for an idle shell.
 
 - **`terminate` on a shell took its whole grace, and `daemon stop` the whole
   of its own** ([#234]). An interactive shell ignores `SIGTERM` (§4.4), so
-  the sweep reached every job and left the shell, and `terminate` of any
-  `bash` session waited its 5 s default before `SIGKILL` — measured at
-  5.16 s — while `daemon stop` waited 10 s for each shell (10.1 s for one
-  idle `bash`). A shell is now **hung up** — `SIGHUP`, what closing its
-  terminal sends, which it answers by passing the hangup to its jobs and
-  exiting — once it is back at its own prompt: the terminal's foreground
-  group is the shell's, so a foreground job that caught the `SIGTERM` and is
-  cleaning up finishes first. Only an interactive shell is hung up (no `-c`,
-  no script operand); a program that handles `SIGTERM` itself is left to it
-  and to the escalation, as before. Measured after: 0.18 s for the reported
-  case, background jobs included. The exit code a hung-up shell reports is
-  still `1` — REQ-P-007's documented limitation, which the `SIGKILL` it
-  replaces reported too. The idle reaper still waits out its grace for a
-  shell; it is a background path and was left alone.
+  the sweep reached every job and left the shell: `terminate` of any `bash`
+  session waited out its 5 s default before `SIGKILL`, and `daemon stop` its
+  10 s whenever a shell session was open. A shell is now **hung up** —
+  `SIGHUP`, what closing its terminal sends — once two things hold, and each
+  is a case the hangup would otherwise break:
+  - **it is alone in its session.** A shell passes a hangup on to every job
+    it has, so a job that caught the `SIGTERM` — in the foreground or the
+    background — and is still cleaning up would be cut short. The hangup
+    waits until each has finished.
+  - **the leader is an interactive shell now** (no `-c`, no script operand),
+    read from its current argv rather than from what the session was started
+    with. A shell that ran `exec python3 app.py` keeps its pid and group, and
+    a hangup there interrupts that program's `SIGTERM` handler — or makes a
+    server that reads `SIGHUP` as "reload" reload mid-shutdown. Such a
+    program is left to its own handling and the escalation, as before.
+
+  Linux and macOS only; where a session cannot be enumerated nothing
+  changes. The reported case — an idle shell whose background jobs die at
+  the sweep — now ends as soon as they have. The exit code a hung-up shell
+  reports is still `1`: REQ-P-007's documented limitation, which the
+  `SIGKILL` it replaces reported too. The idle reaper still waits out its
+  grace for a shell; it is a background path and was left alone.
 - **An exited session's name, as `holdfast list` shows it, answered a bare
   `session not found`** ([#234]). §4.1 keeps exited sessions off the name
   space, so `holdfast logs x79` and `status x79` are still refused once `x79`

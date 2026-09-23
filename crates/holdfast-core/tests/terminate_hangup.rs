@@ -175,6 +175,136 @@ async fn a_foreground_job_finishes_its_cleanup_before_the_shell_is_hung_up() {
     );
 }
 
+/// A directory of the row's own, removed on drop.
+struct Scratch(std::path::PathBuf);
+impl Scratch {
+    fn new(tag: &str) -> Self {
+        let dir = std::env::temp_dir().join(format!(
+            "holdfast-hangup-{tag}-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .subsec_nanos()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        Self(dir)
+    }
+}
+impl Drop for Scratch {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.0);
+    }
+}
+
+/// **The hangup waits for a background job that is cleaning up** — the
+/// case the foreground row above cannot see, because a shell with a job
+/// in the background is at its own prompt and holds the terminal. The
+/// job caught the `SIGTERM` and spends a second writing a file; the shell
+/// passes a hangup on to every job it has, so one sent during that second
+/// kills the job and the file never appears. Found by review: the gate
+/// this branch first had checked only the foreground group, which a
+/// background job never holds.
+#[tokio::test]
+async fn a_background_job_finishes_its_cleanup_before_the_shell_is_hung_up() {
+    let dir = Scratch::new("bg");
+    let done = dir.0.join("cleaned");
+
+    let server = HoldfastServer::new();
+    let (id, session) = interactive_bash(&server).await;
+    let shell = session.pid().unwrap() as i32;
+    let job = format!(
+        "sh -c 'trap \"sleep 1; echo cleaned > {}; exit 0\" TERM; echo BG''_UP; \
+         while :; do sleep 0.1; done' &\n",
+        done.display()
+    );
+    session.write_input(job.as_bytes()).unwrap();
+    wait_for(&session, "BG_UP");
+
+    let (b, took) = terminate(&server, &id).await;
+
+    assert_eq!(b["status"], "ok", "{b}");
+    let cleaned = std::fs::read_to_string(&done).unwrap_or_default();
+    assert_eq!(
+        cleaned.trim(),
+        "cleaned",
+        "the background job was cut off during its SIGTERM cleanup — the shell \
+         was hung up while a job was still running, and passed the hangup on"
+    );
+    assert!(
+        took < Duration::from_secs(u64::from(GRACE_SECS) / 2),
+        "terminate took {took:?} of a {GRACE_SECS} s grace: once the job had \
+         finished, the shell should have been hung up"
+    );
+    assert!(
+        gone_within(shell, Duration::from_secs(5)),
+        "the shell {shell} is still running"
+    );
+}
+
+/// **A shell that `exec`ed into a program is that program now, and is not
+/// hung up.** The session keeps the shell's pid and group, so the gate
+/// this branch first had — which read the spawn-time command — still took
+/// it for a shell. Found by review with `exec python3 app.py`, whose
+/// `SIGTERM` handler was killed a moment into its cleanup.
+///
+/// The program here stands for a server that reads `SIGHUP` as "reload"
+/// and ignores `SIGTERM`, with **no child** — so it is alone in its
+/// session, and the only thing between it and a hangup is the check of
+/// what the leader is running now. It records a hangup in a file, and the
+/// row first sends one by hand to prove the record works: a marker that
+/// could never be written would pass the assertion that it was not.
+#[tokio::test]
+async fn a_program_the_shell_execed_into_is_not_hung_up() {
+    let dir = Scratch::new("exec");
+    let hup = dir.0.join("hup");
+
+    let server = HoldfastServer::new();
+    let (id, session) = interactive_bash(&server).await;
+    let leader = session.pid().unwrap() as i32;
+    let program = format!(
+        "exec sh -c 'trap \"\" TERM; trap \"echo hup > {}\" HUP; echo EXEC''_UP; \
+         while :; do :; done'\n",
+        hup.display()
+    );
+    session.write_input(program.as_bytes()).unwrap();
+    wait_for(&session, "EXEC_UP");
+
+    // The record works: a hangup sent by hand is written down.
+    assert_eq!(unsafe { libc::kill(leader, libc::SIGHUP) }, 0);
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while !hup.exists() {
+        assert!(
+            Instant::now() < deadline,
+            "the program never recorded the hangup sent by hand, so this row \
+             could not tell whether terminate sent one"
+        );
+        std::thread::sleep(Duration::from_millis(25));
+    }
+    std::fs::remove_file(&hup).unwrap();
+
+    // A short grace: the program ignores the `SIGTERM`, so the call waits
+    // all of it and then kills — which is the outcome this row wants.
+    let r = server
+        .terminate(Parameters(TerminateArgs {
+            session: id.clone(),
+            force: Some(false),
+            timeout_secs: Some(2),
+        }))
+        .await
+        .unwrap();
+    assert_eq!(body(&r)["status"], "ok", "{}", body(&r));
+    assert!(
+        gone_within(leader, Duration::from_secs(5)),
+        "the program {leader} is still running"
+    );
+    assert!(
+        !hup.exists(),
+        "terminate hung up a program that is not a shell: the session's leader \
+         had exec'd into it, and a hangup is a reload or an interrupted cleanup there"
+    );
+}
+
 /// The exit code this reports is REQ-P-007's documented one — a shell
 /// that died of a signal reads `1`, as it did when the signal was
 /// `SIGKILL` — and **not** something the hangup invented. Pinned so a

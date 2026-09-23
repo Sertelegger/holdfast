@@ -794,8 +794,8 @@ impl Daemon {
             if !self.clock.is_manual() {
                 let deadline = self.clock.now() + grace;
                 // GH #234: an interactive shell ignores the `SIGTERM`
-                // above and ends on a hangup, once it has nothing in front
-                // of it. Without this, every shell session held `daemon
+                // above and ends on a hangup, once it is alone in its
+                // session. Without this, every shell session held `daemon
                 // stop` for the whole grace — measured at 10.1 s for one
                 // idle `bash` — and that is the upgrade path GH #231 is
                 // about. Once per session, on the first poll it qualifies.

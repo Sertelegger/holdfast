@@ -1751,8 +1751,9 @@ impl HoldfastServer {
             // GH #234: an interactive shell ignores the `SIGTERM` above,
             // so without this every `bash` session sat out the whole grace
             // before the `SIGKILL` below. Asked on every poll, because the
-            // shell only qualifies once its foreground job — which got the
-            // `SIGTERM` and may be cleaning up — has finished; see
+            // shell only qualifies once it is alone in its session — every
+            // job that got the `SIGTERM` and may be cleaning up, in the
+            // foreground or not, has finished; see
             // `Session::hang_up_idle_shell` for what it will not touch.
             let mut hung_up = false;
             while session.tree_alive() && std::time::Instant::now() < deadline {
