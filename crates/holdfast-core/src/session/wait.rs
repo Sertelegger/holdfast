@@ -384,9 +384,9 @@ impl Window {
     }
 
     fn push(&mut self, bytes: &[u8]) {
-        let mut at = self.end();
+        let from = self.end();
         self.raw.extend_from_slice(bytes);
-        for &b in bytes {
+        for (at, &b) in (from..).zip(bytes) {
             if let Some(t) = self.stripper.feed(at, b) {
                 let continues = matches!(
                     self.runs.last(),
@@ -397,7 +397,6 @@ impl Window {
                 }
                 self.text.push(t);
             }
-            at += 1;
         }
     }
 
