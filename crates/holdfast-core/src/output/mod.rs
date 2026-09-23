@@ -5023,6 +5023,134 @@ mod tests {
         }
     }
 
+    /// **Every range the collapse drops wrote nothing a terminal still
+    /// shows** — the property GH #247 is allowed on, checked against a
+    /// terminal rather than argued.
+    ///
+    /// The oracle is the one `get_screen_state` masks keys with: replay the
+    /// stream through `vt100` twice, once as written and once with every
+    /// printable byte of the dropped ranges swapped for another, and
+    /// compare the final screens. If a dropped byte is still visible the
+    /// two differ. Streams are drawn at random from the pieces redraws are
+    /// made of — text, `\r`, erase-in-line in all three spellings, SGR,
+    /// line feeds, and the sequences that move the cursor or switch the
+    /// screen, which is where both of this rule's review findings lived
+    /// (`\x1b[?1049h`, `\x1b[A`). The screen is tall enough that nothing
+    /// scrolls, so "still visible" means exactly that.
+    ///
+    /// **Paired**: the sweep must also have collapsed something, and a
+    /// stream the rule is for must collapse, or the property holds of a
+    /// rule that drops nothing.
+    #[test]
+    fn nothing_a_collapse_drops_is_still_on_a_terminal() {
+        struct Rng(u64);
+        impl Rng {
+            fn below(&mut self, n: usize) -> usize {
+                self.0 ^= self.0 << 13;
+                self.0 ^= self.0 >> 7;
+                self.0 ^= self.0 << 17;
+                (self.0 % n as u64) as usize
+            }
+        }
+        // The ordinary pieces are repeated so that most streams contain
+        // a collapsible redraw; the rest are the ones that break it.
+        const PIECES: &[&str] = &[
+            "alpha",
+            "beta gamma",
+            "x",
+            "Building [==>  ] 3/9",
+            "alpha",
+            "beta gamma",
+            "\r",
+            "\r",
+            "\r",
+            "\r",
+            "\r\x1b[K",
+            "\r\x1b[K",
+            "\x1b[K",
+            "\x1b[K",
+            "\x1b[0K",
+            "\x1b[2K",
+            "\x1b[1K",
+            "\x1b[32m",
+            "\x1b[0m",
+            "\n",
+            "\r\n",
+            "\x1b[?1049h",
+            "\x1b[?1049l",
+            "\x1b[A",
+            "\x1b[B",
+            "\x1b[3C",
+            "\x1b[2D",
+            "\x1b[5G",
+            "\x1b7",
+            "\x1b8",
+            "\x1bM",
+            "\t",
+            "\x08",
+            "\x0b",
+            "\x1b]0;title\x07",
+            "\x1b[?25l",
+            "日本",
+        ];
+        // Leaving the alternate screen at the end, so a line the stream
+        // left on the main screen is on the screen compared.
+        let screen = |bytes: &[u8]| {
+            let mut t = vt100::Parser::new(200, 120, 0);
+            t.process(bytes);
+            t.process(b"\x1b[?1049l");
+            t.screen().clone()
+        };
+        // The arrangements the review found, first, because a random walk
+        // reaches each of them too rarely to be the thing that pins it.
+        const FOUND: &[&str] = &[
+            "VISIBLE\r\x1b[?1049h\x1b[K",
+            "VISIBLE\x1b[?1049h\r\x1b[K",
+            "VISIBLE\x1b[A\r\x1b[K",
+            "VISIBLE\x1b7\r\x1b[K\x1b8",
+            "VISIBLE\x0b\r\x1b[K",
+        ];
+        let mut rng = Rng(0x2545_f491_4f6c_dd1d);
+        let mut collapsed = 0usize;
+        let p = processor();
+        for iter in 0..3000 + FOUND.len() {
+            let text: String = match FOUND.get(iter) {
+                Some(found) => found.to_string(),
+                None => {
+                    let n = 1 + rng.below(24);
+                    (0..n).map(|_| PIECES[rng.below(PIECES.len())]).collect()
+                }
+            };
+            let buf = text.as_bytes();
+            let w = snapshot(&p, buf, 0, 1 << 20, true, false);
+            let erased = erased_redraws(&w, &[], buf.len() as u64);
+            if erased.is_empty() {
+                continue;
+            }
+            collapsed += 1;
+            let mut swapped = buf.to_vec();
+            let mut stripper = AnsiStripper::new();
+            for (i, byte) in swapped.iter_mut().enumerate() {
+                let printed = stripper.feed(i as u64, *byte).is_some();
+                let inside = erased
+                    .iter()
+                    .any(|(s, e)| *s <= i as u64 && (i as u64) < *e);
+                if inside && printed && (0x20..=0x7e).contains(byte) {
+                    *byte = if *byte == b'#' { b'%' } else { b'#' };
+                }
+            }
+            assert_eq!(
+                screen(buf).contents(),
+                screen(&swapped).contents(),
+                "iter {iter}: a dropped range is still on screen: {text:?} dropped {erased:?}"
+            );
+        }
+        assert!(
+            collapsed > 300,
+            "only {collapsed} streams collapsed anything"
+        );
+    }
+
     /// **Dropping a redraw never removes a marker, and never lets the text
     /// it joins carry a credential out** (GH #247's "must not change what
     /// redaction sees").
