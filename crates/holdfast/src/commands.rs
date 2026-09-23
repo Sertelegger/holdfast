@@ -2731,7 +2731,8 @@ pub async fn watch(session: &str) -> ExitCode {
     // The id of the secret request this watch last said was pending, so
     // the same request announced twice — a tool call's raise and then the
     // child's echo drop finding it outstanding — is reported once (GH
-    // #236's review). Cleared by its close, so a later request is new.
+    // #236's review). Not cleared by the close: a request id is never
+    // reused, so the next request is new whatever this holds.
     let mut noticed_secret: Option<String> = None;
 
     // **Created once, above the loop** — `attach`'s rule for its signals,
@@ -2841,11 +2842,7 @@ pub async fn watch(session: &str) -> ExitCode {
                             ),
                         }
                     }
-                    ServerFrame::SecretRequestClosed { request_id, .. } => {
-                        if noticed_secret.as_deref() == Some(request_id.as_str()) {
-                            noticed_secret = None;
-                        }
-                    }
+                    ServerFrame::SecretRequestClosed { .. } => {}
                     // A watcher is told an approval is pending and
                     // **cannot answer it in any build**: §18.4 rejects
                     // `ApproveBinding` from a `ReadOnly` client by name,
@@ -3802,6 +3799,26 @@ mod tests {
             assert_eq!(row(&p, r as u16).trim_end(), want, "session row {r} moved");
         }
         assert_eq!(p.screen().cursor_position(), (3, 2));
+
+        // The last row blank but the cursor on it — a command line being
+        // opened: the program is about to write there, so the notice takes
+        // the top row rather than sitting under the cursor.
+        lines[9] = String::new();
+        let mut p = vt100::Parser::new(10, 80, 0);
+        p.process(&paint_snapshot(
+            &lines,
+            (9, 0),
+            Some((80, 10)),
+            Some(notice),
+            true,
+        ));
+        assert!(row(&p, 0).contains("attached to sess"), "{:?}", row(&p, 0));
+        assert!(
+            !row(&p, 9).contains("attached"),
+            "the notice was drawn on the row the cursor is on: {:?}",
+            row(&p, 9)
+        );
+        assert_eq!(p.screen().cursor_position(), (9, 0));
     }
 
     /// Into a capture, the notice is a sentence on stderr — or nothing,
