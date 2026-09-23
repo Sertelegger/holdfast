@@ -2532,7 +2532,13 @@ pub async fn pty_worker(_args: &[String]) -> ExitCode {
     ExitCode::from(EXIT_USAGE)
 }
 
-/// `holdfast version`
+/// `holdfast version`.
+///
+/// The build is `handshake::build_id()` — the same function the daemon
+/// answers the control handshake with — so this binary and a daemon
+/// started from it cannot describe one build two ways. It said `unknown`
+/// on every build outside the release pipeline until `holdfast-core`'s
+/// `build.rs` derived it (GH #178).
 pub fn version() -> ExitCode {
     println!(
         "holdfast {} (build {}) protocol {}.{}",

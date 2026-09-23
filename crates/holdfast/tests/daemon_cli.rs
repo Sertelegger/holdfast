@@ -2155,3 +2155,45 @@ fn the_no_daemon_server_honours_a_configured_session_cap() {
 
     shim.kill();
 }
+
+// ------------------------------------------------ GH #218, #232, #233, #178, #20
+
+/// **GH #178: `holdfast version` said `(build unknown)` on every build
+/// that was not the release pipeline's**, identical to the tag for a tree
+/// a hundred commits past it. A build from a git checkout now names the
+/// commit — derived here from the same place, not typed in.
+#[test]
+fn version_names_the_commit_it_was_built_from() {
+    let env = TestEnv::new("buildid");
+    let (code, out, err) = env.run(&["version"]);
+    assert_eq!(code, 0, "{err}");
+    let build = out
+        .split("(build ")
+        .nth(1)
+        .and_then(|rest| rest.split(')').next())
+        .unwrap_or_else(|| panic!("no `(build …)` in {out:?}"));
+
+    // What the build script was told, if it was told anything.
+    if let Some(sha) = option_env!("HOLDFAST_BUILD_SHA").filter(|s| !s.trim().is_empty()) {
+        assert_eq!(build, sha.trim(), "{out}");
+        return;
+    }
+    let git = Command::new("git")
+        .arg("-C")
+        .arg(env!("CARGO_MANIFEST_DIR"))
+        .args(["rev-parse", "--short=12", "HEAD"])
+        .output();
+    let Some(sha) = git
+        .ok()
+        .filter(|o| o.status.success())
+        .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
+    else {
+        println!("skipping: no git checkout to derive the expected build from");
+        return;
+    };
+    assert!(
+        build.starts_with(&sha),
+        "`holdfast version` says build {build:?}; the checkout it was built from is at {sha}"
+    );
+}
+
