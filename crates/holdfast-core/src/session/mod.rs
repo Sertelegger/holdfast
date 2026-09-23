@@ -49,6 +49,31 @@ pub type SessionId = String;
 /// capacity decides only how often they take that path.
 pub const OUTPUT_BROADCAST_FRAMES: usize = 256;
 
+/// The most frames an operator may give the output broadcast: sixteen
+/// times [`OUTPUT_BROADCAST_FRAMES`] (GH #210's review).
+///
+/// **A ceiling because the key became live, and a live key with none is
+/// an allocation an operator can make by accident.** `tokio`'s broadcast
+/// allocates every slot when it is built — per session, rounded up to a
+/// power of two. The review measured a key of 4,194,304, the knob GH #210
+/// itself pointed operators at, costing about 230 MB of daemon RSS per
+/// `start_session`; 1,000,000,000 asked for 60 GB and aborted the daemon
+/// with every session in it. While the key was inert the same
+/// `config.toml` was harmless.
+///
+/// **Past this the memory grows and nothing is bought.** Since GH #210 a
+/// lagging consumer resyncs from the ring buffer, so the capacity decides
+/// how often that path is taken, not what anybody is shown — while a
+/// subscriber that stops reading (a paused attach forwarder whose client
+/// the stall bound has not yet detached) keeps alive every frame it has
+/// not read, each up to one reader `read`. That is already a multiple of
+/// the default ring at this ceiling.
+///
+/// `Config::validate` **refuses** a larger value, for the reason that file
+/// refuses rather than clamps everywhere else; `Session::new` clamps to
+/// it too, for the callers that build a `SessionConfig` by hand.
+pub const MAX_OUTPUT_BROADCAST_FRAMES: usize = 16 * OUTPUT_BROADCAST_FRAMES;
+
 /// One chunk the reader appended, with the absolute span it occupies.
 ///
 /// The span is what makes the two-phase scan in `wait::for_pattern`
@@ -183,11 +208,12 @@ pub struct SessionConfig {
     /// broadcast holds for a subscriber that has not read them.
     /// [`OUTPUT_BROADCAST_FRAMES`] by default (GH #210).
     ///
-    /// **Zero is clamped to one** rather than trusted, because
-    /// `tokio::sync::broadcast::channel(0)` panics — and a panic in
-    /// `Session::new` is a panic inside `start_session`. `Config::validate`
-    /// already refuses a zero from the file; the clamp is for the callers
-    /// that build a `SessionConfig` by hand.
+    /// **Clamped to `1..=`[`MAX_OUTPUT_BROADCAST_FRAMES`]** rather than
+    /// trusted: `tokio::sync::broadcast::channel(0)` panics, a huge one
+    /// allocates every slot up front and can abort the daemon, and either
+    /// happens inside `start_session`. `Config::validate` already refuses
+    /// both from the file; the clamp is for the callers that build a
+    /// `SessionConfig` by hand.
     pub output_broadcast_capacity: usize,
 }
 
@@ -830,7 +856,9 @@ impl Session {
         // "effectively never" rather than a wrapped deadline in the past.
         let idle_timeout_ms = (config.idle_timeout_secs as i64).saturating_mul(1000);
         let idle_deadline_ms = Arc::new(AtomicI64::new(deadline_from(started_ms, idle_timeout_ms)));
-        let output_broadcast_capacity = config.output_broadcast_capacity.max(1);
+        let output_broadcast_capacity = config
+            .output_broadcast_capacity
+            .clamp(1, MAX_OUTPUT_BROADCAST_FRAMES);
         let (output_tx, _) = broadcast::channel(output_broadcast_capacity);
         let (events_tx, _) = broadcast::channel(SESSION_EVENT_FRAMES);
         let (write_tx, mut write_rx) = tokio::sync::mpsc::channel(WRITE_QUEUE_FRAMES);
@@ -2661,6 +2689,40 @@ mod tests {
             "the floor ran ahead of what the screen shows; the bytes in between would be \
              in neither the opening picture nor the stream"
         );
+    }
+
+    /// **A hand-built capacity is clamped into `1..=`the ceiling** (GH
+    /// #210's review). `Config::validate` refuses a file's value past
+    /// [`MAX_OUTPUT_BROADCAST_FRAMES`]; this is the half for a caller that
+    /// builds a `SessionConfig` itself. The values past the ceiling are
+    /// kept small enough that an unclamped build allocates them without
+    /// incident, so a removed clamp fails the assertion instead of taking
+    /// the test process with it.
+    #[test]
+    fn a_capacity_outside_the_bounds_is_clamped_into_them() {
+        for (asked, held) in [
+            (0, 1),
+            (MAX_OUTPUT_BROADCAST_FRAMES, MAX_OUTPUT_BROADCAST_FRAMES),
+            (MAX_OUTPUT_BROADCAST_FRAMES + 1, MAX_OUTPUT_BROADCAST_FRAMES),
+            (4 * MAX_OUTPUT_BROADCAST_FRAMES, MAX_OUTPUT_BROADCAST_FRAMES),
+        ] {
+            let s = Session::new(
+                new_session_id(),
+                None,
+                "bash".into(),
+                vec![],
+                Arc::new(MockPty::new()) as Arc<dyn PtyBackend>,
+                SessionConfig {
+                    output_broadcast_capacity: asked,
+                    ..SessionConfig::with_buffer_capacity(4096)
+                },
+            );
+            assert_eq!(
+                s.output_broadcast_capacity(),
+                held,
+                "a hand-built capacity of {asked} was not clamped to {held}"
+            );
+        }
     }
 
     /// **The broadcast holds what the config says, not a constant** (GH

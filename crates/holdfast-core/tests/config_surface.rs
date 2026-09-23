@@ -261,7 +261,7 @@ const EFFECTIVE: &[(&str, &str)] = &[
     ),
     (
         "limits.output_broadcast_capacity",
-        "crates/holdfast-core/src/mcp/tools.rs:440 — start_session copies it into SessionConfig::output_broadcast_capacity, which sizes the live output broadcast at crates/holdfast-core/src/session/mod.rs:833 (GH #210; inert until then).",
+        "crates/holdfast-core/src/mcp/tools.rs:440 — start_session copies it into SessionConfig::output_broadcast_capacity, which sizes the live output broadcast at crates/holdfast-core/src/session/mod.rs:862, clamped to MAX_OUTPUT_BROADCAST_FRAMES — which Config::validate also refuses past (GH #210; inert until then).",
     ),
     (
         "limits.resource_read_max_bytes",

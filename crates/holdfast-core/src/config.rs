@@ -1335,6 +1335,23 @@ impl Config {
             "limits.output_broadcast_capacity",
             l.output_broadcast_capacity,
         )?;
+        // **A ceiling, since the key is live** (GH #210's review). Every
+        // slot is allocated when a session starts, so an operator raising
+        // this to cure a detach could make each `start_session` cost
+        // hundreds of megabytes, or abort the daemon outright. Refused
+        // rather than clamped, like the rest of this function.
+        let most = crate::session::MAX_OUTPUT_BROADCAST_FRAMES;
+        if l.output_broadcast_capacity > most {
+            return Err(ConfigError::invalid(format!(
+                "limits.output_broadcast_capacity = {}, which is more than the {most} \
+                 frames a session's output broadcast may hold. Every frame is allocated \
+                 when a session starts, and past {most} the memory buys nothing: a \
+                 consumer that falls behind the broadcast resumes from the session's \
+                 ring buffer, so this number only decides how often that happens — it \
+                 no longer decides what an attach client is shown (GH #210)",
+                l.output_broadcast_capacity
+            )));
+        }
         nonzero(
             "limits.max_outstanding_secret_requests_per_session",
             l.max_outstanding_secret_requests_per_session as usize,
@@ -2882,6 +2899,34 @@ reference = \"db/prod\"
         let msg = e.to_string();
         assert!(msg.contains("max_concurrent_sessions"), "{msg}");
         assert!(msg.contains('0'), "the message names the value too: {msg}");
+    }
+
+    /// **A broadcast capacity past the ceiling is refused at load** (GH
+    /// #210's review), and the ceiling itself is accepted.
+    ///
+    /// The key became live with GH #210, and every slot is allocated when
+    /// a session starts: the review measured about 230 MB of daemon RSS
+    /// per `start_session` at 4,194,304, and an abort at 1,000,000,000.
+    /// Both boundary values are asserted, so a check written one off in
+    /// either direction is red. Nothing here starts a session, so a
+    /// validator that let a huge value through fails an assertion rather
+    /// than attempting the allocation.
+    #[test]
+    fn a_broadcast_capacity_past_the_ceiling_is_refused_and_the_ceiling_is_not() {
+        let most = crate::session::MAX_OUTPUT_BROADCAST_FRAMES;
+        let cfg = parse_str(&format!("[limits]\noutput_broadcast_capacity = {most}\n"))
+            .expect("the ceiling itself is a legal capacity");
+        assert_eq!(cfg.limits.output_broadcast_capacity, most);
+        for past in [most + 1, 4_194_304, 1_000_000_000] {
+            let e = parse_str(&format!("[limits]\noutput_broadcast_capacity = {past}\n"))
+                .expect_err("a capacity past the ceiling must not load");
+            let msg = e.to_string();
+            assert!(msg.contains("output_broadcast_capacity"), "{msg}");
+            assert!(
+                msg.contains(&past.to_string()) && msg.contains(&most.to_string()),
+                "the message names the value and the ceiling: {msg}"
+            );
+        }
     }
 
     // ------------------------------------------ I-9's second half (headroom)
