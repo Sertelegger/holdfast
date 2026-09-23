@@ -3810,9 +3810,9 @@ impl HoldfastServer {
                     if fresh {
                         break Some(mode);
                     }
-                    // Held as `Executing` is: a program other than the
-                    // shell's prompt has the session, so a prompt that
-                    // follows was watched arriving.
+                    // While held it counts as `Executing`: something other
+                    // than the shell's prompt has the session, so a prompt
+                    // that replaces it was watched arriving.
                     saw_executing = true;
                     idle_since = None;
                 }

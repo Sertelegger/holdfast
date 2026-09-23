@@ -222,22 +222,27 @@ impl TailLine {
     /// How many **characters** the current line holds: every byte that is
     /// not a UTF-8 continuation byte (`0x80..=0xBF`) starts one.
     ///
-    /// **This, and not `len`, is the width a line editor steps past**, and
-    /// the difference was measured on a real prompt (GH #220). starship's
-    /// last row on the owner's machine is `⬢ [Docker] ❯ ` — 13 columns and
-    /// 17 bytes, because `⬢` and `❯` are three bytes each. readline's
-    /// Ctrl-U repaint steps past it with thirteen `CSI C`, so a byte count
-    /// said the repaint had resumed four columns *inside* the prompt, the
-    /// debt stayed unpaid, and a complete `echo short` typed after the
-    /// kill came back as `[REDACTED:unresolved]` — while
+    /// **This, and not the byte count, is the width a line editor steps
+    /// past**, and the difference was measured on a real prompt (GH #220).
+    /// starship's last row on the owner's machine is `⬢ [Docker] ❯ ` — 13
+    /// columns and 17 bytes, because `⬢` and `❯` are three bytes each.
+    /// readline's Ctrl-U repaint steps past it with thirteen `CSI C`, so a
+    /// byte count said the repaint had resumed four columns *inside* the
+    /// prompt, the debt stayed unpaid, and a complete `echo short` typed
+    /// after the kill came back as `[REDACTED:unresolved]` — while
     /// `bash --norc`'s all-ASCII `bash-5.2$ ` recorded it correctly.
     ///
     /// A character is not a column either: a double-width glyph (CJK, most
-    /// emoji) is one character and two columns. That errs **low**, which is
-    /// the safe side of `settle_capture_debt`'s test — a wrap redraw
-    /// repaints its continuation row from column 0 with no cursor-forward,
-    /// and zero never reaches a positive width however low it is counted.
-    /// A byte count errs high, which refuses a complete command.
+    /// emoji) is one character and two columns, so this errs **low**. For
+    /// the shape `settle_capture_debt` exists to catch that costs nothing —
+    /// a wrap redraw repaints its continuation row from column 0 with no
+    /// cursor-forward, and zero reaches no positive width however low it is
+    /// counted. What it widens, slightly and only for wide-glyph prompts, is
+    /// a residual the column test has at any prompt width: a repaint that
+    /// steps into a *continuation* row by a cursor-forward at least the
+    /// prompt's width settles the debt. A byte count errs high instead, and
+    /// that refuses complete commands at every multibyte prompt, which is
+    /// the measured cost above.
     fn columns(&self) -> usize {
         self.buf
             .iter()
