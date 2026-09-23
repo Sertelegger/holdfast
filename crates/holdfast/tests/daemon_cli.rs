@@ -2505,3 +2505,51 @@ fn version_names_the_commit_it_was_built_from() {
     );
 }
 
+/// **GH #20: `daemon stop` returned before the daemon had exited**, so
+/// `daemon stop && rm -rf "$HOLDFAST_RUNTIME_DIR"` raced the daemon's own
+/// teardown and the directory came back — the issue's acceptance, as
+/// written: stop, remove the directory at once, and it stays gone.
+///
+/// An interactive shell in the session makes it the issue's measured case
+/// too: it ignores `SIGTERM`, so the stop spends the whole grace, and it
+/// used to spend it without a word.
+#[test]
+fn daemon_stop_returns_once_the_daemon_is_gone_and_its_directory_stays_gone() {
+    let env = TestEnv::new("stopwait");
+    let mut shim = Shim::start(&env);
+    let started = shim.call_tool(
+        "start_session",
+        json!({ "command": "bash", "args": ["--norc", "--noprofile"], "name": "stubborn" }),
+    );
+    assert_eq!(
+        started["result"]["structuredContent"]["status"], "ok",
+        "{started}"
+    );
+    let pid = env.daemon_pid().expect("pid file");
+    shim.kill();
+
+    let (code, out, err) = env.run(&["daemon", "stop"]);
+    assert_eq!(code, 0, "stdout: {out} stderr: {err}");
+    assert!(out.contains("daemon stopped"), "{out}");
+    if have_proc() {
+        assert!(
+            ended(pid),
+            "`daemon stop` returned while the daemon (pid {pid}) was still running"
+        );
+    }
+    assert!(
+        err.contains("waiting for 1 live session"),
+        "a stop that spends the whole grace must say what it is waiting for: {err}"
+    );
+
+    std::fs::remove_dir_all(&env.dir).expect("remove the runtime directory");
+    // Longer than everything the daemon did after answering, measured
+    // before this fix: the teardown and the 250 ms runtime shutdown.
+    std::thread::sleep(Duration::from_millis(750));
+    assert!(
+        !env.dir.exists(),
+        "the stopped daemon recreated {} after `daemon stop` returned",
+        env.dir.display()
+    );
+}
+

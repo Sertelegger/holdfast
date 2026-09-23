@@ -456,30 +456,99 @@ enum StopRpc {
     Failed(String),
 }
 
+/// How long a graceful `daemon/stop` may go unanswered before the operator
+/// is told why it is taking so long (GH #20).
+///
+/// Not a bound — [`STOP_RPC_TIMEOUT`] is — but the point past which silence
+/// reads as a hang. The ordinary cause is the whole of §3.2's grace: an
+/// interactive shell ignores `SIGTERM` (§4.4), so every stop with a shell
+/// in it waits the full ten seconds for the escalation, and it used to wait
+/// them without a word.
 #[cfg(unix)]
-async fn stop_rpc(force: bool, paths: Option<&RuntimePaths>) -> StopRpc {
+const STOP_PROGRESS_AFTER: Duration = Duration::from_secs(1);
+
+/// How long `daemon stop` waits, after the daemon has answered or been
+/// killed, for the process to be gone (GH #20).
+///
+/// The answer is sent before the daemon's own teardown — the accept loop
+/// returns, the session sweep runs, `remove_runtime_files_we_own` takes
+/// `bind.lock` and removes the sockets and the pid file, and the runtime
+/// is given `SHUTDOWN_GRACE` to wind down — so a caller that trusted the
+/// answer raced all of that: `daemon stop && rm -rf "$HOLDFAST_RUNTIME_DIR"`
+/// removed the directory and the departing daemon's `ensure_dir` put it
+/// back. Generous, because the teardown is short and a loaded machine is
+/// the only thing that stretches it; a daemon still present at the end is
+/// reported rather than waited on for ever.
+#[cfg(unix)]
+const DAEMON_EXIT_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// `daemon/stop`, preceded by `daemon/status` on the same connection.
+///
+/// **The status is asked first so the stop can be waited out.** The pid
+/// it carries is the daemon's own answer about itself, from a process that
+/// is demonstrably alive and serving *this* runtime directory — stronger
+/// evidence than `holdfast.pid`, which `confirm_daemon_pid` exists to
+/// distrust, and it is gone by the time the stop has been answered,
+/// because the teardown removes it. `sessions_live` is what the progress
+/// line reports. A daemon that cannot answer `status` is not asked to
+/// stop any differently: the pid is simply not known, and nothing is
+/// waited for.
+#[cfg(unix)]
+async fn stop_rpc(force: bool, paths: Option<&RuntimePaths>) -> (StopRpc, Option<u32>) {
     // No discoverable runtime directory means no socket to call on and
     // no `holdfast.pid` to read, which is the same outcome as nothing
     // listening — and is what the old `connect()` reported too, since a
     // failed `discover()` was raised as `ClientError::Connect`.
     let Some(paths) = paths else {
-        return StopRpc::NotRunning;
+        return (StopRpc::NotRunning, None);
     };
     let client = match ControlClient::connect(&paths.control_sock(), ClientKind::Cli).await {
         Ok(c) => c,
-        Err(ClientError::Connect { .. }) => return StopRpc::NotRunning,
-        Err(e) => return StopRpc::Failed(e.to_string()),
+        Err(ClientError::Connect { .. }) => return (StopRpc::NotRunning, None),
+        Err(e) => return (StopRpc::Failed(e.to_string()), None),
     };
+    let status = client
+        .call::<_, server::DaemonStatus>(method::METHOD_DAEMON_STATUS, &json!({}))
+        .await
+        .ok();
+    let pid = status.as_ref().map(|s| s.pid);
     let params = server::StopParams {
         force: Some(force),
         timeout_secs: None,
     };
-    match client
-        .call::<_, server::StopOutcome>(method::METHOD_DAEMON_STOP, &params)
-        .await
-    {
+    let stop = client.call::<_, server::StopOutcome>(method::METHOD_DAEMON_STOP, &params);
+    tokio::pin!(stop);
+    let answered = if force {
+        stop.await
+    } else {
+        tokio::select! {
+            r = &mut stop => r,
+            () = tokio::time::sleep(STOP_PROGRESS_AFTER) => {
+                diag!("holdfast daemon stop: {}", stop_progress_note(status.as_ref()));
+                stop.await
+            }
+        }
+    };
+    let rpc = match answered {
         Ok(outcome) => StopRpc::Stopped(outcome),
         Err(e) => StopRpc::Failed(e.to_string()),
+    };
+    (rpc, pid)
+}
+
+/// What a slow graceful stop says while it waits.
+#[cfg(unix)]
+fn stop_progress_note(status: Option<&server::DaemonStatus>) -> String {
+    let grace = server::DEFAULT_STOP_GRACE_SECS;
+    match status.map(|s| s.sessions_live) {
+        Some(0) => "waiting for the daemon to finish stopping".to_string(),
+        Some(n) => format!(
+            "waiting for {n} live session(s) to end — a shell ignores SIGTERM and is \
+             killed after {grace}s; `--force` does not wait"
+        ),
+        None => format!(
+            "waiting for the daemon's sessions to end — up to {grace}s; `--force` does not wait"
+        ),
     }
 }
 
@@ -492,6 +561,9 @@ async fn stop_rpc(force: bool, paths: Option<&RuntimePaths>) -> StopRpc {
 /// accept loop will not hear — so `--force` follows it with a signal to
 /// the daemon process itself, whether the RPC answered, failed, or never
 /// came back.
+///
+/// **Either way it returns once the daemon is gone, not once it has been
+/// asked** (GH #20) — see [`DAEMON_EXIT_TIMEOUT`].
 #[cfg(unix)]
 pub async fn daemon_stop(force: bool) -> ExitCode {
     let deadline = if force {
@@ -502,35 +574,48 @@ pub async fn daemon_stop(force: bool) -> ExitCode {
     // `paths()` is resolved once, here, rather than twice inside. An
     // undiscoverable runtime directory means no socket and no
     // `holdfast.pid`, and both halves below have to agree about that.
-    ExitCode::from(daemon_stop_within(force, paths().ok(), deadline).await)
+    ExitCode::from(daemon_stop_within(force, paths().ok(), deadline, DAEMON_EXIT_TIMEOUT).await)
 }
 
-/// [`daemon_stop`] with the runtime directory resolved and the RPC
-/// deadline supplied, returning §18.8's exit code as a `u8`.
+/// [`daemon_stop`] with the runtime directory resolved and both deadlines
+/// supplied, returning §18.8's exit code as a `u8`.
 ///
-/// Both seams exist for the same test: "the daemon accepts and never
-/// replies" is the state this bound was written for, and driving it
-/// through `daemon_stop` would mean discovering a real runtime directory
-/// and waiting a real [`STOP_RPC_TIMEOUT`]. `u8` rather than `ExitCode`
+/// The seams exist for the tests: "the daemon accepts and never replies"
+/// is the state the RPC bound was written for, and driving it through
+/// `daemon_stop` would mean discovering a real runtime directory and
+/// waiting a real [`STOP_RPC_TIMEOUT`]. `u8` rather than `ExitCode`
 /// because `ExitCode` cannot be compared, so a test could only assert on
 /// its `Debug` formatting.
 #[cfg(unix)]
-async fn daemon_stop_within(force: bool, paths: Option<RuntimePaths>, rpc_timeout: Duration) -> u8 {
+async fn daemon_stop_within(
+    force: bool,
+    paths: Option<RuntimePaths>,
+    rpc_timeout: Duration,
+    exit_timeout: Duration,
+) -> u8 {
     // **Both paths are bounded now.** `--force`'s bound was already here
     // because a daemon that accepts and never replies is the state
     // `--force` exists for; the graceful path had the same exposure with
     // nothing to catch it, and §3.2 bounds it too.
-    let rpc = match tokio::time::timeout(rpc_timeout, stop_rpc(force, paths.as_ref())).await {
-        Ok(rpc) => rpc,
-        Err(_) => StopRpc::Failed(format!(
-            "the daemon did not answer daemon/stop within {}s",
-            rpc_timeout.as_secs()
-        )),
-    };
+    let (rpc, status_pid) =
+        match tokio::time::timeout(rpc_timeout, stop_rpc(force, paths.as_ref())).await {
+            Ok(answered) => answered,
+            Err(_) => (
+                StopRpc::Failed(format!(
+                    "the daemon did not answer daemon/stop within {}s",
+                    rpc_timeout.as_secs()
+                )),
+                None,
+            ),
+        };
 
     if !force {
         return match rpc {
             StopRpc::Stopped(outcome) => {
+                if let Err(e) = await_daemon_exit(status_pid, exit_timeout).await {
+                    diag!("holdfast daemon stop: {e}");
+                    return EXIT_FAILED;
+                }
                 crate::out::line(&format!(
                     "daemon stopped ({} session(s) terminated)",
                     outcome.sessions_terminated
@@ -560,8 +645,17 @@ async fn daemon_stop_within(force: bool, paths: Option<RuntimePaths>, rpc_timeou
         // directory is `NotRunning`.
         None => Escalation::Nothing,
     };
+    // The process to wait out: the one killed, else the one that answered.
+    // Never a pid `escalate_to_sigkill` declined — that one was not
+    // confirmed to be this daemon, and waiting on a stranger would report
+    // its lifetime as ours.
+    let waited = match escalation {
+        Escalation::Killed(pid) => Some(pid),
+        _ => status_pid,
+    };
+    let exited = await_daemon_exit(waited, exit_timeout).await;
 
-    match rpc {
+    let code = match rpc {
         StopRpc::Stopped(outcome) => {
             crate::out::line(&format!(
                 "daemon stopped ({} session(s) terminated)",
@@ -611,7 +705,71 @@ async fn daemon_stop_within(force: bool, paths: Option<RuntimePaths>, rpc_timeou
                 }
             }
         }
+    };
+    match exited {
+        Ok(()) => code,
+        Err(e) => {
+            diag!("holdfast daemon stop: {e}");
+            EXIT_FAILED
+        }
     }
+}
+
+/// Wait, bounded, for `pid` to be gone (GH #20). `Ok` at once for `None`:
+/// with no pid there is nothing to wait on, and saying so every time would
+/// be noise about a case that has its own diagnostics.
+///
+/// Polled rather than waited on, because the daemon is not this process's
+/// child — `daemon start` detached it — so there is nothing to `waitpid`.
+#[cfg(unix)]
+async fn await_daemon_exit(pid: Option<u32>, limit: Duration) -> Result<(), String> {
+    let Some(pid) = pid else {
+        return Ok(());
+    };
+    let deadline = tokio::time::Instant::now() + limit;
+    loop {
+        if process_is_gone(pid) {
+            return Ok(());
+        }
+        if tokio::time::Instant::now() >= deadline {
+            return Err(format!(
+                "the daemon (pid {pid}) was stopped but had not exited after {}s; its \
+                 runtime directory may still be in use",
+                limit.as_secs()
+            ));
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+}
+
+/// Whether `pid` has finished everything it will ever do to the runtime
+/// directory: no such process, or a zombie.
+///
+/// **A zombie counts as gone**, and `kill(pid, 0)` alone cannot say so — it
+/// answers `0` for one. The daemon's parent after `daemon start` detached it
+/// is whatever reaps orphans here, and a container whose pid 1 never reaps
+/// would leave it a zombie for ever: exited, holding nothing, and
+/// indistinguishable by signal 0 from a daemon still tearing down. Linux
+/// says which through `/proc`; elsewhere the orphan reaper is `launchd` or
+/// `init`, which reap at once.
+///
+/// **`EPERM` is alive**: the pid exists and belongs to someone else, which
+/// is a recycled pid rather than our daemon — and since this is only asked
+/// of a pid that was ours a moment ago, the answer that stops the wait
+/// early would be the wrong one to give.
+#[cfg(unix)]
+fn process_is_gone(pid: u32) -> bool {
+    // SAFETY: signal 0 sends nothing and takes no pointers.
+    if unsafe { libc::kill(pid as libc::pid_t, 0) } != 0 {
+        return std::io::Error::last_os_error().raw_os_error() == Some(libc::ESRCH);
+    }
+    std::fs::read_to_string(format!("/proc/{pid}/stat"))
+        .ok()
+        .and_then(|stat| {
+            let (_, after_comm) = stat.rsplit_once(')')?;
+            after_comm.split_whitespace().next().map(|s| s == "Z")
+        })
+        .unwrap_or(false)
 }
 
 /// The result of §3.2's `--force` escalation.
@@ -2746,7 +2904,8 @@ mod tests {
                     if frame::write_frame(&mut stream, &resp).await.is_err() {
                         return;
                     }
-                    // Read the `daemon/stop` and never answer it. The
+                    // Read the next request — `daemon/status`, which the
+                    // stop asks first — and never answer it. The
                     // stream is held for the life of this task: letting
                     // it drop would EOF the client's read, the call would
                     // return an error on its own, and the row would be
@@ -2782,7 +2941,12 @@ mod tests {
 
         let code = tokio::time::timeout(
             Duration::from_secs(20),
-            daemon_stop_within(false, Some(paths.clone()), Duration::from_millis(200)),
+            daemon_stop_within(
+                false,
+                Some(paths.clone()),
+                Duration::from_millis(200),
+                DAEMON_EXIT_TIMEOUT,
+            ),
         )
         .await
         .expect(
@@ -2806,11 +2970,200 @@ mod tests {
 
         let code = tokio::time::timeout(
             Duration::from_secs(20),
-            daemon_stop_within(false, Some(paths.clone()), Duration::from_millis(200)),
+            daemon_stop_within(
+                false,
+                Some(paths.clone()),
+                Duration::from_millis(200),
+                DAEMON_EXIT_TIMEOUT,
+            ),
         )
         .await
         .expect("nothing to connect to must not wait for anything");
         assert_eq!(code, 0, "§3.2 makes `daemon stop` idempotent");
+    }
+
+    /// A control socket that completes the handshake and answers every
+    /// other request with `answer(method, params)`, as `ok` data — or
+    /// never answers it, for `None`. Bound before it returns, for the
+    /// reason `wedged_daemon` gives.
+    fn fake_daemon(
+        paths: &RuntimePaths,
+        answer: impl Fn(&str, &Value) -> Option<Value> + Send + Sync + 'static,
+    ) -> tokio::task::JoinHandle<()> {
+        let listener = tokio::net::UnixListener::bind(paths.control_sock()).unwrap();
+        let answer = Arc::new(answer);
+        tokio::spawn(async move {
+            loop {
+                let Ok((mut stream, _)) = listener.accept().await else {
+                    return;
+                };
+                let answer = Arc::clone(&answer);
+                tokio::spawn(async move {
+                    while let Ok(req) = frame::read_frame::<_, Request>(&mut stream).await {
+                        let resp = if req.method == method::METHOD_HANDSHAKE {
+                            Response::ok(
+                                req.id,
+                                &HandshakeData {
+                                    protocol_major: handshake::PROTOCOL_MAJOR,
+                                    protocol_minor: handshake::PROTOCOL_MINOR,
+                                    daemon_version: "fake".into(),
+                                    build: "fake".into(),
+                                    accepted: true,
+                                    reject_reason: None,
+                                },
+                                "handshake accepted",
+                            )
+                        } else {
+                            let params: Value = method::from_cbor(&req.params).unwrap_or(Value::Null);
+                            match answer(&req.method, &params) {
+                                Some(data) => Response::ok(req.id, &data, "ok"),
+                                None => {
+                                    std::future::pending::<()>().await;
+                                    return;
+                                }
+                            }
+                        };
+                        if frame::write_frame(&mut stream, &resp.unwrap()).await.is_err() {
+                            return;
+                        }
+                    }
+                });
+            }
+        })
+    }
+
+    /// A daemon that answers `daemon/status` with `pid` and `daemon/stop`
+    /// at once — a real daemon's shape, whose process outlives its answer
+    /// by however long its teardown takes. `pid` is a process the test
+    /// controls and stands in for that process.
+    fn answering_daemon(paths: &RuntimePaths, pid: u32) -> tokio::task::JoinHandle<()> {
+        fake_daemon(paths, move |m, _| match m {
+            method::METHOD_DAEMON_STATUS => Some(json!({
+                "pid": pid,
+                "uptime_secs": 1,
+                "version": "fake",
+                "sessions_live": 0,
+                "sessions_exited_retained": 0,
+                "attach_clients": 0,
+                "bridge_sessions": 0,
+            })),
+            method::METHOD_DAEMON_STOP => Some(json!({
+                "stopped_at_unix_secs": 0,
+                "sessions_terminated": 0,
+            })),
+            _ => None,
+        })
+    }
+
+    /// A child of this test that exits after `secs`, reaped by a thread
+    /// the moment it does — so "gone" means gone, and no zombie of the
+    /// test's own making stands in for a daemon that has not exited.
+    fn short_lived(secs: &str) -> (u32, std::thread::JoinHandle<()>) {
+        let mut child = std::process::Command::new("sleep")
+            .arg(secs)
+            .spawn()
+            .expect("spawn sleep");
+        let pid = child.id();
+        let reaper = std::thread::spawn(move || {
+            let _ = child.wait();
+        });
+        (pid, reaper)
+    }
+
+    /// **GH #20: `daemon stop` returned on the answer, not on the exit.**
+    /// The daemon answers `daemon/stop` before its own teardown — which
+    /// takes `bind.lock`, runs `ensure_dir`, removes its sockets and pid
+    /// file — so `daemon stop && rm -rf "$HOLDFAST_RUNTIME_DIR"` raced it
+    /// and the directory came back. The stand-in process here outlives the
+    /// answer by a second; the stop must not return before it is gone.
+    ///
+    /// Both paths: `--force` answered by a daemon that could still answer
+    /// has nothing to escalate against, and returns on the same exit.
+    #[tokio::test]
+    async fn a_stop_returns_only_once_the_daemon_process_is_gone() {
+        for force in [false, true] {
+            let paths = scratch("waitexit");
+            let _scoped = Scoped(paths.clone());
+            paths.ensure_dir().unwrap();
+            let (pid, reaper) = short_lived("1");
+            let daemon = answering_daemon(&paths, pid);
+
+            let code = tokio::time::timeout(
+                Duration::from_secs(20),
+                daemon_stop_within(
+                    force,
+                    Some(paths.clone()),
+                    STOP_RPC_TIMEOUT,
+                    DAEMON_EXIT_TIMEOUT,
+                ),
+            )
+            .await
+            .expect("the stop is bounded");
+            assert_eq!(code, 0, "force {force}: an answered stop whose daemon exits is success");
+            assert!(
+                process_is_gone(pid),
+                "force {force}: `daemon stop` returned while the daemon's process \
+                 (pid {pid}) was still running"
+            );
+            daemon.abort();
+            reaper.join().unwrap();
+        }
+    }
+
+    /// The bound on that wait, and its verdict: a daemon that answered
+    /// and never exited is §18.8's "couldn't stop", not a success and not
+    /// a hang.
+    #[tokio::test]
+    async fn a_daemon_that_answers_and_never_exits_is_reported_within_the_bound() {
+        let paths = scratch("noexit");
+        let _scoped = Scoped(paths.clone());
+        paths.ensure_dir().unwrap();
+        let mut lingering = std::process::Command::new("sleep")
+            .arg("60")
+            .spawn()
+            .expect("spawn sleep");
+        let daemon = answering_daemon(&paths, lingering.id());
+
+        let code = tokio::time::timeout(
+            Duration::from_secs(20),
+            daemon_stop_within(
+                false,
+                Some(paths.clone()),
+                STOP_RPC_TIMEOUT,
+                Duration::from_millis(300),
+            ),
+        )
+        .await
+        .expect("the wait for the exit is bounded");
+        assert_eq!(code, EXIT_FAILED);
+        assert!(!process_is_gone(lingering.id()), "the control: it really was alive");
+        let _ = lingering.kill();
+        let _ = lingering.wait();
+        daemon.abort();
+    }
+
+    /// `process_is_gone` in both directions, and on the case signal 0
+    /// gets wrong: an unreaped child is a zombie, which `kill(pid, 0)`
+    /// reports as alive.
+    #[test]
+    fn a_zombie_is_gone_and_a_live_process_is_not() {
+        let mut child = std::process::Command::new("sleep")
+            .arg("60")
+            .spawn()
+            .expect("spawn sleep");
+        let pid = child.id();
+        assert!(!process_is_gone(pid), "a sleeping child is alive");
+        child.kill().unwrap();
+        if std::path::Path::new("/proc/self/stat").exists() {
+            // Not yet reaped: a zombie. Wait for the kill to land.
+            let deadline = std::time::Instant::now() + Duration::from_secs(5);
+            while !process_is_gone(pid) && std::time::Instant::now() < deadline {
+                std::thread::sleep(Duration::from_millis(10));
+            }
+            assert!(process_is_gone(pid), "an unreaped, killed child is a zombie and gone");
+        }
+        child.wait().unwrap();
+        assert!(process_is_gone(pid), "a reaped child is gone");
     }
 
     /// The bound the shipped command really passes must leave room for
