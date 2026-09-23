@@ -2231,6 +2231,7 @@ fn a_closed_stdout_ends_the_cli_as_it_ends_cat_rather_than_panicking() {
 
     for args in [
         &["version"][..],
+        &["--help"][..],
         &["list"][..],
         &["list", "--json"][..],
         &["logs", "piped"][..],
@@ -2341,6 +2342,128 @@ fn watch_ends_when_its_reader_does() {
 
     shim.call_tool("terminate", json!({ "session": session_id, "force": true }));
     shim.kill();
+}
+
+/// **GH #233**: `--help`, `-h`, `help`, `--version` and `-V` were
+/// `unknown subcommand`, exit 64. Help that was asked for is an answer:
+/// stdout, exit 0.
+#[test]
+fn help_and_version_flags_answer_on_stdout() {
+    let env = TestEnv::new("helpflags");
+    let (code, version, _) = env.run(&["version"]);
+    assert_eq!(code, 0);
+
+    for args in [&["--help"][..], &["-h"][..], &["help"][..]] {
+        let (code, out, err) = env.run(args);
+        assert_eq!(code, 0, "{args:?}: {err}");
+        assert!(out.contains("USAGE:") && out.contains("holdfast mcp"), "{args:?}: {out}");
+        assert!(err.is_empty(), "{args:?} wrote to stderr: {err}");
+    }
+    for args in [&["--version"][..], &["-V"][..]] {
+        let (code, out, err) = env.run(args);
+        assert_eq!(code, 0, "{args:?}: {err}");
+        assert_eq!(out, version, "{args:?} is not `holdfast version`");
+    }
+
+    // One subcommand's help is that subcommand's, however it is asked.
+    for args in [&["logs", "--help"][..], &["logs", "-h"][..], &["help", "logs"][..]] {
+        let (code, out, err) = env.run(args);
+        assert_eq!(code, 0, "{args:?}: {err}");
+        assert!(out.contains("holdfast logs <session>"), "{args:?}: {out}");
+        assert!(!out.contains("holdfast list"), "{args:?} printed more than logs: {out}");
+    }
+    let (code, out, _) = env.run(&["daemon", "--help"]);
+    assert_eq!(code, 0);
+    for verb in ["run", "start", "stop", "status"] {
+        assert!(out.contains(&format!("holdfast daemon {verb}")), "{out}");
+    }
+    let (code, out, _) = env.run(&["help", "daemon", "stop"]);
+    assert_eq!(code, 0);
+    assert!(out.contains("holdfast daemon stop") && !out.contains("holdfast daemon status"));
+
+    let (code, _, err) = env.run(&["help", "nonsense"]);
+    assert_eq!(code, 64, "{err}");
+}
+
+/// REQ-A-002's stated verification, verbatim: *"`holdfast --help` lists
+/// exactly the documented subcommands."* It exited 64 until GH #233.
+///
+/// **The list is a literal**: the documented set as it stands, so adding
+/// or dropping a subcommand is a deliberate edit here and not something
+/// the banner can do on its own. Each one is then asked for its help, so
+/// a banner line with no subcommand behind it fails too.
+#[test]
+fn holdfast_help_lists_exactly_the_documented_subcommands() {
+    let env = TestEnv::new("reqa002");
+    let (code, out, err) = env.run(&["--help"]);
+    assert_eq!(code, 0, "REQ-A-002's own verification must succeed: {err}");
+    let listed: Vec<String> = out
+        .lines()
+        .filter_map(|l| l.strip_prefix("    holdfast "))
+        .map(|rest| {
+            rest.split_whitespace()
+                .take_while(|w| !w.starts_with('<') && !w.starts_with('['))
+                .take_while(|w| w.chars().all(|c| c.is_ascii_lowercase() || c == '-'))
+                .collect::<Vec<_>>()
+                .join(" ")
+        })
+        .collect();
+    let documented = [
+        "mcp",
+        "daemon run",
+        "daemon start",
+        "daemon stop",
+        "daemon status",
+        "list",
+        "logs",
+        "attach",
+        "watch",
+        "version",
+    ];
+    assert_eq!(listed, documented, "the banner's subcommands:\n{out}");
+    for sub in documented {
+        let mut args: Vec<&str> = vec!["help"];
+        args.extend(sub.split(' '));
+        let (code, out, err) = env.run(&args);
+        assert_eq!(code, 0, "`holdfast help {sub}`: {err}");
+        assert!(out.contains(&format!("holdfast {sub}")), "{out}");
+    }
+}
+
+/// **GH #233: an unknown flag was silently dropped** and the command ran
+/// without it — `list --jsn` printed the table, `logs big --tial 5` the
+/// whole log, exit 0 both. Worst of all is a typo on a destructive flag,
+/// so the last case is a running daemon asked to `stop --forse`: it must
+/// refuse, and the daemon must still be there.
+#[test]
+fn an_unknown_flag_is_a_usage_error_and_changes_nothing() {
+    let env = TestEnv::new("badflags");
+    for (args, flag) in [
+        (&["list", "--jsn"][..], "--jsn"),
+        (&["logs", "big", "--tial", "5"][..], "--tial"),
+        (&["mcp", "--no-deamon"][..], "--no-deamon"),
+        (&["version", "--json"][..], "--json"),
+    ] {
+        let (code, out, err) = env.run(args);
+        assert_eq!(code, 64, "{args:?}: stdout {out} stderr {err}");
+        assert!(err.contains(flag), "{args:?} did not name {flag}: {err}");
+        assert!(out.is_empty(), "{args:?} ran anyway: {out}");
+    }
+
+    // Flags before the session are flags, not a missing session: with no
+    // daemon this reaches the connect and fails *there*, exit 2.
+    let (code, _, err) = env.run(&["logs", "--raw", "big"]);
+    assert_eq!(code, 2, "{err}");
+    assert!(!err.contains("needs a session"), "{err}");
+
+    assert_eq!(env.run(&["daemon", "start"]).0, 0);
+    let pid = env.daemon_pid().expect("pid file");
+    let (code, out, err) = env.run(&["daemon", "stop", "--forse"]);
+    assert_eq!(code, 64, "stdout {out} stderr {err}");
+    assert!(err.contains("--forse"), "{err}");
+    assert!(alive(pid), "a mistyped `daemon stop` flag stopped the daemon anyway");
+    let (code, out, _) = env.run(&["daemon", "status", "--json"]);
+    assert_eq!(code, 0, "the daemon stopped answering: {out}");
 }
 
 /// **GH #178: `holdfast version` said `(build unknown)` on every build
