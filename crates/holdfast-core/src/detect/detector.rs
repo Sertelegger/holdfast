@@ -1496,6 +1496,61 @@ mod tests {
         );
     }
 
+    /// GH #240, at the classifier: a program stopped at `[Y/n] ` read
+    /// `Executing` for the whole wait, about one trial in four on a loaded
+    /// box, because the chunk carrying bash's submit was scanned after the
+    /// child had taken the terminal.
+    ///
+    /// The stream is bash's own shape: the prompt (paste on, `A`, `B`)
+    /// scanned while bash holds the terminal, then accept-line's paste-off
+    /// and `PS0`'s `C` scanned **after the fork**, with the child's prompt
+    /// already behind them in the same chunk. Two owners were recorded
+    /// wrong there, one per executing rung, and each one alone keeps the
+    /// answer at `Executing`: fix only the `C` and the T2 rung answers
+    /// `Executing` / `terminal_mode` instead of `semantic`. So both halves
+    /// are pinned by the one row, and the tier in the message says which
+    /// half regressed.
+    #[test]
+    fn a_confirmation_prompt_scanned_after_the_fork_is_not_held_at_executing() {
+        const BASH: Option<i32> = Some(100);
+        const CHILD: Option<i32> = Some(200);
+        let (mut d, start, now) = detector();
+        d.feed_at(
+            b"\x1b[?2004h\x1b]133;A;holdfast=1\x07$ \x1b]133;B;holdfast=1\x07",
+            0,
+            BASH,
+            start,
+        );
+        d.feed_at(
+            b"python3 confirm.py\r\n\x1b[?2004l\r\x1b]133;C;holdfast=1\x07\
+              Do you want to continue? [Y/n] ",
+            100,
+            CHILD,
+            start,
+        );
+
+        let s = d.snapshot_at(true, ld(true, true), CHILD, None, now);
+        assert_eq!(
+            (s.interaction_mode, s.detection_tier),
+            (InteractionMode::AtPrompt, DetectionTier::Heuristic),
+            "the child's prompt was answered by a licence the child never \
+             earned: {s:?}"
+        );
+        assert!((s.confidence - 0.9).abs() < 1e-6, "{}", s.confidence);
+
+        // The paired arm: the same bytes with **bash** still holding the
+        // terminal — `read -p 'Continue? [Y/n] '`, a builtin. The shell
+        // that emitted `C` is running the command itself, so both
+        // executing rungs' premises hold and T1 answers deterministically.
+        // A fix that simply stopped licensing at `C` would fail here.
+        let s = d.snapshot_at(true, ld(true, true), BASH, None, now);
+        assert_eq!(
+            (s.interaction_mode, s.detection_tier),
+            (InteractionMode::Executing, DetectionTier::Semantic),
+            "{s:?}"
+        );
+    }
+
     /// GH #220's classifier half. In a session whose prompt is regenerated
     /// over Holdfast's wrapping no `A` ever follows a `D`, so the momentary
     /// "between commands" answer became the answer at every idle prompt:

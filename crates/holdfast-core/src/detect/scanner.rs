@@ -377,6 +377,11 @@ pub struct ModeScanner {
     /// wrapping does so at every prompt, and a session that recovers — the
     /// user resets `PS1` by hand — should stop saying it is degraded.
     prompt_markers_missing: bool,
+    /// The foreground group sampled at the most recent `A`, `B` or `D`:
+    /// the markers a shell emits while it holds the terminal and is about
+    /// to go on holding it. `None` until one has arrived. See the owner
+    /// rule at the end of `osc133` (GH #240).
+    prompt_owner: Option<Option<i32>>,
 }
 
 impl Default for ModeScanner {
@@ -410,6 +415,7 @@ impl ModeScanner {
             foreground: None,
             b_since_boundary: false,
             prompt_markers_missing: false,
+            prompt_owner: None,
         }
     }
 
@@ -938,6 +944,7 @@ impl ModeScanner {
         for p in params.split(';') {
             match p {
                 "2004" => {
+                    let was_on = self.modes.bracketed_paste;
                     self.modes.bracketed_paste = on;
                     self.modes.saw_bracketed_paste = true;
                     // Re-recorded on every transition, not only the first:
@@ -945,7 +952,23 @@ impl ModeScanner {
                     // re-arms the licence for itself (§8.7 availability
                     // row 4c), which is the case the T2 executing rung's
                     // premise is literally true of.
-                    self.modes.bracketed_paste_owner = self.foreground;
+                    //
+                    // **Except the `l` that turns off a paste mode that
+                    // was on, which keeps the owner the `h` recorded** —
+                    // GH #240's race, in the T2 dimension. readline emits
+                    // that `l` on accept-line and the shell forks at once,
+                    // so a chunk scanned a moment late samples the child;
+                    // the child then owns a signal it never drove, the T2
+                    // executing rung is licensed for it, and a `[Y/n] `
+                    // prompt reads `Executing` / `terminal_mode`. The
+                    // program turning an enabled paste off is the one that
+                    // enabled it, and the `h` was sampled while that
+                    // program sat idle at its prompt. An `l` with nothing
+                    // to turn off is a program declaring itself, and is
+                    // sampled as before.
+                    if on || !was_on {
+                        self.modes.bracketed_paste_owner = self.foreground;
+                    }
                 }
                 "1049" => {
                     self.modes.alt_screen = on;
@@ -1131,10 +1154,36 @@ impl ModeScanner {
             _ => return None,
         };
         self.modes.saw_osc133 = true;
-        // Same rule as bracketed paste, and re-recorded on every marker,
-        // which is what keeps T1 available at every prompt: the shell's
-        // `D`/`A` arrive in the burst in which it regains the terminal.
-        self.modes.osc133_owner = self.foreground;
+        // Re-recorded on every marker, which is what keeps T1 available at
+        // every prompt: the shell's `D`/`A` arrive in the burst in which it
+        // regains the terminal.
+        //
+        // **Except that `C` inherits, and GH #240 is why.** The owner is
+        // "who held the terminal when the marker was *emitted*", and the
+        // only thing the scanner has is who holds it when the chunk is
+        // *scanned*. For `A`, `B` and `D` the two agree, because the shell
+        // emits them and then goes on holding the terminal at its prompt.
+        // `C` is the one marker a shell emits and then immediately gives
+        // the terminal away — `PS0`/`preexec` run, the shell forks, the
+        // child takes the foreground — so a reader that scans the chunk a
+        // moment late samples the **child** and records it as the owner.
+        // Owner then equals holder, the T1 executing rung stays licensed,
+        // and a program stopped at `[Y/n] ` reads `Executing` / `semantic`
+        // for the whole wait: measured 2 trials in 8 on a loaded box.
+        //
+        // The shell that emits a `C` is the shell that drew the prompt it
+        // was typed at, so `C` takes the owner recorded at the last `A`,
+        // `B` or `D` — sampled while that shell sat idle holding the
+        // terminal — and falls back to the scan-time sample only when no
+        // such marker has arrived. Nesting is unchanged: an inner shell's
+        // own `D`/`A`/`B` re-record the owner before its first `C`, and a
+        // shell inside `ssh` is still owned by `ssh`'s group throughout.
+        self.modes.osc133_owner = if kind == b'C' {
+            self.prompt_owner.unwrap_or(self.foreground)
+        } else {
+            self.prompt_owner = Some(self.foreground);
+            self.foreground
+        };
         self.last_marker = Some(kind);
         Some((marker, is_holdfast))
     }
@@ -2145,6 +2194,97 @@ mod tests {
         let ev = s.feed(b"\x1b]133;A\x07", 1005, None);
         assert_eq!(ev[0].start, 1005);
         assert_eq!(ev[0].end, 1013);
+    }
+
+    /// GH #240: who owns a signal is decided when it was *emitted*, and the
+    /// scanner only ever knows when it was *scanned*.
+    ///
+    /// Every row feeds the prompt with the shell (group 100) holding the
+    /// terminal and the submit with the child (group 200) already holding
+    /// it — the chunk a reader reached a moment after the fork. That is
+    /// the measured interleaving: the shell emits `C` (and readline its
+    /// paste-off) and forks in the same breath, so nothing obliges the
+    /// reader to scan those bytes before the child calls `tcsetpgrp`.
+    mod owner_of_the_submit {
+        use super::*;
+
+        const SHELL: Option<i32> = Some(100);
+        const CHILD: Option<i32> = Some(200);
+
+        #[test]
+        fn a_c_marker_belongs_to_the_shell_that_drew_the_prompt_it_was_typed_at() {
+            let mut s = ModeScanner::new();
+            s.feed(
+                b"\x1b]133;A;holdfast=1\x07$ \x1b]133;B;holdfast=1\x07",
+                0,
+                SHELL,
+            );
+            s.feed(b"python3\r\n\x1b]133;C;holdfast=1\x07", 100, CHILD);
+            assert_eq!(
+                s.modes().osc133_owner,
+                SHELL,
+                "the C was scanned after the fork and recorded the child"
+            );
+            // The next prompt-side marker samples afresh: the shell has
+            // the terminal back and is the one emitting.
+            s.feed(b"\x1b]133;D;0;holdfast=1\x07", 200, SHELL);
+            assert_eq!(s.modes().osc133_owner, SHELL);
+        }
+
+        /// The fallback, and the reason the rule is "inherit when there is
+        /// something to inherit" rather than "never sample at `C`".
+        #[test]
+        fn a_c_marker_with_no_prompt_marker_before_it_is_sampled_as_before() {
+            let mut s = ModeScanner::new();
+            s.feed(b"\x1b]133;C\x07", 0, CHILD);
+            assert_eq!(s.modes().osc133_owner, CHILD);
+        }
+
+        /// Nesting: an inner shell's own prompt markers re-record the
+        /// owner, so its `C` inherits the *inner* shell and not the outer
+        /// one that launched it (§8.5).
+        #[test]
+        fn an_inner_shells_c_inherits_the_inner_shells_prompt() {
+            const INNER: Option<i32> = Some(150);
+            let mut s = ModeScanner::new();
+            s.feed(
+                b"\x1b]133;A;holdfast=1\x07$ \x1b]133;B;holdfast=1\x07",
+                0,
+                SHELL,
+            );
+            s.feed(b"bash\r\n\x1b]133;C;holdfast=1\x07", 100, INNER);
+            assert_eq!(s.modes().osc133_owner, SHELL);
+            s.feed(
+                b"\x1b]133;D;0;holdfast=1\x07\x1b]133;A;holdfast=1\x07> \x1b]133;B;holdfast=1\x07",
+                200,
+                INNER,
+            );
+            s.feed(b"sleep 9\r\n\x1b]133;C;holdfast=1\x07", 300, CHILD);
+            assert_eq!(s.modes().osc133_owner, INNER);
+        }
+
+        /// The same race in the T2 dimension: readline's paste-off is
+        /// emitted on accept-line, immediately before the fork.
+        #[test]
+        fn a_paste_off_that_ends_an_enabled_paste_keeps_the_owner_that_enabled_it() {
+            let mut s = ModeScanner::new();
+            s.feed(b"\x1b[?2004h$ ", 0, SHELL);
+            assert_eq!(s.modes().bracketed_paste_owner, SHELL);
+            s.feed(b"\x1b[?2004l\r", 100, CHILD);
+            assert_eq!(
+                s.modes().bracketed_paste_owner,
+                SHELL,
+                "the paste-off was scanned after the fork and recorded the child"
+            );
+
+            // The paired negatives: an `l` with nothing to turn off is a
+            // program declaring itself, and an `h` always samples — which
+            // is §8.7 row 4c, a REPL re-arming the licence for itself.
+            s.feed(b"\x1b[?2004l", 200, CHILD);
+            assert_eq!(s.modes().bracketed_paste_owner, CHILD);
+            s.feed(b"\x1b[?2004h", 300, Some(300));
+            assert_eq!(s.modes().bracketed_paste_owner, Some(300));
+        }
     }
 
     /// GH #220: `osc133_source` said `holdfast` for a session whose history

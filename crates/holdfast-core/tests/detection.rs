@@ -188,6 +188,10 @@ const HOST_DEPENDENT_ROWS: &[(&str, &[Need])] = &[
         &[Need::Program("zsh")],
     ),
     (
+        "a_confirmation_prompt_from_an_external_program_answers_at_prompt",
+        &[Need::Program("python3")],
+    ),
+    (
         "fish_integration_emits_the_measured_marker_stream_and_exact_exit_codes",
         &[Need::Program("fish")],
     ),
@@ -2834,5 +2838,90 @@ async fn a_prompt_regenerated_after_the_snippet_is_reported_as_degraded() {
         "a session whose history has lost its command text still claims \
          Holdfast's integration is whole: {s}"
     );
+    kill(&server, &id).await;
+}
+
+// ---------------------------------------------------------------------
+// GH #240 — whose is the submit
+// ---------------------------------------------------------------------
+
+/// GH #240 through the whole reader, deterministically.
+///
+/// The real-shell row below cannot make the race happen on demand — it is
+/// the scheduler's choice whether the reader scans bash's submit before or
+/// after the child takes the terminal. A mock can: the prompt is scanned
+/// with bash (group 100) holding the terminal, then the foreground moves to
+/// the child (200) **before** the submit chunk is queued, so the reader's
+/// per-chunk sample is the child's — the losing interleaving, every run.
+///
+/// Measured against the unfixed scanner: `Executing` / `semantic` / 0.00
+/// with the child's `[Y/n] ` as the last line, for as long as anyone asks.
+#[tokio::test]
+async fn a_submit_scanned_after_the_fork_does_not_hold_a_confirmation_prompt_at_executing() {
+    use holdfast_core::pty::{MockPty, PtyBackend};
+    use holdfast_core::session::{new_session_id, Session, SessionConfig};
+    use std::sync::Arc;
+
+    let server = HoldfastServer::new();
+    let pty = Arc::new(MockPty::new());
+    pty.set_foreground_group(Some(100));
+    // `input()` reads a canonical, echoing line.
+    pty.set_echo(Some(true));
+    pty.set_canonical(Some(true));
+    let session = Session::new(
+        new_session_id(),
+        None,
+        "bash".into(),
+        vec![],
+        Arc::clone(&pty) as Arc<dyn PtyBackend>,
+        SessionConfig::default(),
+    );
+    let id = session.id.clone();
+    server.registry.insert(session).expect("registry insert");
+
+    pty.queue_output(b"\x1b[?2004h\x1b]133;A;holdfast=1\x07$ \x1b]133;B;holdfast=1\x07");
+    await_status(&server, &id, "bash's own prompt", |s| {
+        s["interaction_mode"] == "AtPrompt" && s["detection_tier"] == "semantic"
+    })
+    .await;
+
+    pty.set_foreground_group(Some(200));
+    pty.queue_output(
+        b"python3 confirm.py\r\n\x1b[?2004l\r\x1b]133;C;holdfast=1\x07\
+          Do you want to continue? [Y/n] ",
+    );
+    let s = await_settled(&server, &id, "Do you want to continue? [Y/n] ").await;
+    assert_classified(&s, "AtPrompt", "heuristic", 0.9);
+}
+
+/// GH #240's reproduction on a real shell and a real child: a program
+/// stopped at a `[Y/n] ` confirmation. The dogfood pass measured 2 trials
+/// in 8 answering `Executing` / `semantic` for the whole 12 s wait.
+///
+/// **This row cannot force the losing interleaving** — see the mock row
+/// above, which does. It pins the behaviour end to end, and it would have
+/// failed intermittently rather than every time against the unfixed
+/// scanner; with the fix there is no interleaving left in which it can.
+#[tokio::test]
+async fn a_confirmation_prompt_from_an_external_program_answers_at_prompt() {
+    if !have(Need::Program("python3")) {
+        eprintln!("skipping: python3 not installed");
+        return;
+    }
+    let server = HoldfastServer::new();
+    let id = start(&server, bash()).await;
+    await_markers(&server, &id, 3).await;
+    send(
+        &server,
+        &id,
+        r#"python3 -c "x=input('Do you want to continue? [Y/n] '); print('got', x)""#,
+    )
+    .await;
+    let s = await_settled(&server, &id, "Do you want to continue? [Y/n] ").await;
+    assert_classified(&s, "AtPrompt", "heuristic", 0.9);
+
+    send(&server, &id, "y").await;
+    let h = await_closed_history(&server, &id, 1).await;
+    assert_eq!(h["data"]["entries"][0]["exit_code"], 0, "{h}");
     kill(&server, &id).await;
 }

@@ -655,6 +655,23 @@ is cut, named and published is in
 
 ### Fixed
 
+- **A program stopped at a `[Y/n] ` confirmation could read `Executing` for
+  the whole wait** ([#240]). The detector records who held the terminal when
+  a signal arrived, so that a shell's markers license nothing about the
+  program it launches — and it took that sample when the reader *scanned*
+  the chunk, not when the shell *emitted* it. bash emits `PS0`'s `C` (and
+  readline its paste-off) and forks in the same breath, so a reader that
+  reached the chunk a moment late recorded the **child** as the owner of
+  both; owner then equalled holder, both executing rungs stayed licensed,
+  and a pattern-less wait ran out its deadline. The dogfood pass measured 2
+  trials in 8 on a loaded box. Now a `C` takes the owner recorded at the
+  shell's last `A`/`B`/`D`, and a paste-off that ends an enabled paste keeps
+  the owner that enabled it — both sampled while the shell sat idle holding
+  the terminal. Measured causally: a 30 ms delay in front of the reader's
+  owner sample made the unfixed build answer `Executing` / `semantic` for
+  the whole 4 s wait in 8 trials of 8, and the fixed build `AtPrompt` in 8
+  of 8.
+
 - **A prompt that regenerates `PS1` at every prompt — starship, the owner's —
   emptied `get_command_history` and dropped the session's first command**
   ([#220]). Holdfast wrapped `PS1` with its `A`/`B` markers once; starship's
@@ -2058,3 +2075,4 @@ residuals that are known and accepted.
 [#202]: https://github.com/Sertelegger/holdfast/issues/202
 [#206]: https://github.com/Sertelegger/holdfast/issues/206
 [#220]: https://github.com/Sertelegger/holdfast/issues/220
+[#240]: https://github.com/Sertelegger/holdfast/issues/240
