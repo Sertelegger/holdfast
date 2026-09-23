@@ -647,6 +647,42 @@ is cut, named and published is in
   optimized both.
 
 ### Fixed
+- **A session started without `cwd` ran in whichever project had spawned the
+  shared daemon, with that project's environment** ([#229]). The daemon is
+  shared by every MCP client on the machine and outlives them all, and it
+  started every session from its own working directory and environment —
+  which were those of the first client. An agent in project B that omitted
+  `cwd` ran `git`, `cargo` or `rm` in project A, with A's
+  `CLAUDE_PROJECT_DIR` and another Claude session's
+  `CLAUDE_CODE_SESSION_ID`; the tool schema called that default *"the
+  directory the Holdfast server itself was started in"*, which an agent reads
+  as its own project.
+
+  The shim now attaches its own working directory and **its whole
+  environment** to every `start_session`, under a reserved `@client` params
+  key that no tool argument can have, and a `command` session starts from
+  those — the directory and environment of the `holdfast mcp` process the
+  client launched, which is what `--no-daemon` (and so Windows) always did.
+  The whole environment rather than a deny-list of per-project variables,
+  because the list has no end: read off the MCP servers Claude Code had
+  running on the machine this was fixed on, it would have had to include one
+  VS Code window's `SSH_AUTH_SOCK` and askpass handle, one Claude session's
+  messaging token, and whatever `direnv` or `mise` exported for the spawning
+  project. The values cross the control socket and never MCP, so they reach
+  no transcript, and `session_start.env_keys` still records only the keys the
+  call supplied. An explicit `cwd` or `env` still wins.
+
+  **A `profile` session takes neither**, and keeps the daemon's own directory
+  and environment as before: the operator wrote that process ([#55]), and the
+  context is reachable by anything that can speak the control protocol. A
+  daemon-hosted session with no client environment — a profile session, or a
+  request from an older shim — still starts from the daemon's, minus
+  `CLAUDECODE` and the `CLAUDE_` family, which name the spawning client and
+  are wrong for every other. Every session is also given `PWD` naming the
+  directory it really starts in. A client whose own directory has been
+  removed since it started is refused with `invalid_params` rather than moved
+  somewhere else.
+
 - **The guard that was supposed to refuse an empty release body could not
   fire, and the release procedure did not mention `Cargo.lock`.** Both are
   release-time defects that no test or check would have caught, because the
@@ -2011,3 +2047,4 @@ residuals that are known and accepted.
 [#203]: https://github.com/Sertelegger/holdfast/issues/203
 [#202]: https://github.com/Sertelegger/holdfast/issues/202
 [#206]: https://github.com/Sertelegger/holdfast/issues/206
+[#229]: https://github.com/Sertelegger/holdfast/issues/229

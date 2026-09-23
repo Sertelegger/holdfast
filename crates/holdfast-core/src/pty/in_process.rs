@@ -115,6 +115,23 @@ fn all_pids() -> Vec<i32> {
 
 impl InProcessPty {
     pub fn spawn(cfg: &PtySpawnConfig) -> Result<Self> {
+        Self::spawn_with_base_env(cfg, None)
+    }
+
+    /// [`spawn`](Self::spawn), with the environment the child starts from
+    /// supplied rather than inherited (GH #229).
+    ///
+    /// `None` is `spawn` exactly: the child inherits this process's
+    /// environment, as `portable-pty` builds it. `Some(base)` starts the
+    /// child from `base` **instead** — nothing of this process's own
+    /// environment reaches it — and `cfg.env` is still applied on top.
+    /// A daemon needs the second form because its own environment is
+    /// whichever client happened to spawn it, not the one asking now;
+    /// see `session::launch`.
+    pub fn spawn_with_base_env(
+        cfg: &PtySpawnConfig,
+        base_env: Option<&[(std::ffi::OsString, std::ffi::OsString)]>,
+    ) -> Result<Self> {
         let sys = native_pty_system();
         let pair = sys
             .openpty(PtySize {
@@ -126,6 +143,12 @@ impl InProcessPty {
             .map_err(|e| HoldfastError::Pty(format!("openpty: {e}")))?;
 
         let mut cmd = CommandBuilder::new(&cfg.command);
+        if let Some(base) = base_env {
+            cmd.env_clear();
+            for (k, v) in base {
+                cmd.env(k, v);
+            }
+        }
         for a in &cfg.args {
             cmd.arg(a);
         }

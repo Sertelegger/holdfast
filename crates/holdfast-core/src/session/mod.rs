@@ -1,5 +1,6 @@
 //! A single PTY-backed session.
 
+pub mod launch;
 pub mod reaper;
 pub mod registry;
 pub mod wait;

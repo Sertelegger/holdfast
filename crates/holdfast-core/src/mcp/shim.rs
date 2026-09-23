@@ -30,6 +30,7 @@
 use super::passthrough;
 use crate::protocol::client::{ClientError, ControlClient};
 use crate::protocol::method::{self, TOOL_METHOD_PREFIX};
+use crate::session::launch::{ClientLaunch, CLIENT_PARAM};
 use rmcp::model::{
     CallToolRequestParams, CallToolResponse, CallToolResult, Implementation,
     ListResourceTemplatesResult, ListResourcesResult, ListToolsResult, PaginatedRequestParams,
@@ -40,6 +41,9 @@ use rmcp::{ErrorData, RoleServer, ServerHandler};
 use serde_json::json;
 use serde_json::Value;
 use std::sync::Arc;
+
+/// The one tool whose call carries the shim's own launch context.
+const START_SESSION: &str = "start_session";
 
 #[derive(Clone)]
 pub struct ShimServer {
@@ -97,7 +101,23 @@ impl ShimServer {
         arguments: Option<serde_json::Map<String, Value>>,
         cancelled: impl std::future::Future<Output = ()>,
     ) -> Result<CallToolResult, ErrorData> {
-        let args = Value::Object(arguments.unwrap_or_default());
+        let mut arguments = arguments.unwrap_or_default();
+        // **GH #229: a session starts where its caller is.** This process
+        // is the one the MCP client launched, in the client's project and
+        // with the client's environment; the daemon is shared by every
+        // client and its own directory and environment are whichever one
+        // spawned it. So the shim says where it is, under a key no tool
+        // argument can have, and the daemon decides what to do with it —
+        // `session::launch` holds the rule, including the one kind of
+        // session (a `profile`) that must ignore it. Inserted *over*
+        // anything the MCP client put there: the context is this
+        // process's to state, not the agent's.
+        if tool == START_SESSION {
+            let context = serde_json::to_value(ClientLaunch::of_this_process())
+                .map_err(|e| ErrorData::internal_error(e.to_string(), None))?;
+            arguments.insert(CLIENT_PARAM.to_string(), context);
+        }
+        let args = Value::Object(arguments);
         let params =
             method::to_cbor(&args).map_err(|e| ErrorData::internal_error(e.to_string(), None))?;
         let token = uuid::Uuid::new_v4().simple().to_string();
@@ -1072,6 +1092,78 @@ mod tests {
                 "details": "read 6 bytes",
             }),
             "§7.4.1: data → structuredContent.data, status and details likewise"
+        );
+    }
+
+    /// **GH #229: `start_session` carries the shim's own directory and
+    /// environment, under the reserved key, on the wire.**
+    ///
+    /// The shim is the only process in the hybrid path that is the
+    /// client's own; a daemon serving several clients cannot know which
+    /// one's project a call belongs to unless the call says so. Read back
+    /// as a literal CBOR map, for this file's usual reason: a round trip
+    /// through `ClientLaunch` would agree with itself under any key.
+    ///
+    /// The value an MCP client put under the key is **overwritten**: the
+    /// context is this process's to state, and a shim that passed an
+    /// agent's through would let the agent name any directory as "where
+    /// the client is" — harmless for a `command` session, which can name
+    /// its own `cwd`, but the daemon should never have to reason about it.
+    #[tokio::test]
+    async fn start_session_carries_the_shims_own_directory_and_environment() {
+        let dir = scratch_dir("client");
+        let _scoped = Scoped(dir.clone());
+        std::fs::create_dir_all(&dir).unwrap();
+        let sock = dir.join("control.sock");
+        let reply = CborValue::Map(vec![
+            (
+                CborValue::Text("status".into()),
+                CborValue::Text("ok".into()),
+            ),
+            (CborValue::Text("data".into()), CborValue::Map(vec![])),
+            (
+                CborValue::Text("details".into()),
+                CborValue::Text("started".into()),
+            ),
+        ]);
+        let captured = stand_in_daemon(sock.clone(), reply);
+        let client = loop {
+            match ControlClient::connect(&sock, ClientKind::Shim).await {
+                Ok(c) => break c,
+                Err(_) => tokio::time::sleep(std::time::Duration::from_millis(10)).await,
+            }
+        };
+        let shim = ShimServer::new(Arc::new(client));
+
+        let mut arguments = serde_json::Map::new();
+        arguments.insert("command".into(), json!("bash"));
+        arguments.insert(CLIENT_PARAM.into(), json!({ "cwd": "/somebody/elses" }));
+        shim.forward("start_session", Some(arguments), std::future::pending())
+            .await
+            .expect("the stand-in answered ok");
+        let req = captured.await.expect("the stand-in captured a request");
+        let params = field(&req, "params");
+        assert_eq!(
+            field(params, "command").as_text(),
+            Some("bash"),
+            "the caller's own arguments still travel verbatim"
+        );
+
+        let context = field(params, CLIENT_PARAM);
+        let here = std::env::current_dir().unwrap();
+        assert_eq!(
+            field(context, "cwd").as_text(),
+            Some(here.to_str().unwrap()),
+            "the context must name this process's directory, not the one the MCP \
+             client wrote under the key"
+        );
+        // One variable every test process has, compared by value: a shim
+        // that sent an empty map, or the daemon's, would fail here.
+        let path = std::env::var("PATH").expect("a test process has PATH");
+        assert_eq!(
+            field(field(context, "env"), "PATH").as_text(),
+            Some(path.as_str()),
+            "the context must carry this process's environment"
         );
     }
 

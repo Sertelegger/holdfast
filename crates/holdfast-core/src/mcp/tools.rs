@@ -202,11 +202,13 @@ pub struct StartSessionArgs {
     #[serde(default)]
     pub name: Option<String>,
     /// Working directory for the spawned process. Must already exist.
-    /// Defaults to the directory the Holdfast server itself was started in.
+    /// Defaults to the working directory of the Holdfast MCP server your
+    /// client launched, which is normally the project you are working in.
     #[serde(default)]
     pub cwd: Option<String>,
-    /// Extra environment variables for the spawned process. Do not pass
-    /// secrets: these values cross the MCP boundary (spec §5.2).
+    /// Extra environment variables for the spawned process, on top of the
+    /// environment of the Holdfast MCP server your client launched. Do not
+    /// pass secrets: these values cross the MCP boundary (spec §5.2).
     #[serde(default)]
     pub env: Option<HashMap<String, String>>,
     /// Terminal width in columns, 1 to 1000. Defaults to 120. A value
@@ -261,8 +263,8 @@ pub struct PromptPatternArg {
 #[tool_router(vis = "pub(crate)")]
 impl HoldfastServer {
     /// Start a PTY-backed shell or program and return its session id.
-    /// Runs in `cwd` if given, otherwise in the directory the Holdfast
-    /// server was started in.
+    /// Runs in `cwd` if given, otherwise in the working directory of the
+    /// Holdfast MCP server your client launched.
     #[tool(
         annotations(
             title = "Start a PTY-backed shell session",
@@ -305,26 +307,55 @@ impl HoldfastServer {
         // canonicalisation, the same `invalid_params`. One resolution
         // function for both sources is what keeps the directory that is
         // approved, reported and actually run in from diverging.
-        cfg.cwd = match &launch.cwd {
-            Some(cwd) => {
-                let resolved = std::path::Path::new(cwd)
-                    .canonicalize()
-                    .ok()
-                    .filter(|p| p.is_dir());
-                match resolved {
-                    Some(p) => Some(p.to_string_lossy().into_owned()),
-                    None => {
-                        return Err(ErrorData::invalid_params(
-                            format!("cwd is not an existing directory: {cwd}"),
-                            None,
-                        ))
-                    }
+        //
+        // **Absent, it is the calling client's directory (GH #229)** —
+        // which in-process is this process's own, and in a daemon is the
+        // one the shim sent, because the daemon's own is whichever client
+        // happened to spawn it. A profile session never takes the
+        // client's: `host.client_cwd` answers `None` for it, and it keeps
+        // this process's directory as before (GH #55). See
+        // `session::launch` for the whole rule.
+        let host = crate::session::launch::host();
+        let profiled = launch.profile.is_some();
+        let canonical_dir = |dir: &str| {
+            std::path::Path::new(dir)
+                .canonicalize()
+                .ok()
+                .filter(|p| p.is_dir())
+                .map(|p| p.to_string_lossy().into_owned())
+        };
+        cfg.cwd = match (&launch.cwd, host.client_cwd(profiled)) {
+            (Some(cwd), _) => match canonical_dir(cwd) {
+                Some(p) => Some(p),
+                None => {
+                    return Err(ErrorData::invalid_params(
+                        format!("cwd is not an existing directory: {cwd}"),
+                        None,
+                    ))
                 }
-            }
+            },
+            // Refused rather than fallen back from. Falling back to this
+            // process's directory is GH #229 exactly — a session running
+            // in somebody else's project — and the only way to reach this
+            // arm is a client whose own directory has been removed since
+            // it started, where no directory Holdfast could pick is the
+            // one the agent meant.
+            (None, Some(client)) => match canonical_dir(client) {
+                Some(p) => Some(p),
+                None => {
+                    return Err(ErrorData::invalid_params(
+                        format!(
+                            "no cwd was given, and the MCP server's own working directory \
+                             is not an existing directory: {client}; pass `cwd`"
+                        ),
+                        None,
+                    ))
+                }
+            },
             // `getcwd(2)` already resolves symlinks, so this is canonical
             // by construction; canonicalise anyway so both arms are
             // provably producing the same kind of path.
-            None => std::env::current_dir()
+            (None, None) => std::env::current_dir()
                 .and_then(|p| p.canonicalize())
                 .ok()
                 .map(|p| p.to_string_lossy().into_owned()),
@@ -336,7 +367,21 @@ impl HoldfastServer {
         // `resolve_launch` refused the call outright if it tried. Already
         // sorted by whichever arm built it, so `env_keys` compares between
         // runs.
-        cfg.env = launch.env.clone();
+        //
+        // **Behind it, in order: the environment the child starts from,
+        // then Holdfast's own defaults** (GH #229). `base_env` is the
+        // calling client's environment for a command session in a daemon,
+        // the daemon's own minus the spawning client's identity otherwise,
+        // and `None` — inherit — in-process, where this process *is* the
+        // client's. The defaults (`PWD`) sit between the two, so an
+        // inherited value loses to them and the call's own `env` beats
+        // them both. They go into `cfg.env` ahead of `launch.env` rather
+        // than into the base, because in-process there is no base to put
+        // them in; a later entry for the same key replaces an earlier one
+        // at the spawn.
+        let base_env = host.base_env(profiled, std::env::vars_os());
+        cfg.env = crate::session::launch::session_defaults(cfg.cwd.as_deref(), &launch.env);
+        cfg.env.extend(launch.env.iter().cloned());
 
         if let Some(c) = args.cols {
             cfg.cols = c;
@@ -468,7 +513,7 @@ impl HoldfastServer {
             Err(e) => return envelope::from_error(&e),
         };
 
-        let backend = match InProcessPty::spawn(&cfg) {
+        let backend = match InProcessPty::spawn_with_base_env(&cfg, base_env.as_deref()) {
             Ok(b) => Arc::new(b) as Arc<dyn PtyBackend>,
             Err(e) => {
                 // `brief` matters here: portable-pty's spawn error embeds
@@ -560,8 +605,14 @@ impl HoldfastServer {
         // `session_record` must not grow an `env` field —
         // `no_tool_advertises_an_env_field_to_echo` in `tests/schema.rs`
         // is what keeps that decision from being undone by convenience.
+        //
+        // **`launch.env`, not `cfg.env`**: the keys *this call* supplied
+        // (or the operator's profile did), which is what the field has
+        // always recorded. `cfg.env` now also carries Holdfast's own
+        // defaults, and listing `PWD` on every session would record a
+        // default as though somebody had chosen it.
         let env_keys: Vec<&str> = {
-            let mut keys: Vec<&str> = cfg.env.iter().map(|(k, _)| k.as_str()).collect();
+            let mut keys: Vec<&str> = launch.env.iter().map(|(k, _)| k.as_str()).collect();
             keys.sort_unstable();
             keys
         };
