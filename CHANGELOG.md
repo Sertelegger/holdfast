@@ -663,6 +663,14 @@ is cut, named and published is in
   it has exited. `tail_bytes` and a front-clipped tail no longer open a page
   on a continuation byte either. None of it is a holdback: no flag, no cause,
   and `cursor` names the byte the next read starts at.
+- **A `tail_bytes` read larger than `max_bytes` says it was cut** ([#246]).
+  `read_output` clamped `tail_bytes` to `max_bytes` before the session saw
+  it, so the session was asked for a tail that fit, returned it whole, and
+  reported `truncated_for_size: false` over a read that had dropped most of
+  what the caller asked for — `tail_bytes: 140000` came back as 32,768 bytes
+  that claimed to be complete. The clamp is gone: the session front-clips an
+  oversized tail itself, keeps the newest bytes, and sets the flag, exactly
+  as `tail_lines` always did.
 - **The guard that was supposed to refuse an empty release body could not
   fire, and the release procedure did not mention `Cargo.lock`.** Both are
   release-time defects that no test or check would have caught, because the
@@ -2028,3 +2036,4 @@ residuals that are known and accepted.
 [#202]: https://github.com/Sertelegger/holdfast/issues/202
 [#206]: https://github.com/Sertelegger/holdfast/issues/206
 [#241]: https://github.com/Sertelegger/holdfast/issues/241
+[#246]: https://github.com/Sertelegger/holdfast/issues/246

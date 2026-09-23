@@ -936,7 +936,12 @@ impl HoldfastServer {
         } else if let Some(n) = args.tail_lines {
             ReadStart::TailLines(n)
         } else {
-            ReadStart::TailBytes(args.tail_bytes.unwrap().min(max_bytes))
+            // Not clamped to `max_bytes` here (GH #246): the session
+            // front-clips an oversized tail and says so with
+            // `truncated_for_size`. Clamping first made the clip invisible
+            // to it, and a 140 KB request came back cut to 32 KB with the
+            // flag false.
+            ReadStart::TailBytes(args.tail_bytes.unwrap())
         };
         // §4.1's bypass, and its whole extent. The caller named a tail
         // argument on the one tool that takes them, so it asked for the
