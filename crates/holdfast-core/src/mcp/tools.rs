@@ -3694,6 +3694,11 @@ impl HoldfastServer {
     /// `send_input` — stalling there would hide the one action that
     /// makes progress. `Exited` has no prompt to reach at all.
     ///
+    /// **Except a `Fullscreen` or `AwaitingSecret` already showing at the
+    /// first sample**, which may predate the write this wait follows and
+    /// is answered only once it has held for the settle window (GH #248,
+    /// `wait::CarriedMode`).
+    ///
     /// So the caller must read `interaction_mode`, not just `reached`.
     /// That is why §8.3's tier rule applies here: `with_detection`
     /// attaches `detection_tier` and `prompt.reason` to this response,
@@ -3768,6 +3773,11 @@ impl HoldfastServer {
         // are unaffected and cover the common case; this window is only the
         // fallback for "no shell integration and never observed executing".
         let settle = Duration::from_millis(session.settle_threshold_ms()).min(timeout);
+        // GH #248. Held from the first sample, which is a hair after the
+        // call, so one poll of headroom keeps it inside the deadline for
+        // the reason `room` below spells out.
+        let mut carried = wait::CarriedMode::new();
+        let carried_hold = settle.min(timeout.saturating_sub(IDLE_WAIT_POLL));
         let mut saw_executing = false;
         let mut idle_since: Option<std::time::Instant> = None;
         // The mode the wait stopped on, or `None` if the deadline won.
@@ -3788,13 +3798,24 @@ impl HoldfastServer {
                 break Some(InteractionMode::Exited);
             }
             let mode = session.detection().interaction_mode;
+            let fresh = carried.answerable(mode, std::time::Instant::now(), carried_hold);
             match mode {
-                // Neither can be mistaken for "about to start the command
-                // you just sent", so both answer at once.
-                InteractionMode::Exited | InteractionMode::AwaitingSecret => break Some(mode),
-                // §5.2: a TUI never returns to `AtPrompt`, so this reports
-                // the mode promptly rather than running out the deadline.
-                InteractionMode::Fullscreen => break Some(mode),
+                // Read from the process, so it cannot be stale.
+                InteractionMode::Exited => break Some(mode),
+                // §5.2: a TUI never returns to `AtPrompt`, and a secret
+                // prompt wants `request_secret_input`, so both report
+                // promptly rather than running out the deadline — once the
+                // sample is not the one from before the write (GH #248).
+                InteractionMode::AwaitingSecret | InteractionMode::Fullscreen => {
+                    if fresh {
+                        break Some(mode);
+                    }
+                    // Held as `Executing` is: a program other than the
+                    // shell's prompt has the session, so a prompt that
+                    // follows was watched arriving.
+                    saw_executing = true;
+                    idle_since = None;
+                }
                 InteractionMode::Executing => {
                     saw_executing = true;
                     idle_since = None;

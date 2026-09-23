@@ -45,6 +45,7 @@
 //! silently.
 
 use super::{OutputFrame, Session};
+use crate::detect::InteractionMode;
 use crate::output::ansi::AnsiStripper;
 use regex::bytes::Regex;
 use std::time::{Duration, Instant};
@@ -99,6 +100,54 @@ pub struct WaitOutcome {
     /// The requested `since_cursor` was older than `buffer.tail`, so
     /// matches between the two may have been missed (§5.2).
     pub truncated_at_tail: bool,
+}
+
+/// Whether a **pattern-less** wait may answer with `Fullscreen` or
+/// `AwaitingSecret` yet (GH #248).
+///
+/// Those two answer at once rather than at the deadline, and the reason
+/// stands: a TUI never returns to a prompt, and a secret prompt wants
+/// `request_secret_input`, not patience. What was wrong is *which* sample
+/// they answer from. An agent sends `q` to `less` and waits; the key is in
+/// the pty but `less` has not read it yet, so the wait's first sample is
+/// the `Fullscreen` from **before** the write — and it was returned in
+/// 0.0 s, 2 times in 5, with `AtPrompt` half a second later. An agent
+/// acting on that presses `q` again and leaves a stray `q` at the shell.
+/// `AwaitingSecret` has the same shape one step later: a secret handed in
+/// by `request_secret_input` and not yet read still shows echo off.
+///
+/// So a mode **already showing at the first sample** is answered only once
+/// it has held for `hold` — the detector's own settle window, the same
+/// evidence `AtPrompt` already needs when the wait never saw anything
+/// execute. A mode the wait **watched arrive** — any change since the first
+/// sample — is fresh by construction and answers at once, as before.
+///
+/// The wait cannot see the write it follows, so this is paid by every wait
+/// that *begins* at one of these modes, including one that follows no
+/// write at all: bounded by the settle window (250 ms by default), and the
+/// price of not answering from a stale sample.
+#[derive(Debug, Default)]
+pub struct CarriedMode {
+    first: Option<(InteractionMode, Instant)>,
+    moved: bool,
+}
+
+impl CarriedMode {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Record one sample and say whether `mode` may be the answer now.
+    /// Call it for **every** sample, whatever the mode, or a change the
+    /// wait did watch goes unrecorded and the mode it produced waits out a
+    /// window it should not.
+    pub fn answerable(&mut self, mode: InteractionMode, now: Instant, hold: Duration) -> bool {
+        let (first, since) = *self.first.get_or_insert((mode, now));
+        if mode != first {
+            self.moved = true;
+        }
+        self.moved || now.saturating_duration_since(since) >= hold
+    }
 }
 
 /// Run the two-phase scan. Cancel-safe only at the granularity of the
@@ -951,5 +1000,39 @@ mod tests {
         assert_eq!(w.text.len(), w.offsets.len());
         let found = w.search(&re("RED")).expect("found");
         assert_eq!(found.start, SCAN_WINDOW_BYTES as u64 + 5);
+    }
+
+    /// GH #248: a mode already showing at the wait's first sample may be
+    /// the one from **before** the write the wait follows.
+    #[test]
+    fn a_mode_carried_from_before_the_wait_is_answered_only_once_it_has_held() {
+        use crate::detect::InteractionMode::*;
+        let hold = Duration::from_millis(250);
+        let t0 = Instant::now();
+        let mut c = CarriedMode::new();
+        assert!(!c.answerable(Fullscreen, t0, hold), "the first sample");
+        assert!(!c.answerable(Fullscreen, t0 + Duration::from_millis(200), hold));
+        assert!(
+            c.answerable(Fullscreen, t0 + hold, hold),
+            "a mode that held for the window is the answer"
+        );
+    }
+
+    /// The other half: a mode the wait watched arrive is fresh by
+    /// construction and answers at once — including the first mode coming
+    /// back after something else was seen.
+    #[test]
+    fn a_mode_the_wait_watched_arrive_is_answered_at_once() {
+        use crate::detect::InteractionMode::*;
+        let hold = Duration::from_millis(250);
+        let t0 = Instant::now();
+        let mut c = CarriedMode::new();
+        assert!(!c.answerable(AwaitingSecret, t0, hold));
+        c.answerable(Executing, t0 + Duration::from_millis(1), hold);
+        assert!(c.answerable(AwaitingSecret, t0 + Duration::from_millis(2), hold));
+
+        let mut c = CarriedMode::new();
+        c.answerable(AtPrompt, t0, hold);
+        assert!(c.answerable(Fullscreen, t0 + Duration::from_millis(1), hold));
     }
 }

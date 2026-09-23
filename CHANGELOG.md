@@ -655,6 +655,18 @@ is cut, named and published is in
 
 ### Fixed
 
+- **A pattern-less wait right after a key to a full-screen program could
+  answer from before the key** ([#248]). `send_input{data: "q"}` to `less`
+  and then `wait_for_pattern` with no pattern answered `Fullscreen` in under
+  a millisecond, 3 times in 10 here, because `less` had not read the `q`
+  yet — and an agent that believes it presses `q` again, leaving a stray `q`
+  at the shell. A `Fullscreen` or `AwaitingSecret` already showing at the
+  wait's first sample is now answered only once it has held for the settle
+  window, the evidence `AtPrompt` already needs; one the wait watched arrive
+  answers at once, as before, and a prompt that replaces a held one was
+  watched arriving too, so it answers without a second window. Re-measured:
+  0 stale answers in 10, the correct ones in about 50 ms.
+
 - **`wait_for` and `wait_for_pattern` could not match coloured output with a
   pattern written from the text an agent reads** ([#238]). cargo prints its
   verdict as `test result: \x1b[32mok\x1b[m`, so `wait_for: "test result:
@@ -2088,3 +2100,4 @@ residuals that are known and accepted.
 [#220]: https://github.com/Sertelegger/holdfast/issues/220
 [#240]: https://github.com/Sertelegger/holdfast/issues/240
 [#238]: https://github.com/Sertelegger/holdfast/issues/238
+[#248]: https://github.com/Sertelegger/holdfast/issues/248

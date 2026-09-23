@@ -2978,3 +2978,108 @@ async fn a_wait_for_written_from_the_text_matches_coloured_output() {
     );
     kill(&server, &id).await;
 }
+
+// ---------------------------------------------------------------------
+// GH #248 — a pattern-less wait right after a key to a full-screen program
+// ---------------------------------------------------------------------
+
+/// GH #248: `send_input{data: "q", append_newline: false}` to `less`, then
+/// a pattern-less wait, answered `Fullscreen` in 0.0 s two times in five —
+/// the mode from **before** the key, because `less` had not read it yet —
+/// and `status` said `AtPrompt` half a second later. An agent acting on
+/// that answer presses `q` again and leaves a stray `q` at the shell.
+///
+/// The mock reacts to the key the way `less` does, only *after* it
+/// arrives: the write hook starts a thread that leaves the alternate
+/// screen 100 ms later. That makes the losing interleaving the only one —
+/// the wait's first sample is always the stale `Fullscreen` — where the
+/// real program only loses it sometimes.
+///
+/// The settle window is widened to 2 s so what is asserted is *which*
+/// sample was answered, not how promptly the reacting thread was
+/// scheduled: the stale answer came back in well under a millisecond, and
+/// the fix holds a carried-over mode for the settle window.
+///
+/// **And the hold must not become a tax on the right answer.** The shell
+/// integration here is live, so the prompt that follows `less` is
+/// `AtPrompt` / `semantic`, and a wait that watched `Fullscreen` give way
+/// to it has watched the program finish — it answers then, not a settle
+/// window later. The 1.5 s bound is that half, with the 2 s window as its
+/// margin: measured on a real `less` before this bound existed, the fixed
+/// wait answered in ~300 ms where the unfixed one's correct answers took
+/// ~50 ms, and the difference was exactly one default settle window.
+#[tokio::test]
+async fn a_pattern_less_wait_right_after_a_key_to_a_full_screen_program_waits_for_the_key() {
+    use holdfast_core::detect::DetectionConfig;
+    use holdfast_core::mcp::tools::WaitForPatternArgs;
+    use holdfast_core::pty::{MockPty, PtyBackend};
+    use holdfast_core::session::{new_session_id, Session, SessionConfig};
+    use std::sync::Arc;
+
+    let server = HoldfastServer::new();
+    let pty = Arc::new(MockPty::new());
+    let session = Session::new(
+        new_session_id(),
+        None,
+        "bash".into(),
+        vec![],
+        Arc::clone(&pty) as Arc<dyn PtyBackend>,
+        SessionConfig {
+            detection: DetectionConfig {
+                settle_threshold_ms: 2_000,
+                ..DetectionConfig::default()
+            },
+            ..SessionConfig::default()
+        },
+    );
+    let id = session.id.clone();
+    server.registry.insert(session).expect("registry insert");
+
+    pty.queue_output(
+        b"\x1b]133;A;holdfast=1\x07$ \x1b]133;B;holdfast=1\x07less README.md\r\n\
+          \x1b]133;C;holdfast=1\x07\x1b[?1049h\x1b[H\x1b[2JREADME.md\r\n",
+    );
+    await_mode(&server, &id, "Fullscreen").await;
+
+    let weak = Arc::downgrade(&pty);
+    pty.on_write(move || {
+        let weak = weak.clone();
+        std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(100));
+            if let Some(pty) = weak.upgrade() {
+                pty.queue_output(
+                    b"\x1b[?1049l\x1b]133;D;0;holdfast=1\x07\
+                      \x1b]133;A;holdfast=1\x07$ \x1b]133;B;holdfast=1\x07",
+                );
+            }
+        });
+    });
+    keypress(&server, &id, "q").await;
+
+    let started = Instant::now();
+    let r = body(
+        &server
+            .wait_for_pattern(Parameters(WaitForPatternArgs {
+                session: id.clone(),
+                pattern: None,
+                timeout_secs: Some(20),
+                since_cursor: None,
+                max_bytes: None,
+            }))
+            .await
+            .expect("wait_for_pattern must not be a protocol error"),
+    );
+    assert_ne!(
+        r["data"]["interaction_mode"], "Fullscreen",
+        "answered from the sample before the key was read: {r}"
+    );
+    assert_eq!(r["status"], "ok", "{r}");
+    assert_eq!(r["data"]["interaction_mode"], "AtPrompt", "{r}");
+    assert_eq!(r["data"]["detection_tier"], "semantic", "{r}");
+    assert!(
+        started.elapsed() < Duration::from_millis(1_500),
+        "the wait watched the program leave and still sat out the settle \
+         window: {:?}",
+        started.elapsed()
+    );
+}
