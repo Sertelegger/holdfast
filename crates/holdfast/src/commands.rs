@@ -713,11 +713,13 @@ const FORCE_RPC_TIMEOUT: Duration = Duration::from_secs(2);
 /// would be a defect.** The daemon answers this method only *after* its
 /// own grace has run: `shutdown_graceful` SIGTERMs every live session,
 /// waits [`server::DEFAULT_STOP_GRACE_SECS`] — §3.2's ten — and then
-/// SIGKILLs whatever is left. An interactive shell ignores SIGTERM
-/// (§4.4) and therefore **always** reaches that escalation, so the full
-/// grace is the *ordinary* duration of this call rather than its worst
-/// case. A two-second bound would report failure on every stop that had
-/// a shell to kill, while the daemon went on stopping correctly.
+/// SIGKILLs whatever is left. Anything that ignores SIGTERM reaches that
+/// escalation, so the full grace is an *ordinary* duration of this call
+/// rather than a worst case: an interactive shell with a job that ignores
+/// SIGTERM, on any platform, and every interactive shell where a session
+/// cannot be enumerated for GH #234's hang-up (§4.4: a shell ignores
+/// SIGTERM). A two-second bound would report failure on every such stop,
+/// while the daemon went on stopping correctly.
 ///
 /// The five seconds on top cover the round trip and the SIGKILL sweep
 /// that follows the grace. The daemon's grace is the floor and this must
@@ -742,10 +744,13 @@ enum StopRpc {
 /// is told why it is taking so long (GH #20).
 ///
 /// Not a bound — [`STOP_RPC_TIMEOUT`] is — but the point past which silence
-/// reads as a hang. The ordinary cause is the whole of §3.2's grace: an
-/// interactive shell ignores `SIGTERM` (§4.4), so every stop with a shell
-/// in it waits the full ten seconds for the escalation, and it used to wait
-/// them without a word.
+/// reads as a hang. The cause is the whole of §3.2's grace, spent on a
+/// session process that ignores or outlasts `SIGTERM`, and it used to be
+/// spent without a word. Until GH #234 every stop with an interactive shell
+/// in it was that case (§4.4: a shell ignores `SIGTERM`); an idle shell
+/// alone in its session is now hung up, so what holds a stop is a job that
+/// kept its shell from being alone, a program, or a platform where a
+/// session cannot be enumerated.
 #[cfg(unix)]
 const STOP_PROGRESS_AFTER: Duration = Duration::from_secs(1);
 
@@ -825,8 +830,8 @@ fn stop_progress_note(status: Option<&server::DaemonStatus>) -> String {
     match status.map(|s| s.sessions_live) {
         Some(0) => "waiting for the daemon to finish stopping".to_string(),
         Some(n) => format!(
-            "waiting for {n} live session(s) to end — a shell ignores SIGTERM and is \
-             killed after {grace}s; `--force` does not wait"
+            "waiting for {n} live session(s) to end — a process that ignores SIGTERM \
+             is killed after {grace}s; `--force` does not wait"
         ),
         None => format!(
             "waiting for the daemon's sessions to end — up to {grace}s; `--force` does not wait"
@@ -4148,9 +4153,10 @@ mod tests {
     /// the grace the *daemon* takes before it answers.
     ///
     /// `shutdown_graceful` SIGTERMs every live session, waits
-    /// `DEFAULT_STOP_GRACE_SECS`, and only then SIGKILLs and replies. An
-    /// interactive shell ignores SIGTERM (§4.4) and therefore always
-    /// reaches that escalation, so the full grace is the **ordinary**
+    /// `DEFAULT_STOP_GRACE_SECS`, and only then SIGKILLs and replies.
+    /// Anything that ignores SIGTERM reaches that escalation — a shell with
+    /// such a job, or any interactive shell where GH #234's hang-up cannot
+    /// enumerate the session — so the full grace is an **ordinary**
     /// duration of this call. Reusing `FORCE_RPC_TIMEOUT` here — the
     /// obvious reading of "bound it like the force path" — would report
     /// failure on every stop that had a shell to kill, while the daemon

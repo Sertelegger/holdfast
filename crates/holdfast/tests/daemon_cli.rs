@@ -2866,9 +2866,11 @@ fn version_names_the_commit_it_was_built_from() {
 /// teardown and the directory came back — the issue's acceptance, as
 /// written: stop, remove the directory at once, and it stays gone.
 ///
-/// An interactive shell in the session makes it the issue's measured case
-/// too: it ignores `SIGTERM`, so the stop spends the whole grace, and it
-/// used to spend it without a word.
+/// A session that holds the stop for the whole grace makes it the issue's
+/// measured case too, and the stop used to spend that grace without a
+/// word. Until GH #234 any interactive shell did it, by ignoring
+/// `SIGTERM`; an idle shell alone in its session is now hung up at the
+/// sweep, so this one keeps a background job that ignores `SIGTERM`.
 #[test]
 fn daemon_stop_returns_once_the_daemon_is_gone_and_its_directory_stays_gone() {
     let env = TestEnv::new("stopwait");
@@ -2889,9 +2891,19 @@ fn daemon_stop_returns_once_the_daemon_is_gone_and_its_directory_stays_gone() {
     // SIGTERM that lands while bash is still starting, before it has set
     // itself up to ignore one, kills it at once — a fast stop with nothing
     // to wait for, and a red row that says nothing about the stop.
+    //
+    // **And it must not be alone in its session** (GH #234). An idle
+    // interactive shell with nothing else running is hung up at the
+    // SIGTERM sweep and the stop is over well inside a second — the fast
+    // path `session_context.rs`'s
+    // `daemon_stop_hangs_up_an_idle_shell_rather_than_waiting_out_its_grace`
+    // pins — so the progress note this row asserts would never be due.
+    // `trap ''` is inherited: the background `sleep` ignores SIGTERM too,
+    // survives the sweep, keeps the shell from being alone, and holds the
+    // stop until the SIGKILL that ends the grace.
     shim.call_tool(
         "send_input",
-        json!({ "session": session_id, "data": "echo READY''_MARK" }),
+        json!({ "session": session_id, "data": "trap '' TERM; sleep 600 & echo READY''_MARK" }),
     );
     let seen = shim.read_until(&session_id, "READY_MARK");
     assert!(
