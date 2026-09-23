@@ -914,7 +914,7 @@ pub async fn serve_stdio() -> anyhow::Result<()> {
 mod tests {
     use super::*;
 
-    /// Where the secret rule has to start by: the first quarter of the
+    /// Where the secret rule has to end by: the first quarter of the
     /// budget. Fitting the budget is what makes today's client read all of
     /// it; this is what keeps the rule first, so a client with a smaller
     /// cut — or a later edit that grows the text — loses the map at the
