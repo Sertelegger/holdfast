@@ -647,6 +647,19 @@ is cut, named and published is in
   optimized both.
 
 ### Fixed
+- **`git log` and `git diff` sat in `less` until the wait timed out** ([#239]).
+  A session inherited no `PAGER`, so git ran `less` with its default
+  `LESS=FRX`, and the `X` keeps it off the alternate screen: the session read
+  `Executing` rather than `Fullscreen`, `wait_for_pattern` ran to its
+  deadline, and the tail held one screen of the log above a `:`. Every
+  session now starts with `PAGER`, `GIT_PAGER`, `MANPAGER` and
+  `SYSTEMD_PAGER` set to `cat`, after the inherited environment and before
+  the call's own `env` — so a pager inherited from the user's environment
+  loses to them, and a caller that sets any of them in `start_session`'s
+  `env` gets the one it asked for. `GIT_PAGER` is the one that matters most:
+  it outranks `core.pager`, so a git config that pipes through `delta` or
+  `less -S` is covered too, where `PAGER` alone would not be.
+
 - **A session started without `cwd` ran in whichever project had spawned the
   shared daemon, with that project's environment** ([#229]). The daemon is
   shared by every MCP client on the machine and outlives them all, and it
@@ -2048,3 +2061,4 @@ residuals that are known and accepted.
 [#202]: https://github.com/Sertelegger/holdfast/issues/202
 [#206]: https://github.com/Sertelegger/holdfast/issues/206
 [#229]: https://github.com/Sertelegger/holdfast/issues/229
+[#239]: https://github.com/Sertelegger/holdfast/issues/239

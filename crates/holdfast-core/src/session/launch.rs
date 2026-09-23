@@ -70,11 +70,11 @@
 //! list the paragraph above argues against as a *fix*; as a fallback for
 //! the paths the fix cannot reach, it is strictly better than nothing.
 //!
-//! ## What every session is told
+//! ## Defaults every session gets (GH #239)
 //!
-//! `PWD`, set to the directory the session really starts in — applied
-//! after the inherited environment and before the call's own `env`, so a
-//! caller that sets it wins.
+//! [`PAGER_DEFAULTS`], and `PWD` set to the directory the session really
+//! starts in. Both are applied after the inherited environment and before
+//! the call's own `env`, so a caller that sets any of them wins.
 
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
@@ -244,8 +244,35 @@ pub fn names_the_spawning_client(key: &str) -> bool {
     key == "CLAUDECODE" || key.starts_with("CLAUDE_")
 }
 
-/// The variables Holdfast sets for every session — `PWD` naming `cwd` —
-/// minus any the call's own `env` sets.
+/// Pagers, off (GH #239).
+///
+/// A pager waits for a keystroke, and an agent reading a session's output
+/// does not send one. `git log` and `git diff` run `less` with git's
+/// default `LESS=FRX`: the `X` keeps it off the alternate screen, so the
+/// session reads `Executing` rather than `Fullscreen`, and a
+/// `wait_for_pattern` runs to its deadline with the first screen of the
+/// log on the tail and `:` as its last line. `cat` is the value every one
+/// of these tools documents as "no pager", and git treats it as exactly
+/// that rather than spawning it.
+///
+/// - `PAGER`: the generic fallback — `git`, `man`, `psql`, `systemctl`
+///   and most others read it when nothing more specific is set.
+/// - `GIT_PAGER`: git's own, which **outranks `core.pager`** — so a user
+///   whose git config pipes through `delta` or `less -S` is covered too,
+///   which `PAGER` alone would not be.
+/// - `MANPAGER`: outranks `PAGER` for `man`, and is commonly set.
+/// - `SYSTEMD_PAGER`: outranks `PAGER` for `systemctl` and `journalctl`.
+///
+/// A caller that wants a pager sets one in `start_session`'s `env`.
+pub const PAGER_DEFAULTS: [(&str, &str); 4] = [
+    ("PAGER", "cat"),
+    ("GIT_PAGER", "cat"),
+    ("MANPAGER", "cat"),
+    ("SYSTEMD_PAGER", "cat"),
+];
+
+/// The variables Holdfast sets for every session — [`PAGER_DEFAULTS`], and
+/// `PWD` naming `cwd` — minus any the call's own `env` sets.
 ///
 /// **`PWD`, because the inherited one names somebody else's directory.**
 /// A shell re-derives it when it disagrees with the real working
@@ -258,7 +285,11 @@ pub fn names_the_spawning_client(key: &str) -> bool {
 /// derived from it compare between runs.
 pub fn session_defaults(cwd: Option<&str>, explicit: &[(String, String)]) -> Vec<(String, String)> {
     let set_by_caller = |key: &str| explicit.iter().any(|(k, _)| k == key);
-    let mut out: Vec<(String, String)> = Vec::new();
+    let mut out: Vec<(String, String)> = PAGER_DEFAULTS
+        .iter()
+        .filter(|(k, _)| !set_by_caller(k))
+        .map(|(k, v)| ((*k).to_string(), (*v).to_string()))
+        .collect();
     if let Some(cwd) = cwd {
         if !set_by_caller("PWD") {
             out.push(("PWD".to_string(), cwd.to_string()));
@@ -422,17 +453,31 @@ mod tests {
         assert_eq!(old_shim, Host::Daemon { client: None });
     }
 
-    /// `PWD` names the directory the child runs in, unless the call's own
-    /// `env` set one.
+    /// GH #239: every default applies, and the caller's own `env` wins
+    /// over each one individually.
     #[test]
     fn the_callers_env_outranks_every_default() {
+        let all = session_defaults(Some("/b"), &[]);
         assert_eq!(
-            session_defaults(Some("/b"), &[]),
-            vec![("PWD".to_string(), "/b".to_string())]
+            all,
+            vec![
+                ("PAGER".to_string(), "cat".to_string()),
+                ("GIT_PAGER".to_string(), "cat".to_string()),
+                ("MANPAGER".to_string(), "cat".to_string()),
+                ("SYSTEMD_PAGER".to_string(), "cat".to_string()),
+                ("PWD".to_string(), "/b".to_string()),
+            ]
         );
-        let explicit = vec![("PWD".to_string(), "/elsewhere".to_string())];
-        assert!(session_defaults(Some("/b"), &explicit).is_empty());
+        let explicit = vec![
+            ("GIT_PAGER".to_string(), "less".to_string()),
+            ("PWD".to_string(), "/elsewhere".to_string()),
+        ];
+        let keys: Vec<String> = session_defaults(Some("/b"), &explicit)
+            .into_iter()
+            .map(|(k, _)| k)
+            .collect();
+        assert_eq!(keys, ["PAGER", "MANPAGER", "SYSTEMD_PAGER"]);
         // No directory, no `PWD` to set.
-        assert!(session_defaults(None, &[]).is_empty());
+        assert!(!session_defaults(None, &[]).iter().any(|(k, _)| k == "PWD"));
     }
 }

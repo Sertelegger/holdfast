@@ -1,5 +1,6 @@
 //! What a session's process starts from — its directory and its
-//! environment — on each of the hosts that can start one (GH #229).
+//! environment — on each of the hosts that can start one (GH #229,
+//! GH #239).
 //!
 //! These drive `start_session` itself, with real children, rather than
 //! `session::launch`'s pure rules: those have their own rows, and what
@@ -23,7 +24,7 @@ use holdfast_core::mcp::HoldfastServer;
 use holdfast_core::session::launch::{hosted_by_daemon, ClientLaunch};
 use rmcp::handler::server::wrapper::Parameters;
 use serde_json::Value;
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashMap};
 use std::path::PathBuf;
 use std::time::{Duration, Instant};
 
@@ -317,4 +318,69 @@ async fn in_process_a_session_inherits_this_processs_environment() {
     assert_eq!(seen["d"], here.to_str().unwrap(), "{seen:?}");
     assert_eq!(seen["pwd"], here.to_str().unwrap(), "{seen:?}");
     assert_eq!(seen["home"], std::env::var("HOME").unwrap(), "{seen:?}");
+}
+
+/// **GH #239.** Every session is handed a pager that does not wait, and
+/// the one git honours over its own config is among them.
+///
+/// `git var GIT_PAGER` prints the pager git *would* run, resolved through
+/// its whole precedence chain, without running it or needing a
+/// repository — so `-c core.pager=less` stands in for a user whose git
+/// config sets one. `PAGER=cat` alone does not beat that (`core.pager`
+/// outranks `PAGER`); only `GIT_PAGER` does, which is why a fix that set
+/// `PAGER` and stopped would fail here and pass a check of the variable.
+#[tokio::test]
+async fn every_session_gets_pagers_that_do_not_wait() {
+    let server = HoldfastServer::new();
+    let script = "printf 'PROBE_OUT git=[%s] pager=[%s] man=[%s] systemd=[%s]\\n' \
+                  \"$(git -c core.pager=less var GIT_PAGER)\" \"$PAGER\" \"$MANPAGER\" \
+                  \"$SYSTEMD_PAGER\"; sleep 30";
+    let id = start(
+        &server,
+        StartSessionArgs {
+            command: Some("/bin/sh".into()),
+            args: vec!["-c".into(), script.into()],
+            ..Default::default()
+        },
+    )
+    .await;
+    let seen = probe_line(&server, &id);
+    kill_all(&server);
+    assert_eq!(
+        seen["git"], "cat",
+        "git would page through something that waits: {seen:?}"
+    );
+    assert_eq!(seen["pager"], "cat", "{seen:?}");
+    assert_eq!(seen["man"], "cat", "{seen:?}");
+    assert_eq!(seen["systemd"], "cat", "{seen:?}");
+}
+
+/// The pairing: the defaults are defaults. A caller that asks for a pager
+/// gets the one it asked for, each variable on its own.
+#[tokio::test]
+async fn a_caller_that_sets_a_pager_gets_that_pager() {
+    let server = HoldfastServer::new();
+    let script = "printf 'PROBE_OUT git=[%s] pager=[%s] man=[%s]\\n' \
+                  \"$(git -c core.pager=less var GIT_PAGER)\" \"$PAGER\" \"$MANPAGER\"; sleep 30";
+    let mut env = HashMap::new();
+    env.insert("GIT_PAGER".to_string(), "more".to_string());
+    env.insert("PAGER".to_string(), "less -R".to_string());
+    let id = start(
+        &server,
+        StartSessionArgs {
+            command: Some("/bin/sh".into()),
+            args: vec!["-c".into(), script.into()],
+            env: Some(env),
+            ..Default::default()
+        },
+    )
+    .await;
+    let seen = probe_line(&server, &id);
+    kill_all(&server);
+    assert_eq!(seen["git"], "more", "{seen:?}");
+    assert_eq!(seen["pager"], "less -R", "{seen:?}");
+    assert_eq!(
+        seen["man"], "cat",
+        "a default the caller did not override stays: {seen:?}"
+    );
 }

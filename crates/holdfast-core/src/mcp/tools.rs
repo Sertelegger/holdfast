@@ -207,7 +207,9 @@ pub struct StartSessionArgs {
     #[serde(default)]
     pub cwd: Option<String>,
     /// Extra environment variables for the spawned process, on top of the
-    /// environment of the Holdfast MCP server your client launched. Do not
+    /// environment of the Holdfast MCP server your client launched. PAGER,
+    /// GIT_PAGER, MANPAGER and SYSTEMD_PAGER default to `cat`, because a
+    /// pager waits for keystrokes; set one here to get a pager back. Do not
     /// pass secrets: these values cross the MCP boundary (spec §5.2).
     #[serde(default)]
     pub env: Option<HashMap<String, String>>,
@@ -369,16 +371,16 @@ impl HoldfastServer {
         // runs.
         //
         // **Behind it, in order: the environment the child starts from,
-        // then Holdfast's own defaults** (GH #229). `base_env` is the
-        // calling client's environment for a command session in a daemon,
-        // the daemon's own minus the spawning client's identity otherwise,
-        // and `None` — inherit — in-process, where this process *is* the
-        // client's. The defaults (`PWD`) sit between the two, so an
-        // inherited value loses to them and the call's own `env` beats
-        // them both. They go into `cfg.env` ahead of `launch.env` rather
-        // than into the base, because in-process there is no base to put
-        // them in; a later entry for the same key replaces an earlier one
-        // at the spawn.
+        // then Holdfast's own defaults** (GH #229, GH #239). `base_env` is
+        // the calling client's environment for a command session in a
+        // daemon, the daemon's own minus the spawning client's identity
+        // otherwise, and `None` — inherit — in-process, where this process
+        // *is* the client's. The defaults (`PAGER=cat` and its three
+        // siblings, and `PWD`) sit between the two, so an inherited pager
+        // loses to them and the call's own `env` beats them both. They go
+        // into `cfg.env` ahead of `launch.env` rather than into the base,
+        // because in-process there is no base to put them in; a later
+        // entry for the same key replaces an earlier one at the spawn.
         let base_env = host.base_env(profiled, std::env::vars_os());
         cfg.env = crate::session::launch::session_defaults(cfg.cwd.as_deref(), &launch.env);
         cfg.env.extend(launch.env.iter().cloned());
@@ -609,8 +611,8 @@ impl HoldfastServer {
         // **`launch.env`, not `cfg.env`**: the keys *this call* supplied
         // (or the operator's profile did), which is what the field has
         // always recorded. `cfg.env` now also carries Holdfast's own
-        // defaults, and listing `PWD` on every session would record a
-        // default as though somebody had chosen it.
+        // defaults, and listing `PAGER` on every session would record a
+        // constant as though somebody had chosen it.
         let env_keys: Vec<&str> = {
             let mut keys: Vec<&str> = launch.env.iter().map(|(k, _)| k.as_str()).collect();
             keys.sort_unstable();
