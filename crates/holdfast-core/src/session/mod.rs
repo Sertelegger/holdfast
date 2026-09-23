@@ -33,6 +33,96 @@ use tokio::sync::broadcast;
 
 pub type SessionId = String;
 
+/// Whether `command args` starts an **interactive** shell — the kind
+/// that ignores `SIGTERM` and ends on `SIGHUP` (GH #234).
+///
+/// Its own list rather than `detect_shell`'s, which answers a different
+/// question (can Holdfast type an OSC 133 snippet into it?) for three
+/// shells. POSIX has every interactive shell ignore `SIGTERM`, so `sh`,
+/// `dash` and `ksh` sat out `terminate`'s grace exactly as `bash` did.
+///
+/// Refuses `-c` and a **script operand**: the first argument that is not
+/// an option — and not the value of one of the options listed, which take
+/// one — is a script, and a shell running a script is not interactive; it
+/// may be handling `SIGTERM` itself, and a hangup would cut that short.
+/// Wrong in the conservative direction, this costs the old behaviour: the
+/// escalation to `SIGKILL` after the grace.
+fn is_interactive_shell(command: &str, args: &[String]) -> bool {
+    const SHELLS: [&str; 9] = [
+        "bash", "zsh", "fish", "sh", "dash", "ksh", "mksh", "tcsh", "csh",
+    ];
+    const TAKES_A_VALUE: [&str; 8] = [
+        "-o",
+        "+o",
+        "-O",
+        "+O",
+        "--rcfile",
+        "--init-file",
+        "-C",
+        "--init-command",
+    ];
+    let base = command.rsplit('/').next().unwrap_or(command);
+    if !SHELLS.contains(&base) {
+        return false;
+    }
+    let mut expects_value = false;
+    for arg in args {
+        if expects_value {
+            expects_value = false;
+            continue;
+        }
+        if arg == "-c" || arg == "--" {
+            return false;
+        }
+        if arg.starts_with('-') || arg.starts_with('+') {
+            expects_value = TAKES_A_VALUE.contains(&arg.as_str());
+            continue;
+        }
+        return false;
+    }
+    true
+}
+
+#[cfg(test)]
+mod interactive_shell_tests {
+    use super::is_interactive_shell;
+
+    fn args(a: &[&str]) -> Vec<String> {
+        a.iter().map(|s| (*s).to_string()).collect()
+    }
+
+    /// Each refusal is a program that *handles* `SIGTERM` or may, where a
+    /// hangup would cut its cleanup short — so each is a row an
+    /// over-eager classifier fails, and each acceptance is a shell the
+    /// hangup exists for, which an over-cautious one fails.
+    #[test]
+    fn only_a_shell_with_no_script_is_interactive() {
+        for (command, a) in [
+            ("bash", &[][..]),
+            ("/bin/bash", &["--norc", "--noprofile"][..]),
+            ("zsh", &["-f"][..]),
+            ("fish", &["--no-config"][..]),
+            ("bash", &["-o", "vi"][..]),
+            ("bash", &["--rcfile", "my.rc", "-i"][..]),
+            ("sh", &[][..]),
+            ("/bin/dash", &["-i"][..]),
+        ] {
+            assert!(is_interactive_shell(command, &args(a)), "{command} {a:?}");
+        }
+        for (command, a) in [
+            ("bash", &["-c", "trap 'exit 77' TERM; sleep 9"][..]),
+            ("bash", &["script.sh"][..]),
+            ("bash", &["--norc", "script.sh"][..]),
+            ("bash", &["--", "script.sh"][..]),
+            ("python3", &[][..]),
+            ("bash", &["-lc", "make"][..]),
+            ("/usr/bin/env", &[][..]),
+        ] {
+            assert!(!is_interactive_shell(command, &args(a)), "{command} {a:?}");
+        }
+    }
+}
+
 /// How many frames the per-session output broadcast holds before a slow
 /// consumer starts losing them (§4.3's default). A consumer that lags gets
 /// `RecvError::Lagged` and resyncs from the ring buffer rather than from
@@ -2483,6 +2573,60 @@ impl Session {
         self.backend.signal_tree(sig)?;
         self.touch();
         Ok(())
+    }
+
+    /// Hang up an interactive shell that has nothing left in front of it
+    /// — what closing its terminal would do — and say whether a hangup
+    /// went out (GH #234).
+    ///
+    /// **Why this exists: an interactive shell ignores `SIGTERM`** (§4.4),
+    /// so `terminate`'s sweep reached every job and left the shell, and
+    /// every `terminate` of a `bash` session waited out its whole grace —
+    /// 5 s by default, measured at 5.16 s — before `SIGKILL` retired it.
+    /// `daemon stop` paid the same for each shell, at 10 s. `SIGHUP` is the
+    /// signal a shell is *built* to end on: a terminal closing sends it, and
+    /// an interactive shell answers by passing it to its jobs and exiting.
+    ///
+    /// **Three conditions, and each one is a case this must not touch:**
+    ///
+    /// - **The session's program is an interactive shell**, with no
+    ///   script operand (`is_interactive_shell`). A program that
+    ///   *handles* `SIGTERM` is doing its cleanup when this is asked, and a
+    ///   hangup's default action would cut it short; a shell ignoring the
+    ///   signal is doing nothing. `bash script.sh` is a shell by name and a
+    ///   program by behaviour, and is left to the escalation.
+    /// - **The shell is at its own prompt: the terminal's foreground group
+    ///   is the shell's.** A foreground job that caught `SIGTERM` and is
+    ///   cleaning up would receive the hangup from the shell, which passes
+    ///   it on — so the hangup waits until the job has finished and the
+    ///   shell has taken the terminal back. `None` from `foreground_group`
+    ///   is unknown and sends nothing: the pre-GH-#234 behaviour.
+    /// - **The leader has not been reaped**, so its pid still names it —
+    ///   the guard `PtyBackend::signal` states, kept by
+    ///   `PtyBackend::hang_up`, which is what delivers.
+    ///
+    /// The shell's exit status is then "killed by `SIGHUP`", which REQ-P-007
+    /// reports as `exit_code: 1`, exactly as the `SIGKILL` it replaces did.
+    pub fn hang_up_idle_shell(&self) -> bool {
+        if !is_interactive_shell(&self.command, &self.args) {
+            return false;
+        }
+        // The shell's own group is its pid (`setsid` in the child), so
+        // "the terminal's foreground group is the shell's" is this
+        // comparison. Unknown on either side sends nothing.
+        let Some(pid) = self.backend.pid().and_then(|p| i32::try_from(p).ok()) else {
+            return false;
+        };
+        if self.backend.foreground_group() != Some(pid) {
+            return false;
+        }
+        // The backend delivers, under its own reaped-leader guard; one
+        // that cannot answers `false` and the caller escalates as before.
+        let sent = self.backend.hang_up();
+        if sent {
+            self.touch();
+        }
+        sent
     }
 
     /// Stamp activity for an event that mutated the session without

@@ -510,6 +510,18 @@ impl SessionRegistry {
     /// *"until the registry cleans up the record, typically at daemon
     /// restart"*); this makes the cleanup happen on a bound rather than
     /// only on a restart.
+    ///
+    /// **A name that only an exited session carries is still not found —
+    /// but the refusal says whose it was** (GH #234). §4.1 keeps exited
+    /// sessions off the name space on purpose: a later session may take
+    /// the name, and a name that resolved to an exited session until then
+    /// and to a live one afterwards would make `status build` answer about
+    /// two different sessions depending on when it was asked. So the rule
+    /// stands, and what changes is the answer. `holdfast list` shows the
+    /// exited session *with* its name, and `holdfast logs <that name>`
+    /// used to answer a bare `session not found`, which reads as "there is
+    /// no such session" when the truth is "that session has ended; here is
+    /// the id that still reaches it".
     pub fn get(&self, id_or_name: &str) -> Result<Arc<Session>> {
         let records = self.records.read();
         if let Some(s) = records.live.get(id_or_name) {
@@ -523,7 +535,46 @@ impl SessionRegistry {
             .values()
             .find(|s| s.is_alive() && s.name.as_deref() == Some(id_or_name))
             .map(Arc::clone)
-            .ok_or_else(|| HoldfastError::SessionNotFound(id_or_name.to_string()))
+            .ok_or_else(|| {
+                HoldfastError::SessionNotFound(Self::not_found_detail(&records, id_or_name))
+            })
+    }
+
+    /// What a `session_not_found` says about `id_or_name`: the string
+    /// alone, or — when exited sessions carried it as a name — the string
+    /// and the ids that still reach them, newest first.
+    ///
+    /// Both places a finished session can be: the completed set, and the
+    /// live set between a child's death and the next sweep, where it is
+    /// already unnamed by §4.1's rule but not yet moved.
+    fn not_found_detail(records: &Records, id_or_name: &str) -> String {
+        let mut exited: Vec<&Arc<Session>> = records
+            .live
+            .values()
+            .filter(|s| !s.is_alive())
+            .chain(records.completed.iter())
+            .filter(|s| s.name.as_deref() == Some(id_or_name))
+            .collect();
+        if exited.is_empty() {
+            return id_or_name.to_string();
+        }
+        // Newest first: the one an operator reading `holdfast list` most
+        // likely means. Creation time, because it is set for every
+        // session and never moves.
+        exited.sort_by_key(|s| std::cmp::Reverse(s.created_at));
+        let ids: Vec<&str> = exited.iter().map(|s| s.id.as_str()).collect();
+        let (who, order) = match ids.len() {
+            1 => (format!("the session named `{id_or_name}` has"), ""),
+            n => (
+                format!("{n} sessions named `{id_or_name}` have"),
+                " (newest first)",
+            ),
+        };
+        format!(
+            "{id_or_name} — {who} exited, and an exited session is addressed by its id, \
+             not its name: {}{order}",
+            ids.join(", ")
+        )
     }
 
     pub fn remove(&self, id: &str) -> Option<Arc<Session>> {
@@ -744,6 +795,98 @@ mod tests {
             reg.get("build"),
             Err(HoldfastError::SessionNotFound(_))
         ));
+    }
+
+    /// **GH #234.** A name only an exited session carried is still
+    /// `session_not_found` — §4.1's rule — and the refusal now names the
+    /// id that still reaches it, in both sets a finished session can be in.
+    ///
+    /// The live set is the case `holdfast list` makes easy to hit: a
+    /// session that has just exited is listed with its name and sits in
+    /// the live set until the next sweep.
+    #[test]
+    fn a_name_only_an_exited_session_had_is_refused_with_the_id_that_reaches_it() {
+        let reg = SessionRegistry::with_defaults();
+        let (a, pa) = mock_session(Some("x79"));
+        let id = a.id.clone();
+        reg.insert(a).unwrap();
+        pa.exit(0);
+
+        let unswept = reg.get("x79").map(|s| s.id.clone());
+        let Err(HoldfastError::SessionNotFound(detail)) = unswept else {
+            panic!("§4.1: an exited session is not addressable by name; got {unswept:?}")
+        };
+        assert!(
+            detail.starts_with("x79 ") && detail.contains("exited") && detail.ends_with(&id),
+            "the refusal must say the named session exited and give its id: {detail:?}"
+        );
+
+        assert_eq!(reg.retire_exited(), 1);
+        let Err(HoldfastError::SessionNotFound(retired)) = reg.get("x79").map(|_| ()) else {
+            panic!("still not addressable by name once retired")
+        };
+        assert_eq!(retired, detail, "both sets must answer the same way");
+
+        // And the id it names does reach the session.
+        assert_eq!(reg.get(&id).unwrap().id, id);
+    }
+
+    /// The negatives that keep the hint honest: a string no session ever
+    /// carried gets the bare answer it always did, and a name a **live**
+    /// session holds still resolves to that live session — the hint is
+    /// only ever an explanation of a refusal, never a second lookup.
+    #[test]
+    fn the_hint_names_only_exited_holders_of_that_exact_name() {
+        let reg = SessionRegistry::with_defaults();
+        let (old, p_old) = mock_session(Some("build"));
+        let old_id = old.id.clone();
+        reg.insert(old).unwrap();
+        p_old.exit(0);
+        let (other, p_other) = mock_session(Some("build-2"));
+        let other_id = other.id.clone();
+        reg.insert(other).unwrap();
+        p_other.exit(0);
+
+        let Err(HoldfastError::SessionNotFound(bare)) = reg.get("nothing").map(|_| ()) else {
+            panic!("an unknown string is not found")
+        };
+        assert_eq!(bare, "nothing", "no session ever had that name");
+
+        let Err(HoldfastError::SessionNotFound(one)) = reg.get("build").map(|_| ()) else {
+            panic!("build has only exited holders")
+        };
+        assert!(one.ends_with(&old_id), "{one:?}");
+        assert!(
+            !one.contains(&other_id),
+            "a session with a different name must not be offered: {one:?}"
+        );
+
+        let (live, _p_live) = mock_session(Some("build"));
+        let live_id = live.id.clone();
+        reg.insert(live).unwrap();
+        assert_eq!(
+            reg.get("build").unwrap().id,
+            live_id,
+            "a live holder of the name still wins outright"
+        );
+
+        // Two exited holders: both ids, newest first.
+        let (again, p_again) = mock_session(Some("x"));
+        let first = again.id.clone();
+        reg.insert(again).unwrap();
+        p_again.exit(0);
+        std::thread::sleep(std::time::Duration::from_millis(2));
+        let (twice, p_twice) = mock_session(Some("x"));
+        let second = twice.id.clone();
+        reg.insert(twice).unwrap();
+        p_twice.exit(0);
+        let Err(HoldfastError::SessionNotFound(both)) = reg.get("x").map(|_| ()) else {
+            panic!("x has only exited holders")
+        };
+        assert!(
+            both.ends_with(&format!("{second}, {first} (newest first)")),
+            "{both:?}"
+        );
     }
 
     #[test]

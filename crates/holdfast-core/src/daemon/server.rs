@@ -793,9 +793,21 @@ impl Daemon {
             // stop` cost ten seconds would be a tax on the common case.
             if !self.clock.is_manual() {
                 let deadline = self.clock.now() + grace;
+                // GH #234: an interactive shell ignores the `SIGTERM`
+                // above and ends on a hangup, once it has nothing in front
+                // of it. Without this, every shell session held `daemon
+                // stop` for the whole grace — measured at 10.1 s for one
+                // idle `bash` — and that is the upgrade path GH #231 is
+                // about. Once per session, on the first poll it qualifies.
+                let mut hung_up = vec![false; live.len()];
                 while self.clock.now() < deadline {
                     if live.iter().all(|s| !s.is_alive()) {
                         break;
+                    }
+                    for (session, done) in live.iter().zip(hung_up.iter_mut()) {
+                        if !*done {
+                            *done = session.hang_up_idle_shell();
+                        }
                     }
                     let next = (self.clock.now() + STOP_POLL_INTERVAL).min(deadline);
                     self.clock.sleep_until(next).await;

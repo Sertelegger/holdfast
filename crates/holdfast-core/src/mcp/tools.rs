@@ -1748,7 +1748,17 @@ impl HoldfastServer {
         } else {
             let _ = session.signal_tree(crate::pty::Signal::Terminate);
             let deadline = std::time::Instant::now() + std::time::Duration::from_millis(grace_ms);
+            // GH #234: an interactive shell ignores the `SIGTERM` above,
+            // so without this every `bash` session sat out the whole grace
+            // before the `SIGKILL` below. Asked on every poll, because the
+            // shell only qualifies once its foreground job — which got the
+            // `SIGTERM` and may be cleaning up — has finished; see
+            // `Session::hang_up_idle_shell` for what it will not touch.
+            let mut hung_up = false;
             while session.tree_alive() && std::time::Instant::now() < deadline {
+                if !hung_up {
+                    hung_up = session.hang_up_idle_shell();
+                }
                 tokio::time::sleep(std::time::Duration::from_millis(50)).await;
             }
             if session.tree_alive() {

@@ -609,6 +609,21 @@ impl PtyBackend for InProcessPty {
         }
     }
 
+    /// GH #234. The child's own group only — the shell, when the caller
+    /// has established that the shell is what holds the terminal — and
+    /// under `signal`'s guard: once the leader is reaped its pid, and so
+    /// its group id, may name a stranger.
+    #[cfg(unix)]
+    fn hang_up(&self) -> bool {
+        if !self.is_alive() {
+            return false;
+        }
+        let Some(g) = self.pgid() else {
+            return false;
+        };
+        self.deliver(g, libc::SIGHUP).is_ok()
+    }
+
     fn resize(&self, cols: u16, rows: u16) -> Result<()> {
         self.master
             .lock()

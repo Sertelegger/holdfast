@@ -1,5 +1,7 @@
 //! A shared daemon, driven by more than one client, through real shims:
-//! whose directory and environment a session starts from (GH #229).
+//! whose directory and environment a session starts from (GH #229), and
+//! how long the daemon takes to let go of a shell when it is stopped
+//! (GH #234).
 //!
 //! `daemon_cli.rs` is this file's neighbour and owns the general
 //! process-level suite. These rows live apart because they are about one
@@ -51,6 +53,34 @@ impl Instance {
         // as `daemon_cli.rs`'s `TestEnv::cmd` does and for its reason.
         c.env("XDG_CONFIG_HOME", self.dir.with_extension("xdg"));
         c
+    }
+
+    fn run(&self, args: &[&str]) -> (i32, String, String) {
+        let mut child = self
+            .cmd()
+            .args(args)
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .expect("run holdfast");
+        let deadline = Instant::now() + Duration::from_secs(60);
+        loop {
+            if let Some(status) = child.try_wait().expect("wait") {
+                let out = child.wait_with_output().expect("output");
+                return (
+                    status.code().unwrap_or(-1),
+                    String::from_utf8_lossy(&out.stdout).into_owned(),
+                    String::from_utf8_lossy(&out.stderr).into_owned(),
+                );
+            }
+            if Instant::now() >= deadline {
+                let _ = child.kill();
+                let _ = child.wait();
+                panic!("`holdfast {}` did not exit within 60s", args.join(" "));
+            }
+            std::thread::sleep(Duration::from_millis(25));
+        }
     }
 
     fn daemon_pid(&self) -> Option<u32> {
@@ -309,5 +339,94 @@ fn no_daemon_mode_starts_sessions_in_its_clients_project_too() {
         format!("WHERE_OUT d=[{}] project=[{}]", b.path(), b.path())
     );
     assert_eq!(inst.daemon_pid(), None, "--no-daemon must start no daemon");
+    shim.kill();
+}
+
+/// **GH #234, on the daemon's side.** `daemon stop` sends every session
+/// the `SIGTERM` an interactive shell ignores, and used to wait out its
+/// whole grace — 10 s by default, measured at 10.1 s for one idle `bash`
+/// — before `SIGKILL`. That is the stop half of every upgrade, which is
+/// the loop GH #231 is about. The shell is now hung up once it has
+/// nothing in front of it, and the stop returns in a fraction of the
+/// grace.
+///
+/// `daemon/stop` is answered only after `shutdown_graceful` has finished
+/// with the sessions, so the command's own duration is the measurement.
+/// Half the default grace is the bar; before the fix the whole of it was
+/// spent, so the two outcomes are five seconds apart.
+#[test]
+fn daemon_stop_hangs_up_an_idle_shell_rather_than_waiting_out_its_grace() {
+    let inst = Instance::new("stop");
+    let here = Project::new(&inst, "proj");
+    let mut shim = Shim::launch(&inst, &here.0, &[], &["mcp"]);
+    let started = shim.call(
+        "start_session",
+        json!({ "command": "bash", "args": ["--norc", "--noprofile"] }),
+    );
+    let id = envelope(&started)["data"]["session_id"]
+        .as_str()
+        .expect("a session")
+        .to_string();
+    let ready = shim.call(
+        "send_input",
+        json!({ "session": id, "data": "echo READY''_MARK", "wait_for": "READY_MARK" }),
+    );
+    assert_eq!(envelope(&ready)["data"]["matched"], true, "{ready}");
+
+    let begun = Instant::now();
+    let (code, out, err) = inst.run(&["daemon", "stop"]);
+    let took = begun.elapsed();
+
+    assert_eq!(code, 0, "stdout {out:?} stderr {err:?}");
+    assert!(
+        out.contains("1 session(s) terminated"),
+        "the stop did not report the session it ended: {out:?}"
+    );
+    assert!(
+        took < Duration::from_secs(5),
+        "`daemon stop` took {took:?} against a 10 s grace: the shell sat out the \
+         SIGTERM it ignores"
+    );
+    shim.kill();
+}
+
+/// **GH #234, the operator's half.** `holdfast list` shows an exited
+/// session with its name, and `holdfast logs <that name>` answered a bare
+/// `session not found` — which reads as "no such session" when the truth
+/// is "it ended; here is the id that still reaches it". §4.1 keeps
+/// exited sessions off the name space, so the name is still refused; the
+/// refusal now names the id, and the id works.
+#[test]
+fn an_exited_sessions_name_is_refused_with_the_id_that_reaches_it() {
+    let inst = Instance::new("name");
+    let here = Project::new(&inst, "proj");
+    let mut shim = Shim::launch(&inst, &here.0, &[], &["mcp"]);
+    let started = shim.call(
+        "start_session",
+        json!({
+            "command": "/bin/sh",
+            "args": ["-c", "echo FINAL''_WORDS; exit 0"],
+            "name": "x79",
+        }),
+    );
+    let id = envelope(&started)["data"]["session_id"]
+        .as_str()
+        .expect("a session")
+        .to_string();
+    let deadline = Instant::now() + Duration::from_secs(15);
+    while envelope(&shim.call("status", json!({ "session": id })))["data"]["state"] != "Exited" {
+        assert!(Instant::now() < deadline, "the session never exited");
+        std::thread::sleep(Duration::from_millis(50));
+    }
+
+    let (code, _, err) = inst.run(&["logs", "x79"]);
+    assert_eq!(code, 1, "{err}");
+    assert!(
+        err.contains("session_not_found") && err.contains(&id),
+        "the refusal must name the id that still reaches the session: {err:?}"
+    );
+    let (code, out, err) = inst.run(&["logs", &id]);
+    assert_eq!(code, 0, "{err}");
+    assert!(out.contains("FINAL_WORDS"), "{out:?}");
     shim.kill();
 }

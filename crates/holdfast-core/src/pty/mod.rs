@@ -233,6 +233,22 @@ pub trait PtyBackend: Send + Sync {
         self.signal(sig)
     }
 
+    /// Hang up the child — `SIGHUP` to its own process group, which is
+    /// what a terminal closing delivers — and say whether it went out
+    /// (GH #234).
+    ///
+    /// **Not a [`Signal`] variant**, because §7.5's attach `Signal` frame
+    /// maps onto that enum and `term` there means exactly `SIGTERM`; a
+    /// hangup is a step inside `terminate`'s escalation, not a signal a
+    /// client can name. `Session::hang_up_idle_shell` decides *when*.
+    ///
+    /// Defaults to `false`, delivering nothing, so a backend that cannot —
+    /// the mock, and any platform without the signal — behaves exactly as
+    /// every backend did before this existed.
+    fn hang_up(&self) -> bool {
+        false
+    }
+
     /// Resize the terminal, triggering `SIGWINCH` in the child.
     fn resize(&self, cols: u16, rows: u16) -> Result<()>;
 

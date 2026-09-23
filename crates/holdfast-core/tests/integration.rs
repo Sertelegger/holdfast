@@ -1239,15 +1239,24 @@ async fn read_output_tail_lines_respects_max_bytes() {
 #[cfg(unix)]
 #[tokio::test]
 async fn terminate_without_force_escalates_to_sigkill_for_a_sigterm_immune_child() {
-    // The normal production path: an interactive bash IGNORES SIGTERM, so
-    // every real terminate(force=false) must escalate to SIGKILL. The
+    // An interactive bash IGNORES SIGTERM. Since GH #234 an idle one is
+    // hung up instead (`tests/terminate_hangup.rs`), so this shell also
+    // ignores SIGHUP — which leaves SIGKILL as the only thing that can
+    // retire it, and keeps this row about the escalation branch. The
     // existing SIGTERM test uses a child that traps and exits, so it never
-    // reaches the escalation branch. A regression inverting that branch
-    // would leave real shells alive while terminate reported ok.
+    // reaches that branch. A regression inverting it would leave such
+    // shells alive while terminate reported ok.
     let server = HoldfastServer::new();
     let id = start_bash(&server).await;
     let session = server.registry.get(&id).unwrap();
     let pid = session.pid().expect("pid") as i32;
+    session
+        .write_input(b"trap '' HUP; echo HUP''_IGNORED\n")
+        .unwrap();
+    assert!(
+        wait_for_buffer(&session, "HUP_IGNORED").contains("HUP_IGNORED"),
+        "the shell never confirmed it ignores SIGHUP, so a hangup could pass for the escalation"
+    );
 
     let r = server
         .terminate(Parameters(TerminateArgs {

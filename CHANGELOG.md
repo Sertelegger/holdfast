@@ -647,6 +647,29 @@ is cut, named and published is in
   optimized both.
 
 ### Fixed
+- **`terminate` on a shell took its whole grace, and `daemon stop` the whole
+  of its own** ([#234]). An interactive shell ignores `SIGTERM` (§4.4), so
+  the sweep reached every job and left the shell, and `terminate` of any
+  `bash` session waited its 5 s default before `SIGKILL` — measured at
+  5.16 s — while `daemon stop` waited 10 s for each shell (10.1 s for one
+  idle `bash`). A shell is now **hung up** — `SIGHUP`, what closing its
+  terminal sends, which it answers by passing the hangup to its jobs and
+  exiting — once it is back at its own prompt: the terminal's foreground
+  group is the shell's, so a foreground job that caught the `SIGTERM` and is
+  cleaning up finishes first. Only an interactive shell is hung up (no `-c`,
+  no script operand); a program that handles `SIGTERM` itself is left to it
+  and to the escalation, as before. Measured after: 0.18 s for the reported
+  case, background jobs included. The exit code a hung-up shell reports is
+  still `1` — REQ-P-007's documented limitation, which the `SIGKILL` it
+  replaces reported too. The idle reaper still waits out its grace for a
+  shell; it is a background path and was left alone.
+- **An exited session's name, as `holdfast list` shows it, answered a bare
+  `session not found`** ([#234]). §4.1 keeps exited sessions off the name
+  space, so `holdfast logs x79` and `status x79` are still refused once `x79`
+  has exited — but the refusal now says the session with that name has
+  exited and gives the id that still reaches it, newest first when several
+  have carried the name.
+
 - **`git log` and `git diff` sat in `less` until the wait timed out** ([#239]).
   A session inherited no `PAGER`, so git ran `less` with its default
   `LESS=FRX`, and the `X` keeps it off the alternate screen: the session read
@@ -2062,3 +2085,4 @@ residuals that are known and accepted.
 [#206]: https://github.com/Sertelegger/holdfast/issues/206
 [#229]: https://github.com/Sertelegger/holdfast/issues/229
 [#239]: https://github.com/Sertelegger/holdfast/issues/239
+[#234]: https://github.com/Sertelegger/holdfast/issues/234
