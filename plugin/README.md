@@ -21,7 +21,9 @@ draft, and a draft's assets are not served until a person promotes it
 ([CONTRIBUTING.md](../CONTRIBUTING.md#releases)); `v0.0.5` to `v0.0.7` were
 published with no binaries at all. Against either, the server fails to start,
 and `claude mcp list` says why in one line: *no holdfast vX.Y.Z
-binary to download … To run Holdfast now, build it*. That line is the way in:
+binary to download … To run Holdfast now, build it* (measured on Linux; on
+Windows the entrypoint is [unverified](#the-windows-entrypoint-is-an-open-question)).
+That line is the way in:
 [Using a binary you built yourself](#using-a-binary-you-built-yourself).
 
 `holdfast@holdfast` is `<plugin>@<marketplace>`. The right-hand `holdfast` is

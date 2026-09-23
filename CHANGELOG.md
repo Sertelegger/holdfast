@@ -36,7 +36,9 @@ is cut, named and published is in
   most five seconds for a request that never comes. The not-published message
   is written to fit the 500 characters `claude mcp list` shows before it cuts
   the line, and a harness row holds it there. `bootstrap.ps1` answers the same
-  way, and the harness runs it under `pwsh` on Linux; **on Windows itself that
+  way — including when it cannot create its cache or temp directory, which
+  was an uncaught PowerShell error — and the harness runs it under `pwsh` on
+  Linux; **on Windows itself that
   is unverified**, as the Windows entrypoint that would reach it is, so a
   Windows install may still see `CONNECTION_CLOSED` ([#237]).
 
@@ -255,24 +257,33 @@ is cut, named and published is in
   request points the listing at a `git-subdir` pin of `plugin/` at that tag
   **and its commit**. `scripts/plugin-manifest-check.py` accepts `"./plugin"`
   or exactly that shape — this repository's URL, `path: "plugin"`, a `vX.Y.Z`
-  ref no newer than `Cargo.toml`, a full sha — and, in a clone that has the
-  tag, checks the sha against it and the pinned tree's `plugin.json` against
-  the ref. Each refusal has a breakage fixture — the tag half's in a fixture
-  made a git clone with the tag in it, so they run in CI, whose own checkout
-  has no tags — and the self-test gains its first *acceptance* fixtures, so a
-  rule that refused every pin — the rule as it stood — now fails it. The
-  listing
-  itself stays `"./plugin"` until a release whose tag contains `plugin/` is
-  promoted: `v0.0.7`'s does not, and the check refuses that pin.
-  `release.yml`'s post-draft checklist names the step ([#237]).
+  ref no newer than `Cargo.toml`, a full sha — checks the sha against the tag
+  and the pinned tree's `plugin.json` against the ref, and asks the release
+  whether it serves its `SHA256SUMS.txt`. **That last one is the rule the
+  pin exists for**: a release that is tagged and still a draft satisfies every
+  other one, `Cargo.toml` having already moved to it, and serves nothing, so
+  a pin to it is this failure again. CI's `plugin` job fetches the tags, and
+  under CI a tag that is not there, or a release that does not answer, fails
+  rather than skips. Each refusal has a breakage fixture — the tag half's in
+  a fixture made a git clone with the tag in it, the served half's against a
+  local release server — and the self-test gains its first *acceptance*
+  fixtures, so a rule that refused every pin — the rule as it stood — now
+  fails it. The listing itself stays `"./plugin"` until a release whose tag
+  contains `plugin/` is promoted: `v0.0.7`'s does not, and the check refuses
+  that pin, in CI too — its tree has no `plugin.json`, and it serves no
+  assets. `release.yml`'s post-draft checklist names the step ([#237]).
 
 - **`HOLDFAST_BOOTSTRAP_ALLOW_PATH` compares the version whole, and says when
   it declines.** It was `grep -q "$version"` over `holdfast version`'s output
   — a regex, unanchored, which `holdfast 0.1.00` and `10.1.0` both satisfy for
   `0.1.0` — and a mismatch or a missing binary fell back to the download in
   silence. The second field must now equal `version.txt`, and a refusal is one
-  stderr line at once and a parenthesis on any later failure's message, which
-  is the line Claude Code shows ([#237]).
+  stderr line at once and the start of any later failure's message, which is
+  the line Claude Code shows — the start, because `claude mcp list` shows 500
+  characters of it and the not-published message is most of them. The probe
+  runs with stdin from `/dev/null`: Claude Code's `initialize` is waiting on
+  the real one, and a `holdfast` that read it there took it from the server
+  ([#237]).
 
 - **`scripts/ci-hygiene.sh`'s release-trigger gate is an allowlist.** It was a
   denylist of four triggers — `branches`, `schedule`, `pull_request`,
@@ -772,13 +783,25 @@ is cut, named and published is in
   403 or a 503 was called "unpublished, a draft, or without binaries". The
   bootstrap now reads the status line wget prints under `-S` — the last one,
   since a release asset is a redirect — so 404, any other status and no answer
-  at all get the same three messages under curl, GNU wget and busybox wget. It
+  at all get the same three messages under curl, GNU wget and busybox wget. A
+  redirect whose target never answers is no answer, under all three: its last
+  status is the redirect's own, and a firewall that passes `github.com` and
+  not the host release assets are served from read *"answered HTTP 302 —
+  retry later"* rather than the air-gapped advice (measured). It
   also runs wget with one try, as curl runs: GNU wget's default retries a
   dropped or silent connection twenty times with a growing wait — minutes for
   a dropped one (measured), and up to twenty 120-second read timeouts for a
   silent one. `scripts/plugin-bootstrap-tests.sh`
   runs every wget it finds on a `$PATH` with no curl, and CI now installs both
   (review of [#237]).
+- **A signal during the plugin bootstrap's download ends it.** `HUP`, `INT`
+  and `TERM` were trapped to remove the download's temp directory, and the
+  bootstrap then carried on — into a fetch, a checksum and an extraction whose
+  paths were all inside the directory it had just removed, until one of them
+  failed and said something else. It now exits, `128+n`, and removes the
+  directory on the way out. Its one probe of a freshly installed binary runs
+  it with stdin from `/dev/null`, so it cannot take the `initialize` request
+  the binary is exec'd to answer (review of [#237]).
 - **The guard that was supposed to refuse an empty release body could not
   fire, and the release procedure did not mention `Cargo.lock`.** Both are
   release-time defects that no test or check would have caught, because the
