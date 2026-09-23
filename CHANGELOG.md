@@ -221,17 +221,19 @@ is cut, named and published is in
 
 - **A progress bar reads back as its last frame** ([#247]). `cargo build` and
   most progress bars redraw a line by returning to column 0 with `\r` and
-  erasing it, so the byte stream holds every frame and a terminal shows one;
-  a nine-second build read back as mostly `Building [...]` redraws, and a
-  400-step bar returned 32 KB to `tail_lines: 3`. Under `ansi: "strip"` a line
-  the stream itself erases — `\r` then an erase-in-line, or `\r` then a
-  redraw that ends in one — is now not shown. Nothing a terminal still shows
-  is dropped: a `\r` followed by a shorter line with no erase, a tab, a
-  backspace or a cursor movement is left as it was, and so is everything under
-  `ansi: "raw"`. The cursor, `bytes_returned` and every flag are unchanged,
-  because the bytes were read, only not shown; a frame a redaction touches is
-  kept with its marker; and the shortened page is itself judged, because
-  removing a frame joins the text either side of it.
+  erasing it, so the byte stream holds every frame and a terminal shows one; a
+  nine-second build read back as mostly `Building [...]` redraws, and a 400-step
+  bar returned 32 KB to `tail_lines: 3`. Under `ansi: "strip"` a line the stream
+  itself erases — `\r` then an erase-in-line, or `\r` then a redraw that ends in
+  one — is now not shown. Nothing a terminal still shows is dropped: a `\r`
+  followed by a shorter line with no erase, a tab, a backspace or a cursor
+  movement is left as it was, so is a line a cursor move or a screen switch
+  separates from the erase, and so is everything under `ansi: "raw"` — a
+  property test replays each dropped range through a terminal emulator to check
+  it. The cursor, `bytes_returned` and every flag are unchanged, because the
+  bytes were read, only not shown; a frame a redaction touches is kept with its
+  marker; and the shortened page is itself judged, because removing a frame
+  joins the text either side of it.
 
 - **`scripts/ci-hygiene.sh`'s release-trigger gate is an allowlist.** It was a
   denylist of four triggers — `branches`, `schedule`, `pull_request`,
