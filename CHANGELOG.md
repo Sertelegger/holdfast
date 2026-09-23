@@ -13,6 +13,29 @@ is cut, named and published is in
 
 ### Added
 
+- **`HOLDFAST_BOOTSTRAP_BIN=/absolute/path/to/holdfast`** makes the plugin's
+  bootstrap exec exactly that binary — no `$PATH` search, no version
+  comparison, no download — so the plugin can run a build from source: a
+  checkout being dogfooded, a platform with no prebuilt, a release that is not
+  promoted yet. Set it in the `env` block of Claude Code's `settings.json`.
+  **An absolute path or a refusal, and no fallback**: the bootstrap runs in
+  whichever project Claude Code was started in, so a relative path names a
+  different file in each, and a user who named a binary and silently got a
+  downloaded one is debugging the wrong program. A leading `~` or `$` is
+  refused by name, because Claude Code passes `settings.json` values literally
+  (measured). It is checked before `version.txt` and `uname`, so it works on a
+  target with no release asset. `bootstrap.ps1` has the same arm ([#237]).
+- **A bootstrap that cannot start the server now says why in Claude Code.**
+  It used to exit 1 with its diagnosis on stderr, which Claude Code files in a
+  jsonl log under `~/.cache` and shows as `Failed to connect — CONNECTION_CLOSED`
+  (measured, 2.1.280). Under `mcp` it now reads the `initialize` request
+  already waiting on stdin and answers it with a JSON-RPC error carrying the
+  diagnosis, which `claude mcp list` shows as `-32603: <the reason>`. It reads
+  nothing on any success path, nothing when stdin is a terminal, and waits at
+  most five seconds for a request that never comes. The not-published message
+  is written to fit the 500 characters `claude mcp list` shows before it cuts
+  the line, and a harness row holds it there ([#237]).
+
 - A `windows-2022` CI job: native MSVC clippy over `--all-targets`, the source
   guards, the `#[cfg(windows)]` CLI arms executed, and a filtered `--lib` over
   the modules whose Windows arm differs from its Unix one. The full `--lib` is
@@ -218,6 +241,14 @@ is cut, named and published is in
   ENOENT), the committed exec bit, and the version lockstep below.
 
 ### Changed
+
+- **`HOLDFAST_BOOTSTRAP_ALLOW_PATH` compares the version whole, and says when
+  it declines.** It was `grep -q "$version"` over `holdfast version`'s output
+  — a regex, unanchored, which `holdfast 0.1.00` and `10.1.0` both satisfy for
+  `0.1.0` — and a mismatch or a missing binary fell back to the download in
+  silence. The second field must now equal `version.txt`, and a refusal is one
+  stderr line at once and a parenthesis on any later failure's message, which
+  is the line Claude Code shows ([#237]).
 
 - **`scripts/ci-hygiene.sh`'s release-trigger gate is an allowlist.** It was a
   denylist of four triggers — `branches`, `schedule`, `pull_request`,
@@ -647,6 +678,21 @@ is cut, named and published is in
   optimized both.
 
 ### Fixed
+- **The plugin bootstrap's "release not found" message sent everyone to a
+  manual download that does not exist.** One sentence covered two failures —
+  *"is the release published, and is this host online?"* — and then told the
+  user to fetch the assets by hand from the releases page, which for an
+  unpublished release, a draft, or `v0.0.5`–`v0.0.7` (published with no
+  assets) has nothing on it. A 404 is now *"no holdfast vX.Y.Z binary to
+  download"* with the from-source route — the `cargo install --git … --tag
+  vX.Y.Z` line and `HOLDFAST_BOOTSTRAP_BIN` — and only a host that reaches no
+  server at all gets the air-gapped placement. That placement also named only
+  the binary: a binary without its `SHA256SUMS-vX.Y.Z.txt` beside it is a cache
+  miss, so following it re-downloaded forever. It names both now. Every other
+  dead end that said *"install holdfast manually from …/releases"* points at the
+  from-source route instead. `bootstrap.ps1` matches, and its `Die` writes one
+  plain stderr line rather than a `Write-Error` record that pwsh wraps at the
+  console width and colours ([#237]).
 - **The guard that was supposed to refuse an empty release body could not
   fire, and the release procedure did not mention `Cargo.lock`.** Both are
   release-time defects that no test or check would have caught, because the
@@ -2011,3 +2057,4 @@ residuals that are known and accepted.
 [#203]: https://github.com/Sertelegger/holdfast/issues/203
 [#202]: https://github.com/Sertelegger/holdfast/issues/202
 [#206]: https://github.com/Sertelegger/holdfast/issues/206
+[#237]: https://github.com/Sertelegger/holdfast/issues/237

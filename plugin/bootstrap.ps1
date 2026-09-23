@@ -11,10 +11,42 @@
 Set-StrictMode -Version 2.0
 $ErrorActionPreference = 'Stop'
 
-$UrlManual = 'https://github.com/Sertelegger/holdfast/releases'
+$UrlReleases = 'https://github.com/Sertelegger/holdfast/releases'
 $UrlSource = 'https://github.com/Sertelegger/holdfast#build-and-try-it'
+$UrlOwnBin = 'https://github.com/Sertelegger/holdfast/tree/main/plugin#using-a-binary-you-built-yourself'
+$RepoGit = 'https://github.com/Sertelegger/holdfast'
 
-function Die([string]$msg) { Write-Error "holdfast bootstrap: $msg"; exit 1 }
+# One plain line on stderr, the same shape `bootstrap` writes. Not
+# Write-Error: under `$ErrorActionPreference = 'Stop'` that throws a
+# formatted error record instead, which pwsh 7 wraps at the console width and
+# decorates with ANSI colour, so the MCP log holds a word-wrapped box rather
+# than the sentence, and the `exit 1` after it never runs.
+function Die([string]$msg) { [Console]::Error.WriteLine("holdfast bootstrap: $msg"); exit 1 }
+
+# --- 0. an explicitly named binary ----------------------------------------
+# HOLDFAST_BOOTSTRAP_BIN, exactly as the Unix `bootstrap` treats it: exec that
+# file, no download, no version comparison, and a refusal rather than a
+# fallback when it is not usable. Above everything it makes irrelevant.
+# "Absolute" means drive-qualified or UNC on Windows -- `\foo` and `C:foo`
+# are rooted there but resolve against the current drive or directory, which
+# is whichever project Claude Code was started in. The `/` arm is pwsh on a
+# Unix host, which is where scripts/plugin-bootstrap-tests.sh runs this.
+if ($env:HOLDFAST_BOOTSTRAP_BIN) {
+    $Bin = $env:HOLDFAST_BOOTSTRAP_BIN
+    if ([System.IO.Path]::DirectorySeparatorChar -eq '/') {
+        $IsAbs = $Bin.StartsWith('/')
+    } else {
+        $IsAbs = $Bin -match '^([A-Za-z]:[\\/]|\\\\)'
+    }
+    if (-not $IsAbs) {
+        Die "HOLDFAST_BOOTSTRAP_BIN must be an absolute path, and '$Bin' is not -- this runs in whichever project Claude Code was started in, so a relative path names a different file in each one"
+    }
+    if (-not (Test-Path -LiteralPath $Bin -PathType Leaf)) {
+        Die "HOLDFAST_BOOTSTRAP_BIN is $Bin, which is not a file -- nothing was downloaded in its place, because the variable asks for exactly that binary"
+    }
+    & $Bin @args
+    exit $LASTEXITCODE
+}
 
 # $PSScriptRoot first, for the same reason `bootstrap` prefers $0: the cwd is
 # the user's, never the plugin root.
@@ -32,11 +64,13 @@ if ($Version -notmatch '^[0-9]+\.[0-9]+\.[0-9]+') { Die "version.txt does not ho
 $Arch = $env:PROCESSOR_ARCHITECTURE
 switch ($Arch) {
     'AMD64' { $Target = 'windows-x86_64' }
-    'ARM64' { Die "no prebuilt binary for windows-aarch64 -- build from source: $UrlSource" }
-    default { Die "no prebuilt binary for '$Arch' -- build from source: $UrlSource" }
+    'ARM64' { Die "no prebuilt binary for windows-aarch64 -- build holdfast from source ($UrlSource) and set HOLDFAST_BOOTSTRAP_BIN to its absolute path ($UrlOwnBin)" }
+    default { Die "no prebuilt binary for '$Arch' -- build holdfast from source ($UrlSource) and set HOLDFAST_BOOTSTRAP_BIN to its absolute path ($UrlOwnBin)" }
 }
 $Exe = 'holdfast.exe'
 $ArchiveName = "holdfast-$Target.zip"
+# Kept under the 500 characters `claude mcp list` shows; see `bootstrap`.
+$BuildIt = "build it -- cargo install --locked --git $RepoGit --tag v$Version holdfast -- and set HOLDFAST_BOOTSTRAP_BIN to its absolute path in the `"env`" block of Claude Code's settings.json, then restart. See $UrlOwnBin"
 
 # ${CLAUDE_PLUGIN_DATA} for the same reasons the Unix half prefers it:
 # uninstall-scoped, and not a well-known path a hostile local process can
@@ -46,7 +80,7 @@ if ($env:CLAUDE_PLUGIN_DATA) {
 } elseif ($env:LOCALAPPDATA) {
     $CacheRoot = Join-Path $env:LOCALAPPDATA 'holdfast'
 } else {
-    Die "neither CLAUDE_PLUGIN_DATA nor LOCALAPPDATA is set, so there is nowhere to cache the binary -- install holdfast manually from $UrlManual"
+    Die "neither CLAUDE_PLUGIN_DATA nor LOCALAPPDATA is set, so there is nowhere to cache the binary -- build holdfast from source and set HOLDFAST_BOOTSTRAP_BIN to its absolute path ($UrlOwnBin)"
 }
 $CacheDir = Join-Path $CacheRoot 'bin'
 $Cached = Join-Path $CacheDir "holdfast-v$Version-$Target.exe"
@@ -78,10 +112,21 @@ try {
     try { [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12 } catch { }
 
     $SumsTmp = Join-Path $Tmp 'SHA256SUMS.txt'
+    # Not published and not reachable need opposite advice; see the same
+    # block in `bootstrap`. A WebException (5.1) or HttpResponseException (7)
+    # carries the status when a server answered, and nothing when none did.
+    $SumsUrl = "$BaseUrl/v$Version/SHA256SUMS.txt"
     try {
-        Invoke-WebRequest -Uri "$BaseUrl/v$Version/SHA256SUMS.txt" -OutFile $SumsTmp -UseBasicParsing
+        Invoke-WebRequest -Uri $SumsUrl -OutFile $SumsTmp -UseBasicParsing
     } catch {
-        Die "cannot reach $BaseUrl/v$Version/SHA256SUMS.txt -- is the release published, and is this host online? On an air-gapped or firewalled host, download $ArchiveName and SHA256SUMS.txt from $UrlManual on a connected machine, verify the checksum yourself, and place the extracted binary at $Cached (see plugin/README.md)"
+        $Status = $null
+        try { $Status = [int]$_.Exception.Response.StatusCode } catch { }
+        if ($Status -eq 404) {
+            Die "no holdfast v$Version binary to download: the v$Version release answered 404 -- unpublished, a draft, or without binaries. To run Holdfast now, $BuildIt"
+        } elseif ($Status) {
+            Die "$SumsUrl answered HTTP $Status -- retry later, or $BuildIt"
+        }
+        Die "cannot reach $SumsUrl -- is this host online? On an air-gapped or firewalled host, fetch $ArchiveName and SHA256SUMS.txt from $UrlReleases/tag/v$Version on a connected machine, verify the checksum yourself, and place the extracted binary at $Cached with SHA256SUMS.txt beside it as $SumsCached -- both files, or it is a cache miss. Or $BuildIt"
     }
 
     # Whole-field equality against exactly one line, never a substring match:
@@ -103,7 +148,7 @@ try {
     try {
         Invoke-WebRequest -Uri "$BaseUrl/v$Version/$ArchiveName" -OutFile $ArcTmp -UseBasicParsing
     } catch {
-        Die "cannot download $ArchiveName from $BaseUrl/v$Version/ -- see $UrlManual for a manual install"
+        Die "cannot download $ArchiveName from $BaseUrl/v$Version/ although the manifest lists it -- retry, or $BuildIt"
     }
     $Got = (Get-FileHash -LiteralPath $ArcTmp -Algorithm SHA256).Hash.ToLowerInvariant()
     if ($Got -cne $Want) {
