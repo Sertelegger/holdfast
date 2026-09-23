@@ -1244,30 +1244,39 @@ is cut, named and published is in
 
 - **`[REDACTED:unresolved]` is explained to the agent (GH #242, the
   explanation half).** It is the one marker that names no rule, and agents
-  were told nothing about it. `read_output`'s description now says it
-  covers bytes the read could not vouch for, starting at something that
-  began like a secret whose end the read could not see; that this is often
-  ordinary text but **can hide a real secret** — the one that began there,
-  or a token a rule did match inside the region, which `merge_spans` then
-  counts as `unresolved` and not under its own kind; that a re-read — later,
-  or with a different `max_bytes` — sometimes clears it but is not
-  guaranteed to (`output/mod.rs` records protection as non-monotonic in
-  `max_bytes`); that `redact: false` returns the text with any secret in it,
-  is audit-logged, and is for a region the agent already knows is not a
+  were told nothing about it. `read_output`'s description now says what it
+  covers, as GH #242's other half (under *Security*) left it: something that
+  began like a secret — a token-shaped run, or a private-key header
+  followed by what can still be key text — whose end the read could not
+  see, or private-key material the read could not tie to a whole key, such
+  as a key cut short by `head` or a pager's next screenful of one; and that
+  a key header merely mentioned in prose is not masked. It says the marker
+  **can hide a real secret** — the one it was placed for, or a token a rule
+  did match inside the region, which `merge_spans` then counts as
+  `unresolved` and not under its own kind; that a re-read — later, or with
+  a different `max_bytes` — sometimes clears it but is not guaranteed to
+  (`output/mod.rs` records protection as non-monotonic in `max_bytes`);
+  that `redact: false` returns the text with any secret in it, is
+  audit-logged, and is for a region the agent already knows is not a
   credential, not for finding out; and that `redactions` counts only the
   markers a response substituted, which is how a real marker is told from
   marker-shaped text already in the output. The server instructions carry
   the short form.
 
   **It does not say *nothing matched*, which is how the marker is usually
-  glossed and is false.** An unterminated private-key header followed a
-  few lines later by a GitHub token comes back as one
-  `[REDACTED:unresolved]` with `redactions: {unresolved: 1}` and no
-  `github` count, so a text that called the bytes unmatched and then
-  offered `redact: false` would send an agent to read a live token raw. A
-  row holds the instructions and every tool description to never saying
-  it. How much the marker masks is the other half of GH #242 and is not
-  changed here.
+  glossed and is false.** A token inside a region the marker covers is
+  folded into it: a private-key header, then key-shaped text with an AWS
+  key id in it, comes back as one `[REDACTED:unresolved]` with
+  `redactions: {unresolved: 1}` and no `aws` count
+  (`an_unresolved_mask_that_meets_a_real_match_is_one_marker_and_the_weaker_kind`),
+  so a text that called the bytes unmatched and then offered
+  `redact: false` would send an agent to read a live credential raw. A row
+  holds the instructions and every tool description to never saying it.
+  Nor does it call the marker *often ordinary text*, as the first draft
+  did while a prose mention of a key header still masked the next 16 KiB:
+  after the narrowing, a marker a key header produces is a key still
+  arriving, cut short or paged through — the case where reaching for
+  `redact: false` costs a key.
 
 - **Ordinary bursts no longer detach `holdfast watch`, or `attach`** ([#210]).
   1,500 lines of test output detached `watch` four runs in four on the

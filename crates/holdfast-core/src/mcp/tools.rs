@@ -911,20 +911,24 @@ impl HoldfastServer {
     /// naming the rule that matched it.
     ///
     /// `[REDACTED:unresolved]` is different: it covers bytes this read
-    /// could not vouch for. They start at something that began like a
-    /// secret (a private-key header, or a token-shaped run of characters)
-    /// whose end the read could not see. That is often ordinary text, but
-    /// it can hide a real secret: the one that began there, or one a rule
-    /// did match inside the region, which is then counted as `unresolved`
-    /// and not under its own kind. A re-read — later, once more output has
+    /// could not vouch for. Either something began like a secret — a
+    /// token-shaped run of characters, or a private-key header followed
+    /// by what can still be key text — and the read could not see where
+    /// it ends; or the bytes are private-key material the read could not
+    /// tie to a whole key: a key cut short (`head` of a key file), or key
+    /// lines printed after a header that stopped short (a pager's next
+    /// screenful of a key, a key printed in pieces). A key header that is
+    /// only mentioned in prose is not masked. Either way it can hide a
+    /// real secret: the one it was placed for, or one a rule did match
+    /// inside the region, which is then counted as `unresolved` and not
+    /// under its own kind. A re-read — later, once more output has
     /// arrived, or with a different `max_bytes` — sometimes clears it, but
     /// neither is guaranteed. `redact: false` returns the raw text, any
     /// secret in it included, and is recorded in the audit log: use it
-    /// only when you already know the region is not a credential (source
-    /// or documentation that quotes a key header, say), not to find out
-    /// whether it is. `redactions` counts only the markers this response
-    /// substituted, so marker-shaped text that was already in the output
-    /// is not counted.
+    /// only when you already know the region is not a credential, not to
+    /// find out whether it is. `redactions` counts only the markers this
+    /// response substituted, so marker-shaped text that was already in the
+    /// output is not counted.
     #[tool(
         annotations(
             title = "Read session output",

@@ -29,7 +29,9 @@ fn description(tool: rmcp::model::Tool) -> String {
 /// sections of ordinary prose.
 ///
 /// Each needle is a separate thing the agent has to be able to act on:
-/// what the marker is; that it can nonetheless hide a real secret,
+/// what the marker is — since GH #242's narrowing, mostly private-key
+/// material cut short or paged through, and never a header merely
+/// mentioned in prose; that it can nonetheless hide a real secret,
 /// including one a rule matched; that a re-read is **not** a guaranteed
 /// way past it; what `redact: false` returns, that it is audited, and
 /// when it may be used; and that `redactions` is how a real marker is
@@ -43,7 +45,10 @@ fn description(tool: rmcp::model::Tool) -> String {
 /// `redactions: {unresolved: 1}` and no `github` count, because
 /// `output::redact::merge_spans` folds a real match that meets an
 /// unjudgeable region into the one marker (pinned on the read path by
-/// `output::tests::an_unresolved_mask_that_meets_a_real_match_is_one_marker_and_the_weaker_kind`).
+/// `output::tests::an_unresolved_mask_that_meets_a_real_match_is_one_marker_and_the_weaker_kind`,
+/// which since GH #242's narrowing folds a key id inside text the
+/// candidate still believes: the `github` shape now ends the candidate
+/// at the token's `_`, and the token comes back `[REDACTED:github]`).
 /// An agent following that text re-reads with `redact: false` and pulls
 /// a live credential into its context believing nothing matched.
 ///
@@ -58,6 +63,14 @@ fn read_output_explains_the_unresolved_marker_and_the_audited_way_past_it() {
     let d = description(HoldfastServer::read_output_tool_attr());
     for needle in [
         "`[REDACTED:unresolved]` is different: it covers bytes this read could not vouch for",
+        // GH #242's other half (lane-read-path) made the marker mostly a
+        // private key the read could not tie to a whole one — cut short,
+        // or paged through — and a prose header no marker at all. The
+        // description says so, or it reads as a reason to try
+        // `redact: false` on a key.
+        "private-key material the read could not tie to a whole key",
+        "a pager's next screenful of a key",
+        "A key header that is only mentioned in prose is not masked",
         "it can hide a real secret",
         "or one a rule did match inside the region, which is then counted as `unresolved`",
         "neither is guaranteed",

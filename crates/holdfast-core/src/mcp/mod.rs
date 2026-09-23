@@ -80,10 +80,14 @@ use std::sync::Arc;
 // say *no rule matched*: `output::redact::merge_spans` folds a real match
 // that meets an unjudgeable region into the one `unresolved` marker, so a
 // live token can sit under it, uncounted under its own kind
-// (`output::tests::an_unresolved_mask_that_meets_a_real_match_is_one_marker_and_the_weaker_kind`),
-// and an unterminated private-key header may be exactly what it looks
-// like. A sentence that called the marker harmless and then pointed at
-// `redact:false` would send an agent to read that token raw.
+// (`output::tests::an_unresolved_mask_that_meets_a_real_match_is_one_marker_and_the_weaker_kind`).
+// And since GH #242's narrowing it does not call the marker *often
+// ordinary text*, which is what it said while any prose mention of a key
+// header masked the next 16 KiB: a header in prose is no longer a
+// candidate, so the marker is now mostly what it looks like — a secret
+// still arriving, or a private key cut short or paged through
+// (`output::pem`). A sentence that called the marker harmless and then
+// pointed at `redact:false` would send an agent to read that key raw.
 pub const INSTRUCTIONS: &str = "Holdfast gives you persistent PTY-backed terminal sessions.\n\n\
      SECRETS: when interaction_mode is AwaitingSecret the session is at a \
      password prompt. Use request_secret_input, NEVER send_input, and never \
@@ -104,10 +108,11 @@ pub const INSTRUCTIONS: &str = "Holdfast gives you persistent PTY-backed termina
      heuristic (a guess: a quiet session reads as finished).\n\n\
      OUTPUT: read_output pages with a cursor you carry between calls. \
      Output is ANSI-stripped and secrets become [REDACTED:<kind>]. \
-     [REDACTED:unresolved] covers bytes the read could not vouch for: often \
-     ordinary text, but it can hide a real secret, and a later re-read may \
-     clear it. redact:false shows raw bytes, secrets included, and is \
-     audit-logged: use it only when you know the text is not a credential.\n\n\
+     [REDACTED:unresolved] covers bytes the read could not vouch for (a \
+     secret whose end it could not see, or part of a private key): it can \
+     hide a real secret, and a later re-read may clear it. redact:false \
+     shows raw bytes, secrets included, and is audit-logged: use it only \
+     when you know the text is not a credential.\n\n\
      TOOLS: start_session spawns a shell or program; send_input types into \
      it; interrupt sends Ctrl+C; terminate ends the session; \
      get_screen_state returns the rendered grid, the read for full-screen \
@@ -948,7 +953,7 @@ mod tests {
 
     /// What the rest of the text must still say, anywhere in it — the
     /// whole of it fits the budget, so presence is enough.
-    const BODY_CLAUSES: [&str; 7] = [
+    const BODY_CLAUSES: [&str; 8] = [
         // WAITING. Unpinned before GH #230's review: the paragraph could
         // be deleted with every row green.
         "call wait_for_pattern with NO pattern",
@@ -956,6 +961,10 @@ mod tests {
         // OUTPUT (GH #242): what the marker is, that it is not harmless,
         // and what the way past it costs.
         "[REDACTED:unresolved] covers bytes the read could not vouch for",
+        // Since GH #242's narrowing the marker is mostly a private key
+        // cut short or paged through (`output::pem`), which is exactly
+        // what an agent must not reach for `redact:false` to read.
+        "or part of a private key",
         "it can hide a real secret",
         "redact:false shows raw bytes, secrets included",
         "audit-logged",
@@ -972,6 +981,9 @@ mod tests {
     /// with `redactions: {unresolved: 1}` — `merge_spans` folds the real
     /// match into the region. A text that says nothing matched and then
     /// points at `redact:false` sends an agent to read that token raw.
+    /// (That shape no longer folds: GH #242's narrowing ends the candidate
+    /// at the token's `_`. A token inside text a candidate still believes
+    /// does, which is the row the fold is now pinned by.)
     /// `tests/agent_guidance.rs` holds every tool description to a copy
     /// of this list — a copy because an integration test cannot see a
     /// `#[cfg(test)]` item of the library.
