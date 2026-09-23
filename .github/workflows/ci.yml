@@ -902,12 +902,23 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
+          # **The tags, because the marketplace pin is checked against one.**
+          # A pin names a release tag and its commit, and the manifest check
+          # compares the two and reads the tagged tree's plugin.json -- which
+          # a default checkout, with no tags, could only skip: a pin to
+          # `v0.0.7`, whose tree has no plugin at all, passed here. Under CI
+          # the check now fails where it cannot look, so this line is what
+          # lets it look. The whole history is a few MB.
+          fetch-depth: 0
 
       # **The self-test first**, for the reason the `hygiene` job gives: this
-      # script's twelve breakage fixtures are the only thing holding its
-      # twenty-five assertions honest, and a guard whose guard is unrun is a
-      # guard on trust.
+      # script's breakage and acceptance fixtures are the only thing holding
+      # its assertions honest, and a guard whose guard is unrun is a guard on
+      # trust. It prints its own totals.
       - run: ./scripts/plugin-manifest-check.py --self-test
+      # Against the real tree. With a pin in the listing this also asks
+      # GitHub whether the pinned release serves its assets -- a draft does
+      # not -- and under CI a release that does not answer is a failure.
       - run: ./scripts/plugin-manifest-check.py
 
       # `claude plugin validate --strict` is the OFFICIAL check and it is
@@ -970,8 +981,13 @@ jobs:
           sudo rm -f /etc/apt/sources.list.d/google-chrome.list \
                      /etc/apt/sources.list.d/google-chrome.sources
           sudo apt-get update -qq
-          sudo apt-get install -y -qq --no-install-recommends libarchive-tools
+          # wget and busybox are for the bootstrap harness's wget rows (T15),
+          # which require both under CI: each wget reports a 404 unlike curl
+          # and unlike the other, and that difference was GH #237's dead end.
+          sudo apt-get install -y -qq --no-install-recommends libarchive-tools wget busybox
           bsdtar --version
+          wget --version | sed -n 1p
+          command -v busybox
       - name: Hostile archives under bash, with GNU tar and then with bsdtar
         run: |
           set -eux

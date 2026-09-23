@@ -35,6 +35,35 @@ is cut, named and published is in
   subcommand's banner lines, and a group's (`holdfast daemon --help`) is its
   members' ([#233], [#178]).
 
+- **`HOLDFAST_BOOTSTRAP_BIN=/absolute/path/to/holdfast`** makes the plugin's
+  bootstrap exec exactly that binary — no `$PATH` search, no version
+  comparison, no download — so the plugin can run a build from source: a
+  checkout being dogfooded, a platform with no prebuilt, a release that is not
+  promoted yet. Set it in the `env` block of Claude Code's `settings.json`.
+  **An absolute path or a refusal, and no fallback**: the bootstrap runs in
+  whichever project Claude Code was started in, so a relative path names a
+  different file in each, and a user who named a binary and silently got a
+  downloaded one is debugging the wrong program. A leading `~` or `$` is
+  refused by name, because Claude Code passes `settings.json` values literally
+  (measured). It is checked before `version.txt` and `uname`, so it works on a
+  target with no release asset. `bootstrap.ps1` has the same arm ([#237]).
+- **A bootstrap that cannot start the server now says why in Claude Code.**
+  It used to exit 1 with its diagnosis on stderr, which Claude Code files in a
+  jsonl log under `~/.cache` and shows as `Failed to connect — CONNECTION_CLOSED`
+  (measured, 2.1.280). Under `mcp` it now reads the `initialize` request
+  already waiting on stdin and answers it with a JSON-RPC error carrying the
+  diagnosis, which `claude mcp list` shows as `-32603: <the reason>`
+  (measured on Linux; the interactive `/mcp` panel was not checked). It reads
+  nothing on any success path, nothing when stdin is a terminal, and waits at
+  most five seconds for a request that never comes. The not-published message
+  is written to fit the 500 characters `claude mcp list` shows before it cuts
+  the line, and a harness row holds it there. `bootstrap.ps1` answers the same
+  way — including when it cannot create its cache or temp directory, which
+  was an uncaught PowerShell error — and the harness runs it under `pwsh` on
+  Linux; **on Windows itself that
+  is unverified**, as the Windows entrypoint that would reach it is, so a
+  Windows install may still see `CONNECTION_CLOSED` ([#237]).
+
 - A `windows-2022` CI job: native MSVC clippy over `--all-targets`, the source
   guards, the `#[cfg(windows)]` CLI arms executed, and a filtered `--lib` over
   the modules whose Windows arm differs from its Unix one. The full `--lib` is
@@ -400,6 +429,43 @@ is cut, named and published is in
   alone in its session ([#234]), so the wait is now for a job, or a program,
   that caught or ignored the `SIGTERM`.
 
+- **The marketplace listing is pinned to a promoted release, after
+  promotion.** The release PR bumps `plugin/version.txt` on `main` before the
+  tag, the release stays a draft until a person promotes it, and the listing's
+  `source: "./plugin"` reads `main` — so every install or update in between
+  pinned a version with no served assets and its MCP server failed to start.
+  `CONTRIBUTING.md`'s release procedure gains a step 8: once promoted, a pull
+  request points the listing at a `git-subdir` pin of `plugin/` at that tag
+  **and its commit**. `scripts/plugin-manifest-check.py` accepts `"./plugin"`
+  or exactly that shape — this repository's URL, `path: "plugin"`, a `vX.Y.Z`
+  ref no newer than `Cargo.toml`, a full sha — checks the sha against the tag
+  and the pinned tree's `plugin.json` against the ref, and asks the release
+  whether it serves its `SHA256SUMS.txt`. **That last one is the rule the
+  pin exists for**: a release that is tagged and still a draft satisfies every
+  other one, `Cargo.toml` having already moved to it, and serves nothing, so
+  a pin to it is this failure again. CI's `plugin` job fetches the tags, and
+  under CI a tag that is not there, or a release that does not answer, fails
+  rather than skips. Each refusal has a breakage fixture — the tag half's in
+  a fixture made a git clone with the tag in it, the served half's against a
+  local release server — and the self-test gains its first *acceptance*
+  fixtures, so a rule that refused every pin — the rule as it stood — now
+  fails it. The listing itself stays `"./plugin"` until a release whose tag
+  contains `plugin/` is promoted: `v0.0.7`'s does not, and the check refuses
+  that pin, in CI too — its tree has no `plugin.json`, and it serves no
+  assets. `release.yml`'s post-draft checklist names the step ([#237]).
+
+- **`HOLDFAST_BOOTSTRAP_ALLOW_PATH` compares the version whole, and says when
+  it declines.** It was `grep -q "$version"` over `holdfast version`'s output
+  — a regex, unanchored, which `holdfast 0.1.00` and `10.1.0` both satisfy for
+  `0.1.0` — and a mismatch or a missing binary fell back to the download in
+  silence. The second field must now equal `version.txt`, and a refusal is one
+  stderr line at once and the start of any later failure's message, which is
+  the line Claude Code shows — the start, because `claude mcp list` shows 500
+  characters of it and the not-published message is most of them. The probe
+  runs with stdin from `/dev/null`: Claude Code's `initialize` is waiting on
+  the real one, and a `holdfast` that read it there took it from the server
+  ([#237]).
+
 - **`scripts/ci-hygiene.sh`'s release-trigger gate is an allowlist.** It was a
   denylist of four triggers — `branches`, `schedule`, `pull_request`,
   `pull_request_target` — and `release.yml`'s header claimed on the strength of
@@ -618,6 +684,29 @@ is cut, named and published is in
   digest inside the carry behind a private-key header, which is masked; and a
   key painted a colour per character (`grep -n .` under `--color=auto`), whose
   header is not in the raw bytes at all.
+
+- **The plugin bootstrap refuses a wget that says it did not verify the TLS
+  certificate.** busybox's built-in TLS validates no certificate and says so on
+  stderr — *"TLS certificate validation not implemented"*, `-q` or not — and
+  busybox falls back to it whenever no `openssl` is on `$PATH`. On a host whose
+  only fetcher was that, the release manifest and the archive it vouches for
+  arrived over the same unauthenticated connection, and TLS to GitHub is the
+  bootstrap's entire trust root (spec A-4). What such a wget fetched is now
+  discarded and the bootstrap stops, naming curl, `openssl` or a build from
+  source as the way on. A busybox that hands TLS to `openssl s_client
+  -verify_return_error` — Ubuntu's does, when `openssl` is present (measured) —
+  says nothing and is unaffected. A busybox built to use `openssl s_client`
+  *without* that flag would validate nothing and say nothing; none was found
+  to test against, and this does not catch it (review of [#237]).
+- **`/holdfast:install` and `/holdfast:attach` pre-approve only the commands
+  they run.** `/holdfast:install` pre-approved `Bash(command:*)` and
+  `Bash(printenv:*)`, and `/holdfast:attach` had copied both: the first
+  matches `command <any program>`, which runs it, and the second a bare
+  `printenv`, which puts every environment variable — including any token in
+  `settings.json`'s `env` block — into the transcript without a prompt. They
+  are now `Bash(command -v:*)` and `printenv` of the named variables only. How
+  Claude Code's matcher treats `command` was not measured; the narrowing does
+  not depend on it (review of [#237]).
 
 - **A read window that cannot vouch for a region now emits one
   `[REDACTED:unresolved]` over it and completes, instead of choosing between
@@ -1359,6 +1448,74 @@ is cut, named and published is in
   | grep -m1 READY` no longer waits for the session's next output to notice.
   `attach` is unchanged: its stdout is the terminal it holds in raw mode
   ([#218]).
+
+- **The install documentation recommended routes that do not work, and left
+  out the one that bites on every upgrade.** `plugin/README.md` said
+  `cargo install holdfast` "also works" and `/holdfast:install` recommended
+  it; crates.io holds a `0.0.0` name reservation with no binary, and cargo
+  refuses it with *"there is nothing to install"*. Both now give
+  `cargo install --locked --git … --tag vX.Y.Z holdfast` with
+  `HOLDFAST_BOOTSTRAP_BIN`, and `plugin/README.md` has a section for exactly
+  that. `README.md`'s *Build and try it* registered `target/debug/holdfast`
+  with Claude Code — which `cargo clean` deletes out from under every session
+  — and said nothing about the daemon: that it outlives Claude Code, is shared
+  by every session, and keeps running the binary it started from until
+  `holdfast daemon stop`, which ends every session it holds. It now installs
+  with `cargo install --path`, gives the stop-and-start upgrade and the reason
+  for starting it yourself and from `~` (GH #231, GH #229: before their fixes,
+  an open session does not restart the daemon, and a daemon started in the
+  checkout is where every session without a `cwd` begins), and says that each
+  `CLAUDE_CONFIG_DIR` needs its own
+  registration and that the plugin and `claude mcp add` should not both be
+  used. `CONTRIBUTING.md`'s setup had the same `target/debug` line and still
+  said *"milestones 0.0.1 through 0.0.5 have landed … nothing is released"*.
+  The *What works today* heading said `v0.0.7` over a list describing `main`;
+  it says `main` now, and the release procedure no longer asks for it to be
+  bumped. A link to `CONTRIBUTING.md#no-binary-assets` pointed at a heading
+  that had been renamed ([#237]).
+- **The plugin bootstrap's "release not found" message sent everyone to a
+  manual download that does not exist.** One sentence covered two failures —
+  *"is the release published, and is this host online?"* — and then told the
+  user to fetch the assets by hand from the releases page, which for an
+  unpublished release, a draft, or `v0.0.5`–`v0.0.7` (published with no
+  assets) has nothing on it. A 404 is now *"no holdfast vX.Y.Z binary to
+  download"* with the from-source route — the `cargo install --git … --tag
+  vX.Y.Z` line and `HOLDFAST_BOOTSTRAP_BIN` — and only a host that reaches no
+  server at all gets the air-gapped placement. That placement also named only
+  the binary: a binary without its `SHA256SUMS-vX.Y.Z.txt` beside it is a cache
+  miss, so following it re-downloaded forever. It names both now. Every other
+  dead end that said *"install holdfast manually from …/releases"* points at the
+  from-source route instead. `bootstrap.ps1` matches, and its `Die` writes one
+  plain stderr line rather than a `Write-Error` record that pwsh wraps at the
+  console width and colours ([#237]).
+- **On a host with wget and no curl, an unpublished release still got the
+  "cannot reach" advice.** The bootstrap's wget fallback read only wget's exit
+  status, which cannot tell a 404 from anything else: busybox wget exits 1 for
+  every failure and GNU wget exits 8 for every HTTP error (both measured). So
+  under busybox — Alpine, slim containers — a 404 got the air-gapped placement
+  advice, the dead end the entry above removes for curl, and under GNU wget a
+  403 or a 503 was called "unpublished, a draft, or without binaries". The
+  bootstrap now reads the status line wget prints under `-S` — the last one,
+  since a release asset is a redirect — so 404, any other status and no answer
+  at all get the same three messages under curl, GNU wget and busybox wget. A
+  redirect whose target never answers is no answer, under all three: its last
+  status is the redirect's own, and a firewall that passes `github.com` and
+  not the host release assets are served from read *"answered HTTP 302 —
+  retry later"* rather than the air-gapped advice (measured). It
+  also runs wget with one try, as curl runs: GNU wget's default retries a
+  dropped or silent connection twenty times with a growing wait — minutes for
+  a dropped one (measured), and up to twenty 120-second read timeouts for a
+  silent one. `scripts/plugin-bootstrap-tests.sh`
+  runs every wget it finds on a `$PATH` with no curl, and CI now installs both
+  (review of [#237]).
+- **A signal during the plugin bootstrap's download ends it.** `HUP`, `INT`
+  and `TERM` were trapped to remove the download's temp directory, and the
+  bootstrap then carried on — into a fetch, a checksum and an extraction whose
+  paths were all inside the directory it had just removed, until one of them
+  failed and said something else. It now exits, `128+n`, and removes the
+  directory on the way out. Its one probe of a freshly installed binary runs
+  it with stdin from `/dev/null`, so it cannot take the `initialize` request
+  the binary is exec'd to answer (review of [#237]).
 
 - **The guard that was supposed to refuse an empty release body could not
   fire, and the release procedure did not mention `Cargo.lock`.** Both are
@@ -2823,3 +2980,4 @@ residuals that are known and accepted.
 [#218]: https://github.com/Sertelegger/holdfast/issues/218
 [#232]: https://github.com/Sertelegger/holdfast/issues/232
 [#233]: https://github.com/Sertelegger/holdfast/issues/233
+[#237]: https://github.com/Sertelegger/holdfast/issues/237

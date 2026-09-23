@@ -321,6 +321,8 @@ jobs:
           echo "  2. Re-read the §12.3 escapes: crates/holdfast-core/tests/wire_shape.rs"
           echo "     and crates/holdfast-core/src/protocol/method.rs. Promoting ends them."
           echo "  3. gh release edit ${GITHUB_REF_NAME} --draft=false"
+          echo "  4. Then pin .claude-plugin/marketplace.json to ${GITHUB_REF_NAME} and its commit,"
+          echo "     in its own PR: CONTRIBUTING.md, Releases, step 8 (GH #237)."
 
   # **crates.io, and it is inert until a token exists.** §12.1 of the design
   # spec lists `cargo install holdfast` as a distribution channel — "published

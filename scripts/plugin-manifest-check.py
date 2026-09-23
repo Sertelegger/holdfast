@@ -31,10 +31,25 @@ What is asserted here, and why each one is here rather than assumed:
                      `plugin/commands/` and `.claude/commands/holdfast/`
                      land in ONE `holdfast:` namespace. A file in both is an
                      ambiguous name, not two commands.
+  marketplace pin    The listing's `source` is `./plugin` -- main's tree,
+                     until a release is promoted -- or a `git-subdir` pin of
+                     THIS repository's `plugin/` at a release tag and that
+                     tag's commit (GH #237). Nothing else: a pin to a branch
+                     moves without review, a pin without `sha` trusts a tag
+                     that can be moved, and a pin to another URL hands every
+                     install to whoever owns it. And the pinned release must
+                     SERVE its assets: a draft does not, and a pin to one is
+                     GH #237 again.
+
+Under CI (`CI` set), a check that could not look -- a tag this clone does not
+have, a release that did not answer -- is a failure, not a skip: CI's
+`plugin` job fetches the tags and has the network, so there it means the
+tag or the release is not there.
 
 Usage:  plugin-manifest-check.py [--self-test]
 """
 
+import http.server
 import json
 import os
 import re
@@ -42,6 +57,9 @@ import shutil
 import subprocess
 import sys
 import tempfile
+import threading
+import urllib.error
+import urllib.request
 
 KEBAB = re.compile(r"^[a-z0-9]+(-[a-z0-9]+)*$")
 SEMVERISH = re.compile(r"^[0-9]+\.[0-9]+\.[0-9]+")
@@ -157,12 +175,7 @@ def check_tree(root):
                "marketplace lists exactly one plugin",
                "marketplace must list exactly one plugin, got %r" % (plugins,)):
         entry = plugins[0]
-        src = entry.get("source")
-        r.check(src == "./plugin",
-                "marketplace source is ./plugin",
-                "marketplace source is %r; paths resolve against the "
-                "MARKETPLACE ROOT (the directory holding .claude-plugin/), "
-                "not against marketplace.json" % src)
+        check_marketplace_source(r, root, entry.get("source"))
         r.check(entry.get("name") == name,
                 "marketplace and plugin.json agree the plugin is %r" % name,
                 "marketplace says %r, plugin.json says %r"
@@ -247,6 +260,156 @@ def check_tree(root):
     return r
 
 
+REPO_GIT_URL = "https://github.com/Sertelegger/holdfast.git"
+# Where a pinned release's assets are served from. The variable exists for the
+# self-test's local server, as HOLDFAST_BOOTSTRAP_BASE_URL does for the
+# bootstrap's harness.
+RELEASE_BASE = "https://github.com/Sertelegger/holdfast/releases/download"
+# Used with `fullmatch`, never `match`: `$` also matches before a trailing
+# newline, so `^...$` under `match` accepts `v0.0.8\n`.
+RELEASE_TAG = re.compile(r"v([0-9]+)\.([0-9]+)\.([0-9]+)")
+FULL_SHA = re.compile(r"[0-9a-f]{40}")
+PIN_KEYS = {"source", "url", "path", "ref", "sha"}
+
+
+def _strict():
+    """Under CI a check that could not look fails rather than skips: the
+    `plugin` job fetches the tags and has the network, so not finding one
+    there is the finding."""
+    return bool(os.environ.get("CI"))
+
+
+def _unchecked(r, what):
+    if _strict():
+        r.fail("%s -- under CI that is a failure, not a skip: the plugin job "
+               "fetches the tags and has the network" % what)
+    else:
+        print("  skip  %s (NOT a pass)" % what)
+
+
+def _release_serves(ref):
+    """The HTTP status of the pinned release's SHA256SUMS.txt, or None when
+    nothing answered. 200 is a promoted release with assets; a draft, and
+    v0.0.5 to v0.0.7 (published with none), answer 404."""
+    base = os.environ.get("HOLDFAST_MANIFEST_RELEASE_BASE", RELEASE_BASE)
+    url = "%s/%s/SHA256SUMS.txt" % (base.rstrip("/"), ref)
+    try:
+        with urllib.request.urlopen(url, timeout=30) as resp:
+            return resp.status, url
+    except urllib.error.HTTPError as e:
+        return e.code, url
+    except (urllib.error.URLError, OSError, ValueError):
+        return None, url
+
+
+def _git_out(root, *args):
+    """`git -C root ...`, stopped at root: a fixture that is not a clone must
+    not be answered by a clone it happens to sit inside -- a TMPDIR under a
+    checkout of this repository, whose tags are the real ones."""
+    root = os.path.abspath(root)
+    env = dict(os.environ, GIT_CEILING_DIRECTORIES=os.path.dirname(root))
+    return subprocess.check_output(["git", "-C", root] + list(args),
+                                   stderr=subprocess.DEVNULL, env=env).decode()
+
+
+def check_marketplace_source(r, root, src):
+    """`./plugin`, or a git-subdir pin of this repo's plugin/ at a release.
+
+    **Why a pin exists at all (GH #237).** With `./plugin`, an install reads
+    `plugin/` off `main`, and the release PR bumps `plugin/version.txt` on
+    `main` before the tag -- so from that merge until a human promotes the
+    draft, every new install and every update pins a version whose assets
+    are not served, and the bootstrap 404s. A pin moved only after promotion
+    closes that window: installs keep the last promoted release while `main`
+    moves on. CONTRIBUTING.md's "Releases" carries the step.
+    """
+    if src == "./plugin":
+        r.ok("marketplace source is ./plugin -- installs read main's tree, "
+             "which is right only until the first promoted release is pinned")
+        return
+    if not isinstance(src, dict) or src.get("source") != "git-subdir":
+        r.fail("marketplace source is %r; it must be \"./plugin\" or a "
+               "git-subdir pin of this repository's plugin/ at a promoted "
+               "release. (A relative path resolves against the MARKETPLACE "
+               "ROOT, the directory holding .claude-plugin/, not against "
+               "marketplace.json.)" % (src,))
+        return
+    extra = set(src) - PIN_KEYS
+    r.check(not extra,
+            "the pin carries no keys beyond %s" % ", ".join(sorted(PIN_KEYS)),
+            "the pin carries unexpected key(s) %s" % sorted(extra))
+    r.check(src.get("url") == REPO_GIT_URL,
+            "the pin names this repository",
+            "the pin's url is %r, not %s -- a pin to anything else hands "
+            "every install to whoever controls it" % (src.get("url"), REPO_GIT_URL))
+    r.check(src.get("path") == "plugin",
+            "the pin's path is plugin",
+            "the pin's path is %r; the plugin tree is `plugin`" % src.get("path"))
+    ref = src.get("ref")
+    m = RELEASE_TAG.fullmatch(ref) if isinstance(ref, str) else None
+    r.check(m is not None,
+            "the pin's ref %r is a release tag" % ref,
+            "the pin's ref is %r; it must be a release tag vX.Y.Z -- a branch "
+            "moves without review, which is the thing the pin is for" % (ref,))
+    sha = src.get("sha")
+    r.check(isinstance(sha, str) and bool(FULL_SHA.fullmatch(sha)),
+            "the pin carries a full commit sha",
+            "the pin's sha is %r; a full 40-hex sha is required -- Claude Code "
+            "takes the sha over the ref, and a tag without one can be moved"
+            % (sha,))
+    cv = cargo_version(r, root)
+    if m and cv and SEMVERISH.match(cv):
+        pinned = tuple(int(x) for x in m.groups())
+        current = tuple(int(x) for x in cv.split("-")[0].split(".")[:3])
+        r.check(pinned <= current,
+                "the pin (%s) is not ahead of Cargo.toml (%s)" % (ref, cv),
+                "the pin names %s, which is ahead of Cargo.toml's %s -- a "
+                "release that does not exist yet" % (ref, cv))
+    if m:
+        # **Served, not merely tagged.** Everything above holds of a pin to
+        # a release that is tagged and still a draft -- Cargo.toml has already
+        # moved to it, and the tag is real -- and a draft serves nothing from
+        # releases/download/, so every install of that pin fails exactly as
+        # GH #237 did. The one thing that tells a promoted release from a
+        # draft is whether it answers.
+        status, url = _release_serves(ref)
+        if status == 200:
+            r.ok("the pinned release %s serves SHA256SUMS.txt" % ref)
+        elif status == 404:
+            r.fail("the pinned release %s does not serve %s (404) -- a draft, "
+                   "or published without binaries -- so every install of "
+                   "this pin fails to download; pin a release only after it "
+                   "is promoted" % (ref, url))
+        else:
+            _unchecked(r, "could not ask whether %s is served (%s)"
+                       % (url, "HTTP %d" % status if status else "no answer"))
+    if not (m and isinstance(sha, str) and FULL_SHA.fullmatch(sha)):
+        return
+    # The tag, when this clone has it. CI's `plugin` job fetches the tags,
+    # so there a missing one fails; elsewhere it is said, not passed.
+    try:
+        tagged = _git_out(root, "rev-parse", "-q", "--verify",
+                          "refs/tags/%s^{commit}" % ref).strip()
+    except (OSError, subprocess.CalledProcessError):
+        tagged = None
+    if not tagged:
+        _unchecked(r, "tag %s is not in this clone, so the pin's sha is not "
+                      "compared with it" % ref)
+        return
+    r.check(tagged == sha,
+            "the pin's sha is what %s points at" % ref,
+            "the pin's sha %s is not %s's commit %s" % (sha, ref, tagged))
+    try:
+        pj = json.loads(_git_out(root, "show",
+                                 "%s:plugin/.claude-plugin/plugin.json" % sha))
+    except (OSError, subprocess.CalledProcessError, ValueError):
+        pj = None
+    r.check(isinstance(pj, dict) and pj.get("version") == ref[1:],
+            "the pinned tree's plugin.json says %s" % ref[1:],
+            "the pinned tree has no plugin.json saying %s -- a pin to a tag "
+            "that predates the plugin, or to the wrong commit" % ref[1:])
+
+
 def git_mode(root, path):
     try:
         out = subprocess.check_output(
@@ -302,36 +465,164 @@ def self_test(root):
          lambda d: shutil.copy(os.path.join(d, "plugin/commands/attach.md"),
                                os.path.join(d, "plugin/commands/doctor.md"))),
         ("version.txt deleted", lambda d: os.remove(os.path.join(d, "plugin/version.txt"))),
+        ("pin without a sha", lambda d: _pin(d, sha=None)),
+        ("pin to a branch", lambda d: _pin(d, ref="main")),
+        ("pin to another repository",
+         lambda d: _pin(d, url="https://github.com/someone-else/holdfast.git")),
+        ("pin to the wrong path", lambda d: _pin(d, path=".")),
+        ("pin ahead of Cargo.toml", lambda d: _pin(d, ref="v999.0.0")),
+        ("pin with an abbreviated sha", lambda d: _pin(d, sha="a81b02d")),
+        ("a github source", lambda d: _patch_source(
+            d, {"source": "github", "repo": "Sertelegger/holdfast"})),
+        # The type on its own: every other field of a good pin, so no other
+        # rule can be what refuses it.
+        ("a pin whose source type is not git-subdir",
+         lambda d: _pin(d, source="url")),
+        ("a pin with a key beyond the five", lambda d: _pin(d, branch="main")),
+        ("a pin to a pre-release tag", lambda d: _pin(d, ref="v0.0.1-rc1")),
+        ("a pin to a tag with a suffix", lambda d: _pin(d, ref="v0.0.1foo")),
+        ("a pin whose ref ends in a newline", lambda d: _pin(d, ref="v0.0.1\n")),
+        ("a pin whose sha ends in a newline", lambda d: _pin(d, sha="0" * 40 + "\n")),
+        # **The half that needs the tag.** The fixture is made a clone with
+        # the tag in it, so these run here -- and in CI, whose own checkout
+        # has no tags and skips that half against the real tree.
+        ("a pin whose sha is not its tag's commit",
+         lambda d: _git_pin(d, "sha-elsewhere")),
+        ("a pin to a tag whose plugin.json says another version",
+         lambda d: _git_pin(d, "tree-disagrees")),
+        # **A pin to a draft.** Tagged, not ahead of Cargo.toml, its sha the
+        # tag's and its tree's plugin.json right -- everything but served.
+        # The self-test's release server answers 404 for this tag, as
+        # GitHub does for a draft's assets.
+        ("a pin to a release that is tagged but serves nothing (a draft)",
+         lambda d: _git_pin(d, "good", served=False)),
+        # **Under CI, not looking is not passing.** Each is otherwise a
+        # well-formed pin; only the missing tag, or the release that does not
+        # answer, can be what refuses it.
+        ("a pin to a tag this clone does not have, under CI",
+         lambda d: _pin(d), {"CI": "true"}),
+        ("a pin whose release does not answer, under CI",
+         lambda d: _git_pin(d, "good"),
+         {"CI": "true", "HOLDFAST_MANIFEST_RELEASE_BASE": "http://127.0.0.1:1"}),
+    ]
+    # **And the shape the release procedure tells people to write must PASS.**
+    # Every case above is a rejection; without this, a check that refused
+    # every pin -- the rule as it stood before GH #237 -- passes them all.
+    acceptances = [
+        ("a well-formed pin", lambda d: _pin(d)),
+        ("a pin that matches its tag, in a clone that has it",
+         lambda d: _git_pin(d, "good")),
+        # Not a clone, but inside one whose tag is somewhere else: the tag
+        # half must skip, not borrow the outer clone's tag and refuse.
+        ("a pin in a non-clone nested inside another clone",
+         lambda d: _nested_in_clone(d)),
+        # What CI's own run of a real pin is: the tag fetched, the release
+        # promoted.
+        ("a pin that matches its tag and is served, under CI",
+         lambda d: _git_pin(d, "good"), {"CI": "true"}),
+        # And off CI, a release that does not answer is said and skipped.
+        ("a pin whose release does not answer, off CI",
+         lambda d: _git_pin(d, "good"),
+         {"HOLDFAST_MANIFEST_RELEASE_BASE": "http://127.0.0.1:1"}),
     ]
     failures = 0
-    print("=== self-test: the real tree must pass ===")
-    base = check_tree(root)
-    if base.fails:
-        print("SELF-TEST FAIL: the real tree does not pass its own rules")
-        return 1
-    print("  (%d assertion(s) green)\n" % base.oks)
+    # Every case runs with CI unset unless it says otherwise, so the result
+    # is the same on a laptop and in the CI job that runs this, and against
+    # a local release server rather than GitHub.
+    srv, served_base = _release_server()
+    saved = {k: os.environ.get(k) for k in ("CI", "HOLDFAST_MANIFEST_RELEASE_BASE")}
 
-    for label, breaker in breakages:
-        d = tempfile.mkdtemp(prefix="hf-manifest-")
-        try:
-            for item in (".claude-plugin", "plugin", "Cargo.toml", ".claude"):
-                s = os.path.join(root, item)
-                t = os.path.join(d, item)
-                if os.path.isdir(s):
-                    shutil.copytree(s, t)
-                elif os.path.isfile(s):
-                    shutil.copy(s, t)
-            breaker(d)
-            rep = _quiet(lambda: check_tree(d))
-            if rep.fails:
-                print("  ok    caught: %s" % label)
+    def env_for(over):
+        os.environ.pop("CI", None)
+        os.environ["HOLDFAST_MANIFEST_RELEASE_BASE"] = served_base
+        os.environ.update(over)
+
+    try:
+        print("=== self-test: the real tree must pass ===")
+        env_for({})
+        base = check_tree(root)
+        if base.fails:
+            print("SELF-TEST FAIL: the real tree does not pass its own rules")
+            return 1
+        print("  (%d assertion(s) green)\n" % base.oks)
+
+        for case in breakages:
+            label, breaker = case[0], case[1]
+            d = _fixture(root)
+            try:
+                breaker(d)
+                env_for(case[2] if len(case) > 2 else {})
+                rep = _quiet(lambda: check_tree(d))
+                if rep.fails:
+                    print("  ok    caught: %s" % label)
+                else:
+                    print("  FAIL  NOT caught: %s" % label)
+                    failures += 1
+            finally:
+                shutil.rmtree(d, ignore_errors=True)
+        for case in acceptances:
+            label, maker = case[0], case[1]
+            d = _fixture(root)
+            try:
+                # A maker may move the tree and say where it put it.
+                at = maker(d) or d
+                env_for(case[2] if len(case) > 2 else {})
+                rep = _quiet(lambda: check_tree(at))
+                if rep.fails:
+                    print("  FAIL  REJECTED: %s -- %s" % (label, "; ".join(rep.fails)))
+                    failures += 1
+                else:
+                    print("  ok    accepted: %s" % label)
+            finally:
+                shutil.rmtree(d, ignore_errors=True)
+    finally:
+        srv.shutdown()
+        for k, v in saved.items():
+            if v is None:
+                os.environ.pop(k, None)
             else:
-                print("  FAIL  NOT caught: %s" % label)
-                failures += 1
-        finally:
-            shutil.rmtree(d, ignore_errors=True)
-    print("\nself-test: %d case(s), %d not caught" % (len(breakages), failures))
+                os.environ[k] = v
+    print("\nself-test: %d breakage case(s) and %d acceptance case(s), %d wrong"
+          % (len(breakages), len(acceptances), failures))
     return 1 if failures else 0
+
+
+# The one tag the self-test's release server does not serve: `_git_pin`'s
+# `served=False` retags the fixture with it.
+DRAFT_TAG = "v0.0.6"
+
+
+def _release_server():
+    """A local stand-in for releases/download/: every tag's SHA256SUMS.txt is
+    served, except DRAFT_TAG's, which is a 404 as a draft's is on GitHub."""
+    class H(http.server.BaseHTTPRequestHandler):
+        def log_message(self, *_):
+            pass
+
+        def do_GET(self):
+            ok = (self.path.endswith("/SHA256SUMS.txt")
+                  and not self.path.startswith("/%s/" % DRAFT_TAG))
+            body = b"0" * 64 + b"  holdfast-linux-x86_64.tar.gz\n" if ok else b""
+            self.send_response(200 if ok else 404)
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+
+    srv = http.server.HTTPServer(("127.0.0.1", 0), H)
+    threading.Thread(target=srv.serve_forever, daemon=True).start()
+    return srv, "http://127.0.0.1:%d" % srv.server_address[1]
+
+
+def _fixture(root):
+    d = tempfile.mkdtemp(prefix="hf-manifest-")
+    for item in (".claude-plugin", "plugin", "Cargo.toml", ".claude"):
+        s = os.path.join(root, item)
+        t = os.path.join(d, item)
+        if os.path.isdir(s):
+            shutil.copytree(s, t)
+        elif os.path.isfile(s):
+            shutil.copy(s, t)
+    return d
 
 
 def _patch(d, rel, updates):
@@ -347,6 +638,93 @@ def _patch_server(d, key, value):
     for srv in obj["mcpServers"].values():
         srv[key] = value
     json.dump(obj, open(p, "w"), indent=2)
+
+
+def _patch_source(d, source):
+    p = os.path.join(d, ".claude-plugin/marketplace.json")
+    obj = json.load(open(p))
+    obj["plugins"][0]["source"] = source
+    json.dump(obj, open(p, "w"), indent=2)
+
+
+def _pin(d, **over):
+    """A pin in the shape CONTRIBUTING.md's post-promotion step writes, at a
+    release no newer than the tree's own Cargo.toml. The fixture directory
+    is not a git clone, so the tag comparison reports a skip here."""
+    pin = {"source": "git-subdir", "url": REPO_GIT_URL, "path": "plugin",
+           "ref": "v0.0.1", "sha": "0" * 40}
+    for k, v in over.items():
+        if v is None:
+            pin.pop(k, None)
+        else:
+            pin[k] = v
+    _patch_source(d, pin)
+
+
+def _git_pin(d, variant, served=True):
+    """Make the fixture a git clone with a release tag at the tree's own
+    version, and pin to it: `good` exactly, `sha-elsewhere` at a later
+    commit, `tree-disagrees` at a tag whose tree's plugin.json says another
+    version (the working tree's own stays right, so nothing else fails).
+    `served=False` moves the whole tree -- Cargo.toml, version.txt,
+    plugin.json -- to DRAFT_TAG's version first, so the pin is right in
+    every way the release server cannot see."""
+    if not served:
+        v = DRAFT_TAG[1:]
+        _write(d, "plugin/version.txt", v + "\n")
+        _patch(d, "plugin/.claude-plugin/plugin.json", {"version": v})
+        cargo = os.path.join(d, "Cargo.toml")
+        text = open(cargo).read()
+        new = re.sub(r'(\[workspace\.package\][^\[]*?^version\s*=\s*")[^"]+"',
+                     lambda m: m.group(1) + v + '"', text, count=1, flags=re.M | re.S)
+        assert new != text, "Cargo.toml's workspace version was not moved"
+        open(cargo, "w").write(new)
+    env = dict(os.environ, GIT_CONFIG_GLOBAL=os.devnull, GIT_CONFIG_NOSYSTEM="1",
+               GIT_CEILING_DIRECTORIES=os.path.dirname(os.path.abspath(d)))
+
+    def git(*args):
+        return subprocess.check_output(
+            ["git", "-C", d, "-c", "user.name=self-test", "-c",
+             "user.email=self-test@invalid", "-c", "commit.gpgsign=false",
+             "-c", "tag.gpgsign=false", "-c", "core.hooksPath=" + os.devnull]
+            + list(args), env=env, stderr=subprocess.STDOUT).decode().strip()
+
+    version = cargo_version(Report(), d)
+    pj = os.path.join(d, "plugin/.claude-plugin/plugin.json")
+    real = open(pj).read()
+    git("init", "-q")
+    if variant == "tree-disagrees":
+        _patch(d, "plugin/.claude-plugin/plugin.json", {"version": "0.0.0"})
+    git("add", "-A")
+    git("commit", "-q", "-m", "tagged")
+    git("tag", "v" + version)
+    sha = git("rev-parse", "HEAD")
+    open(pj, "w").write(real)
+    if variant == "sha-elsewhere":
+        git("commit", "-q", "--allow-empty", "-m", "after the tag")
+        sha = git("rev-parse", "HEAD")
+    _pin(d, ref="v" + version, sha=sha)
+
+
+def _nested_in_clone(d):
+    """The tree moved to d/inner, and d made a clone tagged v0.0.1 -- the
+    ref `_pin` writes -- at a commit that is not the pin's sha."""
+    inner = os.path.join(d, "inner")
+    os.makedirs(inner)
+    for item in os.listdir(d):
+        if item != "inner":
+            shutil.move(os.path.join(d, item), os.path.join(inner, item))
+    env = dict(os.environ, GIT_CONFIG_GLOBAL=os.devnull, GIT_CONFIG_NOSYSTEM="1")
+    for args in (["init", "-q"],
+                 ["commit", "-q", "--allow-empty", "-m", "outer"],
+                 ["tag", "v0.0.1"]):
+        subprocess.check_output(
+            ["git", "-C", d, "-c", "user.name=self-test", "-c",
+             "user.email=self-test@invalid", "-c", "commit.gpgsign=false",
+             "-c", "tag.gpgsign=false", "-c", "core.hooksPath=" + os.devnull]
+            + args, env=env, stderr=subprocess.STDOUT)
+    _pin(inner)
+    return inner
 
 
 def _write(d, rel, text):

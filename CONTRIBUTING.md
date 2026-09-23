@@ -5,8 +5,9 @@ have to pass, and the two testing standards this project actually enforces —
 they are unusual enough that they trip people up, and they are the reason the
 suite is worth anything.
 
-Holdfast is **early**. Milestones 0.0.1 through 0.0.5 have landed on `main`,
-nothing is released, and the surface moves. [ROADMAP.md](./ROADMAP.md) shows
+Holdfast is **early**. Releases up to `v0.0.7` are tagged, none of them
+carries a binary — so building from source is the only way to run it — and the
+surface moves. [ROADMAP.md](./ROADMAP.md) shows
 what is being built next; opening an issue before a large change is
 appreciated.
 
@@ -33,11 +34,22 @@ against them, and prints the exact command for anything missing. If it reports
 a version older than the MSRV, the fix is almost always `rustup self update`
 first and the toolchain install second, in that order.
 
-To point Claude Code at your build:
+To point Claude Code at your build, install it and register the installed
+copy — not `target/debug/holdfast`, which `cargo clean` deletes out from under
+every Claude Code session on the machine:
 
 ```bash
-claude mcp add --scope user holdfast -- "$(pwd)/target/debug/holdfast" mcp
+cargo install --locked --path crates/holdfast
+claude mcp add --scope user holdfast -- "$HOME/.cargo/bin/holdfast" mcp
 ```
+
+After each reinstall, `holdfast daemon stop` then `(cd ~ && holdfast daemon
+start)`: the daemon keeps running the binary it was started from until it is
+restarted, stopping it ends every session it holds, and one started from this
+checkout would be the directory a session with no `cwd` starts in on a build
+without GH #229's fix. [README.md](./README.md#build-and-try-it) covers that,
+the one registration each Claude Code config directory needs, and the plugin
+route.
 
 `holdfast mcp [--no-daemon]` speaks MCP over stdio. By default it runs in
 **hybrid mode**: it auto-spawns a background `holdfast daemon` that owns the
@@ -350,8 +362,9 @@ Cutting one is therefore:
      out-of-band-secret bullet saying that echo gating is "on `main`, and in
      no tag yet, so a `v0.0.7` install does not have it" (that one becomes
      *wrong*, not merely stale, the moment the tag exists).
-   - `README.md` — the status line and the `## What works today (vX.Y.Z)`
-     heading near the top.
+   - `README.md` — the status line near the top. The `## What works today`
+     heading below it no longer carries a version: it describes `main`, and
+     said `v0.0.7` while doing so.
    - `CLAUDE.md` — the "Project Status" paragraph, which pins the newest tag,
      quotes that version's `CHANGELOG.md` heading verbatim, and states the
      workspace version; and the paragraph after it, which names
@@ -383,6 +396,46 @@ Cutting one is therefore:
    unauthenticated and confirm it 404s, then re-read what the workflow prints:
    promoting is *first external distribution*, and several deliberate escapes
    in this tree are conditioned on that not having happened.
+8. **After promoting, pin the marketplace to the tag, in its own pull
+   request.** `.claude-plugin/marketplace.json`'s plugin `source` is what every
+   `/plugin install` and `/plugin update` reads. While it is `"./plugin"` it
+   reads `plugin/` off `main` — and step 4 moved `plugin/version.txt` on `main`
+   before the tag existed, so from the merge of the release PR until the draft
+   is promoted, a new install or an update pins a version whose assets are not
+   served, and its MCP server fails to start ([#237]). A pin that moves only
+   after promotion closes that window: `main` goes on changing `plugin/`, and
+   installs keep the last promoted release until the pin moves.
+
+   ```json
+   "source": {
+     "source": "git-subdir",
+     "url": "https://github.com/Sertelegger/holdfast.git",
+     "path": "plugin",
+     "ref": "vX.Y.Z",
+     "sha": "<git rev-parse vX.Y.Z^{commit}>"
+   }
+   ```
+
+   **The `sha` is the pin; the `ref` is for the reader.** Claude Code takes
+   the `sha` when both are present, and a tag without one can be moved.
+   `scripts/plugin-manifest-check.py` refuses a pin to a branch, to another
+   URL, to another path, without a full sha, or ahead of `Cargo.toml`; checks
+   that the sha is the tag's commit and that the pinned tree's `plugin.json`
+   says `X.Y.Z`; and asks `releases/download/vX.Y.Z/SHA256SUMS.txt` whether
+   the release is served. **That is the check that makes this step's order
+   enforceable**: a pin opened before promotion satisfies every other rule —
+   the tag is real and `Cargo.toml` already names it — and a draft answers
+   404. CI's `plugin` job checks out the tags, and under CI a tag it does not
+   have, or a release that does not answer, fails rather than skips; run
+   locally without them, it says `skip` for that half, which is not a pass.
+
+   **The first release that can be pinned is the first whose tag contains
+   `plugin/`.** `v0.0.7` does not — the plugin landed after it — so until a
+   later release is promoted the source stays `"./plugin"`, and the check
+   refuses a pin to `v0.0.7`: its tree has no `plugin.json`, and it serves
+   no assets. Measured on a scratch config
+   directory, a `git-subdir` source with a `sha` installs exactly that
+   commit's `plugin/` into the cache under its `plugin.json` version.
 
 ### crates.io
 
@@ -494,3 +547,8 @@ Then, by hand:
    is a draft. That is the measurement that the event has not happened yet.
 2. Re-read the two escapes above. Promoting ends them.
 3. `gh release edit vX.Y.Z --draft=false`.
+4. Pin the marketplace to the tag — step 8 of [Releases](#releases). Until
+   that merges, what an install gets is decided by the previous pin, or,
+   before the first one, by `main`.
+
+[#237]: https://github.com/Sertelegger/holdfast/issues/237
