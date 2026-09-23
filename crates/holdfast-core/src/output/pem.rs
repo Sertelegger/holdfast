@@ -127,17 +127,52 @@ pub fn extent(region: &[u8], at: usize) -> PemExtent {
         Lane::new(Filter::StrippedPrintable, start),
     ];
     let mut i = start;
+    // Continuation bytes still owed to the UTF-8 sequence the last lead
+    // byte opened.
+    let mut owed = 0u8;
     while i < region.len() {
         if lanes.iter().all(|l| !l.live()) {
             break;
         }
         let byte = region[i];
+        let continuation = owed > 0 && (0x80..=0xbf).contains(&byte);
+        owed = if continuation {
+            owed - 1
+        } else {
+            match byte {
+                0xc2..=0xdf => 1,
+                0xe0..=0xef => 2,
+                0xf0..=0xf4 => 3,
+                _ => 0,
+            }
+        };
         // The C1 arm: see the module header. A lone `0x80..=0x9f`, or the
         // two-byte spelling `0xc2 0x80..=0x9f`, is dropped or consumed as
         // an introducer by the C1 streams, which this walk does not model;
         // while any stream is still alive, give up and believe the rest.
-        let c1 = (0x80..=0x9f).contains(&byte)
-            || (byte == 0xc2 && region.get(i + 1).is_none_or(|n| (0x80..=0x9f).contains(n)));
+        //
+        // **Except a continuation byte of a well-formed character that
+        // introduces nothing**, which is the common case and was the
+        // costly one: `✔` in a prompt's window title is `e2 9c 94`, both
+        // continuations in the C1 range. A C1 stream only *drops* such a
+        // byte, and every stream still alive at it is one that did not die
+        // on the lead byte in front of it — so it is inside an escape
+        // sequence the stripper is consuming (an OSC title, a DCS string),
+        // where a dropped byte changes nothing. The one arrangement this
+        // does not cover is a lead byte consumed as the single byte a
+        // charset designator takes (`ESC (` directly in front of a
+        // multi-byte character), after which the stripper emits the
+        // continuation a C1 stream drops. The five that open a sequence
+        // under `C1::Strip` —
+        // `0x90`, `0x9b`, `0x9d`, `0x9e`, `0x9f` — can end that sequence's
+        // terminator early or late, so they keep the arm (`”` is `e2 80
+        // 9d`).
+        let c1 = if continuation {
+            matches!(byte, 0x90 | 0x9b | 0x9d | 0x9e | 0x9f)
+        } else {
+            (0x80..=0x9f).contains(&byte)
+                || (byte == 0xc2 && region.get(i + 1).is_none_or(|n| (0x80..=0x9f).contains(n)))
+        };
         if c1 && lanes.iter().any(Lane::live) {
             return PemExtent {
                 end: region.len(),
@@ -766,6 +801,28 @@ mod tests {
         let e = walk(&late);
         assert!(!e.alive && e.material);
         assert_eq!(&late[e.end..], "Note: this is prose\n");
+    }
+
+    /// **A glyph in a window title does not keep a dead candidate alive.**
+    /// `✔` is `e2 9c 94`: both continuation bytes are in the C1 range, and
+    /// before the continuation arm the walk gave up on the first of them —
+    /// so a key cut short and followed by a prompt that sets such a title
+    /// was believed to the end of the region. That is a strand on the read
+    /// and, on the `watch` stream, a key body the end-of-stream flush would
+    /// have released. `”` (`e2 80 9d`) ends in an introducer and still
+    /// gives up, which is what the arm is for.
+    #[test]
+    fn a_non_introducing_continuation_byte_is_not_a_c1_control() {
+        let tick = format!("{HEADER}\n{LINE}\n\x1b]0;title \u{2714}\x07$ echo\n");
+        let e = walk(&tick);
+        assert!(!e.alive && e.material, "{e:?}");
+        assert_eq!(&tick[e.end..], "\x1b]0;title \u{2714}\x07$ echo\n");
+
+        let quote = format!("{HEADER}\n{LINE}\n\x1b]0;title \u{201d}\x07$ echo\n");
+        assert!(
+            walk(&quote).alive,
+            "an introducer keeps the conservative arm"
+        );
     }
 
     /// The C1 arm gives up *alive*, and only while some stream is.

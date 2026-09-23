@@ -267,14 +267,35 @@ impl StreamRedactor {
     /// that never overflowed the carry is emitted raw, because at end of
     /// stream it will never be judged and `ghp_abc` — a prefix that is
     /// not a secret — is the common case. What bounds it is
-    /// [`STREAM_CARRY_BYTES`].
+    /// [`STREAM_CARRY_BYTES`]. **Except a PEM candidate carrying key
+    /// material**, which since GH #242 is masked here: it is a key cut
+    /// short, not a prefix that might be nothing.
     pub fn flush(&mut self) -> Vec<u8> {
         if self.withholding {
             self.reset();
             return Vec::new();
         }
         let stream_end = self.base + self.buf.len() as u64;
-        let spans = self.spans();
+        let mut spans = self.spans();
+        // **A key body still arriving when the stream ends is masked, not
+        // flushed.** At end of stream nothing will close it, and a PEM
+        // candidate with key material behind it is a key cut short — the
+        // case `spans` already masks when a prompt follows it, reached
+        // here with nothing following it. A candidate without material
+        // (`ghp_abc`, a bare header) is still flushed, which is the
+        // residual the paragraph above states.
+        let arriving: Vec<crate::output::redact::Span> = self
+            .processor
+            .index
+            .unterminated_candidates(&self.processor.rules, &self.buf, self.base)
+            .into_iter()
+            .filter(|c| c.in_flight && c.material)
+            .map(|c| crate::output::redact::Span::unresolved(c.start, c.end))
+            .collect();
+        if !arriving.is_empty() {
+            spans.extend(arriving);
+            spans = crate::output::redact::merge_spans(spans);
+        }
         let out = self.render(&spans, stream_end);
         self.retire(stream_end);
         out
@@ -826,6 +847,47 @@ mod tests {
                 }
             }
         }
+    }
+
+    /// **A key cut short by the end of the stream is masked, not flushed**
+    /// (GH #242). Nothing follows it to end the candidate, so it is still
+    /// held when the session ends — and `flush` used to emit whatever was
+    /// held, which for a key is its body. Paired with the prefix that is
+    /// not a secret, which the same flush still releases.
+    #[test]
+    fn a_key_cut_short_by_the_end_of_the_stream_is_masked_not_flushed() {
+        use crate::output::pem::fixtures::KEYS;
+        for key in KEYS {
+            // Four lines: the header and three of body, which is the
+            // whole body of the smallest fixture and leaves it unclosed.
+            let cut: String = key.pem().split_inclusive('\n').take(4).collect();
+            assert!(!cut.contains("-----END"), "{}", key.name);
+            let mut r = redactor();
+            let mut out = r.feed(format!("$ head -n 4 k\n{cut}").as_bytes());
+            assert!(
+                !r.is_withholding(),
+                "{}: the fixture must end in the carry, not in the withhold",
+                key.name
+            );
+            out.extend(r.flush());
+            let out = String::from_utf8_lossy(&out).into_owned();
+            assert_eq!(key.leaked_in(&out), None, "{}: {out:?}", key.name);
+            assert!(
+                out.contains("[REDACTED:unresolved]"),
+                "{}: {out:?}",
+                key.name
+            );
+        }
+        let mut r = redactor();
+        assert!(r.feed(b"ghp_abc").is_empty());
+        assert_eq!(r.flush(), b"ghp_abc");
+        // …and so does a header with no body behind it, which carries no
+        // key material either: masking it would put a marker where the
+        // session printed only a boundary line.
+        let mut r = redactor();
+        let mut out = r.feed(b"-----BEGIN RSA PRIVATE KEY-----\n");
+        out.extend(r.flush());
+        assert_eq!(out, b"-----BEGIN RSA PRIVATE KEY-----\n");
     }
 
     /// **The stream and the read agree about prose** (GH #242). A

@@ -487,6 +487,10 @@ pub struct Unterminated {
     /// Still believed at the region's end. The ones that are not were
     /// returned because they carry key material.
     pub in_flight: bool,
+    /// Its body carried a run of `pem::PEM_MATERIAL_RUN` base64
+    /// characters — always true of one that is not `in_flight`, and what
+    /// the stream's end-of-stream flush asks of one that is.
+    pub material: bool,
 }
 
 impl PrefixIndex {
@@ -844,6 +848,7 @@ impl PrefixIndex {
                         start: region_start + i as u64,
                         end: region_start + e.end as u64,
                         in_flight: e.alive,
+                        material: e.material,
                     });
                 }
                 break;
@@ -2509,7 +2514,8 @@ mod tests {
             vec![Unterminated {
                 start: 0,
                 end: kill as u64,
-                in_flight: false
+                in_flight: false,
+                material: true
             }],
             "the whole body in front of the byte that ended it is reported, \
              and every surface masks what is reported"

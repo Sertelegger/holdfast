@@ -387,7 +387,8 @@ is cut, named and published is in
   stream a read can emit. A prose mention now costs nothing. A candidate that
   dies *with key material behind it* — `head -n 15 id_rsa` and then a prompt —
   is masked from its header to the line that ended it, on the read, the grid
-  and the stream alike, rather than released. The residual is stated in
+  and the stream alike, rather than released; and a key still arriving when a
+  `watch` stream ends is masked rather than flushed. The residual is stated in
   `output/pem.rs`: a key cut inside the first sixteen characters of its body,
   or one a program interrupts with junk and then paints over, is judged on the
   bytes rather than on what a terminal would show.
