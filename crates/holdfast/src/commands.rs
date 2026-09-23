@@ -1382,8 +1382,8 @@ const LOGS_PAGE_BYTES: u64 = 256 * 1024;
 /// returns at most one page, and the command made one call and ignored
 /// both `truncated_for_size` and `next_cursor` — so on any session that
 /// had printed more than a page it stopped mid-line, said nothing, and
-/// exited 0. Both viewers' truncation notices send the operator here for
-/// what they missed, which is almost never the oldest page.
+/// exited 0. Both viewers' `slow_consumer` notices send the operator here
+/// for what they missed, which is almost never the oldest page.
 ///
 /// It now follows `next_cursor` to the end, and stops early only where
 /// the daemon says to:

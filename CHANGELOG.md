@@ -760,6 +760,8 @@ is cut, named and published is in
   returns one marker where the grid returns 39 raw key-body lines. That is
   pre-existing and untouched here, but it is now a gap **between** two surfaces
   rather than shared behaviour, and it is filed rather than described away.
+  *(Since fixed — see [#224] above: the grid now masks the bytes the read
+  does. Kept as written: it is the measurement that fix answers.)*
 
   **The candidate is believed for `UNVOUCHED_CARRY_BYTES` (16,384) past its
   anchor, and that bound is the whole of what the change costs.** The
@@ -783,7 +785,11 @@ is cut, named and published is in
 
   **The false-positive cost, measured rather than asserted**, as the share of
   a corpus covered by `unresolved` markers, at `max_bytes` 4,096 / 32,768 /
-  262,144 / 4 MiB:
+  262,144 / 4 MiB. *(Since changed — see [#242] above: a candidate is now
+  dropped at the first text that cannot be PEM, so a header quoted in prose
+  costs nothing, and the table and the paragraph after it describe the
+  behaviour [#242] replaced. Kept as written: they are the measurement it
+  answers.)*
 
   | corpus | capped (shipped) | uncapped |
   |---|---|---|

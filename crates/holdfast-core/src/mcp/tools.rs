@@ -504,7 +504,7 @@ impl HoldfastServer {
             // handed the set this server's processor runs. The same
             // `Arc`, so the two surfaces cannot drift.
             rules: Some(Arc::clone(&self.processor.rules)),
-            // §4.2's `output_broadcast_capacity`, inert until GH #210.
+            // §4.2's `output_broadcast_capacity`, live since GH #210.
             output_broadcast_capacity: self.config.limits.output_broadcast_capacity,
             ..SessionConfig::default()
         };
