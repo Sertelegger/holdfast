@@ -184,6 +184,10 @@ pub struct StreamRedactor {
     /// state incoming bytes are dropped — not emitted, and not
     /// accumulated past [`STREAM_CARRY_BYTES`].
     withholding: bool,
+    /// Where the span the last marker was emitted for began — so a span
+    /// the reader has seen a marker for is continued silently across
+    /// feeds, and one it has not is marked (see `render`).
+    marked_from: Option<u64>,
 }
 
 impl std::fmt::Debug for StreamRedactor {
@@ -208,6 +212,7 @@ impl StreamRedactor {
             split: 0,
             base: 0,
             withholding: false,
+            marked_from: None,
         }
     }
 
@@ -439,7 +444,7 @@ impl StreamRedactor {
 
     /// Copy `buf[split..emit_end]` out, substituting a marker for every
     /// span that overlaps it.
-    fn render(&self, spans: &[crate::output::redact::Span], emit_end: u64) -> Vec<u8> {
+    fn render(&mut self, spans: &[crate::output::redact::Span], emit_end: u64) -> Vec<u8> {
         let region_start = self.base + self.split as u64;
         if emit_end <= region_start {
             return Vec::new();
@@ -462,11 +467,23 @@ impl StreamRedactor {
             // would claim a substitution the reader never saw begin, and
             // emitting the tail raw would hand over the value half of a
             // token whose prefix already went out.
-            if span.start >= region_start {
+            //
+            // **Except an `unresolved` span no marker has been emitted for
+            // yet.** A run of key-body lines after a stopped candidate
+            // (`pem::body_lines`) starts at its first line, and what went
+            // out of that line before it could be judged is what a pager
+            // repaints first — `\r\x1b[K`. When the rest arrived in later
+            // feeds the whole screenful was dropped with no marker at all,
+            // measured through `holdfast watch` on `less` and a space; the
+            // reader was never told anything was withheld. Once one marker
+            // for the run has gone out, its continuation stays silent.
+            let unmarked = span.is_unresolved() && self.marked_from.is_none_or(|m| m < span.start);
+            if span.start >= region_start || unmarked {
                 // `span_kind`, not `rules[span.rule]`: a span may be the
                 // synthetic `unresolved` one, which names no rule.
                 let kind = crate::output::redact::span_kind(&self.processor.rules, span);
                 out.extend_from_slice(marker(kind).as_bytes());
+                self.marked_from = Some(span.start);
             }
             pos = pos.max(span.end.min(emit_end));
         }
@@ -961,6 +978,50 @@ mod tests {
             }
         }
         assert!(shapes >= KEYS.len() * 2, "the sweep lost its shapes");
+    }
+
+    /// **A pager's next screenful of a key reaches `watch` as a marker, not
+    /// as nothing** — whatever the pty's chunking.
+    ///
+    /// `less` repaints with `\r\x1b[K` and then the lines. When the
+    /// `\r\x1b[K` went out in one feed and the lines arrived in later
+    /// ones, each line was held until it was whole, then masked as part of
+    /// a run of body lines that *began* in the already-emitted bytes — and
+    /// a span opening there got no marker. Measured through `holdfast
+    /// watch` on `less` and a space: no key material, and no marker, just
+    /// the prompt again. Replayed here at one and three bytes per feed
+    /// from the end of the first screenful.
+    #[test]
+    fn a_pagers_next_screenful_is_marked_whatever_the_chunking() {
+        use crate::output::pem::fixtures::KEYS;
+        let key = &KEYS[0];
+        let shape = key
+            .shapes()
+            .into_iter()
+            .find(|s| s.name == "less, next screenful")
+            .unwrap();
+        let text = shape.text.as_bytes();
+        let screenful = shape.text.find("\x1b[27m\x1b[K").unwrap() + 8;
+        for size in [1usize, 3] {
+            let mut r = redactor();
+            let mut out = r.feed(&text[..screenful]);
+            for piece in text[screenful..].chunks(size) {
+                out.extend(r.feed(piece));
+            }
+            out.extend(r.flush());
+            let out = String::from_utf8_lossy(&out).into_owned();
+            assert_eq!(key.leaked_in(&out), None, "at {size}: {out:?}");
+            let after = &out[out.find("id_key lines 1-").unwrap()..];
+            assert!(
+                after.contains("[REDACTED:unresolved]"),
+                "at {size}: the next screenful was dropped without a marker: {after:?}"
+            );
+            assert_eq!(
+                after.matches("[REDACTED:").count(),
+                1,
+                "at {size}: one run, one marker: {after:?}"
+            );
+        }
     }
 
     /// **A key cut short by the end of the stream is masked, not flushed**
