@@ -43,55 +43,53 @@ use std::sync::Arc;
 // agent that trusted it never learned that `status`,
 // `list_sessions` or `get_command_history` existed.
 // `scripts/mcp-smoke.sh` asserts every tool name appears here.
-pub const INSTRUCTIONS: &str = "Holdfast gives you PTY-backed shell sessions. start_session spawns a \
-     shell or program; send_input types into it; read_output reads what \
-     it printed using a cursor you carry between calls; \
-     wait_for_pattern blocks until a regex matches new output, and \
-     **its pattern is optional**. Omit it to wait until the session \
-     stops executing. Read what that answers precisely: it is `is the \
-     session executing`, and it becomes `did the command finish` only \
-     when shell integration is live, because only then can the daemon \
-     count the command that started. Without it, a session that is merely \
-     quiet answers the same as one that is done. The response carries \
-     interaction_mode, detection_tier and prompt.reason so you can tell \
-     a measured prompt from a guessed one; for whether a command \
-     *succeeded*, read get_command_history's exit code. It returns as soon as the \
-     session is anything but Executing, so Fullscreen, AwaitingSecret \
-     and Exited come back at once rather than at the deadline -- read \
-     interaction_mode, because those three need different actions. \
-     Supply a pattern only for a PROGRAM's prompt -- `Password:`, \
-     `(gdb)`, `>>>` -- and NEVER for the shell's own: a shell-prompt \
-     regex is a guess about the operator's $PS1, and against a \
-     customised prompt it simply never matches, so the call reports a \
-     timeout for a command that finished long ago. To know whether a \
-     command succeeded, read get_command_history's exit code. A wait \
-     that ends unmatched against a session already back at a measured \
-     prompt says so, in warning; \
-     interrupt sends Ctrl+C to the foreground process group, \
-     which stops the running command without killing the shell, and \
-     terminate stops the session and its whole process group. \
-     get_screen_state returns the rendered terminal grid rather than \
-     the byte stream, which is the right read for a full-screen \
-     program; pass diff_from with the screen_revision from your \
-     previous call to get only the changed regions. screen_tracking on \
-     a session's responses says whether that emulation is already \
-     running. resize changes the terminal's dimensions and raises \
-     SIGWINCH in the child, so a TUI redraws at the new size. status and list_sessions report what each \
-     session is doing: interaction_mode is one of AtPrompt, Executing, \
-     AwaitingSecret, Fullscreen, Exited, and detection_tier says whether \
-     that was measured from OSC 133 shell integration (semantic), from a \
-     terminal mode such as bracketed paste or termios ECHO \
-     (terminal_mode), or guessed from output quiescence and prompt \
-     patterns (heuristic). For bash, zsh and fish, Holdfast injects OSC 133 \
-     markers at start-up, and get_command_history then reports each \
-     command's exit code and output span. Output is ANSI-stripped \
-     and secret-redacted by default; secrets are replaced with \
-     [REDACTED:<kind>] markers. When a session's interaction_mode is \
-     AwaitingSecret it is blocked on a password prompt: use \
-     request_secret_input, NOT send_input. That tool asks a human at an \
-     attached client to type the credential straight into the session's \
-     terminal; you never receive the value, cannot name which credential \
-     you want, and get back only the number of bytes written.";
+//
+// **Rules first, and the whole of it inside the client's budget (GH
+// #230).** Claude Code keeps the first 2048 characters of a server's
+// instructions and drops the rest — read off its 2.1.280 bundle:
+// `CLAUDE_CODE_MAX_MCP_DESCRIPTION_LENGTH ?? 2048`, compared against a
+// JavaScript string length, so UTF-16 code units. This text ran past that
+// and put its one safety rule last: *at a password prompt use
+// request_secret_input, never send_input* started past the cut, so no
+// agent on the default transport ever read it, and the likely failure is
+// an agent asking the user to paste the password into the chat. The dogfood
+// log's `truncated from 3165` was the **shim's** string — this plus its
+// suffix — which is the one the plugin's `holdfast mcp` serves on Unix;
+// `--no-daemon` and Windows serve this alone. Both are asserted, through
+// `get_info`, by `tests::assert_instructions_survive_the_client`.
+//
+// So the order is the priority: the secret rule, then how to wait for a
+// command without guessing at `$PS1`, then what the state fields mean,
+// then output handling (including what `[REDACTED:unresolved]` is, GH
+// #242), then a one-line map of the rest. Per-tool detail belongs in the
+// tool's own description, which the client carries separately.
+pub const INSTRUCTIONS: &str = "Holdfast gives you persistent PTY-backed terminal sessions.\n\n\
+     SECRETS: when interaction_mode is AwaitingSecret the session is at a \
+     password prompt. Use request_secret_input, NEVER send_input, and never \
+     ask the user to paste a secret into chat: a human at an attached client \
+     types it into the terminal, and you get back only a byte count.\n\n\
+     WAITING: to wait for a command, call wait_for_pattern with NO pattern; \
+     it returns once the session is not Executing. Never pass a regex for \
+     the shell's prompt: it guesses at $PS1, never matches a custom one, and \
+     times out on a finished command. Pass one only for a program's prompt \
+     (Password:, (gdb), >>>). Whether a command succeeded is \
+     get_command_history's exit_code.\n\n\
+     STATE: interaction_mode is AtPrompt, Executing, AwaitingSecret, \
+     Fullscreen or Exited; the last three each need a different action. \
+     detection_tier is semantic (OSC 133 markers, injected for bash, zsh \
+     and fish), terminal_mode (bracketed paste or termios ECHO) or \
+     heuristic (a guess: a quiet session reads as finished).\n\n\
+     OUTPUT: read_output pages with a cursor you carry between calls. \
+     Output is ANSI-stripped and secrets become [REDACTED:<kind>]. \
+     [REDACTED:unresolved] means no rule matched but the read could not \
+     rule a secret out; it is often ordinary text, and a larger max_bytes \
+     may resolve it. redact:false shows raw bytes and is audit-logged.\n\n\
+     TOOLS: start_session spawns a shell or program; send_input types into \
+     it; interrupt sends Ctrl+C to the foreground process group, sparing the \
+     shell; terminate ends the session and its process group; \
+     get_screen_state returns the rendered grid, right for full-screen \
+     programs (diff_from: changes only); resize sets the size and sends \
+     SIGWINCH; status and list_sessions describe sessions.";
 
 /// Buffered `list_changed` pulses before a slow subscriber starts
 /// missing them. Small on purpose: the notification is idempotent — a
@@ -880,6 +878,75 @@ pub async fn serve_stdio() -> anyhow::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// How much of a server's `instructions` Claude Code passes to the
+    /// model, in UTF-16 code units: 2.1.280's
+    /// `CLAUDE_CODE_MAX_MCP_DESCRIPTION_LENGTH ?? 2048`, measured with a
+    /// JavaScript `.length`. The cut keeps the **head**, so a rule past it
+    /// is a rule no agent reads (GH #230).
+    pub(super) const CLAUDE_CODE_INSTRUCTIONS_BUDGET: usize = 2048;
+
+    /// Where the secret rule has to start by: the first quarter of the
+    /// budget. Fitting the budget is what makes today's client read all of
+    /// it; this is what keeps the rule first, so a client with a smaller
+    /// cut — or a later edit that grows the text — loses the map at the
+    /// end and not the rule at the top.
+    pub(super) const SAFETY_RULES_WITHIN: usize = CLAUDE_CODE_INSTRUCTIONS_BUDGET / 4;
+
+    /// The one assertion both transports' `instructions` go through, so
+    /// the in-process text and the shim's cannot be held to two different
+    /// standards (GH #230).
+    ///
+    /// Takes the string **as `get_info` returns it** — the thing the client
+    /// receives — rather than the `INSTRUCTIONS` constant: the shim's is
+    /// longer, it is the one the plugin serves on Unix, and a test of the
+    /// constant alone would pass while the shim's suffix pushed the served
+    /// string over.
+    pub(super) fn assert_instructions_survive_the_client(transport: &str, text: &str) {
+        let units = text.encode_utf16().count();
+        assert!(
+            units <= CLAUDE_CODE_INSTRUCTIONS_BUDGET,
+            "{transport}: the instructions are {units} UTF-16 units and Claude Code keeps \
+             {CLAUDE_CODE_INSTRUCTIONS_BUDGET}; everything past the cut never reaches the \
+             model. Move detail into the tool's own description."
+        );
+        // The head a client with a quarter of the budget would keep,
+        // counted the way the client counts.
+        let mut kept = 0;
+        let head: String = text
+            .chars()
+            .take_while(|c| {
+                kept += c.len_utf16();
+                kept <= SAFETY_RULES_WITHIN
+            })
+            .collect();
+        for rule in ["AwaitingSecret", "request_secret_input", "NEVER send_input"] {
+            assert!(
+                head.contains(rule),
+                "{transport}: `{rule}` is not in the first {SAFETY_RULES_WITHIN} units of \
+                 the instructions. The password-prompt rule goes first, because it is the \
+                 one whose absence costs a credential:\n{head}"
+            );
+        }
+        // GH #242's explanation half: the marker that names no rule is
+        // explained, and so is the audited way past it.
+        for needle in ["[REDACTED:unresolved]", "redact:false", "audit"] {
+            assert!(
+                text.contains(needle),
+                "{transport}: the instructions no longer mention `{needle}`"
+            );
+        }
+    }
+
+    /// `--no-daemon`'s and Windows' instructions, through `get_info`.
+    #[test]
+    fn the_in_process_instructions_fit_the_client_budget_with_the_secret_rule_first() {
+        let text = HoldfastServer::new()
+            .get_info()
+            .instructions
+            .expect("the in-process server sends instructions");
+        assert_instructions_survive_the_client("in-process", &text);
+    }
 
     /// An audit log that could not be opened must leave a mark the host
     /// can act on.

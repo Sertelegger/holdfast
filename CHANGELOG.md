@@ -675,6 +675,44 @@ is cut, named and published is in
   optimized both.
 
 ### Fixed
+- **The server instructions lead with the password-prompt rule, and all of
+  them now reach the model (GH #230).** Claude Code passes the first 2048
+  characters of a server's instructions to the model and drops the rest
+  (2.1.280: `CLAUDE_CODE_MAX_MCP_DESCRIPTION_LENGTH ?? 2048`, counted in
+  UTF-16 units). Holdfast's ran past that, and the one rule whose absence
+  costs a credential — *at a password prompt use `request_secret_input`,
+  never `send_input`* — was the last thing in them, so on the default
+  transport no agent ever read it; the likely failure is an agent asking the
+  user to paste the password into the chat. The text is rewritten in
+  priority order — secrets, then how to wait for a command without guessing
+  at `$PS1`, then what `interaction_mode` and `detection_tier` mean, then
+  output handling, then a one-line map of the rest — and now also says
+  never to ask for a secret in chat. `send_input`'s own description says
+  the same thing, and the hybrid transport's suffix says how a human
+  answers: `holdfast attach <session>`.
+
+  **Both strings a client can receive are held to the budget, through
+  `get_info`:** the shim's — the shared text plus its suffix, which is what
+  the plugin serves on Unix and what the dogfood log measured — and the
+  in-process one for `--no-daemon` and Windows. Each must fit, and must
+  carry the secret rule within its first quarter, so a later edit that
+  grows the text loses the map at the end rather than the rule at the top.
+  `scripts/mcp-smoke.sh` asserts the same on the wire. To see the served
+  text and its length, run `holdfast mcp` and read `initialize`'s
+  `instructions`.
+
+- **`[REDACTED:unresolved]` is explained to the agent (GH #242, the
+  explanation half).** It is the one marker that names no rule — nothing
+  matched those bytes, and the read could not vouch for them — and agents
+  were told nothing about it, so they read it as *a secret was here*.
+  `read_output`'s description now says what it is, that a larger
+  `max_bytes` may resolve it, that `redact: false` returns the raw text and
+  is audit-logged, and that `redactions` counts only the markers a response
+  substituted, which is how a real marker is told from marker-shaped text
+  already in the output. The server instructions carry the short form. How
+  much the marker masks is the other half of GH #242 and is not changed
+  here.
+
 - **The guard that was supposed to refuse an empty release body could not
   fire, and the release procedure did not mention `Cargo.lock`.** Both are
   release-time defects that no test or check would have caught, because the

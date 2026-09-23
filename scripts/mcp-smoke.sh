@@ -541,6 +541,30 @@ jcheck "initialize's instructions name every tool" \
       "resize","interrupt","request_secret_input"]
    | map(. as $n | select(($i | contains($n)) | not))' \
   '[]'
+# GH #230: Claude Code keeps the first 2048 characters of a server's
+# instructions (2.1.280: `CLAUDE_CODE_MAX_MCP_DESCRIPTION_LENGTH ?? 2048`)
+# and this text used to run past that with its password-prompt rule last,
+# so the one rule that costs a credential when missed was the one cut.
+# Asserted on THIS transport's string because it is the one the plugin
+# serves: the shim appends to the shared text, and a check on the shared
+# constant alone would pass while the suffix pushed the served string
+# over. jq's `length` counts codepoints where the client counts UTF-16
+# units; the Rust row counts units, and this text is ASCII. `type` first,
+# so a response that never arrived is `"null"` rather than a `null` that
+# jq happily measures as short. The 512 is the first quarter of the
+# budget -- the Rust row's `SAFETY_RULES_WITHIN`.
+jcheck "initialize's instructions fit the client's budget with the secret rule first (GH #230)" \
+  'resp(1).result.instructions
+   | [type, (length <= 2048), ((index("NEVER send_input") // 99999) < 512)]' \
+  '["string",true,true]'
+# And the two tool descriptions the short instructions now lean on: what
+# `[REDACTED:unresolved]` is and the audited way past it (GH #242), and the
+# password rule on the tool an agent would misuse.
+jcheck "read_output explains [REDACTED:unresolved]; send_input points at request_secret_input" \
+  '[(tool("read_output").description | gsub("\\s+";" ")
+     | contains("[REDACTED:unresolved]") and contains("`redact: false`")),
+    (tool("send_input").description | contains("request_secret_input"))]' \
+  '[true,true]'
 
 # ------------------------------------------------- the advertised surface
 

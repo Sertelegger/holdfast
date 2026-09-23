@@ -833,7 +833,18 @@ impl HoldfastServer {
 
     /// Read output from a session. Supply exactly one of since_cursor,
     /// tail_lines, or tail_bytes. Output is ANSI-stripped and
-    /// secret-redacted by default.
+    /// secret-redacted by default: a secret becomes `[REDACTED:<kind>]`,
+    /// naming the rule that matched it.
+    ///
+    /// `[REDACTED:unresolved]` is different: no rule matched those bytes.
+    /// They belong to something that started like a secret (a private-key
+    /// header, or a token-shaped run of characters) whose end this read
+    /// could not see, so they could not be vouched for. It is often
+    /// ordinary text. A larger `max_bytes` may resolve it; if you need the
+    /// text itself, `redact: false` returns it raw and is recorded in the
+    /// audit log. `redactions` counts only the markers this response
+    /// substituted, so marker-shaped text that was already in the output
+    /// is not counted.
     #[tool(
         annotations(
             title = "Read session output",
@@ -1466,6 +1477,10 @@ impl HoldfastServer {
     }
 
     /// Send keystrokes to a session's stdin.
+    ///
+    /// Not for a password: when `interaction_mode` is `AwaitingSecret`, use
+    /// `request_secret_input`, so the secret is typed by a human and never
+    /// passes through you.
     #[tool(
         annotations(
             title = "Send keystrokes to a session",
