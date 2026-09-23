@@ -8,7 +8,9 @@
 //! bytes the ring holds, so the arithmetic in each assertion is the
 //! arithmetic the read performed.
 
-use holdfast_core::mcp::tools::{GetScreenStateArgs, ReadOutputArgs, WaitForPatternArgs};
+use holdfast_core::mcp::tools::{
+    GetScreenStateArgs, ReadOutputArgs, StatusArgs, WaitForPatternArgs,
+};
 use holdfast_core::mcp::HoldfastServer;
 use holdfast_core::pty::{MockPty, PtyBackend};
 use holdfast_core::session::{new_session_id, Session, SessionConfig};
@@ -319,4 +321,82 @@ async fn one_unterminated_header_does_not_blind_the_commands_after_it() {
         );
         cursor = d["cursor"].as_u64().unwrap();
     }
+}
+
+/// **A key in a window title is masked wherever the title is reported**
+/// (GH #224's `title` field, and `status`'s).
+///
+/// `printf '\033]0;%s\007' "$(head -n 8 id_rsa)"` puts a key cut short
+/// into the title, which the emulator joins into one line. Titles were
+/// redacted with `redact_str`, which replaces complete matches only, so
+/// the eight lines came back on `get_screen_state`'s `title` and on
+/// `status`'s — both `readOnlyHint` tools — while `read_output` masked the
+/// same bytes. Found by an independent review of this branch.
+///
+/// Paired with an ordinary title, which must come back byte for byte.
+#[tokio::test]
+async fn a_key_in_a_window_title_is_masked_on_every_surface_that_reports_it() {
+    let server = HoldfastServer::new();
+    let (id, session, pty) = mock_session_in(&server);
+    let cut: String = RSA4096_BODY
+        .replace("\r\n", "\n")
+        .lines()
+        .take(8)
+        .map(|l| format!("{l}\n"))
+        .collect();
+    let text = format!("$ set-title\r\n\x1b]0;-----BEGIN RSA PRIVATE KEY-----\n{cut}\x07$ ");
+    feed(&session, &pty, text.as_bytes());
+
+    let g = server
+        .get_screen_state(Parameters(GetScreenStateArgs {
+            session: id.clone(),
+            ..Default::default()
+        }))
+        .await
+        .expect("get_screen_state must not be a protocol error");
+    let title = body(&g)["data"]["title"]
+        .as_str()
+        .unwrap_or_default()
+        .to_string();
+    assert!(
+        !title.is_empty(),
+        "the premise: the emulator reports a title"
+    );
+    assert_eq!(leaked(&title), None, "get_screen_state title: {title}");
+
+    let st = server
+        .status(Parameters(StatusArgs {
+            session: id.clone(),
+        }))
+        .await
+        .expect("status must not be a protocol error");
+    let st = body(&st)["data"].clone();
+    let status_title = st["title"].to_string();
+    assert_ne!(
+        st["title"],
+        serde_json::Value::Null,
+        "the premise: status reports a title: {st}"
+    );
+    assert_eq!(leaked(&status_title), None, "status title: {status_title}");
+
+    let r = read(
+        &server,
+        ReadOutputArgs {
+            session: id.clone(),
+            since_cursor: Some(0),
+            ..Default::default()
+        },
+    )
+    .await;
+    assert_eq!(leaked(r["output"].as_str().unwrap()), None, "{r}");
+
+    // The negative: an ordinary title is untouched.
+    feed(&session, &pty, b"\x1b]0;cargo build\x07$ ");
+    let st = server
+        .status(Parameters(StatusArgs {
+            session: id.clone(),
+        }))
+        .await
+        .unwrap();
+    assert_eq!(body(&st)["data"]["title"], "cargo build");
 }

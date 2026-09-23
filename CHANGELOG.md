@@ -369,6 +369,9 @@ is cut, named and published is in
   the parser's own input with the key's printable bytes swapped and comparing
   cell by cell, so scrolling does not smear the mask onto the prompt after it;
   and it judges a header still on screen against the text the screen shows.
+  A key a program puts in the window title — which `redact_str` redacted only
+  when the title held all of it — is masked in `get_screen_state`'s `title`
+  and `status`'s and `list_sessions`' too.
   Both surfaces are swept over every key format — PKCS#1, PKCS#8, encrypted
   PKCS#8, legacy encrypted PKCS#1 with its `Proc-Type`/`DEK-Info` headers, SEC1
   EC, DSA and OpenSSH — using throwaway keys stored without their boundaries.

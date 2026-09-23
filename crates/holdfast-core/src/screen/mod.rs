@@ -747,7 +747,7 @@ impl ScreenTracker {
         let boundary = self.boundary_screen(span, redact, seed, holdback);
         let against: Vec<&vt100::Screen> = boundary.iter().chain(keys.iter()).collect();
         let (rendered, held_back) = self.rendered_screen(&parser, redact, &against, judge);
-        let title = self.rendered_title(&parser, redact);
+        let title = self.rendered_title(&parser, redact, judge);
         grid_of(rendered.screen(), title, UNRETAINED_REVISION, held_back)
     }
 
@@ -1154,12 +1154,21 @@ impl ScreenTracker {
     /// whatever it sees, and there is no unit to enlarge. The same field
     /// on the §5.4 block is redacted separately in `mcp::detection`, which
     /// renders from the detector rather than from this parser.
-    fn rendered_title(&self, parser: &vt100::Parser<TitleSink>, redact: bool) -> Option<String> {
+    ///
+    /// With a judge the title also loses a private-key candidate nothing
+    /// closes (GH #224) — see `OutputProcessor::redact_standalone`, which
+    /// `status` uses for the same field.
+    fn rendered_title(
+        &self,
+        parser: &vt100::Parser<TitleSink>,
+        redact: bool,
+        judge: Option<&OutputProcessor>,
+    ) -> Option<String> {
         let title = parser.callbacks().title.as_deref()?;
-        Some(if redact {
-            redact_str(&self.rules, title)
-        } else {
-            title.to_string()
+        Some(match (redact, judge) {
+            (false, _) => title.to_string(),
+            (true, Some(judge)) => judge.redact_standalone(title),
+            (true, None) => redact_str(&self.rules, title),
         })
     }
 
@@ -1186,7 +1195,7 @@ impl ScreenTracker {
         let boundary = self.boundary_screen(span, redact, seed, holdback);
         let against: Vec<&vt100::Screen> = boundary.iter().chain(keys.iter()).collect();
         let (redacted, held_back) = self.rendered_screen(parser, redact, &against, judge);
-        let title = self.rendered_title(parser, redact);
+        let title = self.rendered_title(parser, redact, judge);
 
         // The `mode == redact` conjunct is REQ-O-011's second normative
         // test: a base captured under the other `redact` value differs

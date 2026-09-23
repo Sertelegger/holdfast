@@ -695,6 +695,40 @@ impl OutputProcessor {
         redact::merge_spans(spans)
     }
 
+    /// Redact one string a surface reports whole — a window title — as
+    /// [`redact::redact_str`] does, and also mask a private-key candidate
+    /// in it that nothing closes (GH #224).
+    ///
+    /// `redact_str` replaces complete matches and nothing else, so
+    /// `printf '\033]0;%s\007' "$(head -n 8 id_rsa)"` put eight lines of
+    /// key into `get_screen_state`'s `title` and `status`'s, joined by the
+    /// emulator into one line, while `read_output` masked the same bytes.
+    /// The candidate walk is the one every other surface runs, over the
+    /// string as the surface reports it; a title is final rather than
+    /// arriving, so a candidate still believed at its end is masked too.
+    pub fn redact_standalone(&self, text: &str) -> String {
+        let redacted = redact::redact_str(&self.rules, text);
+        let spans: Vec<Span> = self
+            .index
+            .unterminated_candidates(&self.rules, redacted.as_bytes(), 0)
+            .into_iter()
+            .map(|c| Span::unresolved(c.start, c.end))
+            .collect();
+        if spans.is_empty() {
+            return redacted;
+        }
+        let bytes = redacted.as_bytes();
+        let mut out = Vec::with_capacity(bytes.len());
+        let mut at = 0usize;
+        for span in redact::merge_spans(spans) {
+            out.extend_from_slice(&bytes[at..span.start as usize]);
+            out.extend_from_slice(redact::marker(redact::UNRESOLVED_KIND).as_bytes());
+            at = span.end as usize;
+        }
+        out.extend_from_slice(&bytes[at..]);
+        String::from_utf8_lossy(&out).into_owned()
+    }
+
     /// The byte ranges of `region` that are a private key as far as this
     /// processor can tell — for a surface that masks by *what bytes wrote
     /// a cell* rather than by a read range (GH #224, `get_screen_state`).
