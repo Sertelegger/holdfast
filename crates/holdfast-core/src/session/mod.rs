@@ -2173,7 +2173,23 @@ impl Session {
                 let clipped = head
                     .saturating_sub(req.max_bytes as u64)
                     .max(requested_start);
-                (clipped, clipped > requested_start)
+                // **A tail read starts on a character, not inside one
+                // (GH #241).** `tail_bytes` and a front clip are both
+                // byte counts back from `head`, so either can land on the
+                // second byte of a character and open the page with
+                // U+FFFD. The continuation bytes of a character whose
+                // lead is behind the start are not text the caller can
+                // use; skipping at most three of them is. A cursor read
+                // is not snapped: its start is the caller's, and the
+                // paging loop no longer produces one inside a character.
+                let snapped = (0..3u64)
+                    .map(|k| clipped + k)
+                    .find(|off| {
+                        *off >= head || !(0x80..=0xbfu8).contains(&buffer.slice(*off, *off + 1)[0])
+                    })
+                    .unwrap_or(clipped + 3)
+                    .min(head);
+                (snapped, clipped > requested_start)
             } else {
                 (requested_start, false)
             };
@@ -2926,6 +2942,63 @@ mod tests {
         assert_eq!(r.output, "export TOKEN=[REDACTED:github]\nnext\n");
         assert_eq!(r.cursor, line.len() as u64);
         assert!(!r.held_back);
+    }
+
+    /// **A tail read opens on a character, never inside one (GH #241).**
+    ///
+    /// `tail_bytes` and a front-clipped tail are byte counts back from
+    /// `head`, so either lands on a continuation byte as readily as on a
+    /// lead, and the page then opens with U+FFFD. Every `tail_bytes` from
+    /// one to the whole buffer is asked here, so every alignment against
+    /// the three- and four-byte characters is reached; the front-clipped
+    /// arm goes through `max_bytes` instead, which is the other road to
+    /// the same arithmetic.
+    #[test]
+    fn a_tail_read_never_opens_inside_a_utf8_character() {
+        let (s, pty) = mock_session();
+        let p = OutputProcessor::builtin().unwrap();
+        let text = "日本語 🦀 é\n".repeat(20);
+        pty.queue_output(text.as_bytes());
+        wait_for_bytes(&s, text.len() as u64);
+
+        let mut snapped = 0usize;
+        for n in 1..=text.len() {
+            let req = ReadRequest {
+                start: ReadStart::TailBytes(n),
+                holdback: Holdback::BypassedByCallerOptIn,
+                ..ReadRequest::since(0, 32 * 1024)
+            };
+            let r = s.read_processed(&req, &p);
+            assert!(
+                !r.output.contains('\u{fffd}'),
+                "tail_bytes {n} opened inside a character: {:?}",
+                &r.output[..r.output.len().min(16)]
+            );
+            assert!(text.ends_with(&r.output), "tail_bytes {n} is not a suffix");
+            snapped += (r.output.len() < n) as usize;
+        }
+        assert!(snapped > 0, "no tail_bytes value landed inside a character");
+
+        // Front-clipped by `max_bytes` rather than by the argument.
+        for max_bytes in 1..=16usize {
+            let req = ReadRequest {
+                start: ReadStart::TailBytes(text.len()),
+                holdback: Holdback::BypassedByCallerOptIn,
+                ..ReadRequest::since(0, max_bytes)
+            };
+            let r = s.read_processed(&req, &p);
+            assert!(r.truncated_for_size, "max_bytes {max_bytes}: front clip");
+            assert!(
+                !r.output.contains('\u{fffd}'),
+                "max_bytes {max_bytes}: {:?}",
+                r.output
+            );
+            assert_eq!(
+                r.cursor,
+                text.len() as u64,
+                "a tail read still ends at head"
+            );
+        }
     }
 
     /// C-1 on the real read path (§4.1: *"a secret that was partially in

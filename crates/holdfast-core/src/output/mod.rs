@@ -312,12 +312,15 @@ pub struct ReadRequest {
     /// Raw-byte budget (§5.1): caps bytes read *from the ring buffer*,
     /// not the size of the encoded payload.
     ///
-    /// It has exactly one documented overshoot: when the cap would fall
-    /// inside a secret, the read consumes to the end of that secret so the
+    /// It has two documented overshoots. When the cap would fall inside a
+    /// secret, the read consumes to the end of that secret so the
     /// continuation cursor lands past it and not inside it (see
-    /// [`OutputProcessor::process`]). Those extra raw bytes are wholly
+    /// [`OutputProcessor::process`]); those extra raw bytes are wholly
     /// inside the one marker the response already carries, so the returned
-    /// payload is unchanged — only `bytes_returned` and `cursor` move.
+    /// payload is unchanged — only `bytes_returned` and `cursor` move. And
+    /// when a page smaller than one UTF-8 character would otherwise end
+    /// inside it, the read finishes the character — at most three bytes,
+    /// and only where stopping short would return nothing (GH #241).
     pub max_bytes: usize,
     pub options: ReadOptions,
     /// Which mechanism is reading — `read_output` or, from 0.0.5,
@@ -424,7 +427,9 @@ pub struct ProcessedRead {
     /// **Raw** bytes consumed, so it stays consistent with the cursor
     /// arithmetic; the encoded `output` may be longer or shorter (§5.1).
     /// It may also exceed the request's `max_bytes` — by the tail of a
-    /// secret the cap landed inside, and only then.
+    /// secret the cap landed inside, or by the at most three remaining
+    /// bytes of a character a page smaller than it would otherwise split
+    /// (GH #241), and only then.
     pub bytes_returned: usize,
     /// Absolute offset just past the bytes consumed.
     pub cursor: u64,
@@ -991,6 +996,12 @@ impl OutputProcessor {
         }
 
         let mut read_end = safety_end.max(w.req_start).min(w.cap_end);
+        // **A read never ends inside a UTF-8 character (GH #241).** The
+        // cap is a raw byte count, and `encode` decodes each page on its
+        // own, so a character split across two pages came back as two
+        // U+FFFD — on both sides, silently, in text an agent then quotes
+        // back into a `sed`. See `utf8_read_end` for the three arms.
+        read_end = utf8_read_end(w, read_end);
         let held_back = safety_end < w.cap_end;
         let truncated_for_size = w.front_clipped || (w.cap_end < w.head && w.cap_end <= safety_end);
         // `held_back` and its cause answer the same question and must
@@ -1177,6 +1188,89 @@ impl OutputProcessor {
         }
         (out, redactions)
     }
+}
+
+/// The length a UTF-8 sequence opening with `lead` claims, or `None` for
+/// a byte that opens nothing — ASCII, a continuation byte, or one of the
+/// bytes no well-formed sequence starts with (`0xc0`, `0xc1`, `0xf5..`).
+fn utf8_sequence_len(lead: u8) -> Option<u64> {
+    match lead {
+        0xc2..=0xdf => Some(2),
+        0xe0..=0xef => Some(3),
+        0xf0..=0xf4 => Some(4),
+        _ => None,
+    }
+}
+
+/// Where a read that would end at `read_end` may end without splitting a
+/// UTF-8 character (GH #241). Returns `read_end` unchanged unless the
+/// bytes in front of it are the first part of a sequence whose remaining
+/// bytes lie at or past it.
+///
+/// **Three arms, and the reason there are three is that the obvious one
+/// wedges.**
+///
+/// * *Pull back to the lead byte* when that still returns the caller
+///   something (`lead > req_start`). The rest of the character is the
+///   first thing the next read returns, so both pages decode whole. At
+///   most three bytes, and only ever of a character the page could not
+///   finish — the same move REQ-O-008 makes for an unfinished escape.
+/// * *Push forward to the character's end* when pulling back would return
+///   nothing — a `max_bytes` smaller than one character, or a read whose
+///   whole page is the front of one. Pulling back there hands the caller
+///   its own cursor on every retry, which is GH #195's wedge through a
+///   third rule; the overshoot is at most three bytes past `max_bytes`,
+///   and only when the character's remaining bytes are already in the
+///   window. `ProcessedRead::bytes_returned` documents it beside the
+///   secret overshoot, which is the only other one.
+/// * *Leave it* at `buffer.head` when the child has exited, or when the
+///   remaining bytes have not arrived and pulling back would return
+///   nothing. A dead child will never finish the character, so holding it
+///   back would strand it; and a read that is *only* an unfinished
+///   character is exactly the case the escape rule already declines to
+///   withhold. What is left is at most three bytes that decode as
+///   U+FFFD, which is what they are.
+///
+/// **Not a holdback.** It sets no flag and names no cause: it moves the
+/// read end by less than one character and costs the caller no byte it
+/// is not handed on the next read, which is why `held_back_cause`'s
+/// closed vocabulary does not grow for it. A read cut short of `head` by
+/// it still reports `cursor` at the lead byte, which is where the next
+/// read must start, and a read that was already truncated for size hands
+/// back that same offset as `next_cursor`.
+fn utf8_read_end(w: &WindowSnapshot<'_>, read_end: u64) -> u64 {
+    let window_end = w.window_start + w.window.len() as u64;
+    if read_end <= w.req_start || read_end > window_end {
+        return read_end;
+    }
+    let byte = |off: u64| w.window[(off - w.window_start) as usize];
+    // Walk back to the byte that opened the character `read_end` might be
+    // inside. At most three of a character's bytes can sit in front of a
+    // split — a four-byte one cut after its third — so at most two of
+    // them are continuation bytes, and the lead is at most three back.
+    let floor = w.req_start.max(w.window_start);
+    let mut lead = read_end - 1;
+    while lead > floor && read_end - lead < 3 && (0x80..=0xbf).contains(&byte(lead)) {
+        lead -= 1;
+    }
+    let Some(len) = utf8_sequence_len(byte(lead)) else {
+        return read_end;
+    };
+    let char_end = lead + len;
+    if char_end <= read_end {
+        // The character closes at or before the read end: no split.
+        return read_end;
+    }
+    if lead > w.req_start && (read_end < w.head || w.child_alive) {
+        return lead;
+    }
+    // Pulling back would return nothing. Finish the character instead,
+    // if the whole of it is here and really is one.
+    if char_end <= window_end && (read_end..char_end).all(|off| (0x80..=0xbf).contains(&byte(off)))
+    {
+        return char_end;
+    }
+    read_end
 }
 
 /// Move `read_end` past any span it would otherwise end *inside*, so the
@@ -3892,5 +3986,134 @@ mod tests {
         );
         assert!(!r.output.contains(GITHUB), "leaked: {}", r.output);
         assert_eq!(r.output, "\u{1b}]0;deploy [REDACTED:github]\u{7}$ ");
+    }
+
+    // ------------------------------------------ GH #241: UTF-8 boundaries
+
+    /// Mixed-width text in which every page boundary a small `max_bytes`
+    /// produces lands inside a character sooner or later: two-, three-
+    /// and four-byte sequences, ASCII between them, and newlines.
+    fn multibyte_corpus(lines: usize) -> String {
+        "한ü日語 — “quoted” 🦀 é 🎉 abc\n".repeat(lines)
+    }
+
+    /// **The documented paging loop returns the text it was given, at
+    /// every `max_bytes`, including the ones smaller than a character**
+    /// (GH #241).
+    ///
+    /// The window end was a raw byte count and `encode` decodes each page
+    /// on its own, so a character split across two pages came back as
+    /// U+FFFD on both sides. Measured on `main` at `a81b02d` with this
+    /// corpus: every `max_bytes` below swaps characters for U+FFFD, and
+    /// `max_bytes: 1` returns nothing *but* U+FFFD for the non-ASCII part.
+    ///
+    /// Two properties, and each one catches a different wrong fix:
+    /// *byte-identical concatenation* catches the split, and *every read
+    /// makes progress* catches the pull-back that returns nothing — which
+    /// at `max_bytes` 1, 2 and 3 is every read that starts on a lead
+    /// byte, and would be GH #195's wedge through a third rule.
+    #[test]
+    fn paging_never_splits_a_utf8_character_at_any_max_bytes() {
+        let p = processor();
+        for max_bytes in [1usize, 2, 3, 5, 7, 64, 1000, 4096] {
+            // Every read of a tiny page re-judges a whole lookahead
+            // window, so the corpus is sized to the page: enough pages to
+            // meet every alignment, few enough to stay fast.
+            let text = multibyte_corpus(if max_bytes < 64 { 3 } else { 200 });
+            let buf = text.as_bytes();
+            // The fixture has to contain the shapes this is about, or it
+            // proves nothing about them.
+            assert!(text.chars().any(|c| c.len_utf8() == 2));
+            assert!(text.chars().any(|c| c.len_utf8() == 3));
+            assert!(text.chars().any(|c| c.len_utf8() == 4));
+            let mut joined = String::new();
+            let mut cursor = 0u64;
+            let mut reads = 0usize;
+            let mut split_seen = false;
+            while cursor < buf.len() as u64 {
+                reads += 1;
+                assert!(
+                    reads <= buf.len() + 1,
+                    "max_bytes {max_bytes}: no termination"
+                );
+                let w = snapshot(&p, buf, cursor, max_bytes, true, false);
+                // The fixture really does put a raw page end inside a
+                // character at this size, or the row is vacuous for it.
+                let cap = w.cap_end;
+                if cap < buf.len() as u64 && (0x80..=0xbf).contains(&buf[cap as usize]) {
+                    split_seen = true;
+                }
+                let r = p.process(&w, &ReadOptions::default());
+                assert!(
+                    r.cursor > cursor,
+                    "max_bytes {max_bytes}: read {reads} from {cursor} made no progress"
+                );
+                assert!(
+                    !r.output.contains('\u{fffd}'),
+                    "max_bytes {max_bytes}: read {reads} from {cursor} split a character: {:?}",
+                    r.output
+                );
+                joined.push_str(&r.output);
+                cursor = r.cursor;
+            }
+            assert!(
+                split_seen,
+                "max_bytes {max_bytes}: no page end fell inside a character"
+            );
+            assert_eq!(
+                joined, text,
+                "max_bytes {max_bytes}: the pages do not rejoin"
+            );
+        }
+    }
+
+    /// The three arms of `utf8_read_end`, each pinned on its own, because
+    /// the paging row above is satisfied by more than one of them at a
+    /// time and a mutant that deletes one arm can hide behind another.
+    #[test]
+    fn a_split_character_is_pulled_back_pushed_forward_or_left_by_rule() {
+        let p = processor();
+        // "ab" then 日 (e6 97 a5), then "c".
+        let buf = "ab日c".as_bytes();
+
+        // Pulled back: a page ending one byte into the character stops
+        // before it and returns what it can.
+        let w = snapshot(&p, buf, 0, 3, true, false);
+        let r = p.process(&w, &ReadOptions::default());
+        assert_eq!(r.output, "ab");
+        assert_eq!(r.cursor, 2, "the next read starts on the lead byte");
+        assert_eq!(r.next_cursor, Some(2));
+        assert!(r.truncated_for_size && !r.held_back);
+
+        // Pushed forward: a page that *is* the front of the character
+        // would return nothing if pulled back, so it finishes it.
+        let w = snapshot(&p, buf, 2, 1, true, false);
+        let r = p.process(&w, &ReadOptions::default());
+        assert_eq!(r.output, "日");
+        assert_eq!(r.bytes_returned, 3, "at most three bytes past max_bytes");
+        assert_eq!(r.cursor, 5);
+
+        // At `head`, with the child alive: the rest has not arrived, so
+        // the page stops before it and `cursor` says where to resume.
+        let partial = &buf[..4];
+        let w = snapshot(&p, partial, 0, 4096, true, false);
+        let r = p.process(&w, &ReadOptions::default());
+        assert_eq!(r.output, "ab");
+        assert_eq!(r.cursor, 2);
+        assert!(!r.held_back, "less than one character is not a holdback");
+
+        // …and with the child gone it never will arrive, so the bytes go
+        // out as what they are rather than being stranded.
+        let w = snapshot(&p, partial, 0, 4096, false, false);
+        let r = p.process(&w, &ReadOptions::default());
+        assert_eq!(r.cursor, 4, "a dead child's partial character is not held");
+        assert!(r.output.starts_with("ab") && r.output.contains('\u{fffd}'));
+
+        // A read that is *only* an unfinished character at `head` is left
+        // alone even while the child lives, for the reason the escape
+        // rule gives: withholding it would return the caller nothing.
+        let w = snapshot(&p, partial, 2, 4096, true, false);
+        let r = p.process(&w, &ReadOptions::default());
+        assert_eq!(r.cursor, 4, "no zero-byte read at head");
     }
 }

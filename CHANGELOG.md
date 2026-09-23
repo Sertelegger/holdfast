@@ -647,6 +647,22 @@ is cut, named and published is in
   optimized both.
 
 ### Fixed
+- **The `read_output` paging loop no longer splits a UTF-8 character across
+  two pages** ([#241]). The cap is a raw byte count and each page is decoded
+  on its own, so a character straddling a page boundary came back as U+FFFD
+  on *both* sides, with nothing in the response saying so — on CJK or
+  emoji-heavy output about every other page, and in the emoji of a starship
+  prompt on any page. A read that would end inside a character now ends
+  before it, and the rest of the character is the first thing the next read
+  returns. Where that would return nothing — a `max_bytes` smaller than one
+  character, or a page that *is* the front of one — the read finishes the
+  character instead, at most three bytes past `max_bytes`; pulling back there
+  would hand the caller its own cursor on every retry, which is GH #195's
+  wedge through a third rule. At `buffer.head` a character still arriving is
+  left for the next read while the child lives and emitted as what it is once
+  it has exited. `tail_bytes` and a front-clipped tail no longer open a page
+  on a continuation byte either. None of it is a holdback: no flag, no cause,
+  and `cursor` names the byte the next read starts at.
 - **The guard that was supposed to refuse an empty release body could not
   fire, and the release procedure did not mention `Cargo.lock`.** Both are
   release-time defects that no test or check would have caught, because the
@@ -2011,3 +2027,4 @@ residuals that are known and accepted.
 [#203]: https://github.com/Sertelegger/holdfast/issues/203
 [#202]: https://github.com/Sertelegger/holdfast/issues/202
 [#206]: https://github.com/Sertelegger/holdfast/issues/206
+[#241]: https://github.com/Sertelegger/holdfast/issues/241
