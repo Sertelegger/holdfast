@@ -793,8 +793,10 @@ pub struct SessionProfile {
     pub env: std::collections::BTreeMap<String, String>,
     /// Working directory for the child, **written by the operator** and
     /// **literal** — no `{…}` (GH #55). `None` means the directory the
-    /// daemon itself was started in, exactly as a `cwd`-less
-    /// `command`/`args` session gets.
+    /// daemon itself was started in. A `cwd`-less `command`/`args` session
+    /// no longer gets that — since GH #229 it starts in its calling
+    /// client's directory — and a profile session deliberately does not
+    /// follow it there: see `session::launch`.
     ///
     /// **A profile-started session takes no `cwd` from the agent**;
     /// `start_session(cwd:)` alongside `profile` is an argument error. A
