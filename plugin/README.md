@@ -16,7 +16,7 @@ Then restart Claude Code. The first MCP call downloads the binary for the
 release this plugin build is pinned to; every call after that is a
 file-existence check.
 
-**That download needs a promoted release.** Every release is created as a
+**That download needs a promoted release.** A release is now created as a
 draft, and a draft's assets are not served until a person promotes it
 ([CONTRIBUTING.md](../CONTRIBUTING.md#releases)); `v0.0.5` to `v0.0.7` were
 published with no binaries at all. Against either, the server fails to start,

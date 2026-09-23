@@ -201,11 +201,11 @@ every live session, so choose the moment. `daemon start` is there because of
 a defect, GH #231: until it is fixed, a Claude Code session whose
 `holdfast mcp` is already running does not start a daemon when its daemon goes
 away — its tools answer `daemon_unreachable` — though it does reconnect as soon
-as one exists again (measured). Those
-`holdfast mcp` processes are still the old binary until each Claude Code
-session restarts; a different protocol *minor* between them and the daemon is
-allowed, and a different major is refused with a message saying which side to
-restart. `holdfast daemon status` shows what is running.
+as one exists again (measured). Those `holdfast mcp` processes are still the
+old binary until each Claude Code session restarts; a different protocol
+*minor* between them and the daemon is allowed, and a different major is
+refused with a message saying which side to restart. `holdfast daemon status`
+shows what is running.
 
 **One registration per Claude Code config directory.** `claude mcp add
 --scope user` writes to the config directory in effect — `~/.claude.json`, or
