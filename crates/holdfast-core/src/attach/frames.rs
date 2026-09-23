@@ -334,6 +334,16 @@ pub enum ServerFrame {
     /// (REQ-SEC-008), and a picture of a secret already on screen is the
     /// one thing a snapshot could add that the live stream never sent.
     ///
+    /// **So it is exactly as safe as that grid, and no safer.** A late
+    /// `watch` was shown a private key's body raw — one cut short, or one
+    /// whose header had scrolled off — which an observer attached during
+    /// the print never saw, because the grid's mask reached only the
+    /// trailing 512 bytes. Before this frame a late observer was shown
+    /// nothing from before its join, so the leak was new to that surface,
+    /// and GH #224's key mask on the grid is what closes it:
+    /// `a_client_joining_after_a_key_was_printed_is_shown_none_of_its_body`
+    /// is red on any tree without it.
+    ///
     /// **Out of band rather than as `Output`**, for `OutputGap`'s reason:
     /// `Output` is the child's own bytes and `interactive` is a
     /// byte-exact surface, so a daemon-drawn screen inside it would

@@ -1715,6 +1715,133 @@ async fn the_opening_screen_is_masked_like_get_screen_state() {
     }
 }
 
+/// Distinct 64-column base64 lines, shaped like a key body.
+///
+/// Distinct so a row can be counted by which lines reached it, and
+/// generated rather than copied from a real key so no scanner reads the
+/// fixture as a leaked one. The alphabet and the width are RFC 7468's,
+/// which is all the grid's key judge asks of a body (GH #224).
+fn key_body(n: usize) -> Vec<String> {
+    const B64: &[u8] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    let mut x: u64 = 0x9e37_79b9_7f4a_7c15;
+    (0..n)
+        .map(|i| {
+            let mut line = if i == 0 {
+                String::from("MIIEowIBAAKCAQEA")
+            } else {
+                String::new()
+            };
+            while line.len() < 64 {
+                x ^= x << 13;
+                x ^= x >> 7;
+                x ^= x << 17;
+                line.push(B64[(x % 64) as usize] as char);
+            }
+            line
+        })
+        .collect()
+}
+
+/// **A client joining after a private key was printed is shown none of
+/// its body** — the case the live observer stream masks and the opening
+/// picture must not undo (GH #235's review, GH #224).
+///
+/// A `watch` attached while `cat key.pem` ran sees the body masked; one
+/// that joins a moment later was shown it raw by the first version of the
+/// picture, because the picture is `get_screen_state`'s grid and that
+/// grid's mask reached only the trailing 512 bytes. Measured on this
+/// branch's release build: 19 of 19 body lines for a key cut short
+/// (`head -n 20 key.pem`), 21 for a whole key whose header had scrolled
+/// off a 24-row screen — against 0 on the live observer in both. **Before
+/// this branch a late `watch` was shown nothing from before its join**, so
+/// the leak was new to the observer surface.
+///
+/// **What closes it is the grid's mask, not anything in `attach/`**, and
+/// that is deliberate: the picture has no renderer of its own to fix
+/// (`attach::conn::screen_snapshot`), so it is exactly as safe as
+/// `get_screen_state` and becomes safe when that does. This row is here
+/// so the two cannot drift apart — **it is red on a tree without GH
+/// #224's grid fix**, which is how it says the join must not ship
+/// without it.
+///
+/// **Both roles.** The picture is masked for `interactive` too (a
+/// re-rendering of history, not the raw live stream it is entitled to),
+/// so a row that checked only the observer would pass an implementation
+/// that unmasked the other.
+///
+/// The non-vacuity half is the unmasked grid: it must hold most of the
+/// body, or the fixture never put the key on the screen and "no raw body
+/// line" would be true of a blank picture.
+#[tokio::test]
+async fn a_client_joining_after_a_key_was_printed_is_shown_none_of_its_body() {
+    let d = TestDaemon::start("snapkey").await;
+    let processor = Arc::clone(&d.daemon.server.processor);
+    // (label, screen rows, body lines, closed with an END line)
+    for (case, rows, lines, closed) in [
+        // `head -n 20 key.pem`: a header and a body nobody will close,
+        // then the prompt.
+        ("cut short", 40u16, 19usize, false),
+        // `cat key.pem` on a screen shorter than the key: the header has
+        // scrolled off the top and only body, footer and prompt remain.
+        ("header scrolled off", 24, 30, true),
+    ] {
+        let body = key_body(lines);
+        let (s, pty) = d.session(None);
+        s.resize(80, rows).expect("resize the fixture's screen");
+        let mut out = b"$ cat key.pem\r\n-----BEGIN RSA PRIVATE KEY-----\r\n".to_vec();
+        for l in &body {
+            out.extend_from_slice(l.as_bytes());
+            out.extend_from_slice(b"\r\n");
+        }
+        if closed {
+            out.extend_from_slice(b"-----END RSA PRIVATE KEY-----\r\n");
+        }
+        out.extend_from_slice(b"$ ");
+        pty.queue_output(&out);
+        wait_for_head(&s, out.len() as u64).await;
+
+        let raw_in = |grid: &[String]| -> usize {
+            body.iter()
+                .filter(|b| grid.iter().any(|row| row.contains(b.as_str())))
+                .count()
+        };
+        let holdfast_core::screen::ScreenCapture::Full(unmasked) =
+            s.screen_state(None, false, &processor)
+        else {
+            panic!("a capture with no diff_from is a full grid");
+        };
+        let on_screen = raw_in(&unmasked.lines);
+        assert!(
+            on_screen >= lines.min(rows as usize) - 4,
+            "{case}: the fixture put only {on_screen} body lines on the screen — the row \
+             would pass on a picture that never showed the key: {:?}",
+            unmasked.lines
+        );
+
+        for (mode, role) in [
+            (AttachMode::ReadOnly, AttachRole::Observer),
+            (AttachMode::ReadWrite, AttachRole::Interactive),
+        ] {
+            let mut c = d.dial().await;
+            send(&mut c, &attach_as(&s.id, mode, role)).await;
+            assert!(matches!(
+                recv_raw(&mut c).await,
+                ServerFrame::Attached { .. }
+            ));
+            let ServerFrame::ScreenSnapshot { lines: picture, .. } = recv_raw(&mut c).await else {
+                panic!("{case}/{role:?}: frame 2 must be the ScreenSnapshot");
+            };
+            let leaked = raw_in(&picture);
+            assert_eq!(
+                leaked, 0,
+                "{case}/{role:?}: the opening screen carried {leaked} of the {on_screen} key-body \
+                 lines on screen raw. The picture is get_screen_state's grid, so this is that \
+                 grid's mask (GH #224) — a tree without its fix must not ship the join: {picture:?}"
+            );
+        }
+    }
+}
+
 /// **The picture goes before a replayed secret prompt**, or it paints
 /// over it (GH #235, §7.5's replay).
 #[tokio::test]
@@ -1752,6 +1879,102 @@ async fn the_opening_screen_precedes_a_replayed_secret_prompt() {
         }
         other => panic!("frame 3 must be the replayed AwaitingSecret, got {other:?}"),
     }
+}
+
+/// **A replayed request says who raised it: the agent, when the agent
+/// did** (GH #236, §7.5's replay; GH #235's review).
+///
+/// The order a human taking over is most likely to meet: the child is
+/// already reading a password with nobody attached — so no edge raised
+/// anything — the agent calls `request_secret_input`, which raises the
+/// request itself, and the human attaches to answer it. The replay is
+/// then the only `AwaitingSecret` that client will ever get, and it must
+/// carry the agent's words **as the agent's**. The review found the
+/// replay's provenance untested: a replay that always said `echo_drop`
+/// passed every row, because the only other replay row raises from the
+/// echo drop, and would have told this human *"the session is reading a
+/// secret at the prompt above"* instead of what the agent asked for.
+///
+/// Through the tool itself, not the slot, so the raise is the one an
+/// agent makes.
+#[tokio::test]
+async fn a_replayed_request_the_agent_raised_says_it_is_the_agents() {
+    let d = TestDaemon::start("replayagent").await;
+    let (s, pty) = d.session(None);
+    pty.set_echo(Some(false));
+    pty.queue_output(b"Password: ");
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+    while !s.is_awaiting_secret() && tokio::time::Instant::now() < deadline {
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    assert!(s.is_awaiting_secret(), "the fixture never dropped echo");
+    assert!(
+        d.daemon.attach_hub().outstanding_secret(&s.id).is_none(),
+        "something raised on the edge with nobody attached, so the agent's call below \
+         would adopt rather than raise — the row would be the echo-drop replay again"
+    );
+
+    let server = d.daemon.server.clone();
+    let session = s.id.clone();
+    let call = tokio::spawn(async move {
+        server
+            .request_secret_input(Parameters(RequestSecretInputArgs {
+                session,
+                prompt_text: "deploy key passphrase".into(),
+                timeout_secs: Some(20),
+                ..Default::default()
+            }))
+            .await
+            .expect("request_secret_input")
+    });
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+    while !d.daemon.attach_hub().secrets().has_waiter(&s.id) {
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "the call never registered a waiter"
+        );
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+
+    let mut c = d.dial().await;
+    send(&mut c, &attach_to(&s.id)).await;
+    let request_id = match recv(&mut c).await {
+        ServerFrame::Attached { .. } => match recv(&mut c).await {
+            ServerFrame::AwaitingSecret {
+                request_id,
+                prompt_text,
+                raised_by,
+            } => {
+                assert_eq!(
+                    raised_by.as_deref(),
+                    Some("tool_call"),
+                    "the replay of a request the agent raised did not say so"
+                );
+                assert_eq!(prompt_text, "deploy key passphrase");
+                request_id
+            }
+            other => panic!("expected the replayed AwaitingSecret, got {other:?}"),
+        },
+        other => panic!("expected Attached, got {other:?}"),
+    };
+
+    // Answer it, so the call ends on the path it was waiting for rather
+    // than on its deadline.
+    send(
+        &mut c,
+        &ClientFrame::SecretInput {
+            request_id,
+            bytes: b"hunter2\r".to_vec(),
+            allow_echo: false,
+        },
+    )
+    .await;
+    let r = tokio::time::timeout(Duration::from_secs(15), call)
+        .await
+        .expect("the call returned")
+        .expect("the call's task");
+    let body = r.structured_content.expect("structured content");
+    assert_eq!(body["status"], "secret_provided", "{body}");
 }
 
 /// **An agent's words are labelled as the agent's** (GH #236).
