@@ -1178,6 +1178,18 @@ impl ModeScanner {
         // such marker has arrived. Nesting is unchanged: an inner shell's
         // own `D`/`A`/`B` re-record the owner before its first `C`, and a
         // shell inside `ssh` is still owned by `ssh`'s group throughout.
+        //
+        // **The residual, measured rather than assumed away.** This moves
+        // the race; it does not remove it. The prompt's own sample is
+        // right only if its chunk is scanned before the shell has run the
+        // *next* command — a window of the agent's whole round trip rather
+        // than of one `fork`, so orders of magnitude wider, but not
+        // infinite. A 50 ms stall put in front of the reader's detector
+        // feed, with the next command typed the instant the prompt reached
+        // the buffer, reproduced `Executing` / `semantic` at a `[Y/n] `
+        // again. Typeahead reaches it for the same reason. Closing it needs
+        // a sample the scanner cannot take — who held the terminal when
+        // the input was *written* — and belongs to the reader, not here.
         self.modes.osc133_owner = if kind == b'C' {
             self.prompt_owner.unwrap_or(self.foreground)
         } else {

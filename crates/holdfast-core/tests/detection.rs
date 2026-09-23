@@ -2901,7 +2901,19 @@ async fn a_submit_scanned_after_the_fork_does_not_hold_a_confirmation_prompt_at_
 /// **This row cannot force the losing interleaving** — see the mock row
 /// above, which does. It pins the behaviour end to end, and it would have
 /// failed intermittently rather than every time against the unfixed
-/// scanner; with the fix there is no interleaving left in which it can.
+/// scanner.
+///
+/// **It waits for the *detector* to have seen the prompt, not the buffer,
+/// and that is the fix's one precondition rather than tidiness.** The
+/// submit's owner is inherited from the prompt's, which is only right if
+/// the prompt was scanned while bash still sat at it. A 50 ms delay put in
+/// front of the reader's detector feed (the documented `buffer -> detector`
+/// probe) turned this row red when it synchronised on `await_markers`:
+/// the markers were in the buffer, the command was typed, and the prompt
+/// chunk was scanned after python already held the terminal. An agent
+/// that waits for `AtPrompt` before typing — which is what the tool
+/// descriptions tell it to do — is on the safe side of that by
+/// construction; see `ModeScanner::osc133`'s residual.
 #[tokio::test]
 async fn a_confirmation_prompt_from_an_external_program_answers_at_prompt() {
     if !have(Need::Program("python3")) {
@@ -2910,7 +2922,10 @@ async fn a_confirmation_prompt_from_an_external_program_answers_at_prompt() {
     }
     let server = HoldfastServer::new();
     let id = start(&server, bash()).await;
-    await_markers(&server, &id, 3).await;
+    await_status(&server, &id, "bash's prompt, as the detector saw it", |s| {
+        s["interaction_mode"] == "AtPrompt" && s["detection_tier"] == "semantic"
+    })
+    .await;
     send(
         &server,
         &id,
