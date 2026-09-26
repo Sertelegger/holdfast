@@ -672,7 +672,8 @@ fn bash_and_zsh_keep_nothing_in_home_however_a_session_ends() {
 }
 
 /// fish in its own row, because CI's `test` job has no fish and its
-/// `fish-req-ts-008` job runs exactly this row against fish 4.
+/// `fish-req-ts-008` job runs exactly this row against fish 4. The
+/// `measured against` line is what lets that job tell a run from a skip.
 #[test]
 fn fish_keeps_nothing_in_home_however_a_session_ends() {
     if !on_path("fish") {
@@ -684,6 +685,12 @@ fn fish_keeps_nothing_in_home_however_a_session_ends() {
         return;
     }
     every_ending("fish", &FISH);
+    let version = Command::new("fish")
+        .arg("--version")
+        .output()
+        .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
+        .unwrap_or_default();
+    eprintln!("shell-history measured against {version}");
 }
 
 /// `[terminal] shell_history_file = "per_session"`: each session's shell

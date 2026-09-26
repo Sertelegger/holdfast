@@ -1518,6 +1518,33 @@ jobs:
             exit 1
           fi
           grep -E '^REQ-TS-008 ' fish-req-ts-008.log
+      # GH #252's fish row, on the same fish and for the same reason: the
+      # `test` job has no fish, and ci-skip-census.sh exempts the row there
+      # because it is measured here. Checked the same three ways as above.
+      - name: Measure GH #252's fish history rows against a real fish
+        run: |
+          set -o pipefail
+          cargo test -p holdfast --locked --test shell_history -- \
+            --exact fish_keeps_nothing_in_home_however_a_session_ends \
+            --show-output 2>&1 | tee fish-shell-history.log
+      - name: The fish history row must have RUN
+        run: |
+          if ! grep -qE '^test result: ok\. 1 passed; 0 failed;' fish-shell-history.log; then
+            echo "GH #252's fish row did not report exactly one passing row." >&2
+            grep -E '^test result:' fish-shell-history.log >&2 || true
+            exit 1
+          fi
+          if grep -q '^skipping: ' fish-shell-history.log; then
+            echo "GH #252's fish row SKIPPED on a runner that installed fish:" >&2
+            grep '^skipping: ' fish-shell-history.log >&2
+            exit 1
+          fi
+          if ! grep -q '^shell-history measured against ' fish-shell-history.log; then
+            echo "The row reported no 'shell-history measured against …' line, so" >&2
+            echo "this log cannot show whether it skipped." >&2
+            exit 1
+          fi
+          grep -E '^shell-history measured against ' fish-shell-history.log
 
   # --- the artifact --------------------------------------------------------
 

@@ -7272,4 +7272,47 @@ mod tests {
 
         kill_everything(&server).await;
     }
+
+    /// GH #252's opt-in, in-process: `per_session` with nowhere to put the
+    /// file refuses the call rather than keep the record nowhere, and with
+    /// a directory it creates `<session_id>.history` `0600` before the
+    /// child exists. `tests/shell_history.rs` in the `holdfast` crate is
+    /// what shows a shell writing to it.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_per_session_history_file_is_created_or_the_call_is_refused() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let mut config = crate::config::Config::default();
+        config.terminal.shell_history_file = "per_session".into();
+        let args = || StartSessionArgs {
+            command: Some("sh".into()),
+            args: vec!["-c".into(), "sleep 30".into()],
+            ..Default::default()
+        };
+
+        let nowhere = HoldfastServer::with_audit_path_and_config(None, &config);
+        let refused = nowhere.start_session(Parameters(args())).await;
+        assert!(refused.is_err(), "{refused:?}");
+        assert!(
+            nowhere.registry.all().is_empty(),
+            "a refused call left a session"
+        );
+
+        let dir = tempfile::tempdir().unwrap();
+        let history = dir.path().join("history");
+        let server = HoldfastServer::with_audit_path_and_config(None, &config)
+            .with_history_dir(Some(history.clone()));
+        let started = row(
+            "start_session",
+            &server.start_session(Parameters(args())).await.unwrap(),
+        )
+        .data;
+        let id = started["session_id"].as_str().expect("session_id");
+        let file = history.join(format!("{id}.history"));
+        let mode = |p: &std::path::Path| std::fs::metadata(p).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode(&file), 0o600, "{}", file.display());
+        assert_eq!(mode(&history), 0o700, "{}", history.display());
+        kill_everything(&server).await;
+    }
 }
