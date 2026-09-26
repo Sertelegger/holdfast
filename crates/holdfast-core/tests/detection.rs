@@ -2943,11 +2943,11 @@ async fn a_zsh_precmd_that_regenerates_its_prompt_keeps_the_marker_stream_and_th
 /// A hook appended to `PROMPT_COMMAND` *after* the snippet ran — what
 /// `eval "$(starship init bash)"` typed into a live session does — runs
 /// after the re-wrap, so the prompt markers stop for good. Exit codes
-/// still arrive, command text cannot, and until GH #220 `osc133_source`
-/// went on saying `holdfast`: the one field a caller checks before
-/// trusting that history.
+/// still arrive, command text cannot, and before GH #220 the history
+/// spelled that `command: ""` — an empty command — beside a session that
+/// reported nothing wrong.
 #[tokio::test]
-async fn a_prompt_regenerated_after_the_snippet_is_reported_as_degraded() {
+async fn a_prompt_regenerated_after_the_snippet_is_reported_as_uncaptured() {
     let server = HoldfastServer::new();
     let id = start(&server, bash()).await;
     await_markers(&server, &id, 3).await;
@@ -2960,18 +2960,16 @@ async fn a_prompt_regenerated_after_the_snippet_is_reported_as_degraded() {
     // `C` and `D;0` for that line, and then no `A`/`B` ever again.
     //
     // **Synchronised on the history, not the buffer** (review of GH #220).
-    // `osc133_source` is the detector's, and the reader feeds the buffer
-    // first and the detector after it, so a read taken once the markers
-    // reach the buffer can see the detector's *earlier* `holdfast` — and a
-    // regression that degraded on that `D` would pass whenever the detector
-    // lagged. The history is fed after the detector, so a closed entry for
-    // this line means the detector has seen its `D`.
+    // The reader feeds the buffer first and the detector and history after
+    // it, so a read taken once the markers reach the buffer can see an
+    // *earlier* answer. A closed entry for this line means the history has
+    // seen its `D`.
     await_markers(&server, &id, 5).await;
     await_closed_history(&server, &id, 1).await;
     let s = status(&server, &id).await;
     assert_eq!(
-        s["osc133_source"], "holdfast",
-        "nothing is known to be missing until a command is submitted: {s}"
+        s["command_capture"], "captured",
+        "that line was typed at a prompt that still carried its `B`: {s}"
     );
     send(&server, &id, "(exit 7)").await;
     await_markers(&server, &id, 7).await;
@@ -2980,15 +2978,18 @@ async fn a_prompt_regenerated_after_the_snippet_is_reported_as_degraded() {
     let entries = h["data"]["entries"].as_array().expect("entries");
     assert_eq!(entries.len(), 2, "{h}");
     // The exit code survives the lost prompt; the text cannot, since no
-    // `B` ever armed the capture.
+    // `B` ever armed the capture — and the entry says it was not
+    // captured rather than that the command was empty.
     assert_eq!(entries[1]["exit_code"], 7, "{h}");
-    assert_eq!(entries[1]["command"], "", "{h}");
+    assert!(entries[1]["command"].is_null(), "{h}");
+    assert!(entries[0]["command"].is_string(), "{h}");
     let s = status(&server, &id).await;
     assert_eq!(
-        s["osc133_source"], "holdfast_degraded",
-        "a session whose history has lost its command text still claims \
-         Holdfast's integration is whole: {s}"
+        s["command_capture"], "missing",
+        "a session whose history has lost its command text says nothing: {s}"
     );
+    // Whose markers are in use is unchanged: every one is still Holdfast's.
+    assert_eq!(s["osc133_source"], "holdfast", "{s}");
     kill(&server, &id).await;
 }
 

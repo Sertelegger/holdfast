@@ -13,12 +13,9 @@ is cut, named and published is in
 
 ### Added
 
-- `osc133_source` gains a fourth value, **`holdfast_degraded`**: every marker
-  is Holdfast's own, but the latest command's `C` arrived with no `B` in
-  front of it — the prompt is being regenerated over Holdfast's wrapping, so
-  exit codes are real and `command` text cannot be captured. It used to say
-  `holdfast` there, the one answer a caller checks before trusting the
-  history ([#220]).
+- `status`/`list_sessions` gain **`command_capture`** (`captured`|`missing`),
+  independent of `osc133_source` ([#220]). **Breaking:** a history entry
+  whose text was not captured is `command: null`, where it was `""`.
 
 - Attach protocol **1.5**: `ServerFrame::ScreenSnapshot`, the session's
   screen as it stands when a client joins — sent once, after `Attached` and
@@ -1196,9 +1193,9 @@ is cut, named and published is in
     at it came back as `[REDACTED:unresolved]` for a command that was whole;
   - when the prompt markers still do not arrive (a hook appended *after*
     the snippet ran, such as `eval "$(starship init bash)"` typed into a live
-    session) `osc133_source` says `holdfast_degraded`, and the T1 rung no
-    longer holds such a session at `Executing` / `semantic` on the `D` that
-    no `A` will ever follow.
+    session) each entry says `command: null` and `command_capture` says
+    `missing`, and the T1 rung no longer holds such a session at `Executing`
+    / `semantic` on the `D` that no `A` will ever follow.
 
   Re-measured against the real starship: 4 of 4 entries with their text and
   exit codes, at `semantic`, in bash and in zsh. The CI rows need no
