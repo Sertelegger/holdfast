@@ -695,6 +695,7 @@ fn end(shim: &mut Shim, s: &Started, how: Ending) {
             // A shell that is not hung up sits out the whole grace, so
             // give it a short one.
             let grace = if s.case.hung_up { 10 } else { 2 };
+            let asked = Instant::now();
             let r = shim.call(
                 "terminate",
                 json!({
@@ -704,10 +705,29 @@ fn end(shim: &mut Shim, s: &Started, how: Ending) {
                 }),
             );
             assert_eq!(r["status"], "ok", "{}: terminate: {r}", s.case.name);
+            // The hangup is what ends the shell, not the `SIGKILL` after
+            // the grace — which saves nothing either, so without this a
+            // terminate that never hung up would pass every leak check.
+            if how == Ending::Terminate && s.case.hung_up {
+                assert_hung_up(s.case.name, "terminate", asked.elapsed(), grace);
+            }
         }
         Ending::DaemonStop | Ending::DaemonKill => unreachable!("ends every session at once"),
     }
     await_gone(s);
+}
+
+/// `holdfast daemon stop`'s grace before it escalates to `SIGKILL`.
+const DAEMON_STOP_GRACE_SECS: u64 = 10;
+
+/// That a graceful ending took well under its grace, which only a hangup
+/// (GH #234) makes it do for an idle shell.
+fn assert_hung_up(name: &str, what: &str, took: Duration, grace_secs: u64) {
+    assert!(
+        took < Duration::from_secs(grace_secs) / 2,
+        "{name}: {what} took {took:?} of a {grace_secs}s grace, so the shell \
+         was not hung up and ended on the SIGKILL after it"
+    );
 }
 
 /// Every file under `home` that holds the marker or the snippet.
@@ -807,8 +827,12 @@ fn run_endings(tag: &str, cases: &[Case], endings: &[Ending]) {
             .iter()
             .map(|c| start(&stop, &mut shim, *c, "DaemonStop"))
             .collect();
+        let asked = Instant::now();
         let (code, out, err) = stop.run(&["daemon", "stop"]);
         assert_eq!(code, 0, "daemon stop: {out} {err}");
+        if cases.iter().all(|c| c.hung_up) {
+            assert_hung_up(tag, "daemon stop", asked.elapsed(), DAEMON_STOP_GRACE_SECS);
+        }
         for s in live {
             await_gone(&s);
             ended.push((s, Ending::DaemonStop));
