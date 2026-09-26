@@ -27,6 +27,12 @@ struct MockState {
     /// How long `read` stalls before draining, modelling a reader that
     /// the scheduler has not run yet. See [`MockPty::set_read_delay`].
     read_delay: Duration,
+    /// What `leader_argv` answers. See [`MockPty::set_leader`].
+    leader_argv: Option<Vec<String>>,
+    /// What `leader_alone` answers. See [`MockPty::set_leader`].
+    leader_alone: bool,
+    /// How many hangups `hang_up` has delivered.
+    hang_ups: usize,
 }
 
 /// Something to run when `line_discipline` is sampled — see
@@ -154,6 +160,19 @@ impl MockPty {
     /// a change (REQ-PD-025).
     pub fn set_foreground_group(&self, g: Option<i32>) {
         self.state.lock().foreground = g;
+    }
+
+    /// Set what the leader is running now (`None`: unreadable, the
+    /// default) and whether it is alone in its session (GH #234).
+    pub fn set_leader(&self, argv: Option<&[&str]>, alone: bool) {
+        let mut s = self.state.lock();
+        s.leader_argv = argv.map(|a| a.iter().map(|s| (*s).to_string()).collect());
+        s.leader_alone = alone;
+    }
+
+    /// How many hangups `hang_up` has delivered.
+    pub fn hang_ups(&self) -> usize {
+        self.state.lock().hang_ups
     }
 
     /// Run `f` at the instant `line_discipline` is sampled.
@@ -294,6 +313,30 @@ impl PtyBackend for MockPty {
             s.exit_code.get_or_insert(0);
         }
         Ok(())
+    }
+
+    /// Delivered only to a live child, as `InProcessPty`'s is, and fatal:
+    /// the one caller hangs up only an interactive shell, which a hangup
+    /// ends.
+    fn hang_up(&self) -> bool {
+        let mut s = self.state.lock();
+        if !s.alive {
+            return false;
+        }
+        s.hang_ups += 1;
+        s.alive = false;
+        s.exit_code.get_or_insert(1);
+        true
+    }
+
+    fn leader_argv(&self) -> Option<Vec<String>> {
+        let s = self.state.lock();
+        s.leader_argv.clone().filter(|_| s.alive)
+    }
+
+    fn leader_alone(&self) -> bool {
+        let s = self.state.lock();
+        s.alive && s.leader_alone
     }
 
     fn resize(&self, cols: u16, rows: u16) -> Result<()> {

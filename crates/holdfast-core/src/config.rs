@@ -24,12 +24,12 @@
 //! — a published key this loader did not model would give an operator
 //! who copied the example verbatim a daemon that refuses to start and an
 //! error naming the *spec's* key as the typo. At the revision this file
-//! was written against that is **43 keys across 7 tables**: `[limits]`
-//! 17, `[terminal]` 5, `[prompts]` 4, `[security]` 5, `[ui]` 4,
+//! was written against that is **44 keys across 7 tables**: `[limits]`
+//! 17, `[terminal]` 6, `[prompts]` 4, `[security]` 5, `[ui]` 4,
 //! `[notifications]` 3, `[daemon]` 5. Read the breakdown, never the
-//! total — 43 was also the pre-rev-48 count across *eight* tables, so a
-//! check against the sum agrees with two revisions while being wrong
-//! against both.
+//! total — 43, the count before `shell_history_file`, was also the
+//! pre-rev-48 count across *eight* tables, so a check against the sum
+//! agrees with two revisions while being wrong against both.
 //!
 //! **"Honoured in 0.0.5? no" means parsed, validated and unread — it
 //! does not mean absent** (REQ-CFG-004's second clause). Each such field
@@ -447,7 +447,9 @@ pub struct LimitsConfig {
     #[serde(default = "d_max_concurrent_sessions")]
     pub max_concurrent_sessions: usize,
     /// `0` **disables** reaping for a session (REQ-S-004, §4.2). One of
-    /// the two keys in this file where zero is legal.
+    /// the two keys in this file where zero is a documented "disable"
+    /// value; `Config::validate` covers the keys that load at zero
+    /// without one.
     #[serde(default = "d_default_idle_timeout_secs")]
     pub default_idle_timeout_secs: u64,
     #[serde(default = "d_output_buffer_bytes")]
@@ -458,6 +460,17 @@ pub struct LimitsConfig {
     pub read_output_hard_max_bytes: usize,
     #[serde(default = "d_resource_read_max_bytes")]
     pub resource_read_max_bytes: usize,
+    /// §4.2: frames the per-session live output broadcast holds for a
+    /// subscriber that has not read them. **Live since GH #210** — it
+    /// sized nothing for five releases while the hardcoded
+    /// `session::OUTPUT_BROADCAST_FRAMES` did — and read by
+    /// `start_session` into `SessionConfig::output_broadcast_capacity`.
+    ///
+    /// **Not an attach client's loss bound.** An attach connection that
+    /// laps the broadcast resyncs from the ring buffer, so raising this
+    /// makes that path rarer and lowering it makes it commoner; neither
+    /// changes what a client is shown. `wait_for_pattern` resyncs the
+    /// same way (REQ-C-006).
     #[serde(default = "d_output_broadcast_capacity")]
     pub output_broadcast_capacity: usize,
     /// **Reserved and unread.** v0.1.0 ships one outstanding secret
@@ -505,6 +518,18 @@ pub struct TerminalConfig {
     pub terminal_query_replies_per_min: u32,
     #[serde(default = "d_shell_integration")]
     pub shell_integration: bool,
+    /// `none` | `per_session` (GH #252): where a session's shell keeps its
+    /// command history. `none` keeps it off disk. `per_session` points
+    /// every session at `<log dir>/history/<session_id>.history` —
+    /// `0600`, in a `0700` directory, kept after the session ends — so an
+    /// operator can read what an agent ran; the file is created up front
+    /// for bash and zsh sessions, and for any other only if a shell it
+    /// starts saves one. fish sessions stay private either way. A session
+    /// started with `shell_integration: false` gets the environment
+    /// alone, so an rc file that sets `HISTFILE` itself wins for bash and
+    /// zsh. See `session::launch::history_defaults`.
+    #[serde(default = "d_shell_history_file")]
+    pub shell_history_file: String,
 }
 
 /// §8.6's prompt-detection knobs.
@@ -662,7 +687,9 @@ pub struct SecurityConfig {
     /// (see `write_secret_if_unread`), not a missing check here.
     #[serde(default = "d_autofill_on_echo_off")]
     pub autofill_on_echo_off: bool,
-    /// **Unread — 0.0.8.**
+    /// **Unread — not built.** §9.3.1's strict mode tightens the
+    /// dangerous-command preflight, which is not built and not scheduled
+    /// to a version.
     #[serde(default = "d_strict_confirmation")]
     pub strict_confirmation: bool,
     /// §9.6's operator bindings. **Read** by `secret::binding::select`.
@@ -793,8 +820,10 @@ pub struct SessionProfile {
     pub env: std::collections::BTreeMap<String, String>,
     /// Working directory for the child, **written by the operator** and
     /// **literal** — no `{…}` (GH #55). `None` means the directory the
-    /// daemon itself was started in, exactly as a `cwd`-less
-    /// `command`/`args` session gets.
+    /// daemon itself was started in. A `cwd`-less `command`/`args` session
+    /// no longer gets that — since GH #229 it starts in its calling
+    /// client's directory — and a profile session deliberately does not
+    /// follow it there: see `session::launch`.
     ///
     /// **A profile-started session takes no `cwd` from the agent**;
     /// `start_session(cwd:)` alongside `profile` is an argument error. A
@@ -823,7 +852,10 @@ pub struct SessionProfile {
     pub cwd: Option<String>,
 }
 
-/// One operator-configured secret binding (§9.6). **Unread in 0.0.5.**
+/// One operator-configured secret binding (§9.6), read by
+/// [`crate::secret::select`]: the first binding in configured order whose
+/// [`profile`](Self::profile) the session carries, and whose
+/// [`match_prompt`](Self::match_prompt) admits the prompt when one is set.
 #[derive(Debug, Clone, PartialEq, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct SecretBinding {
@@ -1015,9 +1047,9 @@ pub struct AdapterPromptPattern {
 #[serde(deny_unknown_fields)]
 pub struct DaemonConfig {
     /// The client-less daemon exit (§7.3, REQ-D-006). **`0` disables
-    /// it** — the second of the two keys in this file where zero is
-    /// legal. §7.3 says the exit is *"configurable, can be disabled"*
-    /// and names no value; `0` is the spelling
+    /// it** — the second of the two keys in this file where zero is a
+    /// documented "disable" value. §7.3 says the exit is *"configurable,
+    /// can be disabled"* and names no value; `0` is the spelling
     /// `[limits] default_idle_timeout_secs` already uses for the same
     /// idea in the same file.
     #[serde(default = "d_idle_shutdown_after_secs")]
@@ -1121,6 +1153,9 @@ fn d_terminal_query_replies_per_min() -> u32 {
 fn d_shell_integration() -> bool {
     true
 }
+fn d_shell_history_file() -> String {
+    "none".into()
+}
 fn d_settle_threshold_ms() -> u64 {
     250
 }
@@ -1215,6 +1250,9 @@ pub const SECRET_PROVIDERS: [&str; 3] = ["prompt", "keychain", "both"];
 /// §4.5's screen-tracking modes, matching `screen::ScreenTracking`.
 pub const SCREEN_TRACKING_MODES: [&str; 3] = ["off", "adaptive", "on"];
 
+/// `[terminal] shell_history_file`'s values (GH #252).
+pub const SHELL_HISTORY_FILE_MODES: [&str; 2] = ["none", "per_session"];
+
 macro_rules! table_default {
     ($t:ty { $($field:ident : $d:ident),* $(,)? } $( ; $($extra:ident),* )? ) => {
         impl Default for $t {
@@ -1254,6 +1292,7 @@ table_default!(TerminalConfig {
     terminal_queries: d_terminal_queries,
     terminal_query_replies_per_min: d_terminal_query_replies_per_min,
     shell_integration: d_shell_integration,
+    shell_history_file: d_shell_history_file,
 });
 
 table_default!(PromptsConfig {
@@ -1302,13 +1341,19 @@ impl Config {
     /// prevent: the operator believes a limit is in force and it is not.
     pub fn validate(&self) -> Result<(), ConfigError> {
         let l = &self.limits;
-        // Zero is legal in exactly two places in this file, and both are
-        // documented "disable" values: `[limits] default_idle_timeout_secs`
-        // (REQ-S-004) and `[daemon] idle_shutdown_after_secs` (§7.3).
-        // A blanket `> 0` validator makes two documented capabilities
-        // unreachable. `[ui] ui_bridge_pinned_port = 0` is a third zero,
+        // Zero is a documented "disable" value for exactly two keys in
+        // this file: `[limits] default_idle_timeout_secs` (REQ-S-004) and
+        // `[daemon] idle_shutdown_after_secs` (§7.3). A blanket `> 0`
+        // validator makes two documented capabilities unreachable.
+        // `[ui] ui_bridge_pinned_port = 0` is a third documented zero,
         // but it is a port rather than a cap and §10.2's own comment
         // spells it as the default.
+        //
+        // **Those are not the only keys that load at zero.** Several
+        // have no `nonzero` floor below and no documented meaning for
+        // zero, and `limits.redaction_lookbehind_bytes` is one of them:
+        // at `0` a context rule loses its label at a read boundary and
+        // the value is returned unredacted (GH #171).
         nonzero("limits.max_concurrent_sessions", l.max_concurrent_sessions)?;
         nonzero("limits.output_buffer_bytes", l.output_buffer_bytes)?;
         nonzero(
@@ -1324,6 +1369,23 @@ impl Config {
             "limits.output_broadcast_capacity",
             l.output_broadcast_capacity,
         )?;
+        // **A ceiling, since the key is live** (GH #210's review). Every
+        // slot is allocated when a session starts, so an operator raising
+        // this to cure a detach could make each `start_session` cost
+        // hundreds of megabytes, or abort the daemon outright. Refused
+        // rather than clamped, like the rest of this function.
+        let most = crate::session::MAX_OUTPUT_BROADCAST_FRAMES;
+        if l.output_broadcast_capacity > most {
+            return Err(ConfigError::invalid(format!(
+                "limits.output_broadcast_capacity = {}, which is more than the {most} \
+                 frames a session's output broadcast may hold. Every frame is allocated \
+                 when a session starts, and past {most} the memory buys nothing: a \
+                 consumer that falls behind the broadcast resumes from the session's \
+                 ring buffer, so this number only decides how often that happens — it \
+                 no longer decides what an attach client is shown (GH #210)",
+                l.output_broadcast_capacity
+            )));
+        }
         nonzero(
             "limits.max_outstanding_secret_requests_per_session",
             l.max_outstanding_secret_requests_per_session as usize,
@@ -1374,9 +1436,9 @@ impl Config {
         // (`daemon::server::write_response`) and it **rejects**, so a
         // buffer cap that reaches it guarantees every response built at
         // that size is refused at the wire — not a slow degradation, a
-        // hard failure on the first oversized read. This is the
-        // cross-check `write_response`'s doc comment names as still
-        // owed.
+        // hard failure on the first oversized read. `write_response`'s
+        // refusal is the runtime backstop; this is the startup check that
+        // keeps a configured cap from reaching it.
         //
         // **Do not size the headroom off the cap alone; redaction can
         // make the encoded body *larger* than the raw bytes that went
@@ -1491,6 +1553,11 @@ impl Config {
             "terminal.screen_tracking_default",
             &self.terminal.screen_tracking_default,
             &SCREEN_TRACKING_MODES,
+        )?;
+        one_of(
+            "terminal.shell_history_file",
+            &self.terminal.shell_history_file,
+            &SHELL_HISTORY_FILE_MODES,
         )?;
         nonzero(
             "terminal.terminal_query_replies_per_min",
@@ -1919,6 +1986,19 @@ mod tests {
         assert!(e.to_string().contains("limmits"), "{e}");
     }
 
+    /// GH #252. `none` by default, `per_session` on request, and anything
+    /// else refused by name — a misspelt opt-in that silently kept history
+    /// off would leave an operator believing a record existed.
+    #[test]
+    fn shell_history_file_is_none_unless_set_and_refuses_other_values() {
+        assert_eq!(Config::default().terminal.shell_history_file, "none");
+        let on = parse_str("[terminal]\nshell_history_file = \"per_session\"\n").expect("loads");
+        assert_eq!(on.terminal.shell_history_file, "per_session");
+        let e =
+            parse_str("[terminal]\nshell_history_file = \"per-session\"\n").expect_err("refused");
+        assert!(e.to_string().contains("terminal.shell_history_file"), "{e}");
+    }
+
     #[test]
     fn the_published_example_config_loads() {
         // Two assertions, deliberately separate: a fixture that is not
@@ -1934,15 +2014,15 @@ mod tests {
             .collect();
         let total: usize = per_table.iter().map(|(_, n)| n).sum();
         assert_eq!(
-            total, 43,
+            total, 44,
             "§10.2's key count moved; per-table: {per_table:?}"
         );
-        // The breakdown, never the sum: 43 was also the pre-rev-48 total
-        // across *eight* tables, so a check against the total agrees with
-        // two revisions of §10.2 while being wrong against both.
+        // The breakdown, never the sum: a total agrees with any revision of
+        // §10.2 that moved a key between tables, and 43 was the total of
+        // two different revisions.
         for (table, want) in [
             ("limits", 17),
-            ("terminal", 5),
+            ("terminal", 6),
             ("prompts", 4),
             ("security", 5),
             ("ui", 4),
@@ -2871,6 +2951,34 @@ reference = \"db/prod\"
         let msg = e.to_string();
         assert!(msg.contains("max_concurrent_sessions"), "{msg}");
         assert!(msg.contains('0'), "the message names the value too: {msg}");
+    }
+
+    /// **A broadcast capacity past the ceiling is refused at load** (GH
+    /// #210's review), and the ceiling itself is accepted.
+    ///
+    /// The key became live with GH #210, and every slot is allocated when
+    /// a session starts: the review measured about 230 MB of daemon RSS
+    /// per `start_session` at 4,194,304, and an abort at 1,000,000,000.
+    /// Both boundary values are asserted, so a check written one off in
+    /// either direction is red. Nothing here starts a session, so a
+    /// validator that let a huge value through fails an assertion rather
+    /// than attempting the allocation.
+    #[test]
+    fn a_broadcast_capacity_past_the_ceiling_is_refused_and_the_ceiling_is_not() {
+        let most = crate::session::MAX_OUTPUT_BROADCAST_FRAMES;
+        let cfg = parse_str(&format!("[limits]\noutput_broadcast_capacity = {most}\n"))
+            .expect("the ceiling itself is a legal capacity");
+        assert_eq!(cfg.limits.output_broadcast_capacity, most);
+        for past in [most + 1, 4_194_304, 1_000_000_000] {
+            let e = parse_str(&format!("[limits]\noutput_broadcast_capacity = {past}\n"))
+                .expect_err("a capacity past the ceiling must not load");
+            let msg = e.to_string();
+            assert!(msg.contains("output_broadcast_capacity"), "{msg}");
+            assert!(
+                msg.contains(&past.to_string()) && msg.contains(&most.to_string()),
+                "the message names the value and the ceiling: {msg}"
+            );
+        }
     }
 
     // ------------------------------------------ I-9's second half (headroom)

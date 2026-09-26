@@ -629,6 +629,11 @@ async fn started_reports_the_childs_real_pgid_and_sid() {
     let token = unique_token("groups");
     let booted = boot(&long_lived(&token)).await;
     let child_pid = booted.started.child_pid;
+    // Read only by the `/proc` block below, so it is gated with it: an
+    // ungated binding is an unused variable on every other Unix, and
+    // `cargo clippy --all-targets --target aarch64-apple-darwin -- -D
+    // warnings` refused to compile this file over it.
+    #[cfg(target_os = "linux")]
     let worker_pid = booted.worker.pid();
 
     // `portable-pty` `setsid`s the child, so all three of these are the
@@ -867,11 +872,12 @@ async fn the_child_that_spawns_a_worker_writing_to_both_streams() {
 
 #[test]
 fn the_worker_is_absent_from_help() {
-    // `holdfast --help` is not a flag this binary models — it falls
-    // through to the usage error — but it prints the banner, which is the
-    // surface under test. Both streams are read, because the banner goes
-    // to stderr and a future one might not.
-    for args in [vec!["--help"], vec![]] {
+    // Three ways to see the banner: `--help` and `help`, which answer on
+    // stdout since GH #233 (they were usage errors before it), and a bare
+    // `holdfast`, which is still one and prints it on stderr. Both streams
+    // are read, so the assertion is about the banner and not about which
+    // stream a given spelling uses.
+    for args in [vec!["--help"], vec!["help"], vec![]] {
         let out = Command::new(BIN)
             .args(&args)
             .output()
@@ -893,22 +899,29 @@ fn the_worker_is_absent_from_help() {
         );
     }
 
-    // Hidden means absent from the banner, not undiagnosable.
-    let out = Command::new(BIN)
-        .arg(WORKER_SUBCOMMAND)
-        .arg("--help")
-        .output()
-        .expect("run holdfast pty-worker --help");
-    assert!(
-        out.status.success(),
-        "`holdfast pty-worker --help` failed: {}",
-        out.status
-    );
-    let text = String::from_utf8_lossy(&out.stdout);
-    assert!(
-        text.contains(WORKER_SUBCOMMAND) && text.contains(WORKER_SOCKET_FLAG),
-        "`holdfast pty-worker --help` printed no usage:\n{text}"
-    );
+    // Hidden means absent from the banner, not undiagnosable — and asked
+    // either way, it is the same answer.
+    for args in [
+        vec![WORKER_SUBCOMMAND, "--help"],
+        vec!["help", WORKER_SUBCOMMAND],
+    ] {
+        let out = Command::new(BIN)
+            .args(&args)
+            .output()
+            .expect("run holdfast pty-worker --help");
+        assert!(
+            out.status.success(),
+            "`holdfast {}` failed: {}",
+            args.join(" "),
+            out.status
+        );
+        let text = String::from_utf8_lossy(&out.stdout);
+        assert!(
+            text.contains(WORKER_SUBCOMMAND) && text.contains(WORKER_SOCKET_FLAG),
+            "`holdfast {}` printed no usage:\n{text}",
+            args.join(" ")
+        );
+    }
 }
 
 // ---------------------------- the two rows Task 1 deferred to this task

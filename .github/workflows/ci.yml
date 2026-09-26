@@ -727,10 +727,10 @@ jobs:
           key: macos-native
           save-if: ${{ github.ref == 'refs/heads/main' }}
       # **The shells the suite spawns BY NAME, which macOS does not ship.**
-      # The `test` job's equivalent installs `zsh dash less python3`; this one
-      # was written without it and the first run showed exactly what that
-      # costs: nine `detection` rows failed with `"last_line":"bash-3.2$ "` and
-      # `"detection_tier":"heuristic"`.
+      # The `test` job's equivalent installs `zsh dash less python3 tcsh`;
+      # this one was written without it and the first run showed exactly what
+      # that costs: nine `detection` rows failed with
+      # `"last_line":"bash-3.2$ "` and `"detection_tier":"heuristic"`.
       #
       # Apple still ships **bash 3.2**, the last GPLv2 release, as `/bin/bash`.
       # OSC 133 shell integration cannot work on it, so every row that expects
@@ -902,12 +902,23 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
+          # **The tags, because the marketplace pin is checked against one.**
+          # A pin names a release tag and its commit, and the manifest check
+          # compares the two and reads the tagged tree's plugin.json -- which
+          # a default checkout, with no tags, could only skip: a pin to
+          # `v0.0.7`, whose tree has no plugin at all, passed here. Under CI
+          # the check now fails where it cannot look, so this line is what
+          # lets it look. The whole history is a few MB.
+          fetch-depth: 0
 
       # **The self-test first**, for the reason the `hygiene` job gives: this
-      # script's twelve breakage fixtures are the only thing holding its
-      # twenty-five assertions honest, and a guard whose guard is unrun is a
-      # guard on trust.
+      # script's breakage and acceptance fixtures are the only thing holding
+      # its assertions honest, and a guard whose guard is unrun is a guard on
+      # trust. It prints its own totals.
       - run: ./scripts/plugin-manifest-check.py --self-test
+      # Against the real tree. With a pin in the listing this also asks
+      # GitHub whether the pinned release serves its assets -- a draft does
+      # not -- and under CI a release that does not answer is a failure.
       - run: ./scripts/plugin-manifest-check.py
 
       # `claude plugin validate --strict` is the OFFICIAL check and it is
@@ -970,8 +981,13 @@ jobs:
           sudo rm -f /etc/apt/sources.list.d/google-chrome.list \
                      /etc/apt/sources.list.d/google-chrome.sources
           sudo apt-get update -qq
-          sudo apt-get install -y -qq --no-install-recommends libarchive-tools
+          # wget and busybox are for the bootstrap harness's wget rows (T15),
+          # which require both under CI: each wget reports a 404 unlike curl
+          # and unlike the other, and that difference was GH #237's dead end.
+          sudo apt-get install -y -qq --no-install-recommends libarchive-tools wget busybox
           bsdtar --version
+          wget --version | sed -n 1p
+          command -v busybox
       - name: Hostile archives under bash, with GNU tar and then with bsdtar
         run: |
           set -eux
@@ -1075,7 +1091,7 @@ jobs:
           sudo rm -f /etc/apt/sources.list.d/google-chrome.list \
                      /etc/apt/sources.list.d/google-chrome.sources
           sudo apt-get update -qq
-          sudo apt-get install -y -qq --no-install-recommends zsh dash less python3
+          sudo apt-get install -y -qq --no-install-recommends zsh dash less python3 tcsh
       # The one requirement of tests/detection.rs that is a VERSION claim
       # rather than a presence one (`Need::PyreplPython`):
       # matrix_row_the_python_repl_is_at_prompt_with_no_repl_specific_config
@@ -1239,7 +1255,7 @@ jobs:
           sudo rm -f /etc/apt/sources.list.d/google-chrome.list \
                      /etc/apt/sources.list.d/google-chrome.sources
           sudo apt-get update -qq
-          sudo apt-get install -y -qq --no-install-recommends zsh dash less python3
+          sudo apt-get install -y -qq --no-install-recommends zsh dash less python3 tcsh
       # `Need::PyreplPython` — see the probe job for why this is a version
       # claim and not a presence one. The row asks each `python3` and
       # `python3.<minor>` on PATH for its own version, so what makes this
@@ -1502,6 +1518,33 @@ jobs:
             exit 1
           fi
           grep -E '^REQ-TS-008 ' fish-req-ts-008.log
+      # GH #252's fish row, on the same fish and for the same reason: the
+      # `test` job has no fish, and ci-skip-census.sh exempts the row there
+      # because it is measured here. Checked the same three ways as above.
+      - name: Measure GH #252's fish history rows against a real fish
+        run: |
+          set -o pipefail
+          cargo test -p holdfast --locked --test shell_history -- \
+            --exact fish_keeps_nothing_in_home_however_a_session_ends \
+            --show-output 2>&1 | tee fish-shell-history.log
+      - name: The fish history row must have RUN
+        run: |
+          if ! grep -qE '^test result: ok\. 1 passed; 0 failed;' fish-shell-history.log; then
+            echo "GH #252's fish row did not report exactly one passing row." >&2
+            grep -E '^test result:' fish-shell-history.log >&2 || true
+            exit 1
+          fi
+          if grep -q '^skipping: ' fish-shell-history.log; then
+            echo "GH #252's fish row SKIPPED on a runner that installed fish:" >&2
+            grep '^skipping: ' fish-shell-history.log >&2
+            exit 1
+          fi
+          if ! grep -q '^shell-history measured against ' fish-shell-history.log; then
+            echo "The row reported no 'shell-history measured against …' line, so" >&2
+            echo "this log cannot show whether it skipped." >&2
+            exit 1
+          fi
+          grep -E '^shell-history measured against ' fish-shell-history.log
 
   # --- the artifact --------------------------------------------------------
 

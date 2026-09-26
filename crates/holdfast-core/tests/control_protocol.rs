@@ -3064,3 +3064,243 @@ async fn a_pattern_wait_in_flight_does_not_stall_an_unrelated_control_call() {
         "the wait's context read skipped the redaction pipeline"
     );
 }
+
+/// **`@client` is `start_session`'s alone, on the daemon path too**
+/// (GH #229 × GH #219).
+///
+/// The daemon takes the shim's launch context out of a call's arguments
+/// before the tool sees them. Taken from *every* call, it was the one key
+/// the daemon path accepted in silence on the eleven other tools, whose
+/// advertised schemas say `additionalProperties: false` — while
+/// `--no-daemon`, which strips nothing, refused the same call by name.
+///
+/// Paired per tool, as `tests/tool_arguments.rs` pairs its rows: the call
+/// without the key reaches the tool's body, and the same call with it is
+/// `bad_params` naming it. `start_session` is the control, and a positive
+/// one: its context is still taken — the call is not refused — and the
+/// session starts in the directory the context names.
+#[tokio::test]
+async fn only_start_session_takes_the_launch_context_every_other_tool_refuses_it() {
+    use holdfast_core::session::launch::CLIENT_PARAM;
+    const NOPE: &str = "sess_nope229";
+    let d = TestDaemon::start("clientkey").await;
+    let client = d.client().await.unwrap();
+    let project = scratch_dir("clientkey-project");
+    std::fs::create_dir_all(&project).unwrap();
+    let project = project.canonicalize().unwrap();
+    let context = json!({ "cwd": project.to_str().unwrap(), "env": { "PATH": "/usr/bin:/bin" } });
+
+    let tools = holdfast_core::mcp::passthrough::tool_manifest();
+    assert!(
+        tools.len() >= 12,
+        "the router lost tools; this loop would pass over nothing"
+    );
+    let mut refused = 0;
+    for tool in tools {
+        let name = tool.name.to_string();
+        if name == "start_session" {
+            continue;
+        }
+        let mut args = match name.as_str() {
+            "list_sessions" => json!({}),
+            "read_output" => json!({ "session": NOPE, "since_cursor": 0 }),
+            "send_input" => json!({ "session": NOPE, "data": "x" }),
+            "resize" => json!({ "session": NOPE, "cols": 80, "rows": 24 }),
+            "request_secret_input" => json!({ "session": NOPE, "prompt_text": "x" }),
+            _ => json!({ "session": NOPE }),
+        };
+        let method_name = format!("tool/{name}");
+
+        // ---- the pairing: without the key, the call reaches the body.
+        let base = client
+            .call_raw(&method_name, method::to_cbor(&args).unwrap())
+            .await
+            .unwrap();
+        assert!(
+            base.control_error().is_none(),
+            "`{name}` with {args} did not reach its body — fix this row's arguments: {}",
+            base.details
+        );
+
+        // ---- with it, refused before the body runs, and by name.
+        args.as_object_mut()
+            .unwrap()
+            .insert(CLIENT_PARAM.into(), context.clone());
+        let resp = client
+            .call_raw(&method_name, method::to_cbor(&args).unwrap())
+            .await
+            .unwrap();
+        let e = resp.control_error().unwrap_or_else(|| {
+            panic!(
+                "`{name}` accepted `{CLIENT_PARAM}` and ran (status {:?}) — the daemon \
+                 took the launch context from a call no shim tags, and served a key the \
+                 tool's schema says it refuses: {}",
+                resp.status, resp.details
+            )
+        });
+        assert_eq!(
+            e.code,
+            ErrorCode::BadParams.as_str(),
+            "`{name}`: {}",
+            e.message
+        );
+        assert!(
+            e.message
+                .contains(&format!("unknown field `{CLIENT_PARAM}`")),
+            "`{name}`'s refusal does not name the key: {}",
+            e.message
+        );
+        refused += 1;
+    }
+    assert!(refused >= 11, "only {refused} tools were asked");
+
+    // ---- the control: start_session still takes the context.
+    let params = method::to_cbor(&json!({
+        "command": "sh",
+        "args": ["-c", "sleep 30"],
+        CLIENT_PARAM: context,
+    }))
+    .unwrap();
+    let resp = client.call_raw("tool/start_session", params).await.unwrap();
+    assert_eq!(
+        resp.status, "ok",
+        "start_session refused its own context: {}",
+        resp.details
+    );
+    let data: Value = method::from_cbor(&resp.data).unwrap();
+    assert_eq!(
+        data["cwd"].as_str(),
+        project.to_str(),
+        "start_session did not start where the context says: {data}"
+    );
+    let id = data["session_id"].as_str().unwrap().to_string();
+    let params = method::to_cbor(&json!({ "session": id, "force": true })).unwrap();
+    client.call_raw("tool/terminate", params).await.unwrap();
+    let _ = std::fs::remove_dir_all(&project);
+}
+
+/// **`@client` is taken only from a peer whose protocol has it** — the
+/// integration review of GH #229, through the upgrade window README
+/// describes.
+///
+/// A shim older than the key (protocol 1.4 and before) forwards an
+/// agent's `start_session` arguments verbatim, and a daemon outlives such
+/// shims by design: they keep running until each Claude Code session
+/// restarts. So from one, `@client` is text the agent typed — and the
+/// daemon took it as a launch context. Measured before the gate, with an
+/// `a81b02d` shim against this daemon: the session started in the
+/// agent's directory, its shell saw the agent's `HOME` and variables and
+/// no `CLAUDE_PROJECT_DIR`, and the `session_start` audit row read
+/// `"env_keys":[]`, where the same variables passed as `env` are listed.
+///
+/// Three calls over a real socket, each with the handshake's minor
+/// chosen:
+///
+/// * a peer one minor older than the key sends it: refused by name, as
+///   `--no-daemon` refuses it;
+/// * the same peer without the key starts a session, and not in the
+///   directory the refused key named — the refusal is about the key, not
+///   the peer;
+/// * a peer of the key's own minor sends it: taken, and the session
+///   starts where it says — the control, without which a daemon that
+///   stopped taking the key from anyone passes the first two.
+#[tokio::test]
+async fn a_peer_older_than_the_launch_context_cannot_supply_one() {
+    use holdfast_core::session::launch::CLIENT_PARAM;
+    async fn peer(d: &TestDaemon, minor: u32) -> UnixStream {
+        let mut s = d.raw().await;
+        let hs = Request::new(
+            0,
+            method::METHOD_HANDSHAKE,
+            &HandshakeParams {
+                protocol_major: handshake::PROTOCOL_MAJOR,
+                protocol_minor: minor,
+                client_kind: ClientKind::Shim,
+                client_version: "0.0.7".into(),
+            },
+        )
+        .unwrap();
+        frame::write_frame(&mut s, &hs).await.unwrap();
+        let resp: Response = frame::read_frame(&mut s).await.unwrap();
+        assert!(
+            resp.data_as::<HandshakeData>().unwrap().accepted,
+            "a 1.{minor} peer must be admitted, or this row is about the handshake"
+        );
+        s
+    }
+    async fn call(s: &mut UnixStream, id: u64, tool: &str, args: &Value) -> Response {
+        let req = Request::new(id, format!("tool/{tool}"), args).unwrap();
+        frame::write_frame(s, &req).await.unwrap();
+        frame::read_frame(s).await.unwrap()
+    }
+
+    let d = TestDaemon::start("oldshim").await;
+    let project = scratch_dir("oldshim-project");
+    std::fs::create_dir_all(&project).unwrap();
+    let project = project.canonicalize().unwrap();
+    let forged = json!({
+        "command": "sh",
+        "args": ["-c", "sleep 30"],
+        CLIENT_PARAM: {
+            "cwd": project.to_str().unwrap(),
+            "env": { "PATH": "/usr/bin:/bin", "HOME": "/tmp", "AGENT_CHOSE": "1" },
+        },
+    });
+    let mut started = Vec::new();
+
+    // ---- a peer older than the key: refused, by name.
+    let older = handshake::LAUNCH_CONTEXT_MINOR - 1;
+    let mut old = peer(&d, older).await;
+    let resp = call(&mut old, 1, "start_session", &forged).await;
+    let e = resp.control_error().unwrap_or_else(|| {
+        panic!(
+            "a 1.{older} peer's `{CLIENT_PARAM}` was taken as a launch context — from a shim \
+             that old it is the agent's argument: {}",
+            resp.details
+        )
+    });
+    assert_eq!(e.code, ErrorCode::BadParams.as_str(), "{}", e.message);
+    assert!(
+        e.message
+            .contains(&format!("unknown field `{CLIENT_PARAM}`")),
+        "the refusal does not name the key: {}",
+        e.message
+    );
+
+    // ---- the pairing: the same peer, without the key, is served.
+    let plain = json!({ "command": "sh", "args": ["-c", "sleep 30"] });
+    let resp = call(&mut old, 2, "start_session", &plain).await;
+    assert_eq!(resp.status, "ok", "{}", resp.details);
+    let data: Value = method::from_cbor(&resp.data).unwrap();
+    assert_ne!(data["cwd"].as_str(), project.to_str(), "{data}");
+    started.push(data["session_id"].as_str().unwrap().to_string());
+
+    // ---- the control: a peer of the key's own minor is taken at its word.
+    let mut new = peer(&d, handshake::LAUNCH_CONTEXT_MINOR).await;
+    let resp = call(&mut new, 1, "start_session", &forged).await;
+    assert_eq!(
+        resp.status,
+        "ok",
+        "a 1.{} peer's launch context was refused: {}",
+        handshake::LAUNCH_CONTEXT_MINOR,
+        resp.details
+    );
+    let data: Value = method::from_cbor(&resp.data).unwrap();
+    assert_eq!(
+        data["cwd"].as_str(),
+        project.to_str(),
+        "the context was not taken: {data}"
+    );
+    started.push(data["session_id"].as_str().unwrap().to_string());
+
+    for (i, id) in started.iter().enumerate() {
+        call(
+            &mut new,
+            10 + i as u64,
+            "terminate",
+            &json!({ "session": id, "force": true }),
+        )
+        .await;
+    }
+    let _ = std::fs::remove_dir_all(&project);
+}

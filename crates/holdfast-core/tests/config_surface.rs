@@ -260,6 +260,10 @@ const EFFECTIVE: &[(&str, &str)] = &[
         "crates/holdfast-core/src/mcp/tools.rs:393 — start_session falls back to it when the call omits idle_timeout_secs; reaches SessionConfig at tools.rs:416.",
     ),
     (
+        "limits.output_broadcast_capacity",
+        "crates/holdfast-core/src/mcp/tools.rs:508 — start_session copies it into SessionConfig::output_broadcast_capacity, which sizes the live output broadcast at crates/holdfast-core/src/session/mod.rs:1014, clamped to MAX_OUTPUT_BROADCAST_FRAMES — which Config::validate also refuses past (GH #210; inert until then).",
+    ),
+    (
         "limits.resource_read_max_bytes",
         "crates/holdfast-core/src/mcp/mod.rs:817 (MCP resources/read) and crates/holdfast-core/src/daemon/server.rs:2245 (control protocol) — both pass it as read_prepared's ceiling.",
     ),
@@ -364,6 +368,11 @@ const EFFECTIVE: &[(&str, &str)] = &[
         "security.secret_input_max_timeout_secs",
         "crates/holdfast-core/src/mcp/tools.rs:1767 — request_secret_input refuses a timeout_secs above it.",
     ),
+    // ---- [terminal]
+    (
+        "terminal.shell_history_file",
+        "crates/holdfast-core/src/mcp/tools.rs:425 — start_session reads it; per_session gives the session a HISTFILE of its own under RuntimePaths::history_dir (GH #252).",
+    ),
     // ---- [daemon]
     (
         "daemon.idle_shutdown_after_secs",
@@ -404,8 +413,8 @@ const INERT: &[(&str, Inert, &str)] = &[
     // ---- [limits]
     (
         "limits.output_buffer_bytes",
-        Inert::NamedElsewhere,
-        "GH #128's repro. The live value is SessionConfig::buffer_capacity, which crates/holdfast-core/src/mcp/tools.rs:394 never sets, so it falls through to the hardcoded twin registry::DEFAULT_BUFFER_BYTES (crates/holdfast-core/src/session/registry.rs:64, also 1 MiB). The other mentions are doc comments and one operator-facing error string in daemon/server.rs.",
+        Inert::NeverNamed,
+        "GH #128's repro. The live value is SessionConfig::buffer_capacity, which crates/holdfast-core/src/mcp/tools.rs:394 never sets, so it falls through to the hardcoded twin registry::DEFAULT_BUFFER_BYTES (crates/holdfast-core/src/session/registry.rs:64, also 1 MiB). The other mentions are doc comments.",
     ),
     (
         "limits.read_output_default_max_bytes",
@@ -416,11 +425,6 @@ const INERT: &[(&str, Inert, &str)] = &[
         "limits.read_output_hard_max_bytes",
         Inert::NeverNamed,
         "GH #128's repro. The hardcoded twin MAX_READ_MAX_BYTES (crates/holdfast-core/src/mcp/tools.rs:88) is the cap applied at tools.rs:853.",
-    ),
-    (
-        "limits.output_broadcast_capacity",
-        Inert::NeverNamed,
-        "The hardcoded twin session::OUTPUT_BROADCAST_FRAMES (crates/holdfast-core/src/session/mod.rs:40) sizes the channel at session/mod.rs:703. VALIDATE-ONLY otherwise.",
     ),
     (
         "limits.max_outstanding_secret_requests_per_session",
@@ -523,7 +527,7 @@ const INERT: &[(&str, Inert, &str)] = &[
     (
         "security.strict_confirmation",
         Inert::NeverNamed,
-        "Doc says \"Unread — 0.0.8\". §9.3.1's strict mode is not built, so REQ-CFG-006's HOLDFAST_STRICT_CONFIRMATION latch has nothing to tighten either.",
+        "Doc says \"Unread — not built\". §9.3.1's strict mode is not built, so REQ-CFG-006's HOLDFAST_STRICT_CONFIRMATION latch has nothing to tighten either.",
     ),
     // ---- [ui]
     (
@@ -544,7 +548,7 @@ const INERT: &[(&str, Inert, &str)] = &[
     (
         "ui.max_bridge_sessions",
         Inert::NamedElsewhere,
-        "0.0.10. VALIDATE-ONLY. The one mention is crates/holdfast-core/src/protocol/method.rs:179, a doc comment saying its only producer, bridge/register, is 0.0.10's.",
+        "0.0.10. VALIDATE-ONLY. The one mention is crates/holdfast-core/src/protocol/method.rs:190, a doc comment saying its only producer, bridge/register, is 0.0.10's.",
     ),
     // ---- [notifications]
     (

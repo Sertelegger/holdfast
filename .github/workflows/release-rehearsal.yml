@@ -125,9 +125,15 @@ jobs:
             "holdfast $want "*) ;;
             *) echo "extracted binary says '$out'; Cargo.toml says $want" >&2; exit 1 ;;
           esac
+          # **The exact commit, not "anything but unknown".** Since GH #178
+          # holdfast-core's build.rs falls back to the checkout's HEAD, so a
+          # build the variable never reached says `build <12 hex>`, not
+          # `build unknown`, and a guard on `unknown` passes it. The variable
+          # carries the full 40-hex sha verbatim; only it produces this.
           case "$out" in
-            *"build unknown"*)
-              echo "the asset reports 'build unknown' — HOLDFAST_BUILD_SHA did not reach the build" >&2
+            *"(build ${GITHUB_SHA})"*) ;;
+            *)
+              echo "the asset reports '$out', not build ${GITHUB_SHA} — HOLDFAST_BUILD_SHA did not reach the build" >&2
               exit 1 ;;
           esac
       - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1

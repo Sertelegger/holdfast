@@ -264,7 +264,7 @@ EXIT_CANNOT_RUN = 3
 # writer means the check goes red before the missing audit trail does.
 # --------------------------------------------------------------------------
 KNOWN_UNWRITTEN = [
-    ("preflight_match", "argv-aware dangerous-command preflight is unbuilt (§5.4)"),
+    ("preflight_match", "argv-aware dangerous-command preflight is unbuilt (§9.3)"),
     ("confirmation_redeem", "strict_confirmation / `holdfast confirm` is unbuilt"),
     ("confirmation_abandoned", "strict_confirmation / `holdfast confirm` is unbuilt"),
     ("bridge_register", "the `holdfast ui` TCP bridge is unbuilt (§7.6.1)"),

@@ -427,14 +427,26 @@ pub struct SecretRequest {
     /// without prompt text rather than suppressing it. Nothing asserts it
     /// is non-empty and nothing should.
     pub prompt_text: String,
+    /// Which raise wrote `prompt_text` — the child's echo drop, whose
+    /// text is the line it drew, or a tool call, whose text is the
+    /// agent's (GH #236). Fixed at the raise, like the text: an adopting
+    /// call changes neither.
+    ///
+    /// The same fact as `RaisedRequest::raised_by`, kept on the request
+    /// as well because the request is what reaches the frame — §7.5's
+    /// replay and every fan-out build `AwaitingSecret` from one of these,
+    /// and a client cannot say whose words it is showing unless the
+    /// frame does.
+    pub raised_by: crate::secret::RaisedBy,
 }
 
 impl SecretRequest {
-    pub fn new(prompt_text: String) -> Self {
+    pub fn new(prompt_text: String, raised_by: crate::secret::RaisedBy) -> Self {
         let id = uuid::Uuid::new_v4().simple().to_string();
         Self {
             request_id: format!("secreq_{}", &id[..12]),
             prompt_text,
+            raised_by,
         }
     }
 }
@@ -691,8 +703,11 @@ mod tests {
 
     #[test]
     fn a_request_id_is_prefixed_and_unique() {
-        let a = SecretRequest::new("[sudo] password for ada:".into());
-        let b = SecretRequest::new(String::new());
+        let a = SecretRequest::new(
+            "[sudo] password for ada:".into(),
+            crate::secret::RaisedBy::EchoDrop,
+        );
+        let b = SecretRequest::new(String::new(), crate::secret::RaisedBy::EchoDrop);
         assert!(a.request_id.starts_with("secreq_"), "{}", a.request_id);
         assert_ne!(a.request_id, b.request_id);
         // An empty prompt is a correct request (REQ-O-013), not a defect.

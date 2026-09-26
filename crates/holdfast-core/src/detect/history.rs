@@ -19,19 +19,19 @@ pub struct CommandEntry {
     /// **Best-effort, and never the command of record.** This is
     /// reconstructed from the terminal *echo* between the OSC 133 `B` and `C`
     /// markers — the bytes the line editor happened to paint — not from
-    /// anything the shell reports about what it ran. It is wrong in two
-    /// measured ways.
+    /// anything the shell reports about what it ran. It can be wrong in two
+    /// directions: it can lose part of the line, and it can hold text that
+    /// is not the command.
     ///
     /// A command longer than the terminal width loses its front: 125
     /// characters typed at 80 columns leaves 47, with the leading 78 gone.
-    /// The line editor's wrap redraw emits `\r` followed by `\x1b[K`, which
-    /// is a *within-line reposition*; a scanner with no grid and no cursor
-    /// cannot distinguish that from a fresh line, so it discards everything
-    /// before it. That is not a defect in the capture rules and must not be
-    /// fixed there — modelling it is exactly the cursor arithmetic tier A
-    /// is defined not to do (tier B, 0.0.4).
+    /// The line editor's wrap redraw emits `\r` followed by `\x1b[K`, and the
+    /// capture discards what a `\r` returns over. The scanner counts only the
+    /// cursor motion that decides how much of a redrawn line survives (see
+    /// `detect::scanner`); it keeps no grid, so it cannot put a lost front
+    /// back.
     ///
-    /// **So that case is refused instead of reported.** Truncation is the
+    /// **So a detected loss is refused instead of reported.** Truncation is the
     /// dangerous half twice over: a tail *looks like a whole command*, and
     /// the front is dropped inside the scanner, long before this field is
     /// redacted — so `export K=AKIAIOSF` + wrap + `ODNN7EXAMPLE` yields a
@@ -40,15 +40,26 @@ pub struct CommandEntry {
     /// scanner reports the capture truncated this field is
     /// `[REDACTED:unresolved]` — the reserved pseudo-kind's own meaning,
     /// "the bytes are withheld and no rule claimed them" — rather than a
-    /// plausible-looking tail. Anything else this field carries is a
-    /// capture the scanner saw whole.
+    /// plausible-looking tail. A loss the scanner does not detect is still
+    /// reported as whole: a continuation at least as long as the lost front,
+    /// and a repaint that resumes inside the command, as history recall does
+    /// (GH #271). Motion the capture does not model can also leave text that
+    /// was not run in the line (GH #272, GH #273).
     ///
-    /// Non-ASCII bytes are also recorded as Latin-1 rather than decoded
-    /// UTF-8 (`echo café` → `echo cafÃ©`), because the capture maps each
-    /// byte to a codepoint. That one is a genuine bug, fixable one layer
-    /// down in the scanner's capture buffer; it is loudly wrong rather than
-    /// quietly wrong, and it changes no detection decision.
-    pub command: String,
+    /// The capture is decoded as UTF-8, so a non-ASCII command reads as it
+    /// was typed (GH #270).
+    ///
+    /// **`None` means the text was not captured**, and is never spelled
+    /// `""`: this command's `C` had no `B` in front of it — none since the
+    /// last `A`, `C` or `D` — so there was no echo span to read. A prompt
+    /// regenerated over the `A`/`B` markers does that, for whichever source
+    /// supplies them (GH #220), and so does a foreign `C` in a program's
+    /// output, which opens an entry of its own (GH #265). `Some("")` is a
+    /// different fact, a capture that ran and saw no echo. Under a
+    /// regenerated prompt the entry's exit code and output span are exact;
+    /// an entry opened by a foreign `C` is not a command at all, and takes
+    /// the exit code and output of the command that printed it (GH #265).
+    pub command: Option<String>,
     /// **`None` does not mean "still running".** `D` may arrive with no
     /// code at all — the shell reports the command finished and says
     /// nothing about how — and a code outside `i32` (`D;99999999999`)
@@ -72,6 +83,42 @@ pub struct CommandEntry {
     /// long-finished command as running indefinitely, so it should say
     /// "not known to have finished" instead.
     pub output_end_cursor: Option<u64>,
+}
+
+/// Whether the session's newest history entry has its command text
+/// (§18.2a `command_capture`, GH #220).
+///
+/// **Separate from `Osc133Source`, and independent of it.** That field
+/// says whose markers are in use; this one says whether they still frame
+/// the command line, and a prompt regenerated over the `A`/`B` markers
+/// loses the text under every source alike.
+///
+/// Read off the newest *entry* rather than off the newest `C`, so the two
+/// surfaces cannot disagree and a line the ring suppressed — §8.5.1 rule
+/// 5's injection line, which a `B`-less foreign emitter marks with a
+/// `C` no `B` preceded — says nothing about the commands after it.
+///
+/// **It changes only when an entry is recorded**, open or closed. So it
+/// describes the last command and cannot predict the next: it lags one
+/// command behind a prompt that has just broken, and after a foreign `C`,
+/// once §8.5.1 rule 3 discards Holdfast's own `C` for the rest of the
+/// session, no entry arrives to change it (GH #265).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CommandCapture {
+    /// The newest entry's `command` holds the echo captured for it.
+    Captured,
+    /// The newest entry's `command` is `None`: its `C` had no `B` in front
+    /// of it.
+    Missing,
+}
+
+impl CommandCapture {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Captured => "captured",
+            Self::Missing => "missing",
+        }
+    }
 }
 
 #[derive(Debug)]
@@ -110,8 +157,8 @@ pub struct CommandHistory {
     /// arming it elsewhere would silently close somebody else's entry.
     suppress_next_done: bool,
     /// Whether any `B` has arrived in this session, which is what decides
-    /// whether an *empty* capture means "the capture was lost" or "there
-    /// was never a span to capture from". See `apply`.
+    /// whether an uncaptured `C` (`command: None`) means "the capture was
+    /// lost" or "there was never a span to capture from". See `apply`.
     seen_command_start: bool,
 }
 
@@ -160,6 +207,17 @@ impl CommandHistory {
         self.evicted
     }
 
+    /// Whether the newest entry's command text was captured, whether that
+    /// entry is still open or already closed. **`None` until the first
+    /// entry is recorded**: before a command has run there is nothing to
+    /// have captured, and answering then would be a guess.
+    pub fn command_capture(&self) -> Option<CommandCapture> {
+        self.entries.back().map(|e| match e.command {
+            Some(_) => CommandCapture::Captured,
+            None => CommandCapture::Missing,
+        })
+    }
+
     /// Entries with `index >= since_index`, newest last, at most `limit`.
     pub fn entries(&self, since_index: u64, limit: usize) -> Vec<CommandEntry> {
         let matching: Vec<&CommandEntry> = self
@@ -184,16 +242,29 @@ impl CommandHistory {
                     // truncating to its tail at the terminal width — so
                     // `ends_with` is the right test and equality would
                     // silently stop matching at narrow widths.
-                    let matched =
-                        !command.is_empty() && line.trim_end().ends_with(command.as_str());
+                    //
+                    // **An armed capture that came out empty matches too.**
+                    // The line is written before the shell draws its first
+                    // prompt, so the terminal echoes it ahead of the first
+                    // `A`. A line editor re-echoes it after `B`; a shell
+                    // reading without one (`bash --noediting`) does not, so
+                    // its foreign `C` carries `Some("")` with no text to
+                    // compare. It is still the injection line — nothing of
+                    // the user's can precede it, as the structural clause
+                    // below argues — and recording it would make the snippet
+                    // entry 0, with `command: ""` and `exit_code: 0`.
+                    let matched = !event.holdfast
+                        && command
+                            .as_deref()
+                            .is_some_and(|c| c.is_empty() || line.trim_end().ends_with(c));
                     // **The suffix test alone is not enough, and this is
                     // measured rather than anticipated.** On a foreign
                     // emitter that supplies no `B` — fish 4.0.2, measured
                     // on a live PTY — nothing ever arms the echo capture,
-                    // so the injection line's `C` carries an *empty*
-                    // command and there is no text to compare. Left at the
-                    // suffix test, the snippet became entry 0 of every such
-                    // session with `command: ""` and `exit_code: 0`, which
+                    // so the injection line's `C` carries no command and
+                    // there is no text to compare. Left at the suffix
+                    // test, the snippet became entry 0 of every such
+                    // session with no text and `exit_code: 0`, which
                     // is REQ-DM-009's "never an entry" failing in the one
                     // arrangement the requirement was written for.
                     //
@@ -213,7 +284,25 @@ impl CommandHistory {
                     // to install *and* a `B`-less foreign emitter is
                     // present, the user's first command is suppressed. That
                     // is a session whose integration is already broken.
-                    let never_had_a_span = command.is_empty() && !self.seen_command_start;
+                    //
+                    // **Both clauses apply to a *foreign* `C` only (GH
+                    // #220), and that is structure, not a heuristic.**
+                    // Holdfast's own `C` cannot mark the line that
+                    // installed it: the snippet defines its `C` emitter
+                    // while that line executes, after `PS0` was expanded
+                    // and after `preexec` ran (see `Osc133Event::holdfast`).
+                    // Without the tag test, "snippet installed but its `B`
+                    // never arrives" — starship regenerating `PS1` at every
+                    // prompt — read as "B-less foreign emitter", and the
+                    // session's **first real command** was suppressed as
+                    // if it were the snippet: every starship session lost
+                    // it, and an agent matching entries to commands by
+                    // count was off by one from the start. The suffix
+                    // clause had the same hole in miniature: a first
+                    // command that happens to end the way the snippet does
+                    // (`fi`) was dropped too.
+                    let never_had_a_span =
+                        !event.holdfast && command.is_none() && !self.seen_command_start;
                     if matched || never_had_a_span {
                         self.suppress_next_done = true;
                         return;
@@ -231,11 +320,13 @@ impl CommandHistory {
                 // injection-line test above, which needs the raw suffix.
                 self.push(CommandEntry {
                     index: self.next_index,
-                    command: if *truncated {
-                        marker(UNRESOLVED_KIND)
-                    } else {
-                        command.clone()
-                    },
+                    command: command.as_ref().map(|c| {
+                        if *truncated {
+                            marker(UNRESOLVED_KIND)
+                        } else {
+                            c.clone()
+                        }
+                    }),
                     exit_code: None,
                     started_at_unix_ms: now_ms,
                     duration_ms: None,
@@ -338,7 +429,10 @@ mod tests {
     /// `redact_str(rules, &e.command)`, so a test that asserts on
     /// `e.command` alone is asserting one layer above the harm.
     fn as_emitted(e: &CommandEntry) -> String {
-        crate::output::redact::redact_str(&crate::output::rules::builtin_shared(), &e.command)
+        crate::output::redact::redact_str(
+            &crate::output::rules::builtin_shared(),
+            e.command.as_deref().expect("captured"),
+        )
     }
 
     /// A live secret straddling the point a wrap redraw discarded: the
@@ -467,7 +561,7 @@ mod tests {
         let e = h.entries(0, 50);
         assert_eq!(e.len(), 1);
         assert_eq!(e[0].index, 0);
-        assert_eq!(e[0].command, "echo hi");
+        assert_eq!(e[0].command.as_deref(), Some("echo hi"));
         assert_eq!(e[0].exit_code, Some(0));
         assert_eq!(e[0].duration_ms, Some(10));
 
@@ -502,7 +596,11 @@ mod tests {
         );
         let e = h.entries(0, 50);
         assert_eq!(e.len(), 1);
-        assert_eq!(e[0].command, "echo hello", "fish entry lost its command");
+        assert_eq!(
+            e[0].command.as_deref(),
+            Some("echo hello"),
+            "fish entry lost its command"
+        );
         // The rest of the entry, so a fix that filled `command` in by
         // breaking the span would not read as a pass.
         assert_eq!(e[0].exit_code, Some(0));
@@ -523,7 +621,7 @@ mod tests {
     /// **kept**, because fish supplies none to yield to. That kept `B` is
     /// the only thing that arms the echo capture, so it is what gives
     /// `command` its `B..C` span. A whole-*source* rule would have
-    /// discarded it along with the rest and left `command: ""` for every
+    /// discarded it along with the rest and left `command: null` for every
     /// entry on every fish 4.0–4.2 session — the same loss declining costs
     /// there, reached by a different route.
     ///
@@ -572,8 +670,8 @@ mod tests {
         assert_eq!(e.len(), 2, "one entry per command: {e:?}");
 
         assert_eq!(
-            e.iter().map(|x| x.command.as_str()).collect::<Vec<_>>(),
-            vec!["echo hello", "sh -c \"exit 42\""],
+            e.iter().map(|x| x.command.as_deref()).collect::<Vec<_>>(),
+            vec![Some("echo hello"), Some("sh -c \"exit 42\"")],
             "the kept `B` did not give the capture its span"
         );
         assert_eq!(
@@ -659,8 +757,8 @@ mod tests {
             // fills `command` in by breaking the span, or one that keeps
             // the spans while emptying `command`, fails exactly here.
             assert_eq!(
-                e.iter().map(|x| x.command.as_str()).collect::<Vec<_>>(),
-                vec!["echo hello", "(exit 42)"],
+                e.iter().map(|x| x.command.as_deref()).collect::<Vec<_>>(),
+                vec![Some("echo hello"), Some("(exit 42)")],
                 "{shell}: the line editor's redraw reached the capture"
             );
             assert_eq!(
@@ -768,7 +866,7 @@ mod tests {
         }
         let e = h.entries(0, 50);
         assert_eq!(e.len(), 1, "the install line became a history entry: {e:?}");
-        assert_eq!(e[0].command, "echo hi");
+        assert_eq!(e[0].command.as_deref(), Some("echo hi"));
         assert_eq!(e[0].exit_code, Some(0));
         assert!(
             e[0].output_end_cursor.is_some(),
@@ -822,7 +920,7 @@ mod tests {
             1,
             "a truncated capture of the install line became an entry: {e:?}"
         );
-        assert_eq!(e[0].command, "echo hi");
+        assert_eq!(e[0].command.as_deref(), Some("echo hi"));
     }
 
     /// The third arrangement, and the one that was **measured wrong before
@@ -834,11 +932,11 @@ mod tests {
     /// verbatim proof that `B` is missing — `mixed` is only reachable
     /// because Holdfast's `B` had nothing to yield to). Nothing arms the echo
     /// capture before the snippet installs itself, so the injection line's
-    /// `C` carries an **empty** command and the suffix test in §8.5.1 rule
-    /// 5 has no text to compare.
+    /// `C` carries **no** command (`None`) and the suffix test in §8.5.1
+    /// rule 5 has no text to compare.
     ///
     /// Driven against the real 4571-byte capture, the suffix test alone
-    /// left the snippet as entry 0 with `command: ""` and `exit_code: 0`,
+    /// left the snippet as entry 0 with no command text and `exit_code: 0`,
     /// ahead of the three real commands — REQ-DM-009's "never an entry"
     /// failing on precisely the shell the requirement was written for. So
     /// the rule identifies the line by the session's structure as well: a
@@ -858,24 +956,35 @@ mod tests {
         raw.extend_from_slice(snippet.as_bytes());
         raw.extend_from_slice(b"\r\n\x1b]133;C;cmdline_url=if%20not\x1b\\");
         raw.extend_from_slice(b"\x1b]133;D;0\x1b\\");
+        let mut t = 1_000i64;
+        for ev in sc.feed(&raw, 0, None) {
+            h.apply(&ev, t);
+            t += 10;
+        }
+        // That `C` found no capture armed, and it is not a command: the
+        // session-level answer must not be taken from it, or every such
+        // session reads `missing` from its start to its first command.
+        assert_eq!(h.command_capture(), None, "the suppressed line spoke");
+        let base = raw.len() as u64;
+        raw.clear();
         // Now the snippet is installed, so Holdfast's tagged `B` arrives and
         // gives the next command its span.
         raw.extend_from_slice(b"\x1b]133;A;special_key=1\x07\x1b]133;A;holdfast=1\x07$ ");
         raw.extend_from_slice(b"\x1b]133;B;holdfast=1\x07echo hi\r\n");
         raw.extend_from_slice(b"\x1b]133;C;cmdline_url=echo%20hi\x1b\\hi\r\n");
         raw.extend_from_slice(b"\x1b]133;D;0\x1b\\");
-        let mut t = 1_000i64;
-        for ev in sc.feed(&raw, 0, None) {
+        for ev in sc.feed(&raw, base, None) {
             h.apply(&ev, t);
             t += 10;
         }
+        assert_eq!(h.command_capture(), Some(CommandCapture::Captured));
         let e = h.entries(0, 50);
         assert_eq!(
             e.len(),
             1,
             "the install line became an entry with no command text: {e:?}"
         );
-        assert_eq!(e[0].command, "echo hi");
+        assert_eq!(e[0].command.as_deref(), Some("echo hi"));
         assert_eq!(e[0].exit_code, Some(0));
         assert!(
             e[0].output_end_cursor.is_some(),
@@ -883,15 +992,68 @@ mod tests {
         );
     }
 
-    /// The negative that separates the row above from a ring that drops
-    /// **any** `C` with an empty capture.
+    /// The fourth arrangement: a foreign emitter that does supply `B`, and a
+    /// shell with no line editor to re-echo what was typed ahead of it.
     ///
-    /// Same empty capture, same first `OutputStart` — and a `B` in front of
-    /// it, which is what a session with no foreign emitter always has by
-    /// the time its first command runs, because Holdfast's own `PS1` emits
-    /// one. This entry must survive with its empty text: `command` is
-    /// documented best-effort and an empty one is a *lossy capture*, not a
-    /// reason to hide that a command ran at all.
+    /// The injection line is written before the shell draws its first
+    /// prompt, so the terminal's own echo of it lands ahead of the first
+    /// `A`. readline echoes it again after `B`, which is what the suffix
+    /// test reads; `bash --noediting` does not, so the capture is armed and
+    /// comes out empty. The marker shape is a live PTY's (`bash
+    /// --noediting` under a `PS1`/`PS0`/`PROMPT_COMMAND` emitter): the echo,
+    /// then `D;0`, `A`, `$ `, `B` and straight on to `C`. Recorded, the
+    /// snippet would be entry 0 with `command: ""` and `exit_code: 0`, and
+    /// `command_capture` would read `captured` before the agent had run
+    /// anything.
+    #[test]
+    fn the_injection_command_produces_no_entry_when_its_echo_preceded_the_first_prompt() {
+        let snippet = "if [ -z \"${HOLDFAST_SHELL_INTEGRATION-}\" ]; then \
+                       HOLDFAST_SHELL_INTEGRATION=1; fi";
+        let mut sc = ModeScanner::new();
+        let mut h = CommandHistory::new(100);
+        h.set_injection_line(snippet.to_string());
+        let mut raw = Vec::new();
+        raw.extend_from_slice(snippet.as_bytes());
+        raw.extend_from_slice(b"\r\n\x1b]133;D;0\x07\x1b]133;A\x07$ \x1b]133;B\x07");
+        raw.extend_from_slice(b"\x1b]133;C\x07\x1b]133;D;0\x07");
+        let mut t = 1_000i64;
+        for ev in sc.feed(&raw, 0, None) {
+            h.apply(&ev, t);
+            t += 10;
+        }
+        assert!(h.entries(0, 50).is_empty(), "{:?}", h.entries(0, 50));
+        assert_eq!(h.command_capture(), None, "the suppressed line spoke");
+        let base = raw.len() as u64;
+        raw.clear();
+        raw.extend_from_slice(b"\x1b]133;A\x07$ \x1b]133;B\x07echo hi\r\n\r\n");
+        raw.extend_from_slice(b"\x1b]133;C\x07hi\r\n\x1b]133;D;0\x07");
+        for ev in sc.feed(&raw, base, None) {
+            h.apply(&ev, t);
+            t += 10;
+        }
+        let e = h.entries(0, 50);
+        assert_eq!(
+            e.iter()
+                .map(|x| (x.command.as_deref(), x.exit_code))
+                .collect::<Vec<_>>(),
+            vec![(Some("echo hi"), Some(0))],
+            "the install line became an entry: {e:?}"
+        );
+        assert!(
+            e[0].output_end_cursor.is_some(),
+            "the suppressed `D` closed the wrong entry"
+        );
+    }
+
+    /// The negative that separates the injection-line rows from a ring that
+    /// drops **any** first `C` with no text.
+    ///
+    /// The same first `OutputStart`, with a `B` in front of it and an
+    /// armed capture that came out empty — and Holdfast's own `C`, which is
+    /// what a session with no foreign emitter always has, and which cannot
+    /// mark the injection line. This entry must survive with its empty
+    /// text: `command` is documented best-effort and an empty one is a
+    /// *lossy capture*, not a reason to hide that a command ran at all.
     #[test]
     fn a_command_whose_capture_came_out_empty_is_still_an_entry() {
         let mut sc = ModeScanner::new();
@@ -906,7 +1068,10 @@ mod tests {
         }
         let e = h.entries(0, 50);
         assert_eq!(e.len(), 1, "a lossy capture cost the whole entry: {e:?}");
-        assert_eq!(e[0].command, "");
+        // Captured, and empty: a `B` armed it and no echo followed. That is
+        // not the same fact as a command whose text was never seen.
+        assert_eq!(e[0].command.as_deref(), Some(""));
+        assert_eq!(h.command_capture(), Some(CommandCapture::Captured));
         assert_eq!(e[0].exit_code, Some(7));
     }
 
@@ -934,13 +1099,172 @@ mod tests {
         let e = h.entries(0, 50);
         assert_eq!(e.len(), 2, "the suppression outlived the injection line");
         assert_eq!(
-            e.iter().map(|x| x.command.as_str()).collect::<Vec<_>>(),
-            vec!["echo one", "fi"]
+            e.iter().map(|x| x.command.as_deref()).collect::<Vec<_>>(),
+            vec![Some("echo one"), Some("fi")]
         );
         assert_eq!(
             e.iter().map(|x| x.exit_code).collect::<Vec<_>>(),
             vec![Some(0), Some(2)]
         );
+    }
+
+    /// GH #220, and the half of it that was not the prompt: the session's
+    /// **first real command** vanished from the history whenever Holdfast's
+    /// snippet installed but its `B` never arrived.
+    ///
+    /// The marker shape is the one the dogfood pass measured under
+    /// starship: the injection line's bare `D`, prompts carrying no marker
+    /// at all, and Holdfast's own tagged `C`/`D` around each command. The
+    /// first `C` has no capture armed and no `B` has ever been seen, which
+    /// is exactly what `never_had_a_span` was written to recognise — in a
+    /// *foreign* emitter. Measured before the fix: 3 entries for 4
+    /// commands, the first command's exit code 3 gone, every later entry
+    /// shifted one place against the commands an agent sent.
+    #[test]
+    fn the_first_command_survives_a_session_whose_prompt_markers_never_arrive() {
+        let mut sc = ModeScanner::new();
+        let mut h = CommandHistory::new(100);
+        h.set_injection_line(
+            "if [ -z \"${HOLDFAST_SHELL_INTEGRATION-}\" ]; then HOLDFAST_SHELL_INTEGRATION=1; fi"
+                .to_string(),
+        );
+        let raw = b"\x1b]133;D;0;holdfast=1\x07host ~ $ echo FIRST\r\n\
+                    \x1b]133;C;holdfast=1\x07FIRST\r\n\x1b]133;D;3;holdfast=1\x07\
+                    host ~ $ echo SECOND\r\n\x1b]133;C;holdfast=1\x07SECOND\r\n\
+                    \x1b]133;D;0;holdfast=1\x07";
+        let mut t = 1_000i64;
+        for ev in sc.feed(raw, 0, None) {
+            h.apply(&ev, t);
+            t += 10;
+        }
+        let e = h.entries(0, 50);
+        assert_eq!(
+            e.iter().map(|x| x.exit_code).collect::<Vec<_>>(),
+            vec![Some(3), Some(0)],
+            "the first command was suppressed as if it were the snippet: {e:?}"
+        );
+        // With no `B` there was nothing to capture, and each entry says so
+        // rather than reading as an empty command. The entry is still the
+        // command's: its span holds its own output.
+        assert_eq!(
+            e.iter().map(|x| x.command.as_deref()).collect::<Vec<_>>(),
+            vec![None, None]
+        );
+        assert_eq!(h.command_capture(), Some(CommandCapture::Missing));
+        let span = &raw
+            [e[0].output_start_cursor as usize..e[0].output_end_cursor.expect("closed") as usize];
+        assert_eq!(span, b"FIRST\r\n");
+    }
+
+    /// GH #220's reporting half, and the model it needs: whether an entry
+    /// has its text is independent of whose markers are in use. Under each
+    /// source a `C` with its `B` is captured and one without is not — the
+    /// entry says so with `command: None`, never `""` — and
+    /// `command_capture` follows the newest entry, open or closed, in both
+    /// directions.
+    #[test]
+    fn an_uncaptured_command_says_so_under_every_source() {
+        // (source, a cycle whose `C` has its `B`, then a cycle with none)
+        let rows: [(&str, &[u8], &[u8]); 3] = [
+            (
+                "holdfast",
+                b"\x1b]133;A;holdfast=1\x07$ \x1b]133;B;holdfast=1\x07echo one\r\n\
+                  \x1b]133;C;holdfast=1\x07one\r\n\x1b]133;D;0;holdfast=1\x07",
+                b"$ echo two\r\n\x1b]133;C;holdfast=1\x07two\r\n\x1b]133;D;4;holdfast=1\x07",
+            ),
+            (
+                "external",
+                b"\x1b]133;A\x07$ \x1b]133;B\x07echo one\r\n\x1b]133;C\x07one\r\n\x1b]133;D;0\x07",
+                b"$ echo two\r\n\x1b]133;C\x07two\r\n\x1b]133;D;4\x07",
+            ),
+            // Holdfast's `A`/`B` and a foreign `C`/`D`.
+            (
+                "mixed",
+                b"\x1b]133;A;holdfast=1\x07$ \x1b]133;B;holdfast=1\x07echo one\r\n\
+                  \x1b]133;C\x07one\r\n\x1b]133;D;0\x07",
+                b"$ echo two\r\n\x1b]133;C\x07two\r\n\x1b]133;D;4\x07",
+            ),
+        ];
+        for (source, framed, bare) in rows {
+            let mut sc = ModeScanner::new();
+            let mut h = CommandHistory::new(100);
+            assert_eq!(h.command_capture(), None, "{source}: before any command");
+            // The bare cycle arrives in two parts, so the answer is read
+            // while its command is still running as well as after its `D`:
+            // the newest entry speaks whether it is open or closed.
+            let d = bare
+                .windows(7)
+                .rposition(|w| w == b"\x1b]133;D")
+                .expect("fixture: the bare cycle ends in a `D`");
+            let (running, done) = bare.split_at(d);
+            let mut at = 0u64;
+            for (chunk, want, open) in [
+                (framed, CommandCapture::Captured, false),
+                (running, CommandCapture::Missing, true),
+                (done, CommandCapture::Missing, false),
+            ] {
+                for ev in sc.feed(chunk, at, None) {
+                    h.apply(&ev, 1_000);
+                }
+                at += chunk.len() as u64;
+                let newest = h.entries(0, 50).pop().expect("an entry");
+                assert_eq!(
+                    newest.output_end_cursor.is_none(),
+                    open,
+                    "{source}: fixture: {newest:?}"
+                );
+                assert_eq!(h.command_capture(), Some(want), "{source}: {newest:?}");
+            }
+            assert_eq!(sc.osc133_source().map(|s| s.as_str()), Some(source));
+            let e = h.entries(0, 50);
+            assert_eq!(
+                e.iter().map(|x| x.command.as_deref()).collect::<Vec<_>>(),
+                vec![Some("echo one"), None],
+                "{source}"
+            );
+            assert_eq!(
+                e[1].exit_code,
+                Some(4),
+                "{source}: the exit code does not depend on the capture"
+            );
+            assert_eq!(
+                h.command_capture(),
+                Some(CommandCapture::Missing),
+                "{source}"
+            );
+
+            // And back: the next command with its `B` is captured again.
+            for ev in sc.feed(framed, at, None) {
+                h.apply(&ev, 1_000);
+            }
+            assert_eq!(
+                h.command_capture(),
+                Some(CommandCapture::Captured),
+                "{source}: a session that recovers"
+            );
+        }
+    }
+
+    /// The suffix clause's hole in miniature: with no foreign emitter the
+    /// first `OutputStart` is always a real command, so one that happens to
+    /// end the way every POSIX snippet ends is still an entry.
+    #[test]
+    fn a_first_command_that_ends_like_the_snippet_is_still_an_entry() {
+        let mut sc = ModeScanner::new();
+        let mut h = CommandHistory::new(100);
+        h.set_injection_line("if true; then :; fi".to_string());
+        let raw = b"\x1b]133;D;0;holdfast=1\x07\x1b]133;A;holdfast=1\x07$ \
+                    \x1b]133;B;holdfast=1\x07fi\r\n\x1b]133;C;holdfast=1\x07\
+                    \x1b]133;D;2;holdfast=1\x07";
+        let mut t = 1_000i64;
+        for ev in sc.feed(raw, 0, None) {
+            h.apply(&ev, t);
+            t += 10;
+        }
+        let e = h.entries(0, 50);
+        assert_eq!(e.len(), 1, "a tagged `C` was taken for the snippet: {e:?}");
+        assert_eq!(e[0].command.as_deref(), Some("fi"));
+        assert_eq!(e[0].exit_code, Some(2));
     }
 
     #[test]
@@ -1058,7 +1382,7 @@ mod tests {
         // Indices are monotonic across eviction, so a cursor-style
         // `since_index` still works after the ring wraps.
         assert_eq!(e.iter().map(|x| x.index).collect::<Vec<_>>(), vec![2, 3, 4]);
-        assert_eq!(e[0].command, "cmd2");
+        assert_eq!(e[0].command.as_deref(), Some("cmd2"));
 
         // A zero cap is clamped to one, not honoured literally — otherwise
         // every entry is evicted by the push that adds it and the history

@@ -113,8 +113,61 @@ fn all_pids() -> Vec<i32> {
     pids
 }
 
+/// An argv from `/proc/<pid>/cmdline`: NUL-separated, NUL-terminated.
+///
+/// `None` for an empty one — a zombie's, or a kernel thread's — and for
+/// any argument that is not UTF-8: the one caller decides whether to
+/// signal a process from this, and an argv it cannot read is one it
+/// must not guess at.
+#[cfg(any(test, target_os = "linux"))]
+fn argv_from_nul_separated(raw: &[u8]) -> Option<Vec<String>> {
+    let raw = raw.strip_suffix(&[0]).unwrap_or(raw);
+    if raw.is_empty() {
+        return None;
+    }
+    raw.split(|b| *b == 0)
+        .map(|arg| String::from_utf8(arg.to_vec()).ok())
+        .collect()
+}
+
+/// An argv from `sysctl(KERN_PROCARGS2)`: a native-endian `int argc`,
+/// the executable's path and its NUL terminator, NUL padding, then
+/// `argc` NUL-terminated arguments — and the environment after them,
+/// which is not read. `None` for anything that does not parse, for the
+/// reason [`argv_from_nul_separated`] gives.
+#[cfg(any(test, target_os = "macos"))]
+fn argv_from_procargs2(buf: &[u8]) -> Option<Vec<String>> {
+    let argc = i32::from_ne_bytes(buf.get(..4)?.try_into().ok()?);
+    let argc = usize::try_from(argc).ok().filter(|n| *n > 0)?;
+    let rest = &buf[4..];
+    let path_end = rest.iter().position(|b| *b == 0)?;
+    let rest = &rest[path_end..];
+    let first_arg = rest.iter().position(|b| *b != 0)?;
+    let mut args = rest[first_arg..].split(|b| *b == 0);
+    (0..argc)
+        .map(|_| String::from_utf8(args.next()?.to_vec()).ok())
+        .collect()
+}
+
 impl InProcessPty {
     pub fn spawn(cfg: &PtySpawnConfig) -> Result<Self> {
+        Self::spawn_with_base_env(cfg, None)
+    }
+
+    /// [`spawn`](Self::spawn), with the environment the child starts from
+    /// supplied rather than inherited (GH #229).
+    ///
+    /// `None` is `spawn` exactly: the child inherits this process's
+    /// environment, as `portable-pty` builds it. `Some(base)` starts the
+    /// child from `base` **instead** — nothing of this process's own
+    /// environment reaches it — and `cfg.env` is still applied on top.
+    /// A daemon needs the second form because its own environment is
+    /// whichever client happened to spawn it, not the one asking now;
+    /// see `session::launch`.
+    pub fn spawn_with_base_env(
+        cfg: &PtySpawnConfig,
+        base_env: Option<&[(std::ffi::OsString, std::ffi::OsString)]>,
+    ) -> Result<Self> {
         let sys = native_pty_system();
         let pair = sys
             .openpty(PtySize {
@@ -126,6 +179,12 @@ impl InProcessPty {
             .map_err(|e| HoldfastError::Pty(format!("openpty: {e}")))?;
 
         let mut cmd = CommandBuilder::new(&cfg.command);
+        if let Some(base) = base_env {
+            cmd.env_clear();
+            for (k, v) in base {
+                cmd.env(k, v);
+            }
+        }
         for a in &cfg.args {
             cmd.arg(a);
         }
@@ -417,6 +476,117 @@ impl InProcessPty {
         }
     }
 
+    /// Whether any process **besides the leader** is alive in the child's
+    /// session (GH #234). `None` when the question cannot be asked.
+    ///
+    /// A zombie does not count: it has exited, so it cannot be in the
+    /// middle of a cleanup, and the shell reaps its own jobs on
+    /// `SIGCHLD`. Counting one would only delay a hangup; nothing else
+    /// here depends on the distinction.
+    #[cfg(target_os = "linux")]
+    fn others_in_session(&self) -> Option<bool> {
+        let sid = self.pgid()?;
+        let entries = std::fs::read_dir("/proc").ok()?;
+        for entry in entries.flatten() {
+            let name = entry.file_name();
+            let Some(name) = name.to_str() else { continue };
+            let Ok(pid) = name.parse::<i32>() else {
+                continue;
+            };
+            if pid == sid {
+                continue;
+            }
+            let Ok(stat) = std::fs::read_to_string(format!("/proc/{name}/stat")) else {
+                continue;
+            };
+            // As `session_survivors`: the fields after `comm` start past
+            // its LAST ')'. rest: [0]=state [1]=ppid [2]=pgrp [3]=session
+            let Some((_, rest)) = stat.rsplit_once(')') else {
+                continue;
+            };
+            let fields: Vec<&str> = rest.split_whitespace().collect();
+            if fields.len() < 4 || matches!(fields[0], "Z" | "X") {
+                continue;
+            }
+            if fields[3].parse::<i32>() == Ok(sid) {
+                return Some(true);
+            }
+        }
+        Some(false)
+    }
+
+    /// The leader's argv as `/proc` has it now.
+    #[cfg(target_os = "linux")]
+    fn read_argv(pid: i32) -> Option<Vec<String>> {
+        argv_from_nul_separated(&std::fs::read(format!("/proc/{pid}/cmdline")).ok()?)
+    }
+
+    /// As the Linux arm, by `getsid(2)` over `proc_listallpids`, the route
+    /// `session_survivors` takes here and for its reasons.
+    ///
+    /// A zombie is counted: nothing on this route says which pids are
+    /// zombies without a second call per process, and counting one only
+    /// delays a hangup until the shell has reaped it.
+    #[cfg(target_os = "macos")]
+    fn others_in_session(&self) -> Option<bool> {
+        let sid = self.pgid()?;
+        let pids = all_pids();
+        if pids.is_empty() {
+            return None;
+        }
+        // SAFETY: `getsid` takes no pointers; a pid gone since the
+        // enumeration answers -1, which is no session's id.
+        Some(
+            pids.into_iter()
+                .any(|pid| pid != sid && unsafe { libc::getsid(pid) } == sid),
+        )
+    }
+
+    /// The leader's argv from `sysctl(KERN_PROCARGS2)`, which is what `ps`
+    /// reads: libproc has the executable's path (`proc_pidpath`) but not
+    /// its arguments, and `bash script.sh` is a shell by path.
+    #[cfg(target_os = "macos")]
+    fn read_argv(pid: i32) -> Option<Vec<String>> {
+        let mut argmax: libc::c_int = 0;
+        let mut len = std::mem::size_of::<libc::c_int>();
+        let mut mib = [libc::CTL_KERN, libc::KERN_ARGMAX];
+        // SAFETY: `argmax` is a `c_int` and `len` says so; nothing is
+        // written through the null new-value pointer.
+        let rc = unsafe {
+            libc::sysctl(
+                mib.as_mut_ptr(),
+                2,
+                (&mut argmax as *mut libc::c_int).cast(),
+                &mut len,
+                std::ptr::null_mut(),
+                0,
+            )
+        };
+        if rc != 0 || argmax <= 0 {
+            return None;
+        }
+        let mut buf = vec![0u8; argmax as usize];
+        let mut len = buf.len();
+        let mut mib = [libc::CTL_KERN, libc::KERN_PROCARGS2, pid];
+        // SAFETY: `buf` owns `len` bytes, which is what the call is told
+        // it may fill; it writes back how many it did.
+        let rc = unsafe {
+            libc::sysctl(
+                mib.as_mut_ptr(),
+                3,
+                buf.as_mut_ptr().cast(),
+                &mut len,
+                std::ptr::null_mut(),
+                0,
+            )
+        };
+        if rc != 0 {
+            return None;
+        }
+        buf.truncate(len.min(buf.len()));
+        argv_from_procargs2(&buf)
+    }
+
     /// Degraded sweep for the Unixes that are neither: the BSDs and
     /// illumos, where there is no `/proc` and `kinfo_proc` is a different
     /// struct than the one the macOS arm reads.
@@ -584,6 +754,42 @@ impl PtyBackend for InProcessPty {
             None => Ok(()),
             Some(e) => Err(HoldfastError::Io(e)),
         }
+    }
+
+    /// GH #234. The child's own group only — the shell, when the caller
+    /// has established that the shell is what holds the terminal — and
+    /// under `signal`'s guard: once the leader is reaped its pid, and so
+    /// its group id, may name a stranger.
+    #[cfg(unix)]
+    fn hang_up(&self) -> bool {
+        if !self.is_alive() {
+            return false;
+        }
+        let Some(g) = self.pgid() else {
+            return false;
+        };
+        self.deliver(g, libc::SIGHUP).is_ok()
+    }
+
+    /// GH #234, on the two platforms that can read one; everywhere else
+    /// the default `None` keeps the escalation to `SIGKILL`.
+    ///
+    /// **After `is_alive`**, for `signal`'s reason: once the leader is
+    /// reaped its pid may name a stranger, and a stranger's argv is not
+    /// ours to decide anything from.
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    fn leader_argv(&self) -> Option<Vec<String>> {
+        if !self.is_alive() {
+            return None;
+        }
+        Self::read_argv(self.pgid()?)
+    }
+
+    /// GH #234, on the two platforms that can enumerate a session, as for
+    /// `tree_alive`. Unanswerable is `false`.
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    fn leader_alone(&self) -> bool {
+        self.is_alive() && self.others_in_session() == Some(false)
     }
 
     fn resize(&self, cols: u16, rows: u16) -> Result<()> {
@@ -888,5 +1094,83 @@ mod foreground_scope {
             pty.foreground_pgid().is_some(),
             "signalling still has a target"
         );
+    }
+}
+
+/// GH #234's two argv readers, on bytes laid out as each kernel lays
+/// them out — so the macOS one is exercised on every platform, not only
+/// on the one CI runner that can call it.
+#[cfg(test)]
+mod leader_argv_parsing {
+    use super::{argv_from_nul_separated, argv_from_procargs2};
+
+    fn owned(a: &[&str]) -> Option<Vec<String>> {
+        Some(a.iter().map(|s| (*s).to_string()).collect())
+    }
+
+    #[test]
+    fn a_proc_cmdline_is_its_arguments_in_order() {
+        assert_eq!(
+            argv_from_nul_separated(b"bash\0--norc\0--noprofile\0"),
+            owned(&["bash", "--norc", "--noprofile"])
+        );
+        assert_eq!(
+            argv_from_nul_separated(b"-bash\0"),
+            owned(&["-bash"]),
+            "a login shell's own spelling reaches the caller unchanged"
+        );
+        assert_eq!(
+            argv_from_nul_separated(b"sh\0-c\0\0"),
+            owned(&["sh", "-c", ""]),
+            "an empty argument is an argument, not the end"
+        );
+        assert_eq!(argv_from_nul_separated(b""), None, "a zombie's is empty");
+        assert_eq!(argv_from_nul_separated(b"bash\0\xff\0"), None);
+    }
+
+    /// `argc`, then the executable path and its padding, then the
+    /// arguments, then the environment — which must not be read as
+    /// arguments, and the path must not be read as `argv[0]`.
+    fn procargs2(argc: i32, path: &str, pad: usize, rest: &[&str]) -> Vec<u8> {
+        let mut buf = argc.to_ne_bytes().to_vec();
+        buf.extend_from_slice(path.as_bytes());
+        buf.extend(std::iter::repeat_n(0u8, 1 + pad));
+        for s in rest {
+            buf.extend_from_slice(s.as_bytes());
+            buf.push(0);
+        }
+        buf
+    }
+
+    #[test]
+    fn a_procargs2_buffer_is_its_arguments_and_not_its_path_or_environment() {
+        let buf = procargs2(
+            3,
+            "/opt/homebrew/bin/python3",
+            5,
+            &[
+                "python3",
+                "app.py",
+                "--port=1",
+                "HOME=/Users/x",
+                "PATH=/bin",
+            ],
+        );
+        assert_eq!(
+            argv_from_procargs2(&buf),
+            owned(&["python3", "app.py", "--port=1"])
+        );
+        assert_eq!(
+            argv_from_procargs2(&procargs2(1, "/bin/bash", 0, &["-bash", "TERM=xterm"])),
+            owned(&["-bash"])
+        );
+        for broken in [
+            procargs2(0, "/bin/bash", 2, &["bash"]),
+            procargs2(-1, "/bin/bash", 2, &["bash"]),
+            procargs2(3, "/bin/bash", 2, &["bash"]),
+            vec![1, 0],
+        ] {
+            assert_eq!(argv_from_procargs2(&broken), None, "{broken:?}");
+        }
     }
 }

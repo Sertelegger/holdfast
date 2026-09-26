@@ -64,9 +64,8 @@
 //! REQ-SEC-012 rests on**: nothing an agent writes may choose which
 //! binding fires or what is looked up. `redacted_command_line` chooses
 //! nothing and looks nothing up — it takes the session's command line and
-//! hands back a string to *show a human*. It is a sink, not a subject,
-//! and the two are kept apart deliberately; see its own doc for why
-//! unifying them would break the matcher.
+//! hands back a string to *show a human*. It is a sink, not a subject:
+//! nothing selects on a command line, redacted or not.
 //!
 //! [`Approval`]: crate::secret::Approval
 //!
@@ -273,11 +272,13 @@ use crate::session::Session;
 
 use super::provider::{resolve, ProviderError};
 
-/// The session's own command line, as a binding matches it.
+/// The session's own command line as one string: `command` then `args`,
+/// single spaces, **no shell quoting**.
 ///
-/// `command` then `args`, single spaces, **no shell quoting** — see the
-/// module header for why there is no quoting scheme and why this string
-/// exists only here.
+/// It exists to be shown, not matched. A binding selects on the session's
+/// operator-declared `profile`, narrowed by `match_prompt` (GH #46; the
+/// module header's "The two subjects"), and the one non-test caller is
+/// [`redacted_command_line`], which renders this line for a human.
 pub fn command_line(command: &str, args: &[String]) -> String {
     if args.is_empty() {
         return command.to_string();
@@ -292,7 +293,7 @@ pub fn command_line(command: &str, args: &[String]) -> String {
     line
 }
 
-/// The same line, for a **human** rather than for a matcher.
+/// [`command_line`], redacted and stripped for a **human** to read.
 ///
 /// §17.5's approval asks somebody to agree that *this command line* may
 /// receive *this credential*, so the line has to be on the frame. It also
@@ -326,14 +327,10 @@ pub fn command_line(command: &str, args: &[String]) -> String {
 /// let it do. Pinned by
 /// `an_unterminated_escape_in_one_argument_does_not_reach_the_next`.
 ///
-/// **Not what [`select`] matches against, and the two must not be
-/// unified.** The matcher reads the *unredacted, unstripped* join, for the
-/// same reason `match_prompt` reads the unredacted prompt line: matching a
-/// processed string would let the redactor silently switch an operator's
-/// binding off — or, worse here, switch a *different* one on. It is also
-/// what keeps the two honest about each other: an operator's pattern that
-/// admits an argument containing an escape sequence still selects, and the
-/// human is still shown a line they can read.
+/// **Not a subject of [`select`].** A binding selects on the session's
+/// `profile`, narrowed by `match_prompt` against the unredacted prompt
+/// line; neither this string nor the unredacted join is matched against,
+/// so redacting and stripping it here switches no binding on or off.
 ///
 /// [`one_line_for_display`]: crate::output::ansi::one_line_for_display
 pub fn redacted_command_line(
@@ -542,7 +539,7 @@ pub struct Resolved {
     /// surface shows (§7.5, §7.6.3, §18.7).
     pub binding_name: String,
     /// The §9.6 config spelling, as [`super::ArgvProvider::as_str`] gives
-    /// it — the same string `binding_resolved` and (0.0.8's)
+    /// it — the same string `binding_resolved` and
     /// `BindingApprovalRequired` put on the wire.
     pub provider: String,
     /// How many times this binding has resolved **in this session**,
@@ -3204,7 +3201,8 @@ mod tests {
             server
                 .attach_hub()
                 .secrets()
-                .matches_outstanding(&s.id, &other.request_id),
+                .submission_bounds(&s.id, &other.request_id)
+                .is_some(),
             "the refusal disturbed the request it refused to take"
         );
         drop(other);
@@ -5577,7 +5575,8 @@ mod tests {
             off_server
                 .attach_hub()
                 .secrets()
-                .matches_outstanding(&off.id, &off_raised.request_id),
+                .submission_bounds(&off.id, &off_raised.request_id)
+                .is_some(),
             "the request was closed by something on a row where nothing should \
              have answered it"
         );
@@ -5788,7 +5787,8 @@ mod tests {
                 server
                     .attach_hub()
                     .secrets()
-                    .matches_outstanding(&miss.id, &miss_raised.request_id),
+                    .submission_bounds(&miss.id, &miss_raised.request_id)
+                    .is_some(),
                 "the unmatched session's request was closed by something"
             );
             assert!(
@@ -5884,7 +5884,8 @@ mod tests {
             server
                 .attach_hub()
                 .secrets()
-                .matches_outstanding(&s.id, &raised.request_id),
+                .submission_bounds(&s.id, &raised.request_id)
+                .is_some(),
             "the raise was closed while the approval was still pending"
         );
 
@@ -6463,7 +6464,9 @@ mod tests {
         );
         // And the second request is untouched — refused, not half-taken.
         assert!(
-            hub.secrets().matches_outstanding(&s.id, &second.request_id),
+            hub.secrets()
+                .submission_bounds(&s.id, &second.request_id)
+                .is_some(),
             "the refusal disturbed the request it refused to take"
         );
 

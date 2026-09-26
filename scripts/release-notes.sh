@@ -1,6 +1,7 @@
 #!/usr/bin/env bash
 # Compose a GitHub Release body from CHANGELOG.md, and refuse to compose an
-# empty one.
+# empty one or one over GitHub's size limit. `--self-test` also holds every
+# `[Unreleased]` entry to `ENTRY_CAP` lines.
 #
 # **This exists because the check it carries used to be unable to fail.** The
 # logic lived inline in `.github/workflows/release.yml`, in this order:
@@ -61,6 +62,13 @@
 #   scripts/release-notes.sh <version> [changelog] [output]
 #   scripts/release-notes.sh --self-test
 set -euo pipefail
+
+# The largest release body `compose` will write, in characters (see the
+# check at the end of `compose`).
+BODY_LIMIT=120000
+# The most non-blank lines an `[Unreleased]` entry may carry (`entry_cap`).
+# The issue and the PR carry the detail.
+ENTRY_CAP=3
 
 fails=0
 passes=0
@@ -287,6 +295,58 @@ has_prose() { # has_prose <file>
   [ "$(prose_count "$1")" -gt 0 ]
 }
 
+# **One line per `[Unreleased]` entry longer than `ENTRY_CAP` non-blank
+# lines**, as `<count> lines: <the entry's first line>`, cut to 100 bytes.
+# Exits 2 when the file has no `## [Unreleased]` heading, so a heading that
+# drifted out of the match cannot read as a section of short entries.
+#
+# An entry is a block of the section, which runs from `## [Unreleased]` to
+# the next `## ` outside a fence or comment:
+#
+#   * a top-level list item (`-`, `*`, `+`, `N.` or `N)` at column 0) opens
+#     one, and runs until the next top-level item or heading;
+#   * a column-0 line after a blank line opens one too -- a paragraph under
+#     the section is capped like an entry, or the cap would not bind prose
+#     written without a bullet;
+#   * indented lines (continuations, sub-bullets, an item's later
+#     paragraphs) and a column-0 line with no blank above it (a lazy
+#     continuation) belong to the open entry, as do fence and comment lines;
+#   * blank lines, headings, thematic breaks and link definitions are
+#     structure and count toward nothing; a heading or a break closes the
+#     open entry.
+#
+# Non-blank lines rather than rendered lines, because the file is where the
+# length is written and read; blank lines are free so an entry's own spacing
+# is not penalised.
+entry_cap() { # entry_cap <changelog>
+  awk -v cap="$ENTRY_CAP" "$AWK_SCAN"'
+    function close_entry() {
+      if (n > cap + 0) print n " lines: " substr(first, 1, 100)
+      n = 0
+    }
+    function count() {
+      if (n == 0) first = $0
+      n++
+      blank = 0
+    }
+    !skip && index($0, "## [Unreleased]") == 1 { on = 1; found = 1; next }
+    !on                                         { next }
+    !skip && /^## /                             { close_entry(); exit }
+    skip {
+      if ($0 ~ /[^ \t]/) count(); else blank = 1
+      next
+    }
+    !/[^ \t]/                                   { blank = 1; next }
+    /^[ \t]*#+[ \t]/                            { close_entry(); blank = 0; next }
+    /^[ \t]*(---+|\*\*\*+|___+)[ \t]*$/         { close_entry(); blank = 0; next }
+    /^[ \t]*\[[^]]+\][ \t]*:/                   { blank = 0; next }
+    /^([-*+]|[0-9]+[.)])[ \t]/                  { close_entry(); count(); next }
+    /^[^ \t]/ && blank                          { close_entry(); count(); next }
+                                                { count() }
+    END { close_entry(); exit(found ? 0 : 2) }
+  ' "$1"
+}
+
 # --------------------------------------------------------------------------
 # The extraction and the guard
 # --------------------------------------------------------------------------
@@ -401,32 +461,30 @@ compose() { # compose <version> <changelog> <output>
   printf 'notes: %s lines total = %s from "## [%s]" + 1 blank + %s link definitions\n' \
     "$total" "$section" "$version" "$defs"
 
-  # **A body has an upper bound and nothing here knew it.** GitHub's release
-  # body limit is documented as 125,000 characters, and **this warning
-  # already fires on `main`** — a real `[Unreleased]` → `[0.0.8]` rename is
-  # over the threshold today, so none of this is a prediction. It was three
-  # different numbers across one evening as other lanes merged entries, which
-  # is why none of them is written here: run the script and read what it
-  # prints. The failure it is about lands on `gh release create`, after five
-  # platform builds, on the one workflow that gets no second attempt.
+  # **A body over `BODY_LIMIT` characters is refused.** GitHub documents a
+  # 125,000-character limit on a release body, and the step that would hit it
+  # is `gh release create`, after five platform builds, on the one workflow
+  # that gets no second attempt. Refused here, it fails with the reason and
+  # before anything is created; and `--self-test` composes `[Unreleased]`
+  # the same way, so a pull request meets the limit before a tag does. The
+  # 5,000-character margin is for the version heading's rename and the link
+  # definition a release adds.
   #
-  # Thresholded on BYTES against a limit stated in CHARACTERS, deliberately:
-  # a UTF-8 byte count is never smaller than the character count, so the
-  # warning fires early rather than late. Measure the real limit before
-  # turning either number into a hard failure.
-  #
-  # **A warning and not an error, deliberately.** The limit is taken from
-  # GitHub's documentation and has not been measured here; failing a correct
-  # release on an unverified number would be the worse mistake of the two,
-  # and it is the mistake this file exists to stop making. So it says so
-  # loudly and lets the release proceed. Make it an error once somebody has
-  # seen the API reject one.
-  local bytes
-  bytes="$(wc -c < "$out")"
-  if [ "$bytes" -gt 100000 ]; then
-    printf 'WARNING: the release body is %s bytes.\n' "$bytes" >&2
-    printf "GitHub's documented limit is 125,000 characters and this is not\n" >&2
-    printf 'far off it. If the release create step rejects the body, that is why.\n' >&2
+  # Characters, not bytes, because that is the limit's unit: this changelog's
+  # `—` and `§` are three and two bytes each, so a byte count refuses bodies
+  # GitHub would accept. They are counted as the bytes that are not UTF-8
+  # continuation bytes, under `LC_ALL=C`, and not with `wc -m`, whose answer
+  # depends on the runner's locale and is a byte count under `C`.
+  local chars
+  chars="$(LC_ALL=C tr -d '\200-\277' < "$out" | wc -c)"
+  chars=$((chars))
+  printf 'notes: %s characters, against a limit of %s\n' "$chars" "$BODY_LIMIT"
+  if [ "$chars" -gt "$BODY_LIMIT" ]; then
+    printf 'The release body is %s characters; the limit here is %s, under\n' \
+      "$chars" "$BODY_LIMIT" >&2
+    printf "GitHub's documented 125,000. Changelog entries are at most 3 lines,\n" >&2
+    printf 'with the detail in the issue and the PR: condense the section.\n' >&2
+    return 1
   fi
 }
 
@@ -960,6 +1018,300 @@ EOF
     fi
   done
 
+  # --- the body-size limit, at its boundary and in characters ------------
+  #
+  # `size_case <label> <accept|reject> <filler> <want-chars> [expect|min-bytes]`
+  # writes a `## [0.0.8]` section holding the file <filler> and runs
+  # `compose` over it. <want-chars> is the body's length worked out from how
+  # the filler is built, not counted, so an accept also asserts that
+  # `compose` counted exactly that: a count that is off by one, or counts
+  # bytes, fails here. On an accept the fifth argument is a byte count the
+  # body must exceed, which is what lets a case tell characters from bytes.
+  #
+  # The body is the section -- a blank line, the filler, a blank line -- then
+  # the separating blank and the one definition (20 bytes): the filler plus
+  # 23 characters.
+  size_case() {
+    local label="$1" want="$2" filler="$3" chars="$4" extra="${5:-}"
+    local cl="$tmp/size.md" out="$tmp/size-out.md" rc=0 log bytes
+    {
+      printf '# Changelog\n\n## [0.0.8]\n\n'
+      cat "$filler"
+      printf '\n## [0.0.7]\n\n- the released thing\n\n[#45]: https://x/45\n'
+    } > "$cl"
+    rm -f "$out"
+    log="$(compose 0.0.8 "$cl" "$out" 2>&1)" || rc=$?
+    case "$want" in
+      accept)
+        if [ "$rc" -ne 0 ]; then
+          bad "$label" "refused (rc=$rc): $log"
+        elif ! printf '%s' "$log" | grep -qF "notes: $chars characters"; then
+          bad "$label" "accepted, but did not count $chars characters: $log"
+        else
+          bytes="$(wc -c < "$out")"
+          if [ -n "$extra" ] && [ "$((bytes))" -le "$extra" ]; then
+            bad "$label" "the body is only $((bytes)) bytes, so the case \
+cannot tell characters from bytes"
+          else
+            ok "$label"
+          fi
+        fi ;;
+      reject)
+        if [ "$rc" -eq 0 ]; then
+          bad "$label" "accepted a body of $(wc -c < "$out") bytes"
+        elif [ -n "$extra" ] && ! printf '%s' "$log" | grep -qF "$extra"; then
+          bad "$label" "refused, but said \"$(printf '%s' "$log" | grep -v '^notes' | head -1)\" \
+rather than naming: $extra"
+        else
+          ok "$label" refusal
+        fi ;;
+    esac
+  }
+  # `x` in lines of at most 100 bytes, <n> bytes in all; the last line may
+  # be empty.
+  size_filler() { # size_filler <n>
+    awk -v n="$1" 'BEGIN {
+      while (n > 0) {
+        k = (n > 100) ? 100 : n
+        s = ""
+        for (i = 1; i < k; i++) s = s "x"
+        print s
+        n -= k
+      }
+    }'
+  }
+  size_filler $((BODY_LIMIT - 23)) > "$tmp/filler-at"
+  size_filler $((BODY_LIMIT - 22)) > "$tmp/filler-over"
+  # 2,000 lines of 50 `é` (two bytes each) and a newline: 102,000 characters
+  # in 202,000 bytes, over the limit in bytes and under it in characters.
+  awk -v u="$(printf '\303\251')" 'BEGIN {
+    s = ""
+    for (i = 1; i <= 50; i++) s = s u
+    for (j = 1; j <= 2000; j++) print s
+  }' > "$tmp/filler-multibyte"
+
+  size_case "a body of exactly the limit in characters is accepted" accept \
+    "$tmp/filler-at" "$BODY_LIMIT"
+  size_case "a body one character over the limit is refused" reject \
+    "$tmp/filler-over" "$((BODY_LIMIT + 1))" \
+    "The release body is $((BODY_LIMIT + 1)) characters"
+  size_case "the limit counts characters: a body over it in bytes only is accepted" \
+    accept "$tmp/filler-multibyte" $((2000 * 51 + 23)) "$BODY_LIMIT"
+
+  # --- the 3-line cap on [Unreleased] entries -----------------------------
+  #
+  # `cap_case <label> <accept|reject> <changelog body> [names] [flagged]`.
+  # A refusal must name the entry by its first line, with its count, and
+  # flag exactly <flagged> entries (default 1): a rule that flagged the
+  # neighbours as well, or split one entry into two, is not the rule.
+  cap_case() {
+    local label="$1" want="$2" body="$3" names="${4:-}" nflag="${5:-1}"
+    local got rc=0 n
+    printf '%s\n%s\n' "$body" "$defs" > "$tmp/cap.md"
+    got="$(entry_cap "$tmp/cap.md")" || rc=$?
+    n="$(printf '%s' "$got" | awk 'END { print NR + 0 }')"
+    case "$want" in
+      accept)
+        if [ "$rc" -eq 0 ] && [ -z "$got" ]; then
+          ok "$label"
+        else
+          bad "$label" "rc=$rc, flagged: $got"
+        fi ;;
+      reject)
+        if [ "$rc" -ne 0 ]; then
+          bad "$label" "rc=$rc: found no [Unreleased] section"
+        elif [ -z "$got" ]; then
+          bad "$label" "accepted it"
+        elif ! printf '%s\n' "$got" | grep -qF "$names"; then
+          bad "$label" "flagged, but not as \"$names\": $got"
+        elif [ "$n" -ne "$nflag" ]; then
+          bad "$label" "flagged $n entries, not $nflag: $got"
+        else
+          ok "$label" refusal
+        fi ;;
+    esac
+  }
+
+  cap_case "a four-line entry is refused, by its first line" reject \
+'# Changelog
+
+## [Unreleased]
+
+### Fixed
+
+- a short neighbour ([#45])
+
+- FLAG-ME the long one
+  two
+  three
+  four
+
+- another short neighbour
+
+## [0.0.7] — 2026-09-01 (Carabiner)
+
+- the released thing' \
+    '4 lines: - FLAG-ME the long one'
+
+  # A paragraph under the section is capped as an entry, or prose written
+  # without a bullet would be exempt.
+  cap_case "a four-line paragraph under [Unreleased] is refused" reject \
+'# Changelog
+
+## [Unreleased]
+
+- a short entry
+
+FLAG-ME a paragraph
+two
+three
+four
+
+## [0.0.7] — 2026-09-01 (Carabiner)
+
+- the released thing' \
+    '4 lines: FLAG-ME a paragraph'
+
+  cap_case "sub-bullets count toward their entry" reject \
+'# Changelog
+
+## [Unreleased]
+
+- FLAG-ME a bullet
+  over two lines
+  - with a sub-bullet
+  - and another
+
+## [0.0.7] — 2026-09-01 (Carabiner)
+
+- the released thing' \
+    '4 lines: - FLAG-ME a bullet'
+
+  # A blank line inside an item does not end it: the indented paragraph
+  # after it is the same entry.
+  cap_case "an entry's later paragraph counts toward it" reject \
+'# Changelog
+
+## [Unreleased]
+
+- FLAG-ME two lines
+  and a second
+
+  then a paragraph
+  of two more
+
+## [0.0.7] — 2026-09-01 (Carabiner)
+
+- the released thing' \
+    '4 lines: - FLAG-ME two lines'
+
+  # A `## ` inside a fence is not the end of the section, so the fence's
+  # lines stay in the entry around them.
+  cap_case "a fenced \`## \` neither ends the section nor the entry" reject \
+'# Changelog
+
+## [Unreleased]
+
+- FLAG-ME a fence
+
+  ```text
+## [0.0.7] — not a heading
+  ```
+
+## [0.0.7] — 2026-09-01 (Carabiner)
+
+- the released thing' \
+    '4 lines: - FLAG-ME a fence'
+
+  # The last section in the file ends at EOF, not at a heading.
+  cap_case "a long entry at the end of the file is refused" reject \
+'# Changelog
+
+## [Unreleased]
+
+- a short entry
+
+- FLAG-ME the last one
+lazy two
+lazy three
+lazy four' \
+    '4 lines: - FLAG-ME the last one'
+
+  cap_case "three lines with blank lines around them are accepted" accept \
+'# Changelog
+
+## [Unreleased]
+
+
+- one
+  two
+  three
+
+
+- one
+  two
+  three
+
+## [0.0.7] — 2026-09-01 (Carabiner)
+
+- the released thing'
+
+  # Headings and the definitions at the foot of the file are structure: a
+  # `### ` directly under a three-line entry, and four definitions in a run
+  # after the last one, belong to no entry.
+  cap_case "headings and link definitions are not counted" accept \
+'# Changelog
+
+## [Unreleased]
+
+### Added
+- one
+  two
+  three
+### Fixed
+- one
+  two
+  three
+
+[#1]: https://x/1
+[#2]: https://x/2
+[#3]: https://x/3
+[#4]: https://x/4'
+
+  cap_case "a long entry in a released section is not counted" accept \
+'# Changelog
+
+## [Unreleased]
+
+- a short entry
+
+## [0.0.7] — 2026-09-01 (Carabiner)
+
+- a released entry
+  that ran
+  to five
+  lines
+  long'
+
+  cap_case "an empty [Unreleased] is accepted" accept \
+'# Changelog
+
+## [Unreleased]
+
+## [0.0.7] — 2026-09-01 (Carabiner)
+
+- the released thing'
+
+  # No heading is not a clean section: the cap would have checked nothing.
+  printf '# Changelog\n\n## [0.0.7]\n\n- one\n  two\n  three\n  four\n' > "$tmp/cap.md"
+  rc=0; entry_cap "$tmp/cap.md" >/dev/null || rc=$?
+  if [ "$rc" -eq 2 ]; then
+    ok "a changelog with no [Unreleased] heading is reported, not passed" refusal
+  else
+    bad "a changelog with no [Unreleased] heading is reported, not passed" \
+      "rc=$rc"
+  fi
+
   # --- the real file, which is what catches the heading format drifting ---
   #
   # Derived from CHANGELOG.md rather than hardcoded: every released version
@@ -1004,6 +1356,37 @@ EOF
     else
       ok "a version CHANGELOG.md does not declare is refused" refusal
     fi
+    # The body `[Unreleased]` would publish as, sized now so that the limit
+    # fails a pull request rather than a tag's publish job. Straight after a
+    # release cut the section is empty, and there is no body to size.
+    local ulog urc=0
+    ulog="$(compose Unreleased "$repo_cl" "$tmp/unreleased.md" 2>&1)" || urc=$?
+    if [ "$urc" -eq 0 ]; then
+      ok "CHANGELOG.md's [Unreleased] composes within $BODY_LIMIT characters"
+    elif printf '%s' "$ulog" | grep -q 'heading with nothing under it'; then
+      ok "CHANGELOG.md's [Unreleased] is empty, so there is no body to size"
+    else
+      bad "CHANGELOG.md's [Unreleased] composes within $BODY_LIMIT characters" \
+        "$(printf '%s' "$ulog" | grep -v '^notes' | head -1)"
+    fi
+    # The cap, on the one section still being written: each entry over it
+    # is its own failure, named by its first line.
+    local over flagged
+    if over="$(entry_cap "$repo_cl")"; then
+      if [ -z "$over" ]; then
+        ok "every [Unreleased] entry in CHANGELOG.md is at most $ENTRY_CAP lines"
+      else
+        while IFS= read -r flagged; do
+          bad "an [Unreleased] entry in CHANGELOG.md is at most $ENTRY_CAP lines" \
+            "$flagged"
+        done <<EOF
+$over
+EOF
+      fi
+    else
+      bad "CHANGELOG.md has a \"## [Unreleased]\" heading" \
+        "entry_cap found none, so the cap checked nothing"
+    fi
   else
     bad "CHANGELOG.md is readable from the script's own directory" \
       "not found at $repo_cl"
@@ -1024,6 +1407,8 @@ EOF
     "$passes" "$refusals" "$seen"
   echo "derived from CHANGELOG.md's released versions) — an empty section is"
   echo "refused before anything is appended to it, and a real one composes."
+  echo "A body over $BODY_LIMIT characters, and an [Unreleased] entry over"
+  echo "$ENTRY_CAP lines, are refused."
 }
 
 usage() { sed -n '/^# Usage:/,/--self-test$/p' "$0" >&2; exit 2; }

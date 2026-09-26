@@ -144,13 +144,15 @@ case "$asset" in
   *)         member=holdfast ;;
 esac
 
-# **Or every shipped binary reports `build unknown` in its handshake.**
-# `crates/holdfast-core/src/protocol/handshake.rs` reads
-# `option_env!("HOLDFAST_BUILD_SHA")` and its own doc comment says the value
-# is "wired to a real git SHA by the release pipeline" — this is that
-# pipeline. Derived from git when the caller did not supply it, so a local
-# run of this script produces the same shape of artifact CI does rather than
-# a differently-labelled one.
+# **The build id every shipped binary reports, in `version` and in its
+# handshake.** `crates/holdfast-core/build.rs` sets `HOLDFAST_BUILD_SHA` for
+# `protocol::handshake::build_id()`, using this variable verbatim when it is
+# set and otherwise the checkout's HEAD — so without it a build from a
+# checkout still names its commit, shortened, and one from an exported tree
+# says `build unknown`. The release workflows pass the full `github.sha`,
+# which `release-rehearsal.yml` checks for exactly. Derived here when the
+# caller did not supply it, so a local run of this script labels its
+# artifact the way it always has.
 if [ -z "${HOLDFAST_BUILD_SHA:-}" ] && git rev-parse HEAD >/dev/null 2>&1; then
   HOLDFAST_BUILD_SHA="$(git rev-parse --short=12 HEAD)"
   export HOLDFAST_BUILD_SHA
@@ -158,7 +160,7 @@ fi
 
 echo "asset:   $asset"
 echo "triple:  $triple"
-echo "build:   ${HOLDFAST_BUILD_SHA:-<unset — the binary will say 'build unknown'>}"
+echo "build:   ${HOLDFAST_BUILD_SHA:-<unset — build.rs derives it from the checkout, else 'unknown'>}"
 
 # `--locked` is §12.4's requirement verbatim: "releases built with
 # `cargo build --release --locked`". `--workspace` matches what ci.yml's

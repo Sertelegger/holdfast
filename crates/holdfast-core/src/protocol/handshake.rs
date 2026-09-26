@@ -54,7 +54,42 @@ pub const PROTOCOL_MAJOR: u32 = 1;
 /// today's behaviour and not a regression. **Neither direction can
 /// mistake the frame for something else**, which is the only property a
 /// minor has to carry.
-pub const PROTOCOL_MINOR: u32 = 4;
+///
+/// 1.5 adds `ServerFrame::ScreenSnapshot` (GH #235) and the optional
+/// `AwaitingSecret.raised_by` (GH #236). Additive in both directions for
+/// 1.4's reason: a 1.4 client maps the unknown frame to `Unknown` and
+/// skips it, and ignores the unknown key, so it joins a session exactly
+/// as blind as it always did; a 1.5 client against a 1.4 daemon receives
+/// no snapshot and no key, and renders a secret prompt's text without
+/// claiming to know who wrote it.
+///
+/// 1.5 also adds [`CLIENT_PARAM`] on `tool/start_session`: the shim's own
+/// working directory and environment, which the daemon starts the session
+/// from (GH #229). The only entry in this log that is **gated on the
+/// peer's minor**, and the gate is [`LAUNCH_CONTEXT_MINOR`]. Every other
+/// addition here is safe in an older peer's hands because an older peer
+/// never sends it; this one an older shim *can* send, because it forwards
+/// the agent's `arguments` verbatim, and from such a shim the key is the
+/// agent's text rather than a launch context. So a 1.5 daemon takes it
+/// only from a peer that declared 1.5 or later and leaves it in an older
+/// peer's arguments, where the tool refuses it. A 1.5 shim against a 1.4
+/// daemon sends a key that daemon ignores as an unknown argument, and its
+/// sessions start where that daemon would have started them anyway.
+///
+/// Not a control-protocol change, and recorded here because it changes
+/// what an older peer is answered: from 1.5 every tool's arguments are
+/// closed (GH #219), so an argument the daemon does not know — an agent's
+/// typo passed on by any shim — is refused where it used to be ignored.
+///
+/// [`CLIENT_PARAM`]: crate::protocol::method::CLIENT_PARAM
+pub const PROTOCOL_MINOR: u32 = 5;
+
+/// The first minor whose shim sends [`CLIENT_PARAM`] on
+/// `tool/start_session` — and so the first a daemon takes it from. See
+/// the 1.5 entry above for why this key, alone in this log, is gated.
+///
+/// [`CLIENT_PARAM`]: crate::protocol::method::CLIENT_PARAM
+pub const LAUNCH_CONTEXT_MINOR: u32 = 5;
 
 /// How long either peer waits for the **first** frame of the handshake
 /// before giving up on the connection.
@@ -97,8 +132,12 @@ pub const PROTOCOL_MINOR: u32 = 4;
 /// out.
 pub const HANDSHAKE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
 
-/// Build identifier reported in the handshake. Wired to a real git SHA
-/// by the release pipeline in 0.0.12; `unknown` until then.
+/// Build identifier reported in the handshake and printed by `holdfast
+/// version`, so the CLI and the daemon it talks to name a build the same
+/// way. This crate's `build.rs` sets it: `HOLDFAST_BUILD_SHA` when the
+/// caller did (the release pipeline does), else the commit the crate was
+/// packaged or checked out at; `unknown` only when none of those answers
+/// (GH #178).
 pub fn build_id() -> &'static str {
     option_env!("HOLDFAST_BUILD_SHA").unwrap_or("unknown")
 }

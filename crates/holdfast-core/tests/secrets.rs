@@ -104,7 +104,7 @@
 //! | §11.4 Concurrent secret requests | [`a_second_caller_collides_and_the_first_still_completes`] |
 //! | §11.4 Adoption is not `concurrent_request_pending` | [`a_tool_call_adopts_an_echo_raised_request`], in this same file, as §11.4 requires |
 //! | §11.4 The agent cannot aim a secret (adversarial) | [`a_wrong_request_id_writes_nothing_and_the_right_one_still_works`] here; `secret::binding::tests::no_agent_argument_reaches_a_provider_lookup` for the binding half |
-//! | §11.4 Web secret endpoint `request_id` binding (`409 conflict`) | **0.0.10** — `SecretSlots::matches_outstanding` is exported for it to call; the HTTP rendering is not written |
+//! | §11.4 Web secret endpoint `request_id` binding (`409 conflict`) | **0.0.10** — `SecretSlots::submission_bounds` is the read-only check it would call; the HTTP rendering is not written |
 //! | §11.3 Windows `not_supported_on_platform` on a **Windows runner** | **0.0.11** — [`an_unsupported_platform_returns_before_allocating_anything`] asserts the same code path on Unix through a forced capability, which is the Unix half and not the runner assertion |
 
 // Unix-only, like `crates/holdfast/tests/attach_cli.rs`. Everything below drives a real
@@ -553,12 +553,20 @@ async fn send(s: &mut UnixStream, f: &ClientFrame) {
 /// One server frame, or a failed test — **never a hang.** The workspace
 /// has no `nextest.toml`, so a bare `await` on a daemon that stopped
 /// answering is a hung CI job rather than a red row.
+///
+/// **The one `ScreenSnapshot` a join sends is read past** (GH #235): it
+/// arrives right after `Attached`, and no row in this file is about it.
 async fn recv(s: &mut UnixStream) -> ServerFrame {
-    let body = tokio::time::timeout(Duration::from_secs(10), frame::read_frame_body(s))
-        .await
-        .expect("no frame arrived within 10s")
-        .expect("a frame body");
-    decode_server_frame(&body).expect("a decodable server frame")
+    loop {
+        let body = tokio::time::timeout(Duration::from_secs(10), frame::read_frame_body(&mut *s))
+            .await
+            .expect("no frame arrived within 10s")
+            .expect("a frame body");
+        match decode_server_frame(&body).expect("a decodable server frame") {
+            ServerFrame::ScreenSnapshot { .. } => continue,
+            other => return other,
+        }
+    }
 }
 
 async fn attach_ok(d: &TestDaemon, session: &str, mode: AttachMode) -> UnixStream {
@@ -578,6 +586,7 @@ async fn next_awaiting_secret(c: &mut UnixStream, secs: u64) -> (String, String)
             ServerFrame::AwaitingSecret {
                 request_id,
                 prompt_text,
+                ..
             } => return (request_id, prompt_text),
             ServerFrame::Output { .. } | ServerFrame::Resize { .. } => {}
             other => panic!("expected AwaitingSecret, got {other:?}"),
@@ -623,6 +632,8 @@ async fn stream_until(c: &mut UnixStream, needle: &[u8], secs: u64) -> Vec<u8> {
         match decode_server_frame(&body).expect("a decodable server frame") {
             ServerFrame::Output { bytes, .. } => acc.extend_from_slice(&bytes),
             ServerFrame::AwaitingSecret { .. } | ServerFrame::SecretRequestClosed { .. } => {}
+            // The join's picture (GH #235), not the stream.
+            ServerFrame::ScreenSnapshot { .. } => {}
             // **The child is gone, so no more `Output` is coming — return
             // what arrived and let the caller's own assertion say what is
             // missing.** Frames are ordered, so a needle the child really
@@ -2216,8 +2227,8 @@ async fn a_wrong_request_id_writes_nothing_and_the_right_one_still_works() {
 
     // The named authority agrees with the wire, in both directions.
     let slots = d.daemon.server.attach_hub().secrets();
-    assert!(slots.matches_outstanding(&s.id, &request_id));
-    assert!(!slots.matches_outstanding(&s.id, "secreq_notours"));
+    assert!(slots.submission_bounds(&s.id, &request_id).is_some());
+    assert!(slots.submission_bounds(&s.id, "secreq_notours").is_none());
 
     send(
         &mut c,
@@ -2286,7 +2297,8 @@ async fn an_unadopted_request_has_no_deadline_and_an_adopted_one_does() {
             .server
             .attach_hub()
             .secrets()
-            .matches_outstanding(&s.id, &raised_id),
+            .submission_bounds(&s.id, &raised_id)
+            .is_some(),
         "a raise with no call was given the tool's deadline, which §5.2 forbids in as \
          many words"
     );

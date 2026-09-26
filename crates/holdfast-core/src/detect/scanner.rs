@@ -2,9 +2,10 @@
 //! PTY byte stream that tracks bracketed paste, the alternate screen, the
 //! window title, and OSC 133 semantic markers.
 //!
-//! It allocates no grid and keeps no history beyond a 512-byte tail line,
-//! so it runs unconditionally on every output chunk. Tier B (full VT100
-//! emulation) is 0.0.4.
+//! It allocates no grid and keeps no history beyond a 512-byte tail line
+//! and the command line being echoed (`COMMAND_CAPTURE_MAX`, plus the one
+//! copy of it a prompt redraw may put back), so it runs unconditionally on
+//! every output chunk. Tier B (full VT100 emulation) is 0.0.4.
 //!
 //! The scanner is also where escape sequences are recognised, so the tail
 //! line it maintains is naturally free of them. That is *not* the
@@ -76,13 +77,23 @@ pub enum Osc133 {
     /// `C` — the command was submitted; what follows is its output.
     /// `command` is the text echoed between `B` and `C`.
     ///
+    /// **`None` means nothing was captured**: no `B` armed the capture
+    /// since the last `A`, `C` or `D`, whichever source's markers are in
+    /// use. That is a different fact from `Some("")`, a capture that ran
+    /// and saw no echo, and the two must not collapse into one value — a
+    /// history of empty strings reads as commands with no text rather
+    /// than as commands whose text was never seen.
+    ///
     /// `truncated` says the echo capture is **missing its front**: a bare
     /// `\r` discarded text that was never repainted (see
     /// `ModeScanner::resolve_capture_return`), so `command` is a tail
     /// whose front was dropped *before* any redactor could see it. The
     /// text is still carried — §8.5.1 rule 5's injection-line suppression
     /// matches on it as a suffix — but no consumer may present it.
-    OutputStart { command: String, truncated: bool },
+    OutputStart {
+        command: Option<String>,
+        truncated: bool,
+    },
     /// `D;<code>` — the command finished.
     CommandDone { exit_code: Option<i32> },
 }
@@ -93,6 +104,13 @@ pub enum Osc133 {
 /// *injected* — a session can carry `shell_integration: Some(Fish)` with
 /// `Osc133Source::External`, meaning the snippet is installed and firing
 /// and its markers are being dropped on arrival (§8.5.1).
+///
+/// **Source only, and deliberately not capture health.** Whether the
+/// markers in use still frame the command line is a second, independent
+/// question — a prompt framework can regenerate the prompt over any
+/// source's `A`/`B` (GH #220) — and one value cannot carry both. It is
+/// answered per history entry (`command: None`) and by
+/// `CommandHistory::command_capture`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Osc133Source {
     /// Every marker seen so far carries `holdfast=1`. The ordinary case.
@@ -126,6 +144,16 @@ pub struct Osc133Event {
     /// Offset just past the sequence's terminator.
     pub end: u64,
     pub marker: Osc133,
+    /// Whether the marker carried §8.5.1's `holdfast=1` tag — i.e. it was
+    /// emitted by Holdfast's own snippet rather than by a foreign emitter.
+    ///
+    /// Read by the history ring's injection-line rule (§8.5.1 rule 5),
+    /// which needs it for a structural reason: **Holdfast's own `C` can
+    /// never mark the line that installed it**, because the snippet
+    /// defines its `C` emitter while that line is executing — after `PS0`
+    /// was expanded, after `preexec` ran. So only a *foreign* `C` can be
+    /// the injection line, and a tagged one is always a real command.
+    pub holdfast: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -191,9 +219,35 @@ impl TailLine {
         self.truncated = false;
     }
 
-    /// How many printable bytes the current line holds.
-    fn len(&self) -> usize {
-        self.buf.len()
+    /// How many **characters** the current line holds: every byte that is
+    /// not a UTF-8 continuation byte (`0x80..=0xBF`) starts one.
+    ///
+    /// **This, and not the byte count, is the width a line editor steps
+    /// past**, and the difference was measured on a real prompt (GH #220).
+    /// starship's last row on the owner's machine is `⬢ [Docker] ❯ ` — 13
+    /// columns and 17 bytes, because `⬢` and `❯` are three bytes each.
+    /// readline's Ctrl-U repaint steps past it with thirteen `CSI C`, so a
+    /// byte count said the repaint had resumed four columns *inside* the
+    /// prompt, the debt stayed unpaid, and a complete `echo short` typed
+    /// after the kill came back as `[REDACTED:unresolved]` — while
+    /// `bash --norc`'s all-ASCII `bash-5.2$ ` recorded it correctly.
+    ///
+    /// A character is not a column either: a double-width glyph (CJK, most
+    /// emoji) is one character and two columns, so this errs **low**. For
+    /// the shape `settle_capture_debt` exists to catch that costs nothing —
+    /// a wrap redraw repaints its continuation row from column 0 with no
+    /// cursor-forward, and zero reaches no positive width however low it is
+    /// counted. What it widens, slightly and only for wide-glyph prompts, is
+    /// a residual the column test has at any prompt width: a repaint that
+    /// steps into a *continuation* row by a cursor-forward at least the
+    /// prompt's width settles the debt. A byte count errs high instead, and
+    /// that refuses complete commands at every multibyte prompt, which is
+    /// the measured cost above.
+    fn columns(&self) -> usize {
+        self.buf
+            .iter()
+            .filter(|b| !(0x80..=0xbf).contains(*b))
+            .count()
     }
 
     /// A backspace un-draws the last cell; it does not un-evict the front,
@@ -205,6 +259,34 @@ impl TailLine {
     fn as_string(&mut self) -> String {
         String::from_utf8_lossy(self.buf.make_contiguous()).into_owned()
     }
+}
+
+/// How many bytes of `line`, a capture, the first `columns` columns of it
+/// take — none for a motion that went backwards, all of it for one past
+/// its end.
+///
+/// A capture holds one codepoint per byte, so a column starts at every
+/// codepoint that is not a UTF-8 continuation byte (`U+0080..=U+00BF`):
+/// [`TailLine::columns`]'s count, with its low error on wide glyphs.
+fn columns_prefix(line: &str, columns: isize) -> usize {
+    let Ok(columns) = usize::try_from(columns) else {
+        return 0;
+    };
+    line.char_indices()
+        .filter(|(_, c)| !('\u{80}'..='\u{bf}').contains(c))
+        .nth(columns)
+        .map_or(line.len(), |(i, _)| i)
+}
+
+/// The text a capture spells. A capture holds one `char` per byte of the
+/// echo, and the echo is UTF-8, so the bytes are collected back and
+/// decoded — the command field is text, and `é` read a byte at a time is
+/// `Ã©`. A sequence the capture cut short (`COMMAND_CAPTURE_MAX`, a repaint
+/// that kept part of a line) decodes as `U+FFFD`.
+fn decode_capture(capture: &str) -> String {
+    // Every `char` in a capture is at most `U+00FF`, so none is truncated.
+    let bytes: Vec<u8> = capture.chars().map(|c| c as u8).collect();
+    String::from_utf8_lossy(&bytes).into_owned()
 }
 
 /// Terminal modes observed so far, plus whether each was ever observed at
@@ -275,7 +357,10 @@ pub struct ModeScanner {
     seq_start: u64,
     /// Bytes consumed by the sequence being parsed, against `SEQUENCE_MAX`.
     seq_len: usize,
-    /// Echoed command line, accumulated between OSC 133 `B` and `C`.
+    /// Echoed command line, accumulated between OSC 133 `B` and `C`: one
+    /// `char` per byte of the echo, so `U+0080..=U+00FF` stand for the
+    /// bytes of a UTF-8 sequence, and `decode_capture` reads it back as
+    /// the text it spells at `C`.
     capture: Option<String>,
     /// A bare `\r` was seen inside the capture and the overwrite it
     /// promises has not been observed yet. See `capture_return`.
@@ -287,15 +372,28 @@ pub struct ModeScanner {
     capture_debt: usize,
     /// How wide the prompt row was when OSC 133 `B` arrived — the column
     /// the *command* starts at. `0` means unknown (no prompt was drawn, or
-    /// the tail line had already evicted bytes off its front), and the
-    /// unknown case falls back to the length test. See
-    /// `settle_capture_debt`.
+    /// the tail line had already evicted bytes off its front), and then
+    /// only the length test can settle a debt. See `settle_capture_debt`.
     prompt_columns: usize,
     /// Net cursor motion, in columns, between a bare `\r` inside a capture
     /// and the first byte it repaints: `+n` for `CSI n C`, `-n` for
     /// `CSI n D`. Re-zeroed at every `\r`, so it describes one repaint and
     /// never accumulates across them.
     repaint_columns: isize,
+    /// The command line, and its debt, still on screen behind a prompt
+    /// that an `A` has started drawing again in front of it. Held from that
+    /// `A` to the marker after it, which puts it back only if it is the
+    /// `B`. See `line_behind_a_redrawn_prompt`.
+    redrawn: Option<(String, usize)>,
+    /// The armed return is a redrawn prompt's `B`, not a `\r`: the repaint
+    /// resumes `repaint_columns` into the command rather than into the row.
+    /// See `resume_redrawn_line`.
+    redraw_resume: bool,
+    /// The capture, and its debt, as they stood when the most recent bare
+    /// `\r` on the line's row was applied — the line that `\r` began
+    /// writing over. Cleared at a newline and at every marker. See
+    /// `line_behind_a_redrawn_prompt`.
+    line_at_return: Option<(String, usize)>,
     /// Last OSC 133 marker letter seen (`A`/`B`/`C`/`D`), for the T1 state.
     last_marker: Option<u8>,
     /// Per marker letter (`A`, `B`, `C`, `D`), whether a **foreign** marker
@@ -318,6 +416,24 @@ pub struct ModeScanner {
     /// is decided by the reader thread, which is the only place that knows
     /// (§8.3, REQ-PD-025).
     foreground: Option<i32>,
+    /// The most recent `C` found no capture armed — no `B` since the last
+    /// `A`, `C` or `D` — so its `OutputStart` carried `command: None`
+    /// (GH #220). See `prompt_markers_missing`.
+    ///
+    /// **Any source's `C`.** The capture is armed by whichever `B` is in
+    /// use, so a foreign integration whose prompt is regenerated out from
+    /// under its `A`/`B` loses its command text, and its `A` after each
+    /// `D`, exactly as Holdfast's does.
+    ///
+    /// The most recent, not sticky: a prompt framework that defeats the
+    /// wrapping does so at every prompt, and a session that recovers — the
+    /// user resets `PS1` by hand — should stop saying it is missing.
+    prompt_markers_missing: bool,
+    /// The foreground group sampled at the most recent `A`, `B` or `D`:
+    /// the markers a shell emits while it holds the terminal and is about
+    /// to go on holding it. `None` until one has arrived. See the owner
+    /// rule at the end of `osc133` (GH #240).
+    prompt_owner: Option<Option<i32>>,
 }
 
 impl Default for ModeScanner {
@@ -344,11 +460,16 @@ impl ModeScanner {
             capture_debt: 0,
             prompt_columns: 0,
             repaint_columns: 0,
+            redrawn: None,
+            redraw_resume: false,
+            line_at_return: None,
             last_marker: None,
             foreign_letters: [false; 4],
             holdfast_letters: [false; 4],
             pending_cr: false,
             foreground: None,
+            prompt_markers_missing: false,
+            prompt_owner: None,
         }
     }
 
@@ -610,6 +731,7 @@ impl ModeScanner {
                 // *this* return is followed by and must not inherit the
                 // last one's.
                 self.repaint_columns = 0;
+                self.redraw_resume = false;
             }
             0x08 => {
                 self.tail.backspace();
@@ -655,9 +777,10 @@ impl ModeScanner {
     ///
     /// Deferring costs nothing on the shells that were already right: bash
     /// and zsh submit with `\r\r\n`, and a `\r` run ending in `\n` never
-    /// arms this at all (see `ground`). It is also not cursor arithmetic —
-    /// no column is tracked and no CSI is interpreted — so it stays inside
-    /// tier A. What it does not model is an *erase*: a `\r` followed by
+    /// arms this at all (see `ground`). Arming tracks no column; the only
+    /// cursor arithmetic the capture does is `apply_csi`'s net count of
+    /// `CSI C`/`CSI D` between an armed return and the first byte written
+    /// over it. What it does not model is an *erase*: a `\r` followed by
     /// `\x1b[K` and no text really did blank the line, and the capture will
     /// keep what was there. That is the same class of best-effort the
     /// `command` field already documents, and it fails toward reporting
@@ -699,8 +822,23 @@ impl ModeScanner {
             return;
         }
         self.capture_return_pending = false;
+        let resume = std::mem::take(&mut self.redraw_resume);
         if let Some(cap) = self.capture.as_mut() {
             let keep = cap.rfind('\n').map(|i| i + 1).unwrap_or(0);
+            if resume {
+                // What the repaint writes replaces the rest of the line,
+                // as after a `\r`; what it stepped over is still on screen.
+                // Nothing went off the front, so no debt is added, and a
+                // repaint from the command's first column rewrote all of it.
+                let resumed_at = keep + columns_prefix(&cap[keep..], self.repaint_columns);
+                cap.truncate(resumed_at);
+                if resumed_at == keep {
+                    self.capture_debt = 0;
+                }
+                self.repaint_columns = 0;
+                return;
+            }
+            self.line_at_return = Some((cap.clone(), self.capture_debt));
             let dropped = cap.len() - keep;
             cap.truncate(keep);
             self.capture_debt = self.capture_debt.max(dropped);
@@ -740,23 +878,29 @@ impl ModeScanner {
     /// 133 `B`, and `repaint_columns` is the net `CSI C`/`CSI D` motion
     /// since the `\r`.
     ///
-    /// **The length test stays, as the fallback for an unknown prompt
-    /// width** — no OSC 133 `A`, a prompt row that lost bytes off the
-    /// front of the tail line, or a prompt of zero width. Every stream in
-    /// this tree's fish, bash and zsh corpora that settled by length before
-    /// still settles.
+    /// **The length test stays, as the fallback whenever the column test
+    /// does not settle** — an unknown prompt width (no OSC 133 `A`, a
+    /// prompt row that lost bytes off the front of the tail line, a prompt
+    /// of zero width), and every repaint that stepped less than the
+    /// prompt's width. Every stream in this tree's fish, bash and zsh
+    /// corpora that settled by length before still settles.
     ///
-    /// Two residuals, named rather than implied. A shell that repaints
-    /// from column 0 by **re-echoing the prompt** is not recognised and
-    /// keeps its debt — the fail-safe direction, and no shell in the
-    /// measured corpus does it. And a wrapped line whose *first* row is
-    /// the one repainted settles even though later rows hold the rest;
-    /// that is the same best-effort class `CommandEntry::command` already
-    /// documents.
+    /// Three residuals, named rather than implied, and the length test is
+    /// behind two of them because it cannot tell a rewrite from a longer
+    /// tail. A wrap redraw whose continuation row is at least as long as
+    /// the front it lost settles, and the tail is reported whole. A shell
+    /// that repaints from column 0 by **re-echoing the prompt** is not
+    /// recognised: a shorter line keeps its debt, the fail-safe direction,
+    /// and a full-length one settles with the prompt's text in the
+    /// command; no shell in the measured corpus does it. And a wrapped line
+    /// whose *first* row is the one repainted settles even though later
+    /// rows hold the rest; that is the same best-effort class
+    /// `CommandEntry::command` already documents.
     ///
-    /// Length rather than content throughout: the discarded bytes are not
-    /// kept, and keeping them to compare would hold a copy of the secret
-    /// this exists to withhold.
+    /// Length rather than content throughout: nothing compares what the
+    /// repaint wrote with what went. The discarded line is kept only until
+    /// its row ends (`line_at_return`), to be put back if the `\r` turns
+    /// out to be a redrawn prompt's.
     fn settle_capture_debt(&mut self) {
         if self.capture_debt == 0 {
             return;
@@ -773,6 +917,12 @@ impl ModeScanner {
     }
 
     fn capture_newline(&mut self) {
+        self.line_at_return = None;
+        // A redrawn prompt's `B` arms a repaint from the command's first
+        // column. A newline moves the cursor off that row, so what follows
+        // it is not that repaint, and a line resumed from the start of the
+        // next row would read as rewritten whole and owe nothing.
+        self.redraw_resume = false;
         if let Some(cap) = self.capture.as_mut() {
             if cap.len() < COMMAND_CAPTURE_MAX {
                 cap.push('\n');
@@ -788,9 +938,81 @@ impl ModeScanner {
         // before it, exactly as it did when the truncate happened on the
         // `\r` itself.
         self.resolve_capture_return();
+        // One backspace un-draws one character, and a character the echo
+        // wrote as UTF-8 is its lead byte and every continuation byte after
+        // it. zsh echoes a first key, backspaces over it and redraws the
+        // line, so popping a single byte leaves `Ã` in front of a command
+        // that begins with `é`.
         if let Some(cap) = self.capture.as_mut() {
-            cap.pop();
+            while let Some(c) = cap.pop() {
+                if !('\u{80}'..='\u{bf}').contains(&c) {
+                    break;
+                }
+            }
         }
+    }
+
+    /// The command line still on screen behind a prompt that this `A` or
+    /// `B` is part of drawing again, with its debt — or `None` when the
+    /// marker begins a new line.
+    ///
+    /// **A line editor may repaint the prompt, markers and all, without
+    /// ending the line.** bash 5.3's readline does it at every redisplay
+    /// of a prompt holding multibyte characters as well as `\[`…`\]`
+    /// invisible ones, and a prompt carrying these markers always holds
+    /// the second. It redraws the prompt's **last row**: `\r`, that row,
+    /// then `CSI n C` over the part of the line that is already drawn,
+    /// then only the new keys. Measured with `⬢ [x] ❯ ` and `echo` typed a
+    /// key at a time: `\r` `A` `⬢ [x] ❯ ` `B` `\x1b[C\x1b[C\x1b[C` `o`.
+    /// Restarting the capture at that `B` keeps `o` and loses `ech`, which
+    /// are still on the screen. bash 5.2 echoes the same keys plainly, and
+    /// bash 5.3 does too at a prompt that lacks either kind of character.
+    ///
+    /// **The last row need not carry the `A`, or begin with it.** A prompt
+    /// of several rows — starship's default shape, `\n…\n❯ ` — has its `A`
+    /// on an earlier row, so its redraw is `\r` `❯ ` `B` and nothing else;
+    /// readline's `show-mode-in-prompt` writes the mode string in front of
+    /// `PS1`, so its redraw is `\r` `(ins)` `A` … `B`. So both markers ask,
+    /// and the line is the capture as it stood at the `\r`, before the
+    /// prompt's own text was written over it (`line_at_return`).
+    ///
+    /// Three conditions tell a redraw from a new prompt. The capture is
+    /// **open** — a `B` and no `A`, `C` or `D` since — so the line was
+    /// never submitted or abandoned. A bare **`\r`** has come since, so the
+    /// prompt is being drawn over the line's own row. And the line holds
+    /// **no newline**, because a line that has been ended is not being
+    /// redrawn: fish draws its next prompt after a Ctrl-C or a syntax
+    /// error with no `C` and no `D`, so the capture is still open, but
+    /// after the `^C` or the error report and a newline — and read as a
+    /// redraw, the abandoned line and the report become the front of the
+    /// next command. A prompt drawn after a newline, which is where every
+    /// new prompt goes, fails both of the last two and restarts the
+    /// capture as before.
+    fn line_behind_a_redrawn_prompt(&self) -> Option<(String, usize)> {
+        let capture = self.capture.as_ref()?;
+        let line = if self.capture_return_pending {
+            // Nothing has been written over the line since the `\r`.
+            Some((capture.clone(), self.capture_debt))
+        } else {
+            self.line_at_return.clone()
+        };
+        line.filter(|(line, _)| !line.contains('\n'))
+    }
+
+    /// At the `B` that ends a redrawn prompt, put back the line the prompt
+    /// was drawn in front of, and treat what follows as a repaint of it.
+    ///
+    /// The repaint starts at the command's first column — the prompt has
+    /// just been drawn — so the net cursor motion before its first byte is
+    /// a count of the line's own columns, and those survive
+    /// (`resolve_capture_return`). Written text replaces the rest, exactly
+    /// as after a `\r`; a repaint that writes nothing before the line ends
+    /// leaves all of it, as a `\r` never written over does.
+    fn resume_redrawn_line(&mut self, (line, debt): (String, usize)) {
+        self.capture = Some(line);
+        self.capture_debt = debt;
+        self.capture_return_pending = true;
+        self.redraw_resume = true;
     }
 
     fn esc(&mut self, b: u8, offset: u64) {
@@ -844,9 +1066,10 @@ impl ModeScanner {
             return;
         }
         // **CUF/CUB, and only inside one specific window**: between a bare
-        // `\r` that landed inside a capture and the first byte the repaint
-        // writes. That is the whole of the cursor arithmetic this scanner
-        // does, and `settle_capture_debt` is the only reader. Outside the
+        // `\r` that landed inside a capture — or a redrawn prompt's `B` —
+        // and the first byte the repaint writes. That is the whole of the
+        // cursor arithmetic this scanner does, and `settle_capture_debt`
+        // and `resolve_capture_return` are its only readers. Outside the
         // window nothing is counted, so no ordinary cursor motion reaches
         // it.
         if self.capture_return_pending && (final_byte == b'C' || final_byte == b'D') {
@@ -876,6 +1099,7 @@ impl ModeScanner {
         for p in params.split(';') {
             match p {
                 "2004" => {
+                    let was_on = self.modes.bracketed_paste;
                     self.modes.bracketed_paste = on;
                     self.modes.saw_bracketed_paste = true;
                     // Re-recorded on every transition, not only the first:
@@ -883,7 +1107,23 @@ impl ModeScanner {
                     // re-arms the licence for itself (§8.7 availability
                     // row 4c), which is the case the T2 executing rung's
                     // premise is literally true of.
-                    self.modes.bracketed_paste_owner = self.foreground;
+                    //
+                    // **Except the `l` that turns off a paste mode that
+                    // was on, which keeps the owner the `h` recorded** —
+                    // GH #240's race, in the T2 dimension. readline emits
+                    // that `l` on accept-line and the shell forks at once,
+                    // so a chunk scanned a moment late samples the child;
+                    // the child then owns a signal it never drove, the T2
+                    // executing rung is licensed for it, and a `[Y/n] `
+                    // prompt reads `Executing` / `terminal_mode`. The
+                    // program turning an enabled paste off is the one that
+                    // enabled it, and the `h` was sampled while that
+                    // program sat idle at its prompt. An `l` with nothing
+                    // to turn off is a program declaring itself, and is
+                    // sampled as before.
+                    if on || !was_on {
+                        self.modes.bracketed_paste_owner = self.foreground;
+                    }
                 }
                 "1049" => {
                     self.modes.alt_screen = on;
@@ -921,11 +1161,12 @@ impl ModeScanner {
             return;
         };
         if let Some(rest) = payload.strip_prefix("133;") {
-            if let Some(marker) = self.osc133(rest) {
+            if let Some((marker, holdfast)) = self.osc133(rest) {
                 events.push(Osc133Event {
                     start: self.seq_start,
                     end,
                     marker,
+                    holdfast,
                 });
             }
             return;
@@ -953,7 +1194,7 @@ impl ModeScanner {
     /// foreign integration may be partial — measured, fish 4.0.2 emits `A`,
     /// `C` and `D` and never `B` — and whole-source suppression would then
     /// discard Holdfast's `B` along with the rest, leaving the echo capture no
-    /// `B..C` span and `get_command_history` reporting `command: ""` for
+    /// `B..C` span and `get_command_history` reporting `command: null` for
     /// every entry. Yielding per letter keeps exactly the letters the
     /// foreign emitter does not supply, which is why `osc133_source` needs
     /// a `mixed` value at all.
@@ -969,7 +1210,7 @@ impl ModeScanner {
     /// fish emits its own `A` before calling `fish_prompt` and its own `C`
     /// before Holdfast's; that ordering is a property of one emitter and is
     /// not guaranteed.
-    fn osc133(&mut self, rest: &str) -> Option<Osc133> {
+    fn osc133(&mut self, rest: &str) -> Option<(Osc133, bool)> {
         let kind = rest.as_bytes().first().copied()?;
         // Letters Holdfast models. `P`, `L` and anything else stay inert:
         // they are not evidence about whether a command is running and
@@ -999,13 +1240,25 @@ impl ModeScanner {
         } else {
             self.foreign_letters[slot] = true;
         }
+        // Read before the reset below takes the armed `\r` it depends on.
+        let behind = match kind {
+            b'A' | b'B' => self.line_behind_a_redrawn_prompt(),
+            _ => None,
+        };
+        // What an `A` found behind it is put back by the `B` right after
+        // that `A` and by no later one: any other marker in between began
+        // something else.
+        let carried = self.redrawn.take();
         // Every modelled marker begins or ends a capture, so none of them
         // may inherit an armed `\r` — or an unpaid discard — from the span
         // before it.
         self.capture_return_pending = false;
+        self.redraw_resume = false;
         self.repaint_columns = 0;
+        self.line_at_return = None;
         let marker = match kind {
             b'A' => {
+                self.redrawn = behind;
                 self.capture = None;
                 self.capture_debt = 0;
                 self.prompt_columns = 0;
@@ -1026,16 +1279,29 @@ impl ModeScanner {
                 self.prompt_columns = if self.tail.truncated {
                     0
                 } else {
-                    self.tail.len()
+                    self.tail.columns()
                 };
+                if let Some(line) = behind.or(carried) {
+                    self.resume_redrawn_line(line);
+                }
                 Osc133::CommandStart
             }
             b'C' => {
-                let command = self.capture.take().unwrap_or_default().trim().to_string();
+                // `None` when no `B` armed the capture: the text was not
+                // seen, which is not the same as an empty line.
+                let command = self
+                    .capture
+                    .take()
+                    .map(|c| decode_capture(&c).trim().to_string());
                 // A debt the repaint never repaid: the line's front went
                 // to a `\r` and is not in `command`.
                 let truncated = self.capture_debt > 0;
                 self.capture_debt = 0;
+                // GH #220: a `C` with no capture armed means the prompt
+                // markers that frame the command line are not arriving —
+                // for whichever source is in use, since the capture is
+                // armed by whichever `B` is.
+                self.prompt_markers_missing = command.is_none();
                 Osc133::OutputStart { command, truncated }
             }
             b'D' => {
@@ -1059,12 +1325,56 @@ impl ModeScanner {
             _ => return None,
         };
         self.modes.saw_osc133 = true;
-        // Same rule as bracketed paste, and re-recorded on every marker,
-        // which is what keeps T1 available at every prompt: the shell's
-        // `D`/`A` arrive in the burst in which it regains the terminal.
-        self.modes.osc133_owner = self.foreground;
+        // Re-recorded on every marker, which is what keeps T1 available at
+        // every prompt: the shell's `D`/`A` arrive in the burst in which it
+        // regains the terminal.
+        //
+        // **Except that `C` inherits, and GH #240 is why.** The owner is
+        // "who held the terminal when the marker was *emitted*", and the
+        // only thing the scanner has is who holds it when the chunk is
+        // *scanned*. For `A`, `B` and `D` the two agree, because the shell
+        // emits them and then goes on holding the terminal at its prompt.
+        // `C` is the one marker a shell emits and then immediately gives
+        // the terminal away — `PS0`/`preexec` run, the shell forks, the
+        // child takes the foreground — so a reader that scans the chunk a
+        // moment late samples the **child** and records it as the owner.
+        // Owner then equals holder, the T1 executing rung stays licensed,
+        // and a program stopped at `[Y/n] ` reads `Executing` / `semantic`
+        // for the whole wait: measured 2 trials in 8 on a loaded box.
+        //
+        // The shell that emits a `C` is the shell that drew the prompt it
+        // was typed at, so `C` takes the owner recorded at the last `A`,
+        // `B` or `D` — sampled while that shell sat idle holding the
+        // terminal — and falls back to the scan-time sample only when no
+        // such marker has arrived. Nesting is unchanged: an inner shell's
+        // own `D`/`A`/`B` re-record the owner before its first `C`, and a
+        // shell inside `ssh` is still owned by `ssh`'s group throughout.
+        //
+        // **The residual, measured rather than assumed away.** This moves
+        // the race; it does not remove it. The prompt's own sample is
+        // right only if its chunk is scanned before the shell has run the
+        // *next* command — a window of the agent's whole round trip rather
+        // than of one `fork`, so orders of magnitude wider, but not
+        // infinite. A 50 ms stall put in front of the reader's detector
+        // feed, with the next command typed the instant the prompt reached
+        // the buffer, reproduced `Executing` / `semantic` at a `[Y/n] `
+        // again. Typeahead reaches it for the same reason. Closing it needs
+        // a sample the scanner cannot take — who held the terminal when
+        // the input was *written* — and belongs to the reader, not here.
+        self.modes.osc133_owner = if kind == b'C' {
+            self.prompt_owner.unwrap_or(self.foreground)
+        } else {
+            self.prompt_owner = Some(self.foreground);
+            self.foreground
+        };
         self.last_marker = Some(kind);
-        Some(marker)
+        Some((marker, is_holdfast))
+    }
+
+    /// Whether the most recent `C`, from any source, found no capture
+    /// armed (GH #220). See `prompt_markers_missing`.
+    pub fn prompt_markers_missing(&self) -> bool {
+        self.prompt_markers_missing
     }
 }
 
@@ -1312,7 +1622,7 @@ mod tests {
         assert_eq!(
             ev[0].marker,
             Osc133::OutputStart {
-                command: "ls".into(),
+                command: Some("ls".into()),
                 truncated: false,
             },
             "a well-formed sequence under SEQUENCE_MAX leaked into the \
@@ -1434,7 +1744,7 @@ mod tests {
         assert_eq!(
             ev[2].marker,
             Osc133::OutputStart {
-                command: "echo hi".into(),
+                command: Some("echo hi".into()),
                 truncated: false,
             }
         );
@@ -1460,7 +1770,7 @@ mod tests {
         assert_eq!(
             ev[1].marker,
             Osc133::OutputStart {
-                command: "echo hello".into(),
+                command: Some("echo hello".into()),
                 truncated: false,
             }
         );
@@ -1472,7 +1782,7 @@ mod tests {
         assert_eq!(
             ev[1].marker,
             Osc133::OutputStart {
-                command: "real command".into(),
+                command: Some("real command".into()),
                 truncated: false,
             }
         );
@@ -1525,7 +1835,7 @@ mod tests {
             assert_eq!(
                 ev[1].marker,
                 Osc133::OutputStart {
-                    command: want.into(),
+                    command: Some(want.into()),
                     truncated: false,
                 },
                 "fish repaint lost the command"
@@ -1541,7 +1851,7 @@ mod tests {
         assert_eq!(
             ev[1].marker,
             Osc133::OutputStart {
-                command: "real command".into(),
+                command: Some("real command".into()),
                 truncated: false,
             },
             "a carriage return that was written over must still discard"
@@ -1568,14 +1878,14 @@ mod tests {
         assert_eq!(
             ev[1].marker,
             Osc133::OutputStart {
-                command: "first".into(),
+                command: Some("first".into()),
                 truncated: false,
             }
         );
         assert_eq!(
             ev.last().unwrap().marker,
             Osc133::OutputStart {
-                command: "echo hello".into(),
+                command: Some("echo hello".into()),
                 truncated: false,
             },
             "a carriage return armed in one span fired inside the next"
@@ -1590,7 +1900,7 @@ mod tests {
         assert_eq!(
             ev[0].marker,
             Osc133::OutputStart {
-                command: "echo hi".into(),
+                command: Some("echo hi".into()),
                 truncated: false,
             }
         );
@@ -1611,7 +1921,7 @@ mod tests {
         assert_eq!(
             ev[0].marker,
             Osc133::OutputStart {
-                command: "real".into(),
+                command: Some("real".into()),
                 truncated: false,
             },
             "the carriage return did not carry across the chunk boundary"
@@ -1620,17 +1930,367 @@ mod tests {
 
     #[test]
     fn a_second_command_start_restarts_the_capture() {
-        // `B` always begins a fresh command line; it does not resume an
-        // open one. Reusing the capture concatenates two prompts' worth of
-        // echo into a single command ("onetwo").
-        let (_, ev) = scan(b"\x1b]133;B\x07one\x1b]133;B\x07two\r\n\x1b]133;C\x07");
-        assert_eq!(
-            ev[2].marker,
-            Osc133::OutputStart {
-                command: "two".into(),
-                truncated: false,
+        // A `B` with no `\r` in front of it begins a fresh command line; it
+        // does not resume an open one, however far the cursor then steps.
+        // Reusing the capture concatenates two prompts' worth of echo into
+        // a single command ("onetwo").
+        for raw in [
+            &b"\x1b]133;B\x07one\x1b]133;B\x07two\r\n\x1b]133;C\x07"[..],
+            b"\x1b]133;B\x07one\x1b]133;B\x07\x1b[3Ctwo\r\n\x1b]133;C\x07",
+        ] {
+            let (_, ev) = scan(raw);
+            assert_eq!(
+                ev[2].marker,
+                Osc133::OutputStart {
+                    command: Some("two".into()),
+                    truncated: false,
+                }
+            );
+        }
+    }
+
+    /// bash 5.3 at `⬢ [x] ❯ `, `LC_ALL=C.UTF-8`: `echo this is a long
+    /// command` typed a key at a time, `Ctrl-U`, then `echo HOLDFAST''_TYPED`
+    /// a key at a time and Enter. Verbatim from the prompt to `C`, lifted
+    /// out of the real PTY capture — every redisplay redraws the prompt
+    /// with its markers and steps over the part already drawn.
+    const BASH_53_REDRAWN_PROMPT: &[u8] =
+        "\x1b]133;A;holdfast=1\x07⬢ [x] ❯ \x1b]133;B;holdfast=1\x07\
+         \r\x1b]133;A;holdfast=1\x07⬢ [x] ❯ \x1b]133;B;holdfast=1\x07e\
+         \r\x1b]133;A;holdfast=1\x07⬢ [x] ❯ \x1b]133;B;holdfast=1\x07\
+         \x1b[Ccho this is a long command\
+         \r\x1b[C\x1b[C\x1b[C\x1b[C\x1b[C\x1b[C\x1b[C\x1b[C\x1b[K\
+         \r\x1b]133;A;holdfast=1\x07⬢ [x] ❯ \x1b]133;B;holdfast=1\x07ec\
+         \r\x1b]133;A;holdfast=1\x07⬢ [x] ❯ \x1b]133;B;holdfast=1\x07\x1b[C\x1b[Ch\
+         \r\x1b]133;A;holdfast=1\x07⬢ [x] ❯ \x1b]133;B;holdfast=1\x07\
+         \x1b[C\x1b[C\x1b[Co HOLDFAST''_TYPED\
+         \r\n\x1b[?2004l\r\x1b]133;C;holdfast=1\x07"
+            .as_bytes();
+
+    fn last_command(ev: &[Osc133Event]) -> Osc133 {
+        ev.iter()
+            .rev()
+            .find(|e| matches!(e.marker, Osc133::OutputStart { .. }))
+            .expect("an OutputStart")
+            .marker
+            .clone()
+    }
+
+    #[test]
+    fn a_prompt_redrawn_in_front_of_the_line_keeps_what_it_steps_over() {
+        let want = Osc133::OutputStart {
+            command: Some("echo HOLDFAST''_TYPED".into()),
+            truncated: false,
+        };
+        let (_, ev) = scan(BASH_53_REDRAWN_PROMPT);
+        assert_eq!(last_command(&ev), want);
+        // A PTY read can end anywhere, including between the `\r` and the
+        // `A` that makes it a redraw.
+        let mut s = ModeScanner::new();
+        let mut ev = Vec::new();
+        for (i, b) in BASH_53_REDRAWN_PROMPT.iter().enumerate() {
+            ev.extend(s.feed(std::slice::from_ref(b), i as u64, None));
+        }
+        assert_eq!(last_command(&ev), want, "fed a byte at a time");
+    }
+
+    /// The rows that keep the redraw rule from being a blanket "a `B`
+    /// never restarts the capture".
+    #[test]
+    fn only_a_prompt_redrawn_over_the_line_it_belongs_to_resumes_it() {
+        for (what, raw, want) in [
+            (
+                "a repaint from the command's first column rewrites the line",
+                &b"\x1b]133;A\x07$ \x1b]133;B\x07one\r\x1b]133;A\x07$ \x1b]133;B\x07two\
+                   \r\n\x1b]133;C\x07"[..],
+                "two",
+            ),
+            (
+                "a repaint that writes nothing leaves the whole line",
+                &b"\x1b]133;A\x07$ \x1b]133;B\x07echo hello\
+                   \r\x1b]133;A\x07$ \x1b]133;B\x07\x1b[9C\
+                   \r\x1b]133;A\x07$ \x1b]133;B\x07\x1b[8C\r\n\x1b]133;C\x07"[..],
+                "echo hello",
+            ),
+            (
+                "a backward step keeps less of the line",
+                &b"\x1b]133;A\x07$ \x1b]133;B\x07echo hullo\
+                   \r\x1b]133;A\x07$ \x1b]133;B\x07\x1b[9C\x1b[3Dello\r\n\x1b]133;C\x07"[..],
+                "echo hello",
+            ),
+            (
+                "a net step backwards keeps none of it",
+                &b"\x1b]133;A\x07$ \x1b]133;B\x07echo hullo\
+                   \r\x1b]133;A\x07$ \x1b]133;B\x07\x1b[2C\x1b[3Dls\r\n\x1b]133;C\x07"[..],
+                "ls",
+            ),
+            (
+                "a prompt after a newline is a new line",
+                &b"\x1b]133;A\x07$ \x1b]133;B\x07one\r\n\x1b]133;A\x07$ \x1b]133;B\x07\
+                   \x1b[3Ctwo\r\n\x1b]133;C\x07"[..],
+                "two",
+            ),
+            (
+                "a prompt after a `D` is a new line",
+                &b"\x1b]133;A\x07$ \x1b]133;B\x07one\r\x1b]133;D;130\x07\
+                   \r\x1b]133;A\x07$ \x1b]133;B\x07\x1b[3Ctwo\r\n\x1b]133;C\x07"[..],
+                "two",
+            ),
+            (
+                "a `D` between the redrawn prompt's `A` and a `B` ends the line",
+                &b"\x1b]133;A\x07$ \x1b]133;B\x07one\r\x1b]133;A\x07$ \x1b]133;D;0\x07\
+                   \x1b]133;B\x07\x1b[3Ctwo\r\n\x1b]133;C\x07"[..],
+                "two",
+            ),
+            (
+                "a `\\r` after the redrawn prompt repaints the row, not the command",
+                &b"\x1b]133;A\x07$ \x1b]133;B\x07echo hi\r\x1b]133;A\x07$ \x1b]133;B\x07\
+                   \r\x1b[C\x1b[Cls\r\n\x1b]133;C\x07"[..],
+                "ls",
+            ),
+            (
+                "a last row drawn after a newline is a new line",
+                &b"\x1b]133;B\x07one^C\r\n\r> \x1b]133;B\x07\x1b[3Ctwo\r\n\x1b]133;C\x07"[..],
+                "two",
+            ),
+            (
+                "a `\\r` on an earlier row does not make a `B` a redraw",
+                &b"\x1b]133;B\x07one\rX\r\n> \x1b]133;B\x07\x1b[3Ctwo\r\n\x1b]133;C\x07"[..],
+                "two",
+            ),
+            (
+                "a `\\r` before an earlier `B` does not make a later one a redraw",
+                &b"\x1b]133;B\x07one\r> \x1b]133;B\x07two\x1b]133;B\x07\x1b[3Cthree\
+                   \r\n\x1b]133;C\x07"[..],
+                "three",
+            ),
+        ] {
+            let (_, ev) = scan(raw);
+            assert_eq!(
+                last_command(&ev),
+                Osc133::OutputStart {
+                    command: Some(want.into()),
+                    truncated: false,
+                },
+                "{what}"
+            );
+        }
+    }
+
+    /// The debt `settle_capture_debt` guards is about the *front* of the
+    /// line, and a redrawn prompt does not change what the front is. A line
+    /// that had already lost its front to a wrap redraw keeps owing it
+    /// when a repaint steps over what is left — whatever the step's width
+    /// against the prompt's, which is the test that settles a `\r`'s debt
+    /// and means nothing here — and a repaint from the command's first
+    /// column rewrites the line whole, so nothing is owed after it.
+    #[test]
+    fn a_redrawn_prompt_neither_pays_nor_invents_a_debt() {
+        for (what, raw, want, truncated) in [
+            (
+                "the front a wrap redraw lost stays owed",
+                &b"\x1b]133;A\x07$ \x1b]133;B\x07export K=AKIAIOSF\rODNN7EXAMPLE\
+                   \r\x1b]133;A\x07$ \x1b]133;B\x07\x1b[12CX\r\n\x1b]133;C\x07"[..],
+                "ODNN7EXAMPLEX",
+                true,
+            ),
+            (
+                "a rewrite from the first column owes nothing",
+                &b"\x1b]133;A\x07$ \x1b]133;B\x07export K=AKIAIOSF\rODNN7EXAMPLE\
+                   \r\x1b]133;A\x07$ \x1b]133;B\x07ls\r\n\x1b]133;C\x07"[..],
+                "ls",
+                false,
+            ),
+            (
+                "a newline after the redrawn prompt leaves the front owed",
+                &b"\x1b]133;A\x07$ \x1b]133;B\x07export K=AKIAIOSF\rODNN7EXAMPLE\
+                   \r\x1b]133;A\x07$ \x1b]133;B\x07\nzz\r\n\x1b]133;C\x07"[..],
+                "ODNN7EXAMPLE\nzz",
+                true,
+            ),
+            (
+                "a step into a line that owed nothing owes nothing",
+                &b"\x1b]133;A\x07$ \x1b]133;B\x07echo this is a long command\
+                   \r\x1b]133;A\x07$ \x1b]133;B\x07\x1b[4C hi\r\n\x1b]133;C\x07"[..],
+                "echo hi",
+                false,
+            ),
+        ] {
+            let (_, ev) = scan(raw);
+            assert_eq!(
+                last_command(&ev),
+                Osc133::OutputStart {
+                    command: Some(want.into()),
+                    truncated,
+                },
+                "{what}"
+            );
+        }
+    }
+
+    /// bash 5.3 redraws a prompt's **last row** only, so a prompt of
+    /// several rows redraws with no `A` in front of its `B`, and one led by
+    /// readline's `show-mode-in-prompt` string redraws with text in front
+    /// of its `A`. `echo HOLDFAST_TYPED` typed a key at a time at
+    /// `LC_ALL=C.UTF-8`, verbatim from the prompt to `C`.
+    #[test]
+    fn a_prompt_redrawn_from_its_last_row_keeps_the_line() {
+        let want = Osc133::OutputStart {
+            command: Some("echo HOLDFAST_TYPED".into()),
+            truncated: false,
+        };
+        for (what, raw) in [
+            (
+                "two rows",
+                "\x1b[?2004h\x1b]133;A;holdfast=1\x07top line ⬢\r\n[x] ❯ \x1b]133;B;holdfast=1\x07\
+                 \r[x] ❯ \x1b]133;B;holdfast=1\x07e\
+                 \r[x] ❯ \x1b]133;B;holdfast=1\x07\x1b[Ccho HOLDFAST_TYPED\
+                 \r\n\x1b[?2004l\r\x1b]133;C;holdfast=1\x07",
+            ),
+            (
+                "starship's shape: an empty row, a status row, then `❯ `",
+                "\x1b[?2004h\x1b]133;A;holdfast=1\x07\r\n\x1b[1;36m~/src\x1b[0m on \x1b[35m main\x1b[0m\
+                 \r\n\x1b[32m❯\x1b[0m \x1b]133;B;holdfast=1\x07\
+                 \r\x1b[32m❯\x1b[0m \x1b]133;B;holdfast=1\x07e\
+                 \r\x1b[32m❯\x1b[0m \x1b]133;B;holdfast=1\x07\x1b[Ccho HOLDFAST_TYPED\
+                 \r\n\x1b[?2004l\r\x1b]133;C;holdfast=1\x07",
+            ),
+            (
+                "the mode string in front of the `A`",
+                "\x1b[?2004h(ins)\x1b]133;A;holdfast=1\x07⬢ [x] ❯ \x1b]133;B;holdfast=1\x07\
+                 \r(ins)\x1b]133;A;holdfast=1\x07⬢ [x] ❯ \x1b]133;B;holdfast=1\x07e\
+                 \r(ins)\x1b]133;A;holdfast=1\x07⬢ [x] ❯ \x1b]133;B;holdfast=1\x07\x1b[Cc\
+                 \r(ins)\x1b]133;A;holdfast=1\x07⬢ [x] ❯ \x1b]133;B;holdfast=1\x07\x1b[C\x1b[Ch\
+                 \r(ins)\x1b]133;A;holdfast=1\x07⬢ [x] ❯ \x1b]133;B;holdfast=1\x07\
+                 \x1b[C\x1b[C\x1b[Co HOLDFAST_TYPED\r\n\x1b[?2004l\r\x1b]133;C;holdfast=1\x07",
+            ),
+            (
+                "the mode string on the last of two rows",
+                "\x1b[?2004h\x1b]133;A;holdfast=1\x07top line ⬢\r\n(ins)[x] ❯ \x1b]133;B;holdfast=1\x07\
+                 \r(ins)[x] ❯ \x1b]133;B;holdfast=1\x07e\
+                 \r(ins)[x] ❯ \x1b]133;B;holdfast=1\x07\x1b[Ccho HOLDFAST_TYPED\
+                 \r\n\x1b[?2004l\r\x1b]133;C;holdfast=1\x07",
+            ),
+        ] {
+            let raw = raw.as_bytes();
+            let (_, ev) = scan(raw);
+            assert_eq!(last_command(&ev), want, "{what}");
+            let mut s = ModeScanner::new();
+            let mut ev = Vec::new();
+            for (i, b) in raw.iter().enumerate() {
+                ev.extend(s.feed(std::slice::from_ref(b), i as u64, None));
             }
-        );
+            assert_eq!(last_command(&ev), want, "{what}, fed a byte at a time");
+        }
+    }
+
+    /// fish ends a line with no `C` and no `D` when Ctrl-C cancels it or it
+    /// fails to parse. It prints `^C`, or its error report, and a newline,
+    /// then its missing-newline mark — `⏎`, spaces to the last column,
+    /// `\r⏎ \r` — and then the next prompt, all over a capture that is
+    /// still open. fish 3.7.0 at an 80-column PTY, verbatim from the
+    /// abandoned line's prompt to the next command's `C`, but for the
+    /// window title, which is shortened.
+    #[test]
+    fn a_line_the_shell_abandoned_is_not_the_front_of_the_next() {
+        const PROMPT: &[u8] =
+            b"\x1b]133;A;holdfast=1\x07\x1b(B\x1b[mdev@host ~/src> \x1b]133;B;holdfast=1\x07";
+        let mark = [
+            &b"\x1b[2m\xe2\x8f\x8e\x1b(B\x1b[m"[..],
+            &[b' '; 79],
+            b"\r\xe2\x8f\x8e \r\x1b[K",
+        ]
+        .concat();
+        let next: &[u8] = b"\x1b[K\r\x1b[16Cecho \r\x1b[21CSECOND\r\x1b[27C\x1b[11Decho SECOND\
+            \r\x1b[27C\r\n\x1b[30m\x1b(B\x1b[m\x1b]133;C;holdfast=1\x07";
+        let cancelled = [
+            PROMPT,
+            b"\x1b[K\r\x1b[16Cecho \r\x1b[21CCANCELLED\r\x1b[30C\x1b[14Decho CANCELLED\
+              \r\x1b[30C^C\x1b[30m\x1b(B\x1b[m\r\n",
+            &mark,
+            PROMPT,
+            next,
+        ]
+        .concat();
+        // fish keeps a line that failed to parse, and redraws it — a real
+        // redraw, over an open capture with no newline in it — before the
+        // Ctrl-C that clears it.
+        let unparsed = [
+            PROMPT,
+            b"\x1b[K\r\x1b[16Cecho \r\x1b[21C)\r\x1b[22C\r\n\
+              fish: Unexpected ')' for unopened parenthesis\r\necho )\r\n     ^\r\n",
+            &mark,
+            PROMPT,
+            b"echo )\x1b[K\r\x1b[22C\x1b]0;~/src\x07\x1b[30m\x1b(B\x1b[m\r",
+            PROMPT,
+            b"echo )\x1b[K\r\x1b[22C\x08\x08\x08\x08\x08\x08echo )\r\x1b[22C^C\x1b[30m\x1b(B\x1b[m\r\n",
+            &mark,
+            PROMPT,
+            next,
+        ]
+        .concat();
+        for (what, raw) in [("Ctrl-C", cancelled), ("a syntax error", unparsed)] {
+            let (_, ev) = scan(&raw);
+            let starts: Vec<_> = ev
+                .iter()
+                .filter(|e| matches!(e.marker, Osc133::OutputStart { .. }))
+                .collect();
+            assert_eq!(starts.len(), 1, "{what}: only the second line ran");
+            assert_eq!(
+                starts[0].marker,
+                Osc133::OutputStart {
+                    command: Some("echo SECOND".into()),
+                    truncated: false,
+                },
+                "{what}"
+            );
+        }
+    }
+
+    /// The command field is the text that was typed, not the bytes of its
+    /// echo read one to a character. `éé=1; echo ok` typed a key at a time
+    /// at `LC_ALL=C.UTF-8`, verbatim from `B` (bash 5.3 from its prompt)
+    /// to `C`: zsh echoes the first key, backspaces over it and redraws,
+    /// and bash 5.3 steps over the `é`s already drawn, a column for each.
+    #[test]
+    fn a_command_is_the_text_its_echo_spells() {
+        for (what, raw, want) in [
+            (
+                "echoed plainly",
+                "\x1b]133;A\x07$ \x1b]133;B\x07echo héllo wörld\r\n\x1b]133;C\x07",
+                "echo héllo wörld",
+            ),
+            (
+                "zsh, backspacing over a first key of two bytes",
+                "\x1b]133;B;holdfast=1\x07\x1b[K\x1b[?2004hé\x08éé=1; echo ok\x1b[?2004l\
+                 \r\r\n\x1b]133;C;holdfast=1\x07",
+                "éé=1; echo ok",
+            ),
+            (
+                "bash 5.3, stepping over two-byte characters a column at a time",
+                "\x1b[?2004h\x1b]133;A;holdfast=1\x07⬢ [x] ❯ \x1b]133;B;holdfast=1\x07\
+                 \r\x1b]133;A;holdfast=1\x07⬢ [x] ❯ \x1b]133;B;holdfast=1\x07é\
+                 \r\x1b]133;A;holdfast=1\x07⬢ [x] ❯ \x1b]133;B;holdfast=1\x07\x1b[Cé\
+                 \r\x1b]133;A;holdfast=1\x07⬢ [x] ❯ \x1b]133;B;holdfast=1\x07\x1b[C\x1b[C=\
+                 \r\x1b]133;A;holdfast=1\x07⬢ [x] ❯ \x1b]133;B;holdfast=1\x07\
+                 \x1b[C\x1b[C\x1b[C1; echo ok\r\n\x1b[?2004l\r\x1b]133;C;holdfast=1\x07",
+                "éé=1; echo ok",
+            ),
+        ] {
+            let want = Osc133::OutputStart {
+                command: Some(want.into()),
+                truncated: false,
+            };
+            let raw = raw.as_bytes();
+            let (_, ev) = scan(raw);
+            assert_eq!(last_command(&ev), want, "{what}");
+            let mut s = ModeScanner::new();
+            let mut ev = Vec::new();
+            for (i, b) in raw.iter().enumerate() {
+                ev.extend(s.feed(std::slice::from_ref(b), i as u64, None));
+            }
+            assert_eq!(last_command(&ev), want, "{what}, fed a byte at a time");
+        }
     }
 
     #[test]
@@ -1640,7 +2300,7 @@ mod tests {
         assert_eq!(
             ev[2].marker,
             Osc133::OutputStart {
-                command: "ls".into(),
+                command: Some("ls".into()),
                 truncated: false,
             }
         );
@@ -1677,7 +2337,7 @@ mod tests {
         assert_eq!(
             ev[0].marker,
             Osc133::OutputStart {
-                command: String::new(),
+                command: None,
                 truncated: false,
             }
         );
@@ -2067,5 +2727,303 @@ mod tests {
         let ev = s.feed(b"\x1b]133;A\x07", 1005, None);
         assert_eq!(ev[0].start, 1005);
         assert_eq!(ev[0].end, 1013);
+    }
+
+    /// GH #240: who owns a signal is decided when it was *emitted*, and the
+    /// scanner only ever knows when it was *scanned*.
+    ///
+    /// Every row feeds the prompt with the shell (group 100) holding the
+    /// terminal and the submit with the child (group 200) already holding
+    /// it — the chunk a reader reached a moment after the fork. That is
+    /// the measured interleaving: the shell emits `C` (and readline its
+    /// paste-off) and forks in the same breath, so nothing obliges the
+    /// reader to scan those bytes before the child calls `tcsetpgrp`.
+    mod owner_of_the_submit {
+        use super::*;
+
+        const SHELL: Option<i32> = Some(100);
+        const CHILD: Option<i32> = Some(200);
+
+        #[test]
+        fn a_c_marker_belongs_to_the_shell_that_drew_the_prompt_it_was_typed_at() {
+            let mut s = ModeScanner::new();
+            s.feed(
+                b"\x1b]133;A;holdfast=1\x07$ \x1b]133;B;holdfast=1\x07",
+                0,
+                SHELL,
+            );
+            s.feed(b"python3\r\n\x1b]133;C;holdfast=1\x07", 100, CHILD);
+            assert_eq!(
+                s.modes().osc133_owner,
+                SHELL,
+                "the C was scanned after the fork and recorded the child"
+            );
+            // The next prompt-side marker samples afresh: the shell has
+            // the terminal back and is the one emitting.
+            s.feed(b"\x1b]133;D;0;holdfast=1\x07", 200, SHELL);
+            assert_eq!(s.modes().osc133_owner, SHELL);
+        }
+
+        /// The fallback, and the reason the rule is "inherit when there is
+        /// something to inherit" rather than "never sample at `C`".
+        #[test]
+        fn a_c_marker_with_no_prompt_marker_before_it_is_sampled_as_before() {
+            let mut s = ModeScanner::new();
+            s.feed(b"\x1b]133;C\x07", 0, CHILD);
+            assert_eq!(s.modes().osc133_owner, CHILD);
+        }
+
+        /// Nesting: an inner shell's own prompt markers re-record the
+        /// owner, so its `C` inherits the *inner* shell and not the outer
+        /// one that launched it (§8.5).
+        #[test]
+        fn an_inner_shells_c_inherits_the_inner_shells_prompt() {
+            const INNER: Option<i32> = Some(150);
+            let mut s = ModeScanner::new();
+            s.feed(
+                b"\x1b]133;A;holdfast=1\x07$ \x1b]133;B;holdfast=1\x07",
+                0,
+                SHELL,
+            );
+            s.feed(b"bash\r\n\x1b]133;C;holdfast=1\x07", 100, INNER);
+            assert_eq!(s.modes().osc133_owner, SHELL);
+            s.feed(
+                b"\x1b]133;D;0;holdfast=1\x07\x1b]133;A;holdfast=1\x07> \x1b]133;B;holdfast=1\x07",
+                200,
+                INNER,
+            );
+            s.feed(b"sleep 9\r\n\x1b]133;C;holdfast=1\x07", 300, CHILD);
+            assert_eq!(s.modes().osc133_owner, INNER);
+        }
+
+        /// The same race in the T2 dimension: readline's paste-off is
+        /// emitted on accept-line, immediately before the fork.
+        #[test]
+        fn a_paste_off_that_ends_an_enabled_paste_keeps_the_owner_that_enabled_it() {
+            let mut s = ModeScanner::new();
+            s.feed(b"\x1b[?2004h$ ", 0, SHELL);
+            assert_eq!(s.modes().bracketed_paste_owner, SHELL);
+            s.feed(b"\x1b[?2004l\r", 100, CHILD);
+            assert_eq!(
+                s.modes().bracketed_paste_owner,
+                SHELL,
+                "the paste-off was scanned after the fork and recorded the child"
+            );
+
+            // The paired negatives: an `l` with nothing to turn off is a
+            // program declaring itself, and an `h` always samples — which
+            // is §8.7 row 4c, a REPL re-arming the licence for itself.
+            s.feed(b"\x1b[?2004l", 200, CHILD);
+            assert_eq!(s.modes().bracketed_paste_owner, CHILD);
+            s.feed(b"\x1b[?2004h", 300, Some(300));
+            assert_eq!(s.modes().bracketed_paste_owner, Some(300));
+        }
+    }
+
+    /// GH #220: a prompt regenerated over the `A`/`B` markers (starship
+    /// rewrites `PS1` at every prompt) leaves every `C` with no capture
+    /// armed. The text is then not captured, and the history said
+    /// `command: ""` — the spelling of an empty line — while `osc133_source`
+    /// said `holdfast`, the one answer a caller checked before trusting it.
+    mod prompt_markers_missing {
+        use super::*;
+
+        /// The shape the dogfood pass measured, reduced to its markers:
+        /// the injection line's own `D`, a prompt with no markers at all,
+        /// then Holdfast's `C` and `D` for a real command.
+        const REGENERATED: &[u8] = b"\x1b]133;D;0;holdfast=1\x07user@host ~ \xe2\x9d\xaf \
+            echo hi\r\n\x1b]133;C;holdfast=1\x07hi\r\n\x1b]133;D;0;holdfast=1\x07";
+
+        fn output_start(ev: &[Osc133Event]) -> &Osc133 {
+            &ev.iter()
+                .find(|e| matches!(e.marker, Osc133::OutputStart { .. }))
+                .expect("a `C`")
+                .marker
+        }
+
+        #[test]
+        fn a_c_with_no_b_before_it_captured_nothing_and_says_so() {
+            let mut s = ModeScanner::new();
+            s.feed(b"\x1b]133;D;0;holdfast=1\x07", 0, None);
+            assert!(
+                !s.prompt_markers_missing(),
+                "nothing is known to be missing until a command is submitted"
+            );
+            let ev = s.feed(&REGENERATED[21..], 21, None);
+            assert_eq!(
+                *output_start(&ev),
+                Osc133::OutputStart {
+                    command: None,
+                    truncated: false,
+                },
+                "an uncaptured command must not read as an empty one"
+            );
+            assert!(s.prompt_markers_missing());
+            // The source is a separate question and its answer is unchanged:
+            // every marker in use is still Holdfast's.
+            assert_eq!(s.osc133_source(), Some(Osc133Source::Holdfast));
+        }
+
+        /// The negative that keeps this from reading every session as
+        /// missing, and the recovery: the next command with a `B` in front
+        /// of it is captured again.
+        #[test]
+        fn a_c_with_its_b_is_captured_and_a_session_that_recovers_says_so() {
+            let mut s = ModeScanner::new();
+            s.feed(REGENERATED, 0, None);
+            assert!(s.prompt_markers_missing());
+            let ev = s.feed(
+                b"\x1b]133;A;holdfast=1\x07$ \x1b]133;B;holdfast=1\x07ls\r\n\x1b]133;C;holdfast=1\x07",
+                500,
+                None,
+            );
+            assert_eq!(
+                *output_start(&ev),
+                Osc133::OutputStart {
+                    command: Some("ls".into()),
+                    truncated: false,
+                }
+            );
+            assert!(!s.prompt_markers_missing());
+        }
+
+        /// **Capture does not depend on whose markers are in use.** The
+        /// capture is armed by whichever `B` survives §8.5.1's yielding, so
+        /// a foreign integration whose prompt is regenerated away loses its
+        /// text exactly as Holdfast's does — and the same `B` in front of
+        /// the `C` keeps it, under each source.
+        #[test]
+        fn a_c_with_no_b_captures_nothing_under_every_source() {
+            // (source, a cycle whose `C` has its `B`, then a `C` with none)
+            let rows: [(Osc133Source, &[u8], &[u8]); 3] = [
+                (
+                    Osc133Source::Holdfast,
+                    b"\x1b]133;A;holdfast=1\x07$ \x1b]133;B;holdfast=1\x07ls\r\n\
+                      \x1b]133;C;holdfast=1\x07\x1b]133;D;0;holdfast=1\x07",
+                    b"$ ls\r\n\x1b]133;C;holdfast=1\x07",
+                ),
+                (
+                    Osc133Source::External,
+                    b"\x1b]133;A\x07$ \x1b]133;B\x07ls\r\n\x1b]133;C\x07\x1b]133;D;0\x07",
+                    b"$ ls\r\n\x1b]133;C\x07",
+                ),
+                // Holdfast's `A`/`B` and a foreign `C`/`D`: a partial
+                // foreign integration.
+                (
+                    Osc133Source::Mixed,
+                    b"\x1b]133;A;holdfast=1\x07$ \x1b]133;B;holdfast=1\x07ls\r\n\
+                      \x1b]133;C\x07\x1b]133;D;0\x07",
+                    b"$ ls\r\n\x1b]133;C\x07",
+                ),
+            ];
+            for (source, framed, bare) in rows {
+                let mut s = ModeScanner::new();
+                let ev = s.feed(framed, 0, None);
+                assert_eq!(
+                    *output_start(&ev),
+                    Osc133::OutputStart {
+                        command: Some("ls".into()),
+                        truncated: false,
+                    },
+                    "{source:?}"
+                );
+                assert!(!s.prompt_markers_missing(), "{source:?}");
+                let ev = s.feed(bare, framed.len() as u64, None);
+                assert_eq!(
+                    *output_start(&ev),
+                    Osc133::OutputStart {
+                        command: None,
+                        truncated: false,
+                    },
+                    "{source:?}"
+                );
+                assert!(s.prompt_markers_missing(), "{source:?}");
+                assert_eq!(
+                    s.osc133_source(),
+                    Some(source),
+                    "capture health reached the source"
+                );
+            }
+        }
+
+        /// The boundaries are load-bearing: a `B` from the *previous*
+        /// prompt cycle must not vouch for a `C` after the `D` that closed
+        /// it, nor after an `A` that began a prompt with no `B` of its own.
+        #[test]
+        fn a_b_from_an_earlier_cycle_does_not_vouch_for_a_later_c() {
+            for boundary in [
+                &b"\x1b]133;D;0;holdfast=1\x07"[..],
+                b"\x1b]133;A;holdfast=1\x07",
+            ] {
+                let mut s = ModeScanner::new();
+                s.feed(b"\x1b]133;B;holdfast=1\x07", 0, None);
+                s.feed(boundary, 100, None);
+                let ev = s.feed(b"ls\r\n\x1b]133;C;holdfast=1\x07", 200, None);
+                assert_eq!(
+                    *output_start(&ev),
+                    Osc133::OutputStart {
+                        command: None,
+                        truncated: false,
+                    },
+                    "{boundary:?}"
+                );
+                assert!(s.prompt_markers_missing(), "{boundary:?}");
+            }
+        }
+
+        #[test]
+        fn every_event_says_whether_it_carried_the_tag() {
+            let mut s = ModeScanner::new();
+            let ev = s.feed(
+                b"\x1b]133;C;holdfast=1\x07\x1b]133;D;0\x07\x1b]133;A;x=holdfast=1\x07",
+                0,
+                None,
+            );
+            assert_eq!(
+                ev.iter().map(|e| e.holdfast).collect::<Vec<_>>(),
+                vec![true, false, false]
+            );
+        }
+    }
+
+    /// The owner's starship prompt, measured (GH #220): the last row is
+    /// `⬢ [Docker] ❯ `, 13 columns in 17 bytes, and readline's Ctrl-U
+    /// repaint steps past it with thirteen `CSI C` before painting the
+    /// shorter line. The colour escapes are the measured ones; the rows
+    /// above it are omitted because the tail line restarts at `\r\n`.
+    #[test]
+    fn a_repaint_past_a_prompt_with_multibyte_glyphs_keeps_its_command() {
+        let mut raw = b"\x1b]133;A;holdfast=1\x07\r\n\x1b[1;2;31m\xe2\xac\xa2 [Docker]\x1b[0m \
+                        \x1b[1;32m\xe2\x9d\xaf\x1b[0m \x1b]133;B;holdfast=1\x07\
+                        echo this is a long command\r"
+            .to_vec();
+        for _ in 0..13 {
+            raw.extend_from_slice(b"\x1b[C");
+        }
+        raw.extend_from_slice(b"\x1b[Kecho short\r\n\x1b[?2004l\r\x1b]133;C;holdfast=1\x07");
+        let (_, ev) = scan(&raw);
+        assert_eq!(
+            ev.last().unwrap().marker,
+            Osc133::OutputStart {
+                command: Some("echo short".into()),
+                truncated: false,
+            },
+            "a complete command was refused because the prompt was measured in bytes"
+        );
+
+        // The paired arm: the same prompt, and a wrap redraw that repaints
+        // a continuation row from column 0 — the front really is gone, and
+        // counting characters must not change that.
+        let raw = b"\x1b]133;A;holdfast=1\x07\xe2\xac\xa2 [Docker] \xe2\x9d\xaf \
+                    \x1b]133;B;holdfast=1\x07export K=AKIAIOSF\rODNN7EXAMPLE\r\n\
+                    \x1b]133;C;holdfast=1\x07";
+        let (_, ev) = scan(raw);
+        assert_eq!(
+            ev.last().unwrap().marker,
+            Osc133::OutputStart {
+                command: Some("ODNN7EXAMPLE".into()),
+                truncated: true,
+            }
+        );
     }
 }

@@ -71,9 +71,11 @@ echo "--- shells and helpers the test suite spawns by name ---"
 #                       ubuntu-24.04 image manifest, so this one is load-bearing
 #   python3          -> both getpass()/REPL rows of §8.7, and the pty probe below
 #   jq               -> scripts/mcp-smoke.sh, a hard requirement not a soft skip
+#   tcsh             -> shell_history.rs's tcsh row: Holdfast must never hang a
+#                       tcsh up, because a hung-up tcsh saves ~/.history (GH #252)
 # `fish` is deliberately NOT in this list; see the note printed after the
 # loop, which is a measurement rather than an omission.
-for prog in bash zsh dash sh python3 less jq; do
+for prog in bash zsh dash sh python3 less jq tcsh; do
   path="$(command -v "$prog" 2>/dev/null)"
   if [ -n "$path" ]; then
     ver="$("$prog" --version 2>&1 | head -1)"

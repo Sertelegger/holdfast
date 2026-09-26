@@ -422,6 +422,9 @@ fn session_record_keys() -> BTreeSet<String> {
         "exit_code",
         "shell_integration",
         "osc133_source",
+        // GH #220: whether the newest history entry has its text. A second
+        // question beside the source, so a field of its own.
+        "command_capture",
         "command_count",
         "started_at_unix_secs",
         "exited_at_unix_secs",
@@ -1044,10 +1047,9 @@ fn the_closed_vocabularies_declare_exactly_what_the_session_emits() {
     let emitted_shells: BTreeSet<String> = shells.iter().map(|s| s.as_str().to_string()).collect();
 
     // §8.5.1's `osc133_source`, walked the same way. It is a *third*
-    // vocabulary rather than a fourth `ShellIntegration` value because
-    // §12.3's append-only rule is written over fields, not over enum value
-    // sets — and because `mixed` is a state no answer to "which shell did
-    // Holdfast inject for" could carry.
+    // vocabulary rather than a fourth `ShellIntegration` value because it
+    // answers a different question — `mixed` is a state no answer to
+    // "which shell did Holdfast inject for" could carry.
     use holdfast_core::detect::Osc133Source as Src;
     fn next_source(s: Src) -> Option<Src> {
         match s {
@@ -1067,6 +1069,28 @@ fn the_closed_vocabularies_declare_exactly_what_the_session_emits() {
     }
     let emitted_sources: BTreeSet<String> =
         sources.iter().map(|s| s.as_str().to_string()).collect();
+
+    // GH #220's `command_capture`, and a fourth vocabulary rather than a
+    // fourth `osc133_source` value for the same reason: whether the text
+    // was captured is a question with its own answer under every source.
+    use holdfast_core::detect::CommandCapture as Cap;
+    fn next_capture(c: Cap) -> Option<Cap> {
+        match c {
+            Cap::Captured => Some(Cap::Missing),
+            Cap::Missing => None,
+        }
+    }
+    let mut captures = vec![Cap::Captured];
+    while let Some(next) = next_capture(*captures.last().expect("non-empty")) {
+        assert!(
+            !captures.contains(&next),
+            "the CommandCapture walk revisits {:?}",
+            next.as_str()
+        );
+        captures.push(next);
+    }
+    let emitted_captures: BTreeSet<String> =
+        captures.iter().map(|c| c.as_str().to_string()).collect();
 
     // GH #195's `held_back_cause`, and this one is a walk `output`
     // already provides: `HeldBackCause::ALL` exists for exactly this, so
@@ -1129,6 +1153,11 @@ fn the_closed_vocabularies_declare_exactly_what_the_session_emits() {
         "schema::Osc133Source and detect::Osc133Source::as_str disagree"
     );
     assert_eq!(
+        declared("status", "CommandCapture"),
+        emitted_captures,
+        "schema::CommandCapture and detect::CommandCapture::as_str disagree"
+    );
+    assert_eq!(
         declared("read_output", "HeldBackCause"),
         emitted_causes,
         "schema::HeldBackCause and output::HeldBackCause::as_str disagree"
@@ -1136,6 +1165,7 @@ fn the_closed_vocabularies_declare_exactly_what_the_session_emits() {
     assert_eq!(emitted_states.len(), 4);
     assert_eq!(emitted_shells.len(), 3);
     assert_eq!(emitted_sources.len(), 3);
+    assert_eq!(emitted_captures.len(), 2);
     assert_eq!(emitted_causes.len(), 2);
 }
 
@@ -1826,6 +1856,9 @@ async fn status_reports_each_field_from_the_session_it_names() {
         data["osc133_source"], "external",
         "untagged markers are a foreign emitter's"
     );
+    // Each `C` in `TWO_COMMANDS` has its `B`. The `missing` arm, and the
+    // entries it describes, are `an_uncaptured_command_is_null_on_the_wire`.
+    assert_eq!(data["command_capture"], "captured");
 
     // The other value, on a second mock fed a `holdfast=1`-tagged copy of the
     // same stream — cheaper than a real shell and enough to keep both
@@ -2101,6 +2134,69 @@ async fn get_command_history_ok_response_matches_its_schema() {
     let end = entries[0]["output_end_cursor"].as_u64().expect("end");
     let read = session.read_from(start, (end - start) as usize);
     assert_eq!(String::from_utf8_lossy(&read.bytes), "one\r\n");
+}
+
+/// GH #220 on the wire: a command whose `C` no `B` preceded has no
+/// captured text, and both surfaces say so in their own published shape —
+/// the entry's `command` is `null`, never `""`, and `status` reports
+/// `command_capture: "missing"` beside an `osc133_source` that is still
+/// `holdfast`. Validated against the advertised schemas, because a
+/// `command` still declared as a bare string rejects exactly this response.
+#[tokio::test]
+async fn an_uncaptured_command_is_null_on_the_wire() {
+    let server = HoldfastServer::new();
+    let pty = Arc::new(MockPty::new());
+    // The first command's prompt carries its `B`; the second's prompt was
+    // regenerated without its markers.
+    pty.queue_output(
+        b"\x1b]133;A;holdfast=1\x07$ \x1b]133;B;holdfast=1\x07echo one\r\n\
+          \x1b]133;C;holdfast=1\x07one\r\n\x1b]133;D;3;holdfast=1\x07\
+          regen$ echo two\r\n\x1b]133;C;holdfast=1\x07two\r\n\x1b]133;D;4;holdfast=1\x07",
+    );
+    let id = register(
+        &server,
+        None,
+        "mock",
+        &[],
+        SessionConfig::with_buffer_capacity(4096),
+        &pty,
+    );
+    let session = server.registry.get(&id).expect("session");
+    until("both commands to be recorded", || {
+        session.command_count() == 2
+    })
+    .await;
+
+    let r = server
+        .get_command_history(Parameters(GetCommandHistoryArgs {
+            session: id.clone(),
+            limit: None,
+            since_index: None,
+        }))
+        .await
+        .expect("get_command_history must not be a protocol error");
+    let payload = assert_matches_schema("get_command_history", &r);
+    let entries = payload["data"]["entries"].as_array().expect("entries");
+    assert_eq!(entries.len(), 2, "{payload}");
+    assert_eq!(
+        entries[0]["command"], "echo one",
+        "a captured entry: {payload}"
+    );
+    assert!(
+        entries[1]["command"].is_null(),
+        "an uncaptured entry must say so, not read as an empty command: {payload}"
+    );
+    assert_eq!(entries[1]["exit_code"], 4, "{payload}");
+
+    let r = server
+        .status(Parameters(StatusArgs {
+            session: id.clone(),
+        }))
+        .await
+        .expect("status must not be a protocol error");
+    let payload = assert_matches_schema("status", &r);
+    assert_eq!(payload["data"]["command_capture"], "missing", "{payload}");
+    assert_eq!(payload["data"]["osc133_source"], "holdfast", "{payload}");
 }
 
 #[tokio::test]
@@ -3825,6 +3921,7 @@ async fn every_declared_status_is_returned_by_a_real_response() {
             // chose.
             capabilities: small.capabilities,
             attach_hub: std::sync::Arc::clone(&small.attach_hub),
+            history_dir: small.history_dir.clone(),
         };
         let (_first, _) = start_bash(&server_one).await;
         note(&body(

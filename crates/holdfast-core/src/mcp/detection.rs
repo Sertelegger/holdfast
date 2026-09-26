@@ -226,7 +226,7 @@ pub fn with_detection(mut data: Value, session: &Session, processor: &OutputProc
     map.insert("screen_tracking".into(), json!(session.screen_tracking()));
     map.insert(
         "title".into(),
-        json!(d.title.as_deref().map(|t| redact_str(&processor.rules, t))),
+        json!(d.title.as_deref().map(|t| processor.redact_standalone(t))),
     );
     map.insert(
         "prompt".into(),
