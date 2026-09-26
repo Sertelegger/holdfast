@@ -29,15 +29,16 @@ preflight exists on any platform.
 
 **Output is ANSI-stripped and secret-redacted by default, and the promise is
 now stated in two tiers.** [SECURITY.md](./SECURITY.md) lists the hard
-guarantees Holdfast aims for — every agent-facing byte routed through the
-redactor, known secret values masked within a published scope, secrets written
-only at a real secret prompt, one verdict per byte across every surface, and
-nothing withheld indefinitely — each with its status today, several of them
-"not built" or "partial". Below them sit the pattern rules, which are best
+guarantees Holdfast aims for — every byte an agent or an observer reads routed
+through the redactor, except on the raw paths it names; known secret values
+masked within a published scope; secrets written only at a real secret prompt;
+one verdict per byte across every surface; and nothing withheld indefinitely.
+Only the routing holds today, the write gate holds in part, and the rest are
+not built or not claimed. Below them sit the pattern rules, which are best
 effort and say so. Every known way output gets past the redactor, or is masked
-when it should not be, is a numbered row in SECURITY.md's residual register
-with the issue it is filed as. `read_output(redact: false)` and `holdfast logs
---raw` are the audited ways to raw bytes.
+when it should not be, is in SECURITY.md's residual register with the issue it
+is filed as. `read_output(redact: false)` and `holdfast logs --raw` are the
+audited ways to raw bytes; SECURITY.md names the unaudited ones too.
 
 **No release carries binaries yet.** `v0.0.5` to `v0.0.7` were published
 with source only. Since then a release's binaries are attached to a draft,
