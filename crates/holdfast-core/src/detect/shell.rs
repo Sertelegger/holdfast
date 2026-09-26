@@ -571,7 +571,10 @@ mod tests {
     /// mistake for behaviour.
     #[test]
     fn the_bash_completion_emitter_restores_the_status_it_reported() {
-        let s = Shell::Bash.integration_snippet();
+        let snippet = Shell::Bash.integration_snippet();
+        // `__holdfast_d`'s body alone: `__holdfast_h` returns the same way.
+        let at = snippet.find("__holdfast_d() {").expect("__holdfast_d");
+        let s = &snippet[at..at + snippet[at..].find("}; ").expect("its end")];
         assert!(
             s.contains(r#"return "${1:-0}""#),
             "__holdfast_d must hand $? on to the rest of PROMPT_COMMAND: {s}"
