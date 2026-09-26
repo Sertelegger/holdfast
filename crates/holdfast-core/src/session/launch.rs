@@ -416,11 +416,15 @@ pub const CLIENT_HISTORY_DEFAULTS: [(&str, &str); 6] = [
 ///   disk under it (measured on 3.7.0, 4.0.2 and 4.9.3) and prints no
 ///   banner. A fish Holdfast spawns itself also gets
 ///   `detect::shell::FISH_HISTORY_INIT`, which re-asserts it after
-///   config.fish and makes any fish started inside the session private;
-///   a call whose own `env` sets `fish_history` gets neither, so its
-///   choice stands. What still reaches disk is a fish started inside a
-///   bash or zsh session, or through a wrapper Holdfast does not
-///   recognise (`env fish`), whose config.fish sets `fish_history`.
+///   config.fish and makes any fish started inside the session save
+///   nothing. A call whose own `env` sets a non-empty `fish_history` gets
+///   neither: that fish starts as a plain fish with the call's value in its
+///   environment, which a config.fish that sets `fish_history` overrides.
+///   What still reaches disk is a fish started inside a bash or zsh
+///   session, or through a wrapper Holdfast does not recognise (`env
+///   fish`), whose config.fish sets `fish_history`; a fish started inside
+///   a fish session writes nothing but still reads the history its
+///   config.fish names.
 /// - **`HISTORY_IGNORE`**, [`ZSH_HISTORY_IGNORE`]. zsh's
 ///   `inc_append_history` and `share_history` write a line when it is
 ///   entered, before it runs, so the snippet's own line reached the rc's

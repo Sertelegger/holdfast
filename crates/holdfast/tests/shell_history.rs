@@ -26,10 +26,10 @@
 //!   `~/.zsh_history` whenever the session's `HISTFILE` is unset;
 //! - fish, as Holdfast spawns it, with and without shell integration and
 //!   a config that sets `fish_history` itself — at start-up, or on every
-//!   `cd` as a per-directory history plugin does — and a fish the agent
-//!   starts inside a fish session; and fish started through `env`, which
-//!   Holdfast does not recognise and so reaches only through the
-//!   environment;
+//!   `cd` as a per-directory history plugin does — or erases it at every
+//!   prompt, and a fish the agent starts inside a fish session; and fish
+//!   started through `env`, which Holdfast does not recognise and so
+//!   reaches only through the environment;
 //! - tcsh with a `savehist` rc, for the endings Holdfast brings about.
 //!
 //! Every session gets its own `HOME`, and the assertion is over **every
@@ -176,7 +176,7 @@ const BASH_AND_ZSH: [Case; 7] = [
     },
 ];
 
-const FISH: [Case; 5] = [
+const FISH: [Case; 6] = [
     Case {
         name: "fish-default",
         command: "fish",
@@ -191,9 +191,12 @@ const FISH: [Case; 5] = [
         name: "fish-config-sets-history",
         command: "fish",
         args: &[],
-        files: &[(".config/fish/config.fish", FISH_SETS_HISTORY)],
+        files: &[
+            (".config/fish/config.fish", FISH_SETS_HISTORY),
+            (".local/share/fish/fish_history", FISH_OPERATOR_HISTORY),
+        ],
         integration: true,
-        before: &[],
+        before: &[("history | cat", "")],
         hung_up: true,
         needs: "fish",
     },
@@ -217,6 +220,19 @@ const FISH: [Case; 5] = [
         ],
         integration: true,
         before: &[("cd /", ""), ("history | cat", "")],
+        hung_up: true,
+        needs: "fish",
+    },
+    Case {
+        name: "fish-config-erases-history",
+        command: "fish",
+        args: &[],
+        files: &[
+            (".config/fish/config.fish", FISH_ERASES_HISTORY),
+            (".local/share/fish/fish_history", FISH_OPERATOR_HISTORY),
+        ],
+        integration: true,
+        before: &[("history | cat", "")],
         hung_up: true,
         needs: "fish",
     },
@@ -246,11 +262,19 @@ const FISH_OPERATOR_HISTORY: &str = "- cmd: echo OPERATORS_OWN_HISTORY\n  when: 
 const FISH_REPOINTS_HISTORY: &str =
     "function per_dir_history --on-variable PWD\n  set -g fish_history fish\nend\n";
 
+/// A config.fish that erases `fish_history` at every prompt, which leaves
+/// fish on its default session: the operator's own history file, read into
+/// the output and, on fish 3.7, rewritten by `history save`.
+const FISH_ERASES_HISTORY: &str =
+    "function erase_history --on-event fish_prompt\n  set -e fish_history\nend\n";
+
 /// A fish the agent starts inside a fish session, under a config.fish that
 /// names its own history session. Holdfast types nothing into it, so what
-/// keeps it private is the session's exported `fish_private_mode`. Only
-/// endings that reach both shells at once: an `exit` would end the inner
-/// one alone.
+/// keeps it private is the session's exported `fish_private_mode`. Private
+/// is not unread: it still reads the history its config.fish names, which
+/// SECURITY.md registers, so this row gives it none of the operator's to
+/// read. Only endings that reach both shells at once: an `exit` would end
+/// the inner one alone.
 const FISH_NESTED: Case = Case {
     name: "fish-nested",
     command: "fish",

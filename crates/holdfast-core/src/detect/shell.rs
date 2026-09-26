@@ -54,15 +54,25 @@ impl Shell {
 
 /// What Holdfast puts ahead of the caller's arguments when it spawns
 /// `command args` with the call's own `env` (GH #252): the recognised
-/// shell's [`Shell::spawn_args`], unless the call sets `fish_history`
-/// itself — that choice then stands, as a `HISTFILE` the call sets does
-/// for bash and zsh.
+/// shell's [`Shell::spawn_args`], unless the call sets a **non-empty**
+/// `fish_history` itself.
+///
+/// Such a fish starts without the init command, as a plain fish with that
+/// variable in its environment, so a config.fish that sets `fish_history`
+/// still overrides the call's value. An empty `fish_history` is
+/// Holdfast's own default restated and gets the init like any other
+/// session: without it, config.fish's assignment wins and the session
+/// saves to, and reads from, the operator's history (measured on fish
+/// 3.7.0, 4.0.2 and 4.9.3).
 pub fn history_spawn_args(
     command: &str,
     args: &[String],
     env: &[(String, String)],
 ) -> &'static [&'static str] {
-    if env.iter().any(|(k, _)| k == "fish_history") {
+    if env
+        .iter()
+        .any(|(k, v)| k == "fish_history" && !v.is_empty())
+    {
         return &[];
     }
     detect_shell(command, args).map_or(&[], Shell::spawn_args)
@@ -80,15 +90,23 @@ pub fn history_spawn_args(
 ///   environment is read and its own assignment would win.
 /// - **Pinned empty** by `__holdfast_history`, for configuration that
 ///   re-points it later — a per-directory history plugin does, on every
-///   `cd`.
+///   `cd` — **or erases it**. An erased `fish_history` is fish's default
+///   session, which reads the operator's history file and offers its lines
+///   into the output, and which fish 3.7's `history save` rewrites
+///   (measured). Re-pinned exported, so a fish started inside the session
+///   inherits the empty value either way.
 /// - **`fish_private_mode` exported**, so a fish started inside the session
-///   is private whatever its own config.fish says. At the first prompt and
-///   not here, because the default `fish_greeting` announces private mode:
-///   by then this session's greeting has run (fish runs `fish_prompt`
+///   saves nothing whatever its own config.fish says. At the first prompt
+///   and not here, because the default `fish_greeting` announces private
+///   mode: by then this session's greeting has run (fish runs `fish_prompt`
 ///   handlers in the order they were defined, and the greeting's comes
 ///   first), so its output starts as a plain fish's does. A nested fish
 ///   prints the announcement; a fish that ran the handlers in another order
-///   would too, and would still keep nothing.
+///   would too, and would still keep nothing. **Private is not unread:**
+///   none of this runs in the nested fish, so a config.fish there that
+///   names a history session still has that file read, its lines offered
+///   as autosuggestions and listed by `history`, and an empty one created
+///   where there was none (measured on 3.7.0, 4.0.2 and 4.9.3).
 ///
 /// **Not `--private`**, which this was until measured: every session's
 /// output began *fish is running in private mode, history will not be
@@ -100,7 +118,8 @@ pub fn history_spawn_args(
 pub const FISH_HISTORY_INIT: &str = concat!(
     "set -g fish_history ''; ",
     "function __holdfast_history --on-variable fish_history; ",
-    "if test -n \"$fish_history\"; set -g fish_history ''; end; end; ",
+    "if not set -q fish_history; or test -n \"$fish_history\"; ",
+    "set -gx fish_history ''; end; end; ",
     "function __holdfast_private --on-event fish_prompt; ",
     "set -gx fish_private_mode 1; functions -e __holdfast_private; end",
 );
@@ -662,13 +681,20 @@ mod tests {
 
         let none: &[(String, String)] = &[];
         let own = [("fish_history".to_string(), "work".to_string())];
+        let empty = [("fish_history".to_string(), String::new())];
         assert_eq!(
             history_spawn_args("/usr/bin/fish", &args(&["-l"]), none),
             Shell::Fish.spawn_args()
         );
         assert!(
             history_spawn_args("fish", &[], &own).is_empty(),
-            "the call's own fish_history must stand"
+            "a call that names its own history session starts a plain fish"
+        );
+        assert_eq!(
+            history_spawn_args("fish", &[], &empty),
+            Shell::Fish.spawn_args(),
+            "an empty fish_history is the default restated, and config.fish \
+             beats it unless the init runs"
         );
         assert!(history_spawn_args("fish", &args(&["-c", "ls"]), none).is_empty());
         assert!(history_spawn_args("bash", &[], none).is_empty());
