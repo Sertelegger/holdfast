@@ -746,7 +746,7 @@ else
     chk "T14 redirect to nowhere: cannot reach" "$(printf '%s' "$out" | grep -c 'cannot reach http://127.0.0.1:[0-9]*/tonowhere/v9.9.9/SHA256SUMS.txt')" 1
 
     # **The initialize answer, as T12 checks it for `bootstrap`.** It is what
-    # makes CHANGELOG's "says why in Claude Code" true of this file at all;
+    # makes CHANGELOG's "says why in `claude mcp list`" true of this file at all;
     # before, it said so of the Unix half only and read as both.
     pwsh_io() { # pwsh_io <extra env...> -- <args...>; stdio is the caller's
         _e=
