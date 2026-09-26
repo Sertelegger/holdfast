@@ -1024,8 +1024,10 @@ fn zsh_ends_without_a_history_error_under_an_rc_that_saves_history() {
 ///   exit, and without `histappend` that save overwrites the file with the
 ///   three-entry list; zsh trims to `SAVEHIST` as it appends;
 /// - a bash with shell integration off, where only `HISTFILE` in the
-///   environment names the file and the shell writes it when it exits.
-const PER_SESSION_EXTRA: [(Case, Ending); 4] = [
+///   environment names the file and the shell writes it when it exits;
+/// - [`BASH_APPEND_STOPPED`], whose per-command append stops after the
+///   marker.
+const PER_SESSION_EXTRA: [(Case, Ending); 5] = [
     (
         Case {
             name: "bash-own-markers",
@@ -1044,10 +1046,7 @@ const PER_SESSION_EXTRA: [(Case, Ending); 4] = [
             name: "bash-small-limits",
             command: "bash",
             args: &[],
-            files: &[(
-                ".bashrc",
-                "HISTFILE=~/.bash_history\nHISTSIZE=3\nHISTFILESIZE=3\n",
-            )],
+            files: &[(".bashrc", BASH_SMALL_LIMITS_RC)],
             integration: true,
             before: &[],
             hung_up: true,
@@ -1069,7 +1068,32 @@ const PER_SESSION_EXTRA: [(Case, Ending); 4] = [
         Ending::ForceTerminate,
     ),
     (BASH_AND_ZSH[1], Ending::Exit),
+    (BASH_APPEND_STOPPED, Ending::Exit),
 ];
+
+const BASH_SMALL_LIMITS_RC: &str = "HISTFILE=~/.bash_history\nHISTSIZE=3\nHISTFILESIZE=3\n";
+
+/// A bash whose per-command append stops once the marker is recorded, with
+/// limits of 3 — fewer than the commands typed after it. [`STOP_THE_APPEND`]
+/// shadows the `history` builtin, so the snippet's `history -a` does
+/// nothing, as happens when something replaces `PROMPT_COMMAND`
+/// mid-session; bash's own save at exit does not go through it. That save
+/// is then all that writes: with `histappend` it appends the last three
+/// commands, and without it bash rewrites the file from its three-entry
+/// list, losing the marker and everything else recorded before.
+const BASH_APPEND_STOPPED: Case = Case {
+    name: "bash-append-stopped",
+    command: "bash",
+    args: &[],
+    files: &[(".bashrc", BASH_SMALL_LIMITS_RC)],
+    integration: true,
+    before: &[],
+    hung_up: true,
+    needs: "bash",
+};
+
+/// Typed into [`BASH_APPEND_STOPPED`] once its marker is recorded.
+const STOP_THE_APPEND: &str = "history() { :; }";
 
 /// A user's own complete OSC 133 integration, untagged, which Holdfast's
 /// snippet yields to.
@@ -1108,6 +1132,10 @@ fn a_per_session_history_file_keeps_what_the_agent_ran_and_home_keeps_nothing() 
             continue;
         }
         let s = start(&inst, &mut shim, case, "PerSession");
+        if case.name == BASH_APPEND_STOPPED.name {
+            send(&mut shim, &s, STOP_THE_APPEND, true);
+            await_prompt(&mut shim, &s);
+        }
         for command in &commands {
             send(&mut shim, &s, command, true);
             let printed = command.trim_start_matches("echo ").replace("''", "");
@@ -1127,6 +1155,21 @@ fn a_per_session_history_file_keeps_what_the_agent_ran_and_home_keeps_nothing() 
         let text = std::fs::read_to_string(&file)
             .unwrap_or_else(|e| panic!("{}: no {}: {e}", s.case.name, file.display()));
         assert_eq!(mode(&file), 0o600, "{}", file.display());
+        if s.case.name == BASH_APPEND_STOPPED.name {
+            // The first command after the stop is absent, or the append
+            // never stopped and this row measured nothing; the last is
+            // present, or bash never saved at exit.
+            let (first, last) = (&commands[0], &commands[commands.len() - 1]);
+            assert!(
+                text.contains(MARK)
+                    && !text.contains(first.as_str())
+                    && text.contains(last.as_str()),
+                "{} / {how:?}: {} should hold the marker and {last}, and not {first}: {text:?}",
+                s.case.name,
+                file.display()
+            );
+            continue;
+        }
         for needle in std::iter::once(MARK).chain(commands.iter().map(String::as_str)) {
             assert!(
                 text.contains(needle),
@@ -1136,5 +1179,32 @@ fn a_per_session_history_file_keeps_what_the_agent_ran_and_home_keeps_nothing() 
             );
         }
     }
+
+    // A fish session is pointed at its file and gets none: its history
+    // never reaches one, so creating it would leave an empty file per
+    // session. A stand-in named `fish`, because Holdfast recognises the
+    // program by name and the file is made before the program runs; it
+    // measures the same where no fish is installed.
+    let stand_in = inst.home().join("stand-in").join("fish");
+    std::fs::create_dir_all(stand_in.parent().unwrap()).unwrap();
+    std::fs::write(&stand_in, "#!/bin/sh\nexec cat\n").unwrap();
+    std::fs::set_permissions(&stand_in, std::fs::Permissions::from_mode(0o755)).unwrap();
+    let mut shim = Shim::launch(&inst);
+    let started = shim.call(
+        "start_session",
+        json!({ "command": stand_in, "cwd": inst.home() }),
+    );
+    assert_eq!(started["status"], "ok", "{started}");
+    let id = started["data"]["session_id"].as_str().unwrap().to_string();
+    let r = shim.call("terminate", json!({ "session": id, "force": true }));
+    assert_eq!(r["status"], "ok", "{r}");
+    shim.kill();
+    let file = dir.join(format!("{id}.history"));
+    assert!(
+        !file.exists(),
+        "a fish session was given {}",
+        file.display()
+    );
+
     assert_no_leaks(&ended);
 }
