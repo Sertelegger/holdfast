@@ -2,7 +2,7 @@
 
 Where Holdfast is heading. Shipped work is in [CHANGELOG.md](./CHANGELOG.md).
 
-**Read the numbers as scope groupings, not as a schedule.** `0.0.3`, `0.0.4`
+**Read the numbers as scope groupings, not as a schedule.** `0.0.8`, `0.0.9`
 and so on are working labels for coherent bundles of work in the order they are
 being built. The version a bundle actually ships under is decided at release
 time from what is in it, and no date, number, or delivery is promised here.
@@ -11,24 +11,41 @@ resequenced before.
 
 The end state this is walking toward is the framing the project is built on:
 **Holdfast gives the agent a persistent shell environment, the way tmux gives a
-developer one.** Two milestones in, it gives the agent a shell; the persistence,
-the safety machinery, and the human's view into what the agent is doing are all
-still ahead.
+developer one.** The shell, its persistence and the human's read-only and
+interactive views into it have shipped. What is still ahead is making the
+safety machinery say exactly what it guarantees and then keep to it, and the
+first release anyone is expected to install.
 
 ## Where it is now
 
 Twelve MCP tools in **hybrid mode on Unix**: a background `holdfast daemon`
 owns the sessions and a `holdfast mcp` shim proxies to it over a Unix socket, so
-sessions outlive the MCP client rather than dying with it. Output is
-ANSI-stripped and **secret-redacted by default**, with `--raw` and
-`read_output(redact: false)` as audited opt-outs. Detection is real — sessions
-report `interaction_mode` with the `detection_tier` that produced it. Neither
-the web UI nor the dangerous-command preflight exists on any platform yet.
+sessions outlive the MCP client rather than dying with it. A human can follow a
+session with `holdfast watch`, take it over with `holdfast attach`, and answer
+a `request_secret_input` there without the value crossing the MCP wire.
+Detection is real — sessions report `interaction_mode` with the
+`detection_tier` that produced it. Neither the web UI nor the dangerous-command
+preflight exists on any platform.
 
-**On Windows the MCP server now starts, and that is close to the whole of it.**
-This paragraph read "Unix only" while the Windows section below said `holdfast
-mcp` serves stdio in-process there with an audit trail, so the file
-contradicted itself about one platform. What is true as of the #19 work:
+**Output is ANSI-stripped and secret-redacted by default, and the promise is
+now stated in two tiers.** [SECURITY.md](./SECURITY.md) lists the hard
+guarantees Holdfast aims for — every byte an agent or an observer reads routed
+through the redactor, except on the raw paths it names; known secret values
+masked within a published scope; secrets written only at a real secret prompt;
+one verdict per byte across every surface; and nothing withheld indefinitely.
+Only the routing holds today, the write gate holds in part, and the rest are
+not built or not claimed. Below them sit the pattern rules, which are best
+effort and say so. Every known way output gets past the redactor, or is masked
+when it should not be, is in SECURITY.md's residual register with the issue it
+is filed as. `read_output(redact: false)` and `holdfast logs --raw` are the
+audited ways to raw bytes; SECURITY.md names the unaudited ones too.
+
+**No release carries binaries yet.** `v0.0.5` to `v0.0.7` were published
+with source only. Since then a release's binaries are attached to a draft,
+and a draft's assets are not served until it is promoted. The plugin installs
+and then says so (see Distribution).
+
+**On Windows the MCP server starts, and that is close to the whole of it.**
 `holdfast mcp` serves MCP over stdio in-process and writes the §9.4 audit
 trail, and `version` works. There is no daemon, so sessions end with the
 process and the daemon-backed subcommands refuse by name rather than
@@ -37,61 +54,131 @@ idempotent and on this platform that is its only case. The PTY layer itself is
 still unported (ConPTY, below), so "the server serves" is a smaller claim than
 "the tools work", and the Windows section is where the difference is listed.
 
-**`attach` shipped in 0.0.6** and this line said otherwise until
-0.0.7 — the README has opened with it as a shipped property the whole time,
-so the two files disagreed about the same feature. See the README for the accurate current surface and
-[SECURITY.md](./SECURITY.md) for what that means in practice.
+## Next: 0.0.8 "Dowel"
 
-## Output processing
+**The fixes from the September dogfood pass, integrated and gated as one
+tree.** That pass drove `main` as a user would and filed what it found.
+Among the changes:
+- **Sessions start where the caller is.** A session gets the calling client's
+  working directory and environment rather than whichever client happened to
+  start the daemon ([#229](https://github.com/Sertelegger/holdfast/issues/229)).
+- **The shells Holdfast starts write no history under `$HOME`.** An operator
+  can keep one history file per session instead
+  ([#252](https://github.com/Sertelegger/holdfast/issues/252)).
+- **Private keys are masked on every read surface.** This includes the grid
+  and a `watch` that joins partway through a key, within the limits
+  SECURITY.md's register lists.
+- **Tool arguments are closed.** An unknown argument is refused rather than
+  ignored.
+- **Bursts no longer detach viewers.**
+- **Idle shells are hung up on `terminate`,** so it takes a fraction of a
+  second instead of five.
 
-**Redaction, and the ANSI stripper.** The largest gap between what Holdfast is
-designed to be and what it is. A gitleaks-derived redactor at **every** output
-boundary — tool results, the audit log, and every later boundary as it is added
-— plus a read-path ANSI stripper with holdback-aligned boundary rules and an
-`ansi: "raw"` escape hatch for callers that want the bytes.
+The CHANGELOG has the list.
 
-The stripper is a correctness fix as much as a cosmetic one: the tier-3 pattern
-table is specified against stripped text, so until it lands a coloured prompt
-scores 0 and the table's false-positive surface is wider than it is designed to
-be. The audit log arrives in the same group, which is also what turns the
-current Unix-seconds timestamps into RFC 3339.
+**0.0.8 is tagged as a draft and is not promoted.** The first release a user
+can install is the first one that also carries the next group.
 
-## Terminal state
+## Next: before the first promoted release
 
-**Tier B: full VT100 emulation.** Today's scanner is deliberately bounded — a
-state machine that allocates no grid and keeps a 512-byte tail line, so it can
-run on every chunk. A real screen model answers questions the tail line cannot:
-what the session *looks* like right now, where the cursor is, what a full-screen
-program is showing. It is also the foundation for anything that has to render a
-session to a human, so it comes before the attach and UI groups.
+**Promoting a draft is the first external distribution, and some changes are
+cheapest before it** — anything that breaks a config, a wire shape or an
+agent's expectations costs nothing while nobody depends on the old behaviour.
+This group is what has to be true before that step:
 
-## Daemon and control protocol
+- **Known values are masked.** A secret-named environment variable's value is
+  registered when the session starts, so `printenv GITHUB_TOKEN` returns a
+  marker rather than the token
+  ([#253](https://github.com/Sertelegger/holdfast/issues/253)). This is the
+  first source of the "known values" guarantee, and its scope — which names,
+  which values, which encodings, which surfaces — is published in SECURITY.md
+  with it.
+- **A narrower way past a mask than `redact: false`.** Today the only way to
+  read text behind a mask that might not be a secret returns everything raw,
+  including secrets the redactor had already caught. The plan is a
+  `redact: "complete_only"` read that keeps complete secrets, known values and
+  all private-key material masked and shows the rest. The tool descriptions
+  also need to say what `held_back` and `[REDACTED:unresolved]` mean and what
+  to try first.
+- **The live leaks in the register that an agent reaches with ordinary
+  commands.**
+  - A token that a colour escape joins to the word before it
+    ([#254](https://github.com/Sertelegger/holdfast/issues/254)).
+  - Key body in `prompt.last_line`
+    ([#257](https://github.com/Sertelegger/holdfast/issues/257)).
+- **Clients and daemons that disagree about the protocol say so.** A daemon
+  outlives upgrades by design. So a client that needs something an older
+  daemon lacks should refuse with "restart the daemon" rather than have the
+  argument silently dropped. The daemon also stops carrying the first client's
+  environment into sessions that do not take the caller's.
+- **Instruments.**
+  - Property tests that judge every read surface against a whole-stream
+    reference, so "does this change leak, over-mask, or make two surfaces
+    disagree" is a test result rather than a review argument. The residual
+    register is pinned by those tests.
+  - A per-session statistics record in the audit log.
+- **Config refusal and scope removals, if decided** (see Pending decisions).
 
-**Sessions that outlive the MCP process.** A persistent Unix-socket daemon with
-the stdio MCP server as a thin shim in front of it, so closing a client stops
-being the same event as killing every session. This is the single change that
-makes the tmux framing true rather than aspirational, and everything below
-depends on it.
+## After that
 
-## Attach protocol and CLI clients
+- **Nothing withheld indefinitely.**
+  - A label-keyed hold starts at the value, not the label.
+  - An idle, unfinished candidate is committed as a mask after a quiet
+    period, so a prompt such as `Enter password:` is shown
+    ([#255](https://github.com/Sertelegger/holdfast/issues/255)).
+  - Every surface commits what it holds when the session ends; `watch`
+    currently does not ([#256](https://github.com/Sertelegger/holdfast/issues/256)).
+  - Only once that commit ships on by default does the `tail_*` bypass of the
+    holdback go.
+- **The secret write gate uses the classifier's own test for a secret
+  prompt,** with a per-submission human override. Today it admits any
+  terminal with echo off, including an idle shell or REPL prompt, where the
+  secret is echoed, run as a command and saved to history
+  ([#262](https://github.com/Sertelegger/holdfast/issues/262)). The override
+  is what keeps prompts the stricter test would refuse, such as `ssh -t`,
+  working.
+- **The cheap performance fixes the measurements found:**
+  - ASCII word boundaries in the two generic rules
+    ([#206](https://github.com/Sertelegger/holdfast/issues/206));
+  - the quadratic in-flight scan
+    ([#163](https://github.com/Sertelegger/holdfast/issues/163));
+  - UTF-8-aware C1 handling;
+  - an O(1) ring buffer;
+  - dropping a finished session's screen model;
+  - moving the terminate and wait rescans off the async executor.
+  None of these depends on a redesign.
 
-**A human can look.** `holdfast attach`, `watch`, `list`, and `logs` (with
-`--raw`), talking the attach protocol to the daemon. The point is not
-convenience: an agent driving a shell that no human can see is the failure mode
-this project exists to avoid, and attach is what makes "what is the agent doing
-in there" answerable without reading a transcript.
+## Pending decisions
 
-## Secrets
+These are open. The analysis for each exists; the owner has not chosen.
 
-**Secret input that never crosses the MCP wire.** `request_secret_input`, with
-the value routed **client → daemon → PTY** and never through a tool argument or
-result: the agent learns that a secret was supplied, not what it was. Entry
-happens out of band in an attached client — a `SecretInput` frame for CLI
-attach, a masked field in the web UI.
+- **Scope for the first release.**
+  - **The candidates:**
+    - the dangerous-command preflight (Command safety, below);
+    - keychain bindings, profiles, approval and autofill;
+    - the web UI;
+    - data movement: file transfer, waiting on several sessions, recording;
+    - process-isolated PTYs;
+    - native Windows beyond the stdio server;
+    - the config keys that load and do nothing.
+  - **The second question is what "cut" means:**
+    - **deactivate**: the code stays and the feature is refused at config load;
+    - **remove**: the code is deleted and kept on an archive branch.
+  - Whatever is removed is removed before the first promoted release.
+- **A field week.** A week of real agent work routed through Holdfast, with
+  the questions and their thresholds written down beforehand. It asks:
+  - how often agents choose Holdfast over their built-in shell tool;
+  - how often a read carries `[REDACTED:unresolved]`;
+  - how often an agent escalates to a raw read, and after what.
 
-This is the group the current `AwaitingSecret` detection exists to serve.
-Detecting a password prompt and then having no way to answer it except
-`send_input` is half a feature.
+  Today every ranking behind this roadmap comes from constructed workloads.
+- **A per-session verdict ledger, or targeted fixes.** Several register rows
+  exist because each surface decides what to show over its own window. A
+  ledger that judges each byte once and has every surface render from it
+  would close those by construction. The other course is to keep fixing
+  rows one at a time and accept the few no targeted fix can close — keys
+  longer than 16 KiB, mostly — in the register. The choice waits for the
+  field week.
 
 ## Command safety
 
@@ -103,17 +190,11 @@ optional strict mode in which the agent receives a token and only a trusted
 client sees the code that authorises it, so approval is something a human does
 rather than something the agent can arrange.
 
-## Data movement
-
-**Bounded responses, and somewhere for bulk output to go.** A raw-byte budget on
-`read_output` responses with bulk output delivered as MCP resources rather than
-inline, so a chatty build cannot consume the agent's context, and the tools that
-mean an agent no longer has to poll — `wait_for_pattern`, `interrupt`, `resize`.
-**All three shipped**, and `wait_for_pattern`'s `pattern` became optional in
-0.0.7 so the "has it finished?" question is answered from the detector rather
-than from a regex against the operator's `$PS1`. This paragraph described
-them as unexposed until then, which is the shape of staleness a roadmap
-collects: it is written forward and read as a status.
+**Nothing of it is built, and it is a candidate for cutting** (Pending
+decisions). The case against it is that Claude Code's own permission prompts
+and `PreToolUse` hooks already see every `start_session` and `send_input`
+call, and a strict mode an agent can satisfy from a second session is not the
+barrier it reads as.
 
 ## Web UI
 
@@ -123,6 +204,10 @@ explicit `holdfast ui` command, with bearer-token auth and `Origin`/`Host`
 validation. The default has to stay "not reachable from the network", because a
 web view of a shell an agent is typing into is exactly the thing that must not
 be accidentally exposed.
+
+**Deferred past the first release, pending the scope decision.** `attach` and
+`watch` already give the human a view. The `[ui]` config keys load today and
+do nothing.
 
 ## Session panel
 
@@ -141,7 +226,8 @@ how often, which **profile** a session was launched from — or that it was
 agent-authored `command`/`args` and therefore can never receive a credential
 (§9.6) — and what is pending a strict-mode confirmation. Ranking sessions by
 *needs a human* is a different product from tiling terminals, and it is the one
-that follows from what holdfast already knows.
+that follows from what holdfast already knows. Some of those rows depend on
+features in the scope decision above.
 
 Surface is undecided and deliberately so: the `attach`/`watch` TUI, the web UI,
 or one model rendered by both. The state is specified and shipped; only the view
@@ -153,23 +239,18 @@ is missing, which is why this is a design question rather than a detection one.
 signal semantics are genuinely different, not a port of `killpg`), and
 stdio-only mode where the hybrid daemon does not apply.
 
-**It no longer starts from a red build, and this paragraph has been wrong in
-both directions.** `windows-cross` — the `x86_64-pc-windows-gnu` clippy job —
-was red on `main` from before 0.0.6 with 0 passes in its last 20 runs, while
-this file claimed the tree was "kept compiling and clippy-clean" for that
-target. [#19](https://github.com/Sertelegger/holdfast/issues/19) fixed it, and
-this paragraph then overstated *how* by one word: **27 of the 31 errors were
-in the daemon subsystem** — the subsystem this milestone already says does not
-exist on Windows — and the remaining **four were not**, three in `config.rs`
-(`std::os::unix` twice, `libc::O_NONBLOCK` once, all in the mode-bit trust
-check) and one in `protocol/client.rs` (`tokio::net::UnixStream`). The
-correction does not change the conclusion, because all four are the same
-`#[cfg]` class, and `#[cfg(unix)]` was still the whole of the work — but "all
-in one subsystem" is the sentence that licensed compile-gating over porting,
-so the universal is left on the record rather than silently narrowed. Counts
-re-measured at `origin/main` on 2026-09-03 from `cargo clippy --lib -p
-holdfast-core --target x86_64-pc-windows-gnu --message-format json`, attributed
-by each error's primary span. The tree now cross-compiles
+**Whether the first release supports native Windows at all is part of the
+scope decision.** The alternative is WSL only, with the Windows assets and
+bootstrap refusing and pointing at WSL. What would be missing today is listed
+below. Reading the code, a native session's `interrupt` and `terminate`
+cannot signal its child, and no test starts one.
+
+**The tree compiles and lints clean for Windows.** `windows-cross` — the
+`x86_64-pc-windows-gnu` clippy job — was red on `main` from before 0.0.6
+until [#19](https://github.com/Sertelegger/holdfast/issues/19) fixed it: 27 of
+the 31 errors were in the daemon subsystem, which this section already says
+does not exist on Windows, and the other four were the same `#[cfg(unix)]`
+class in `config.rs` and `protocol/client.rs`. The tree now cross-compiles
 clippy-clean, a `windows-2022` job runs native MSVC clippy and executes the
 CLI's Windows arms, and `holdfast mcp` serves stdio in-process there with an
 audit trail.
@@ -199,40 +280,41 @@ a port rather than a `#[cfg]`:
 ## Distribution
 
 **Something a user can install.** Prebuilt per-platform binaries on GitHub
-Releases, `cargo install`, and a Claude Code plugin marketplace with a bootstrap
-launcher that fetches the right binary on demand.
+Releases, and a Claude Code plugin marketplace with a bootstrap launcher that
+fetches the right binary on demand. `cargo install` builds from source; the
+README no longer recommends it as the way in.
 
-**The plugin half of that now exists and the binary half does not**, which is
-the whole of what is left here. `/plugin marketplace add Sertelegger/holdfast`
-then `/plugin install holdfast@holdfast` installs — measured — and the
-bootstrap it installs then fails with a message naming the manual install,
-because no *published* release carries binaries or a `SHA256SUMS.txt`. This
-paragraph read "`release.yml` attaches none on purpose", which stopped being
-true at #198: it builds five and attaches them, **to a draft**, and a draft's
-assets are not served from `releases/download/`. The purpose the sentence was
-reaching for survives the correction — promoting that draft is the
-first-external-distribution event, not a side effect of writing release
-notes. So the remaining work is one
-decision and the assets that follow it, not more plugin code. Windows is the
-one part of the plugin that is genuinely unfinished rather than waiting —
-`.mcp.json` has a single `command` string and no platform conditional, so the
-entrypoint shape shipped there is a hypothesis nobody has been able to run.
+**The plugin half exists and the binary half waits on one decision.**
+`/plugin marketplace add Sertelegger/holdfast` then `/plugin install
+holdfast@holdfast` installs, and the bootstrap it installs then fails with a
+message naming the manual and from-source routes, because no *promoted*
+release carries binaries or a `SHA256SUMS.txt`. `release.yml` builds five and
+attaches them to a **draft**, and a draft's assets are not served from
+`releases/download/`. Promoting that draft is the first-external-distribution
+event, not a side effect of writing release notes. It happens for the first
+release that carries the group above, not for 0.0.8. Once a release is
+promoted, the marketplace listing is pinned to it. Windows is the one part of
+the plugin whose entrypoint shape nobody has been able to run, which the
+Windows decision above settles one way or the other.
 
 ## Beyond the first release
 
 - **Process-isolated PTYs.** The `PtyBackend` trait exists so the isolation
   model can change without touching session logic; `InProcessPty` is the only
   implementation today. A `SubprocessPty` that puts each session in its own
-  process is the priority follow-up — an in-process PTY means one session's
-  pathology is the whole server's, which is a lesson already paid for once (see
-  the wedged-writer fix in the changelog).
+  process would keep one session's pathology from becoming the whole server's
+  (see the wedged-writer fix in the changelog). Its groundwork — the frame
+  catalogue and a per-session worker socket — is in the tree. It predates
+  several changes to the trait and to how a session's environment is built,
+  so it resumes only after those reach the seam. Whether it stays in scope is
+  tied to the Windows decision, because native Windows is what made it urgent.
 - **Full process-group enumeration on the BSDs.** macOS is done — it enumerates
   via `proc_listallpids` plus `getsid(2)`, which yields the same predicate Linux
-  reads out of `/proc/<pid>/stat`. It is **not** `sysctl(KERN_PROC_SESSION)`,
-  which this roadmap named until somebody tried the call: XNU registers no such
-  OID and answers `ENOENT`, `kinfo_proc`'s `e_sess` is NULL on every process,
-  and libc does not declare `kinfo_proc` for Apple at all. On the remaining BSDs
-  `terminate` can still leave a background job in a third process group behind.
+  reads out of `/proc/<pid>/stat`. It is **not** `sysctl(KERN_PROC_SESSION)`:
+  XNU registers no such OID and answers `ENOENT`, `kinfo_proc`'s `e_sess` is
+  NULL on every process, and libc does not declare `kinfo_proc` for Apple at
+  all. On the remaining BSDs `terminate` can still leave a background job in a
+  third process group behind.
 - **Signed and notarized macOS builds, and an Authenticode-signed Windows
   binary.** The first release ships unsigned. The plugin's bootstrap downloads
   with `curl`, which sets no quarantine attribute, so the install path most
@@ -245,9 +327,11 @@ entrypoint shape shipped there is a hypothesis nobody has been able to run.
 
 ## Principles
 
-- **Never claim protection that has not shipped.** Output is raw today and the
-  README, the MCP server's own `instructions` string, and
-  [SECURITY.md](./SECURITY.md) all say so. An overstated capability reads as a
+- **Never claim protection that has not shipped.** Output is redacted by
+  default, and SECURITY.md says clause by clause which guarantees hold today,
+  which are partial and which are not built, with every known gap in its
+  register. The README, the MCP server's own `instructions` string and
+  SECURITY.md say the same thing. An overstated capability reads as a
   guarantee and is not one.
 - **Tell the agent how it knows.** `detection_tier` exists so a measurement is
   distinguishable from a guess. Any new signal ships with the same honesty about
@@ -255,5 +339,7 @@ entrypoint shape shipped there is a hypothesis nobody has been able to run.
 - **The human keeps a way in.** Attach, watch, and the UI are not conveniences
   layered on top; a shell an agent can drive and a human cannot observe is the
   thing this project is trying not to build.
-- **Design before build.** Each group gets its own brainstorm/spec/plan cycle.
-  This file tracks direction, not commitments.
+- **Evidence before structure.** A redesign has to be justified by measured
+  failures on real use, not by the count of edge cases a review can construct.
+- **Design before build.** Each group gets its own design pass before it is
+  built. This file tracks direction, not commitments.
