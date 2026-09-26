@@ -445,13 +445,27 @@ pub const NULL_DEVICE: &str = "nul";
 ///   prints *failed to write history file* at every exit when an rc set
 ///   `SAVEHIST` and left `HISTFILE` empty, and bash prints *history: :
 ///   cannot create* at every prompt when an rc's `PROMPT_COMMAND` runs
-///   `history -a`. Neither shell writes through a temporary file beside a
+///   `history -a`. bash never writes through a temporary file beside a
 ///   `HISTFILE` that is not a regular file: as uid 0 in a user namespace,
 ///   with the real `/dev/null` bind-mounted into a writable directory,
-///   bash's exit, `SIGHUP`, `history -w`, `history -a` and
-///   `HISTFILESIZE=1`, and zsh's exit and `SIGHUP` under `SAVEHIST`,
-///   `inc_append_history`, `share_history` and `no_hist_save_by_copy`,
-///   left it a character device with nothing created beside it.
+///   its exit, `SIGHUP`, `history -w`, `history -a` and `HISTFILESIZE=1`
+///   left it a character device with nothing created beside it, as did
+///   zsh's exit and `SIGHUP` under `SAVEHIST` with its default
+///   `append_history`, `inc_append_history`, `share_history` and
+///   `no_hist_save_by_copy`.
+///
+///   **zsh with `SAVEHIST` set has two exceptions of its own, and the
+///   snippet is what closes them.** Before it saves, zsh locks by creating
+///   `/dev/null.LOCK`: as any user but root that fails, and zsh prints
+///   *locking failed for /dev/null: permission denied* at every exit, EOF
+///   and `exec zsh` under an rc that sets `SAVEHIST` — macOS's
+///   `/etc/zshrc` and oh-my-zsh do. As root it succeeds, and under
+///   `unsetopt append_history` zsh's default `hist_save_by_copy` writes
+///   `/dev/null.new` and renames it over `/dev/null`, leaving a regular
+///   `0666` file of the agent's commands (simulated as uid 0 in a user
+///   namespace). So the snippet's `/dev/null` branch also sets `SAVEHIST=0`,
+///   under which zsh saves nothing, and unsets `hist_save_by_copy` for an
+///   rc re-sourced later that sets `SAVEHIST` again.
 /// - **[`HISTFILE_CARRIER`]**, for the snippet, whose own `HISTFILE`
 ///   assignment is what overrides an rc file that hard-sets one. It
 ///   carries a `HISTFILE` the call set itself, so that choice survives

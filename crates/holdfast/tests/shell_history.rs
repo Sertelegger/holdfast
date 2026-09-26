@@ -32,6 +32,9 @@
 //!   reaches only through the environment;
 //! - tcsh with a `savehist` rc, for the endings Holdfast brings about.
 //!
+//! A zsh whose history goes nowhere must also say nothing about it at exit,
+//! which is `zsh_ends_without_a_history_error_under_an_rc_that_saves_history`.
+//!
 //! Every session gets its own `HOME`, and the assertion is over **every
 //! file** under it rather than over the names a shell is expected to use:
 //! a history written somewhere unexpected is the failure this exists for.
@@ -958,6 +961,57 @@ fn tcsh_is_never_hung_up_so_holdfast_ending_it_saves_nothing() {
             Ending::DaemonStop,
         ],
     );
+}
+
+/// Everything the session has printed, once it has stopped printing: the
+/// last of a shell's output can arrive after the shell has gone.
+fn settled_output(shim: &mut Shim, s: &Started) -> String {
+    let deadline = Instant::now() + SHELL_TIMEOUT;
+    let mut last = output(shim, s);
+    loop {
+        std::thread::sleep(Duration::from_millis(300));
+        let now = output(shim, s);
+        if now == last {
+            return now;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "{}: output never settled",
+            s.case.name
+        );
+        last = now;
+    }
+}
+
+/// A zsh whose history goes to `/dev/null` says nothing about it as it
+/// ends. Under an rc that sets `SAVEHIST`, zsh locks the history file
+/// before it saves by creating `/dev/null.LOCK`, which fails, and it
+/// printed *zsh: locking failed for /dev/null: permission denied* into the
+/// output at `exit` and at EOF. The snippet's `SAVEHIST=0` is what stops it
+/// saving at all.
+#[test]
+#[ignore = "needs ZSH-SNIPPET-CHANGE"]
+fn zsh_ends_without_a_history_error_under_an_rc_that_saves_history() {
+    let cases = available(&[BASH_AND_ZSH[4]]);
+    let Some(case) = cases.first().copied() else {
+        return;
+    };
+    assert_eq!(case.name, "zsh-omz");
+    let inst = Instance::new("zsh-quiet");
+    let mut shim = Shim::launch(&inst);
+    for how in [Ending::Exit, Ending::Eof] {
+        let s = start(&inst, &mut shim, case, &format!("Quiet{how:?}"));
+        let before = output(&mut shim, &s).len();
+        end(&mut shim, &s, how);
+        let out = settled_output(&mut shim, &s);
+        let ending = out.get(before..).unwrap_or(&out);
+        assert!(
+            !ending.contains("zsh:"),
+            "{} / {how:?}: zsh complained as it ended: {ending:?}",
+            case.name
+        );
+    }
+    shim.kill();
 }
 
 /// The per-session rows beyond `BASH_AND_ZSH`'s, each with the ending
