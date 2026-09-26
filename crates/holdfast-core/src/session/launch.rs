@@ -465,7 +465,10 @@ pub const NULL_DEVICE: &str = "nul";
 ///   `0666` file of the agent's commands (simulated as uid 0 in a user
 ///   namespace). So the snippet's `/dev/null` branch also sets `SAVEHIST=0`,
 ///   under which zsh saves nothing, and unsets `hist_save_by_copy` for an
-///   rc re-sourced later that sets `SAVEHIST` again.
+///   rc re-sourced later that sets `SAVEHIST` again. `exec zsh` and a
+///   nested zsh run their rc with neither, so the message comes back there,
+///   and as root they replace `/dev/null` as before; SECURITY.md registers
+///   both.
 /// - **[`HISTFILE_CARRIER`]**, for the snippet, whose own `HISTFILE`
 ///   assignment is what overrides an rc file that hard-sets one. It
 ///   carries a `HISTFILE` the call set itself, so that choice survives
