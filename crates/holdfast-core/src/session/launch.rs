@@ -350,6 +350,41 @@ pub const HISTFILE_CARRIER: &str = "HOLDFAST_HISTFILE";
 /// nothing a user is likely to type. See [`history_defaults`].
 pub const ZSH_HISTORY_IGNORE: &str = "*HOLDFAST_SHELL_INTEGRATION*";
 
+/// History a session's other interactive programs would keep under
+/// `$HOME`, switched off (GH #252). Each measured through a PTY with a
+/// fresh `HOME`, against a control run without it that wrote the file:
+///
+/// | Variable | Program, version measured |
+/// |---|---|
+/// | `MYSQL_HISTFILE=/dev/null` | MariaDB client 15.1 (10.11) and Oracle `mysql` 8.0 |
+/// | `PSQL_HISTORY=/dev/null` | psql 16 |
+/// | `NODE_REPL_HISTORY=` (empty) | node 22 |
+/// | `SQLITE_HISTORY=/dev/null` | sqlite3 3.45 |
+/// | `PYTHON_HISTORY=/dev/null` | Python 3.13, PyREPL and basic REPL |
+/// | `SHELL_SESSIONS_DISABLE=1` | macOS Terminal's per-session history; not measured |
+///
+/// **Python 3.12 and older ignore `PYTHON_HISTORY`** and still write
+/// `~/.python_history` (measured on 3.12.3); nothing in the environment
+/// reaches them. An empty `PYTHON_HISTORY` would not do either: 3.13 reads
+/// an empty value as unset. sqlite3 finds its default file through the
+/// password database rather than `$HOME`, so a session's own `HOME` does
+/// not move it, and only the variable keeps it off disk.
+///
+/// `SHELL_SESSIONS_DISABLE` is Apple's documented off switch for
+/// `/etc/zshrc_Apple_Terminal` and `/etc/bashrc_Apple_Terminal`, which save
+/// each Terminal window's history under `~/.zsh_sessions/` or
+/// `~/.bash_sessions/` whatever `HISTFILE` says. A session inherits
+/// `TERM_PROGRAM=Apple_Terminal` from a daemon started in Terminal (GH
+/// #229), so it is set everywhere; nothing else reads it.
+pub const CLIENT_HISTORY_DEFAULTS: [(&str, &str); 6] = [
+    ("MYSQL_HISTFILE", "/dev/null"),
+    ("PSQL_HISTORY", "/dev/null"),
+    ("NODE_REPL_HISTORY", ""),
+    ("SQLITE_HISTORY", "/dev/null"),
+    ("PYTHON_HISTORY", "/dev/null"),
+    ("SHELL_SESSIONS_DISABLE", "1"),
+];
+
 /// The shell-history policy, as environment (GH #252).
 ///
 /// Without one, a session's shell wrote the agent's commands — and any
@@ -393,6 +428,10 @@ pub const ZSH_HISTORY_IGNORE: &str = "*HOLDFAST_SHELL_INTEGRATION*";
 ///   pattern matches only lines that name the snippet's guard variable,
 ///   so a history file zsh rewrites keeps every other line (measured).
 ///
+/// - **[`CLIENT_HISTORY_DEFAULTS`]**, for the REPLs and database clients
+///   that keep a history file of their own, in either mode: they are not
+///   the shell history a per-session file records.
+///
 /// With shell integration off only this environment applies, so an rc
 /// file that assigns `HISTFILE` itself wins for bash and zsh.
 pub fn history_defaults(
@@ -417,6 +456,7 @@ pub fn history_defaults(
         ("HISTORY_IGNORE", ZSH_HISTORY_IGNORE),
     ]
     .into_iter()
+    .chain(CLIENT_HISTORY_DEFAULTS)
     .filter(|(k, _)| set_by_caller(k).is_none())
     .map(|(k, v)| (k.to_string(), v.to_string()))
     .collect()
@@ -681,12 +721,19 @@ mod tests {
                 ("HOLDFAST_HISTFILE", ""),
                 ("fish_history", ""),
                 ("HISTORY_IGNORE", "*HOLDFAST_SHELL_INTEGRATION*"),
+                ("MYSQL_HISTFILE", "/dev/null"),
+                ("PSQL_HISTORY", "/dev/null"),
+                ("NODE_REPL_HISTORY", ""),
+                ("SQLITE_HISTORY", "/dev/null"),
+                ("PYTHON_HISTORY", "/dev/null"),
+                ("SHELL_SESSIONS_DISABLE", "1"),
             ])
         );
         let explicit = pairs(&[
             ("GIT_PAGER", "less"),
             ("PWD", "/elsewhere"),
             ("fish_history", "work"),
+            ("PYTHON_HISTORY", "/tmp/py"),
         ]);
         let keys: Vec<String> = session_defaults(Some("/b"), History::Discard, &explicit)
             .into_iter()
@@ -700,7 +747,12 @@ mod tests {
                 "SYSTEMD_PAGER",
                 "HISTFILE",
                 "HOLDFAST_HISTFILE",
-                "HISTORY_IGNORE"
+                "HISTORY_IGNORE",
+                "MYSQL_HISTFILE",
+                "PSQL_HISTORY",
+                "NODE_REPL_HISTORY",
+                "SQLITE_HISTORY",
+                "SHELL_SESSIONS_DISABLE"
             ]
         );
         // No directory, no `PWD` to set.
