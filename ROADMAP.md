@@ -132,8 +132,11 @@ This group is what has to be true before that step:
     holdback go.
 - **The secret write gate uses the classifier's own test for a secret
   prompt,** with a per-submission human override. Today it admits any
-  terminal with echo off. That waits on an end-to-end measurement of what it
-  admits and what the stricter test would cost under `ssh -t`.
+  terminal with echo off, including an idle shell or REPL prompt, where the
+  secret is echoed, run as a command and saved to history
+  ([#262](https://github.com/Sertelegger/holdfast/issues/262)). The override
+  is what keeps prompts the stricter test would refuse, such as `ssh -t`,
+  working.
 - **The cheap performance fixes the measurements found:**
   - ASCII word boundaries in the two generic rules
     ([#206](https://github.com/Sertelegger/holdfast/issues/206));
