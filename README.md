@@ -28,7 +28,11 @@ this heading while describing `main`, which is a claim about `v0.0.7` that
 - `request_secret_input` — ask for a password without ever holding one. The
   value is typed by an attached human or resolved by a configured provider
   and goes straight to the PTY; the agent gets back a status and a byte
-  count, never the secret
+  count, never the secret. That is true of the tool's result, not of the
+  session's output: if the program prints the value, or a shell's line
+  editor draws it because it arrived while the shell sat at its prompt, only
+  the pattern rules stand between it and the agent (G3 in
+  [SECURITY.md](https://github.com/Sertelegger/holdfast/blob/main/SECURITY.md))
 - `read_output` — read what it printed, using a cursor you carry between
   calls; escape sequences stripped and secrets replaced with
   `[REDACTED:<kind>]` markers by default
@@ -80,7 +84,10 @@ session's output, where the agent reads it; so Holdfast refuses that write and
 tells you why rather than delivering it. `holdfast attach --allow-echo` sends it
 anyway, for the programs that ask for a code or an API key without ever clearing
 echo — the value is still masked on your own terminal, and it will still appear
-in the session's output. `request_secret_input`, the tool an agent calls to *ask* for that
+in the session's output. Echo off is not proof of a password prompt, though: a
+shell's line editor turns echo off too and draws what it is given, so a value
+sent while a shell sits at its prompt passes that test and lands in the output
+(G3 in SECURITY.md). `request_secret_input`, the tool an agent calls to *ask* for that
 password, ships in 0.0.7 and is one of the twelve above. It was not: this
 sentence said twelve while the list above it enumerated eleven, and
 `request_secret_input` — the tool the sentence is about — was the one it
@@ -510,7 +517,9 @@ more, the assertion simply runs and the census says so.
   standards this project actually enforces
 - [SECURITY.md](https://github.com/Sertelegger/holdfast/blob/main/SECURITY.md) — what is in scope. Holdfast runs commands on your
   machine by design, so the interesting surface is the machinery around that:
-  detection, signals, and the redactor that now runs at every output boundary.
+  detection, signals, and the redactor, which stands between a session's
+  output and every agent- and observer-facing surface except the raw paths
+  SECURITY.md names.
 
 The design specification and the per-milestone implementation plans are kept
 as the author's working documents and are not part of this repository. The

@@ -18,12 +18,12 @@ v0.0.0`, because it has no binaries"*. Those two were published by hand.
 **The paragraph above used to describe the workflow rather than the
 artifacts, and two of those descriptions are now false.** It said
 "`release.yml` creates the release and uploads nothing" and "no workflow can
-repeat it — the release workflow has no such step". Both were true when #161
+repeat it — the release workflow has no such step". Both were true when GH #161
 wrote them on 2026-09-14. Two consecutive merges four days later took out one
 clause each:
 
 - **`release.yml` builds five platform binaries and a `SHA256SUMS.txt` and
-  attaches them** (#198). It attaches them to a **draft**, and a draft's
+  attaches them** (GH #198). It attaches them to a **draft**, and a draft's
   assets are not served from `releases/download/vX.Y.Z/` — so nothing has
   reached anyone, but the *reason* has changed. It is no longer that nothing
   is built; it is that promoting a draft is a human running
@@ -32,7 +32,7 @@ clause each:
   three releases above carry no assets and why there is no draft sitting
   there to promote.
 - **`release.yml` carries a `cargo publish --workspace --locked`** in a
-  `crates-io` job (#197). It is gated on a `CARGO_REGISTRY_TOKEN` repository
+  `crates-io` job (GH #197). It is gated on a `CARGO_REGISTRY_TOKEN` repository
   secret that does not exist, so today it prints why it stopped and exits
   green, and nothing is uploaded. But the barrier moved from *no code path
   exists* to *a secret is unset* — and a secret is set in the GitHub UI, with
@@ -49,8 +49,8 @@ the promotion step, are how `release.yml` keeps that moment an act somebody
 takes; its header carries the argument in full.
 
 This section said "nothing is tagged, nothing is on crates.io, and no binaries
-are distributed" from 0.0.3 until #161. Only the third clause was still true
-by then — and #161's replacement for it was false four days later. Both
+are distributed" from 0.0.3 until GH #161. Only the third clause was still true
+by then — and GH #161's replacement for it was false four days later. Both
 rewrites went wrong the same way, by describing the machinery instead of the
 artifacts, which is why this paragraph now says what exists and leaves what
 `release.yml` does to `release.yml`. `CONTRIBUTING.md`'s release procedure
@@ -113,14 +113,17 @@ not a protection.
 
 - **Surface**: any way a session's output leaves Holdfast. That includes an
   MCP tool result, the `holdfast://session/…/buffer` resource, `holdfast
-  logs`, a `holdfast watch` stream, and the audit log.
+  logs`, a `holdfast watch` stream, the audit log, and the daemon's own log.
 - **Rule**: one entry in the vendored rule set
   (`crates/holdfast-core/data/redaction_default.toml`, 55 rules), describing
   one secret shape. A match is replaced with `[REDACTED:<kind>]`, where
   `<kind>` names the rule.
-- **Label-keyed rule**: a rule that finds a value by the label in front of it
-  (`password=…`, `API_KEY: …`), rather than by the value's own shape. These
-  rules need a value of at least 8 bytes.
+- **Label-keyed rule**: a rule that finds a value by the label or flag in
+  front of it (`password=…`, `API_KEY: …`, `mysql -p…`), rather than by the
+  value's own shape. The two broadest, `generic-secret-assignment` and
+  `secret-key-assignment`, need a value of at least 8 bytes. The others set
+  lengths of their own, down to a single byte for `mysql-cli-password` and
+  `registry-login-password`.
 - **The redactor**: the code that applies the rules to output before a
   surface emits it.
 - **In flight**: text at the end of the output so far that could still become
@@ -135,13 +138,15 @@ not a protection.
 
 #### The contract: guarantees and best effort
 
-**Tier 1: guarantees.** Each is stated with its status today.
+**Tier 1: what Holdfast is built to guarantee.** Today only G1 holds, and
+only with the raw paths it names. G3 holds in part, G2 and G4 are not built,
+and G5 is not claimed. Each row states its status.
 
 | Clause | What it promises | Status today |
 |---|---|---|
 | **G1. Routing** | Every byte that reaches an agent or an observer comes from the redactor, except through the raw paths named below. | **Holds**, with the raw paths listed under G1. |
 | **G2. Known values** | A secret whose exact value Holdfast knows is masked wherever it appears, within a published scope. | **Not built.** Known gap: `printenv`. |
-| **G3. Write gate** | Holdfast writes a secret into a session only at a real secret prompt, or on a human's explicit override. | **Partial.** The gate admits any terminal with echo off, which includes an idle shell prompt. |
+| **G3. Write gate** | Holdfast writes a secret into a session only at a real secret prompt, or on a human's explicit override. | **Partial.** The gate admits any terminal with echo off, which includes an idle shell prompt (GH #262). |
 | **G4. One verdict per byte** | Once Holdfast has decided whether a byte is shown or masked, every surface and every later read give the same answer. | **Not built.** Each read decides on its own. |
 | **G5. Bounded withholding** | Nothing is withheld indefinitely. | **Not claimed.** One indefinite hold is known. |
 
@@ -176,25 +181,42 @@ The surfaces do not apply the redactor equally:
   `send_input(wait_for:)` return all share one pipeline
   (`Session::read_processed`).
   - **The window.** Matching runs over a window from 512 bytes before the
-    requested range to 8192 bytes past its cap. It covers the raw bytes and
-    every text stream the read can emit.
+    requested range to 8192 bytes past its cap. Those are the defaults of
+    `redaction_lookbehind_bytes` and `redaction_lookahead_bytes` in the
+    `[limits]` config section. The window covers the raw bytes and every
+    text stream the read can emit.
   - **Straddling secrets.** A secret that straddles the start of a page is
-    found if it begins within those 512 bytes. One that straddles the end is
-    found if it ends within those 8192.
+    found if it begins within the lookbehind. One that straddles the end is
+    found if it ends within the lookahead. A token longer than the
+    lookbehind, such as a 1 KB JWT, is missed by a read that begins more
+    than the lookbehind into it (R18).
+  - **The lookbehind is not checked to be nonzero.** Set to 0, a read finds
+    no secret that straddles the start of its page (GH #171).
   - **Private keys** are kilobytes long, so they get a longer reach. A
-    complete key that opens up to 16 KiB (`UNVOUCHED_CARRY_BYTES`) behind the
-    window is found as well.
+    complete key whose header lies up to 16 KiB (`UNVOUCHED_CARRY_BYTES`, a
+    constant) before the first requested byte is found as well.
   - **Outside the reach.** A longer match, or one that opens further back, is
     outside it; see the [register](#residual-register).
   - **Withholding.** A cursor read also withholds in-flight text at the end of
     the output.
 - **The observer stream** behind `holdfast watch` (attach role `Observer`).
-  - It runs the same rules over the same set of text streams, with 512 bytes
-    of lookbehind and up to 8 KiB carried between PTY reads.
-  - It withholds in-flight text in the same way.
-  - A viewer that joins part way through is seeded from the 16 KiB before its
-    join point, so it judges the stream as a viewer that had watched from the
-    start would.
+  - It runs the same rules over the same set of text streams, with the same
+    lookbehind (512 bytes by default).
+  - After a private-key header whose block did not close, it keeps that
+    header for up to 16 KiB, to recognise key-body lines that follow it.
+  - It holds back in-flight text, carrying up to 8 KiB between PTY reads.
+    If more than that is still unresolved at the end of a read, it sends one
+    `[REDACTED:unresolved]` and drops what it held. It then drops all output
+    until a PTY read ends with nothing in flight in the last 16 KiB, and
+    drops that read too (R17). Dropped output is never sent to the viewer;
+    it stays in the session's buffer for a cursor read.
+  - At the end of a session it sends what it still holds, up to 8 KiB, with
+    complete matches masked. An unfinished private key is masked; any other
+    partial secret is sent in the clear (R6).
+  - A viewer that joins part way through is seeded from up to 16 KiB before
+    its join point (less if the session's buffer no longer holds it), so it
+    judges the stream much as a viewer that had watched from the start
+    would.
   - Its opening picture is the masked screen.
 - **`get_screen_state`** masks the rendered grid:
   - complete matches over the joined rows;
@@ -242,11 +264,19 @@ or reveals something about output the redactor masked:
    - Each call writes a `redaction_disabled` audit entry naming the session,
      the tool and the kind of client, with a running count. The entry records
      no range and no content.
+   - The daemon does not start without its audit log. `holdfast mcp
+     --no-daemon` starts without one if it cannot open it, and then records
+     nothing. On either, a write that fails later is reported once as a
+     diagnostic, and the read goes ahead.
    - It is audited, not gated.
-   - A withheld partial has to be reachable somehow, and this is the way.
+   - A withheld partial has to be reachable somehow. This is one way; a tail
+     read is the other.
 3. **`tail_bytes` and `tail_lines` reads skip the in-flight withhold.**
-   - A tail read returns in-flight text from the last 512 bytes as far as it
-     has arrived. Every complete match, and every other mask, still applies.
+   - A tail read returns in-flight text that starts in the last 512 bytes
+     (the default of `partial_secret_scan_bytes`) as far as it has arrived.
+   - Every complete match that begins within the lookbehind before the
+     read's start, and every other mask, still applies. A token longer than
+     the lookbehind, which began further back, comes back in part (R18).
    - A tail read that passes `apply_holdback: true` keeps the withhold.
      `holdfast logs --tail` always passes it.
 4. **`wait_for_pattern` and `send_input(wait_for:)` match the agent's
@@ -259,6 +289,11 @@ or reveals something about output the redactor masked:
    - Unlike `redact: false`, this is not audited.
    - Measured: by matching one character class at a time, an agent recovered
      a masked 40-character token in about two hundred calls.
+   - A token longer than the lookbehind takes one call. `match.text` is
+     redacted over a window of its own, which starts one lookbehind before
+     the match. So a match that begins further than that into the token
+     returns that part of it raw, while the same response's
+     `output_since_start` masks it (R18).
    - Redaction guards against accidental disclosure. It is no barrier to an
      agent that sets out to read a secret, which `redact: false` would hand
      over anyway.
@@ -273,6 +308,10 @@ or reveals something about output the redactor masked:
    - its `spawn_failed` error echoes the command;
    - `resources/list` labels each session with its command (GH #175);
    - a session's `name` is shown verbatim everywhere.
+7. **Raw offsets.** `cursor`, `next_cursor`, `bytes_returned`,
+   `match.offset` and `get_command_history`'s output spans count raw bytes.
+   Set beside the text a read returns, they disclose how long each masked
+   region is.
 
 **Outside Holdfast.** Holdfast redacts only what an agent reads *through
 Holdfast*:
@@ -291,7 +330,8 @@ rule only.
   `request_secret_input` or one a provider resolves, is protected by never
   being placed where a surface reads.
 - It travels in a type that cannot be serialised or copied, is zeroed when
-  dropped, and reaches nothing but the PTY write.
+  dropped, and reaches nothing but the PTY write. Some transient copies on
+  the way in are not zeroed yet (GH #82 to GH #86).
 - If the child then prints it, only the pattern rules stand between it and
   the agent.
 
@@ -354,11 +394,16 @@ submitted while a shell sits idle at its prompt passes the gate. Then:
    arrives;
 3. it can be saved to the shell's history.
 
+This is measured end to end for bash, zsh and the Python REPL, on both write
+paths, in GH #262. On the provider path, with a binding that asks for no
+confirmation, no human takes part at all.
+
 The classifier that reports `interaction_mode: AwaitingSecret` already asks a
 stricter question: echo off, the terminal still in canonical (line-at-a-time)
 mode, and no bracketed paste (`crates/holdfast-core/src/detect/detector.rs`).
-The write gate does not use it. Using the classifier's predicate, with a
-per-submission override for the human, is proposed and not yet decided.
+The write gate does not use it. The planned fix is for the gate to use the
+classifier's predicate, with a per-submission override for the human
+(GH #262).
 
 **The human override.** `holdfast attach --allow-echo` skips the echo test
 for that connection:
@@ -393,8 +438,9 @@ made. So:
   was not a secret. That is by design.
 
 The register lists the measured cases. A design in which each byte is judged
-once, and every surface renders that single verdict, is under consideration
-and not decided.
+once, and every surface renders that single verdict, would close them by
+construction. Whether to build it, or to go on fixing cases one at a time, is
+an open question in [ROADMAP.md](./ROADMAP.md).
 
 #### G5. Bounded withholding: not claimed
 
@@ -407,13 +453,14 @@ and not decided.
 - `holdfast watch` does the opposite at the end of a session: it releases
   what it was still holding (R6 in the register).
 
-A bound for this is proposed and not built: mask such text once the session
-has been quiet for a set time, and at exit.
+A bound is planned and not built: mask such text once the session has been
+quiet for a set time, and at exit.
 
 **Known indefinite hold.** A prompt that ends in a secret label with no value
 after it, printed by a program waiting on input, is held.
 - In bash, `printf 'Enter password:'; read -r x` leaves every cursor read
-  stopped before `Enter password:`, for as long as the program waits, with:
+  stopped at `password:` (the read ends at `Enter `), for as long as the
+  program waits, with:
   - `held_back: true`;
   - `prompt.last_line` empty;
   - `interaction_mode: Executing`.
@@ -445,9 +492,9 @@ claim to catch:
 - **A secret with no recognisable shape and no label.** Examples are a
   passphrase such as `correct horse battery staple`, or a password printed on
   its own.
-- **A label-keyed value shorter than 8 bytes** (`PASSWORD=hunter2`). The
-  floor exists because without it ordinary text such as `token: default` and
-  `password: example` would be masked.
+- **A value shorter than 8 bytes after a generic label** (`PASSWORD=hunter2`).
+  The two broadest label rules have that floor because without it ordinary
+  text such as `token: default` and `password: example` would be masked.
 - **An escape sequence deliberately planted inside a secret** to break the
   match (GH #51). A program in the session is inside the trust boundary.
 - **A label spelled with a Unicode character that case-folds to an ASCII
@@ -461,37 +508,56 @@ claim to catch:
 
 #### Residual register
 
-This table lists every known case in which output gets past the redactor
-through something other than a raw path named under G1, and every known case
-in which the redactor masks or drops output that is not a secret.
+This table, with the list after it, covers every known case in which output
+gets past the redactor through something other than a raw path named under
+G1, and every known case in which the redactor masks or drops output that is
+not a secret.
 
 - Each row was measured on the tree this file describes.
 - Every repro uses generated values. Never test with a real credential.
 - A *key* below means a PEM private-key block (`-----BEGIN RSA PRIVATE
   KEY-----`, random base64 lines of 64 characters, `-----END …`). The largest
-  standard key, RSA-16384, is 12.4 KB of PEM.
+  standard key, RSA-16384, is about 12.6 KB of PEM.
 - Row numbers are stable. A fixed row stays in the table, marked fixed, so a
   reference to it keeps its meaning.
 
 | ID | Leaks or over-masks | Trigger | Repro sketch | Status | Can a targeted fix close it? |
 |---|---|---|---|---|---|
-| R1 | Both: a document's masking depended on the page size it was read at | Paging the same output at different `max_bytes` | `cat` a long document that mentions a private-key header in prose; page it at 4 KiB, 32 KiB and 256 KiB | **Fixed for prose** by `e80a631` (GH #242): a header in prose no longer starts a candidate. This repository's `CHANGELOG.md` now loses the same 10 of 2,842 lines at every page size, all of them rule matches on credential-shaped examples. Keys longer than 16 KiB still depend on page size: R2–R4 | Done for prose. For long keys, see R2–R4 |
-| R2 | **Leaks** the later lines of a complete key, with `redactions: {}` | A single key block longer than about 16 KiB + `max_bytes` + 8 KiB, paged with cursor reads; or a tail read that starts more than 16 KiB after the header of a key longer than 16 KiB. On `holdfast watch`, any complete key longer than about 16 KiB | Generate a 500-line key, `cat` it, and page from before the `cat` at `max_bytes: 4096`: body lines 248–499 come back raw. A 1,000-line key leaks at the default 32 KiB | **Narrowed** by `e80a631` (GH #243): every standard key size is masked at every page size, and so are blocks up to 26 KB at 4 KiB and 8 KiB pages. Longer blocks: open, GH #259 | Partly. A longer reach moves the bound; no fixed reach removes it |
-| R3 | **Leaks** key body more than 16 KiB past the header | A key block with no END line, longer than 16 KiB, followed by other output | Print a header and 300 body lines with no END, then `echo done`; page from before at 4 KiB or 32 KiB: body lines 248–299 come back raw | **Narrowed** by `e80a631` (GH #242), from 114 lines at 4 KiB and all 300 at 32 KiB. Open: GH #166, tracked in GH #259 | Partly. The 16 KiB reach bounds what a header whose block never closes can mask, so a longer reach moves the bound without removing it |
-| R4 | **Leaks** a whole key still arriving, `held_back: false`, `redactions: {}` | A read at the end of the output while a key's header is more than 16 KiB behind it | `cat` a 260-line key with no END, then `sleep 25`; read during the sleep: all 260 body lines raw, and 12 raw rows on the grid. At 245 lines (16.2 KB) every surface masks it | **Open**, GH #166, tracked in GH #259. The 16 KiB bound is deliberate: an unbounded search on every read is quadratic in output an agent controls | Only with an unbounded search at the end of the output on every read |
-| R5 | **Leaks** a token glued to a word character in front of it | A prefix rule's leading `\b` does not match after a letter, digit or `_`, with or without a colour change between them | `printf 'x\033[31mghp_%s\033[0m done\n' <36 random alphanumerics>`; a read from before it returns the token clear with `redactions: {}`. A read whose page starts exactly at the escape or at the token masks it. With a space instead of `x`, every read masks it | **Open**, GH #254 | The dependence on where a page starts, yes. Whether `xghp_…` should match at all is a rule decision, because the `\b` keeps rules from matching inside longer identifiers |
-| R6 | **Leaks** on `holdfast watch` a partial secret still carried when the session ends | The child exits with a partial token unfinished at the end of its output | `sh -c 'printf "deploy with ghp_0123456789abcdefghij"; sleep 2'` with `watch` attached. While it runs, `watch` shows `deploy with `; at exit it prints the partial token raw, with no marker. `read_output` goes on withholding it after the exit | **Open**, GH #256. A partial private key is masked at exit (`600bab7`, GH #242). Bounded by what the stream still carries, at most 8 KiB | Yes |
-| R7 | **Leaked** key body on the `get_screen_state` grid | A completed key whose header had scrolled off the screen, or a key still arriving | `cat` a 50-line key in a 40-row session, then `get_screen_state` | **Fixed** by `e80a631` and `8c77f22` (GH #224). 0 raw rows for 50- and 200-line keys, after scrolling, at 40 to 80 columns, and while a key streams, up to 16 KiB. Beyond that, see R4 | Done |
-| R8 | **Over-masked**: `watch` dropped about 30% of prose | A private-key header mentioned in prose held the observer stream | `holdfast watch` a session, then `cat CHANGELOG.md` | **Fixed** by `e80a631` (GH #242). `watch` now receives every line `read_output` does, with no gap notice. For the drop after a long key, see R17 | Done |
-| R9 | Both: surfaces disagreed about the same bytes at the same moment | Any output that one surface judges differently from another | Stream an 8-line key with no END, then `sleep 10`. Compare `read_output`, `watch`, `get_screen_state` and `status` within 0.1 s | **Narrowed** by `e80a631` and `8c77f22`. All four now mask that key; the grid used to show 8 raw lines, and `prompt.last_line` a raw body line. A grep hit naming a key header, followed by a failing test log, now shows the failure on every default read with the secrets masked. Still open: R6, R16 | Surface by surface only, without G4 |
+| R1 | Both: a document's masking depended on the page size it was read at | Paging the same output at different `max_bytes` | `cat` a long document that mentions a private-key header in prose; page it at 4 KiB, 32 KiB and 256 KiB | **Fixed for prose** (GH #242). A header in prose starts a candidate that ends at the first character that cannot be part of a key, so the mention itself masks nothing. This repository's `CHANGELOG.md` now masks the same lines at every page size, all of them rule matches on credential-shaped examples. Lines after such a header can still be over-masked: R19. Keys longer than 16 KiB still depend on page size: R2–R4 | Done for prose. For long keys, see R2–R4 |
+| R2 | **Leaks** the later lines of a complete key, with `redactions: {}` | A single key block longer than somewhere between 24 KiB and 16 KiB + `max_bytes` + 8 KiB, depending on where the pages fall, paged with cursor reads; or a tail read that starts more than 16 KiB after the header of a key longer than 16 KiB. On `holdfast watch`, any complete key longer than about 16 KiB | Generate a 500-line key, `cat` it, and page from before the `cat` at `max_bytes: 4096`: 249 of body lines 248–499 come back raw, counting lines from 0; the lines that straddle a page seam are masked. A 1,000-line key leaks 750 lines at the default 32 KiB | **Narrowed** (GH #243): every standard key size is masked at every page size, and so are blocks up to 26 KB at 4 KiB and 8 KiB pages. Longer blocks: open, GH #259 | Partly. A longer reach moves the bound; no fixed reach removes it |
+| R3 | **Leaks** key body more than 16 KiB past the header | A key block with no END line, longer than 16 KiB, followed by other output | Print a header and 300 body lines with no END, then `echo done`; page from before at 4 KiB or 32 KiB: body lines 248–299 come back raw | **Narrowed** (GH #242), from 114 lines at 4 KiB and all 300 at 32 KiB. Open, GH #259 | Partly. The 16 KiB reach bounds what a header whose block never closes can mask, so a longer reach moves the bound without removing it |
+| R4 | **Leaks** a whole key still arriving, `held_back: false`, `redactions: {}` | A read at the end of the output while a key's header is more than 16 KiB behind it | `cat` a 260-line key with no END, then `sleep 25`; read during the sleep: all 260 body lines raw, and 12 raw rows on the grid. At 245 lines (16.2 KB) every surface masks it | **Open**, GH #259. GH #166's own reproduction, a key of up to 50 lines, is masked now. The 16 KiB bound is deliberate: an unbounded search on every read is quadratic in output an agent controls | Only with an unbounded search at the end of the output on every read |
+| R5 | **Leaks** a token glued to a word character in front of it, on every surface | A prefix rule's leading `\b` does not match after a letter, digit or `_`, with or without a colour change between them. So whether the token is masked depends on where a read's text starts | `printf 'x\033[31mghp_%s\033[0m done\n' <36 random alphanumerics>`: a cursor read from before it, a `tail_bytes` read, the grid and `watch` all show the token clear, and `read_output` reports `redactions: {}`. Plain `xghp_…`, `_ghp_…` and `9ghp_…` do the same. A read whose page starts exactly at the escape or at `ghp_` masks it. With a space instead of `x`, every read masks it | **Open**, GH #254 | The dependence on where a page starts, yes. Whether `xghp_…` should match at all is a rule decision, because the `\b` keeps rules from matching inside longer identifiers |
+| R6 | **Leaks** on `holdfast watch` a partial secret still carried when the session ends | The child exits with a partial token unfinished at the end of its output, while a `watch` that saw it arrive is attached | With `watch` attached first, run `sh -c 'sleep 3; printf "deploy with ghp_0123456789abcdefghij"; sleep 2'`. While it runs, `watch` shows `deploy with `; at exit it prints the partial token raw, with no marker. A `watch` that joins after the `printf` prints neither. `read_output` goes on withholding it after the exit | **Open**, GH #256. A partial private key is masked at exit (GH #242). Bounded by what the stream still carries, at most 8 KiB | Yes |
+| R7 | **Leaked** key body on the `get_screen_state` grid | A completed key whose header had scrolled off the screen, or a key still arriving | `cat` a 50-line key in a 40-row session, then `get_screen_state` | **Fixed** (GH #224). 0 raw rows for 50- and 200-line keys, after scrolling, at 40 to 80 columns, and while a key streams, up to 16 KiB. Beyond that, see R4 | Done |
+| R8 | **Over-masked**: `watch` dropped about 30% of prose | A private-key header mentioned in prose held the observer stream | `holdfast watch` a session, then `cat CHANGELOG.md` | **Fixed** (GH #242). `watch` now receives every line `read_output` does, with no gap notice. For the drop after a long key, see R17 | Done |
+| R9 | Both: surfaces disagreed about the same bytes at the same moment | Any output that one surface judges differently from another | Stream an 8-line key with no END, then `sleep 10`. Compare `read_output`, `watch`, `get_screen_state` and `status` within 0.1 s | **Narrowed** (GH #224, GH #242). All four now mask that key; the grid used to show 8 raw lines, and `prompt.last_line` a raw body line. A grep hit naming a key header, followed by a failing test log, now shows the failure on every default read with the secrets masked. Still open: R6, R16 | Surface by surface only, without G4 |
 | R10 | **Leaks** a key painted one colour per character | `grep --color=always -n . key.pem` (or `--color=auto`, which colours on a PTY), `lolcat`. No `-----BEGIN` survives in the raw bytes, and the key grows about twenty-fold | Colour a 40-line key that way: the first default page carries 27 raw body lines with `redactions: {}`, and paging carries all 40. The grid shows 16 raw rows, or 38 with `start_session(screen_tracking: "on")`. A read of 64 KiB or more masks it. A 26-line key is masked | **Registered, not fixed** | Yes: look for key candidates in the ANSI-stripped text as well as in the raw bytes |
 | R11 | **Leaks** a quoted label-keyed value that contains a `;` | A label-keyed value ends at `;`, and fewer than 8 bytes come before it | `echo "DB_PASS='Xk9;mP2qLzAB'"` comes back whole, with `redactions: {}`. With 8 or more bytes before the `;` (`'Xk9mP2qL;zAB'`), the part after the `;` is shown | **Registered, not fixed.** The 8-byte value floor is kept | Yes, by making the two broadest label rules read a quoted value to its closing quote. That is a larger change to those rules |
 | R12 | **Over-masks** a type name after a secret-named label | A CamelCase value after `secret`, `token`, `api_key` and the like, as in Rust signatures and struct fields | `rg -n secret crates/holdfast-core/src/session \| head -60` masks 6 of 60 lines, all of them `secret: SecretBytes`. `token: TokenKind`, `api_key: ApiKey256`, `let token = uuid::Uuid::new_v4(` and digit-bearing types are masked too | **Registered, not fixed**; GH #245 stays open. For Rust-heavy work an operator can list `generic-secret-assignment` in `[security] disabled_redaction_rules` | Not without a cost. Nothing in the value tells `SecretBytes` from a capitalised passphrase with no separator. Keying on the byte after the value would stop masking `password=Hunter2hunter, user=bob`, and a stoplist of type suffixes would stop masking `JWT_SECRET=MySuperSecretKey` |
 | R13 | **Leaks** the value of a secret-named environment variable | `printenv NAME` or `echo "$NAME"`, where the value has no recognisable shape | `start_session` with `env: {"MY_SERVICE_TOKEN": "<32 random lowercase alphanumerics>"}`, then `printenv MY_SERVICE_TOKEN`: the value comes back clear, with `redactions: {}`. The same happens when the variable is only in the environment of the client that launched `holdfast mcp`. `env \| grep MY_SERVICE_TOKEN` is masked by a label rule | **Open**, GH #253. See G2 | Yes: G2's environment-name registration |
-| R14 | **Withholds indefinitely** a prompt a program is waiting at | A secret label ending in `:` or `=` with no trailing space, printed by a program waiting on input: `Enter password:`, `Password:`, `API_KEY=` | In bash, `printf 'Enter password:'; read -r x`. Cursor reads stop before `Enter password:` with `held_back: true` and `held_back_cause: "in_flight_secret"`; `prompt.last_line` is `""` and `interaction_mode` is `Executing`, for as long as the program waits. A `tail_bytes` read shows the prompt. `Password: `, with a trailing space, is not held | **Open**, GH #255 | Yes: start a label rule's hold at the first byte of the value, not at the label |
-| R15 | **Leaks** part of a credential that arrives with an escape sequence inside it | The in-flight test reads raw bytes, and an escape ends the run it is testing | `printf 'ghp_%s\033[0m%s' <17 alphanumerics> <18 alphanumerics>` (39 of a GitHub token's 40 characters), then a cursor read: the default, ANSI-stripped read returns all 39 characters together, with `held_back: false` and `redactions: {}`. On `watch` a token split across two PTY reads with an escape inside it does the same, and that happens more often, because the unit is one PTY read | **Open**, GH #142. The grid masks this case. At most one character short of the rule's minimum length: 39 for a GitHub token | Needs a sharper in-flight test. The form that has been tried withholds ordinary output indefinitely |
-| R16 | **Leaks** one line of key body in `prompt.last_line` | A key still arriving whose last body line has no line break yet | Print a header and 7 body lines with no END, then an eighth body line with no `\n`, then `sleep 10`. `status`, `list_sessions` and the `prompt` block of `read_output` and `wait_for_pattern` report that line raw. Every byte-stream surface masks it | **Open**, GH #257 | Yes: report no last line while a read masks the region it lies in |
-| R17 | **Over-masks**: `watch` silently drops the output that follows a long key | Output that arrives in the same PTY read as the END of a key longer than 8 KiB | `printf 'before\n'; cat key.pem; cat after.txt` with a 200-line key and `watch` attached: none of `after.txt` reaches `watch`, with no gap notice, and `read_output` shows all of it | **Open**, GH #258 | Yes: emit the rest of the read once the key has been judged |
+| R14 | **Withholds indefinitely** a prompt a program is waiting at | A secret label ending in `:` or `=` with no trailing space, printed by a program waiting on input: `Enter password:`, `Password:`, `API_KEY=` | In bash, `printf 'Enter password:'; read -r x`. Cursor reads stop at `password:` (the read ends at `Enter `) with `held_back: true` and `held_back_cause: "in_flight_secret"`; `prompt.last_line` is `""` and `interaction_mode` is `Executing`, for as long as the program waits. A `tail_bytes` read shows the prompt. `Password: `, with a trailing space, is not held | **Open**, GH #255 | Yes: start a label rule's hold at the first byte of the value, not at the label |
+| R15 | **Leaks** part of a credential that arrives with an escape sequence inside it | The in-flight test reads raw bytes, and an escape ends the run it is testing | `printf 'ghp_%s\033[0m%s' <17 alphanumerics> <18 alphanumerics>` (39 of a GitHub token's 40 characters), then a cursor read: the default, ANSI-stripped read returns all 39 characters together, with `held_back: false` and `redactions: {}`. On `watch` a token split across two PTY reads with an escape inside it does the same, and that happens more often, because the unit is one PTY read | **Open**, GH #142 and GH #160. The grid masks this case. At most one character short of the rule's minimum length: 39 for a GitHub token | Needs a sharper in-flight test. The form that has been tried withholds ordinary output indefinitely |
+| R16 | **Leaks** one line of key body in `prompt.last_line`, and goes on leaking it after the command ends | A key still arriving whose last body line has no line break yet | Print a header and 7 body lines with no END, then an eighth body line with no `\n`, then `sleep 10`. `status`, `list_sessions` and the `prompt` block of every response that carries one (`read_output`, `wait_for_pattern`, `send_input`, `interrupt`, `request_secret_input`) report that line raw. Once the shell prints its prompt, `last_line` is that line followed by the prompt. If the child then asks for a secret, the prompt text sent to attached clients is built from the same line, with only complete matches masked. Every byte-stream surface and the grid mask it | **Open**, GH #257 | Yes: report no last line while a read masks the region it lies in |
+| R17 | **Over-masks**: `watch` silently drops output that follows a long key | Output that arrives in the same PTY read as the END of a key, once `watch` has begun dropping output because more than 8 KiB of the key was unresolved at the end of an earlier read. How the output splits into PTY reads decides that, so it is timing-dependent | `printf 'before\n'; cat key.pem after.txt` with a 200-line key, a 30-line `after.txt` and `watch` attached: in 2 runs of 2, `watch` received 3 and 0 of the 30 lines, with no gap notice, while `read_output` showed all 30. As two commands, `cat key.pem; cat after.txt`, it dropped lines in 2 runs of 6. No run with a key under 8 KiB dropped anything | **Open**, GH #258 | Yes: emit the rest of the read once the key has been judged |
+| R18 | **Leaks** the tail of a token longer than 512 bytes, such as a JWT | Every rule but the private-key rule is judged over a window that reaches only the lookbehind (512 bytes by default) behind a read's start. So a read that begins more than that into a long token misses it: a `tail_bytes` read, `wait_for_pattern`'s `match.text`, a read from an arbitrary `since_cursor`, or the cursor read after one that saw the token partly arrived | `cat` a generated 1,027-byte JWT, then `read_output(tail_bytes: 400)`: the last 310 characters of the signature come back raw, with `redactions: {}`, with or without `apply_holdback: true`. `tail_bytes: 600` masks them. `wait_for_pattern(pattern: "[A-Za-z0-9_-]{300}\r\n")` returns 300 signature characters raw in `match.text` in one call, while the same response's `output_since_start` masks them. Print 600 bytes of the token, pause, then print the rest: the first cursor read masks what has arrived as `[REDACTED:unresolved]`, and the next returns the rest of the token raw. With 300 bytes before the pause, the token is held and then masked | **Open**, GH #261 | Yes: give token rules the backward search that private keys have |
+| R19 | **Over-masks** hex digests and base64 lines after a mention of a private-key header | A line that names a whole `…PRIVATE KEY-----` header without being a key, such as a `grep` hit, a code literal or a test fixture's name. Up to 16 KiB past the header, every line with a run of 48 or more base64-alphabet characters (letters, digits, `+`, `/`, `=`) is masked as `[REDACTED:unresolved]`: SHA-256 hex digests, the base64 part of a `sha512-` integrity string, base64 blobs. A 40-digit git object id is too short to qualify | `grep` a file for `-----BEGIN RSA PRIVATE KEY-----`, then run `sha256sum` over twelve files: all 12 digest lines are masked on the default cursor read, on a 1 KiB page and on the grid. Only `redact: false` shows them, and it also shows every real secret in the window | **Open**, GH #260 | Partly. Refusing hex-only runs and `sha256-`, `sha384-` and `sha512-` prefixes closes digests and integrity strings. A base64 blob has the alphabet of key body, and stays masked |
+
+**Known, filed, and not yet a row.** Each of these is a leak:
+- **A partial token in a window title.** Metadata is matched for complete
+  secrets only, so a title of `deploy ghp_` and 20 more characters of a token
+  is reported raw by `status` (GH #142). A complete token in a title is
+  masked.
+- **A token whose first characters have scrolled above the top row of
+  `get_screen_state`'s grid** is not matched there. Only private keys are
+  followed off screen.
+- **Two rules are never withheld in flight:** `telegram-bot-token`, which
+  has no prefix to hold on (GH #170), and the `api-` form of
+  `launchdarkly-key`, which its declared prefixes leave out (GH #189). A
+  cursor read returns either one as far as it has arrived.
+- **`redaction_lookbehind_bytes = 0` is accepted at load** (GH #171). A read
+  then matches nothing that began before its range, so a secret that
+  straddles the start of a page comes back raw, with `redactions: {}`.
 
 #### Shell history
 
@@ -510,7 +576,10 @@ it.** It shipped in 0.0.7.
    bytes written, so it does disclose the value's length.
 
 The value travels client → daemon → PTY, and it appears in no tool argument
-and no tool result.
+and no tool result. That is a statement about the tool, not about the
+session's output: written at an idle shell prompt, the value is drawn into
+the output, where only the pattern rules stand between it and the agent (G3,
+GH #262).
 
 The channel needs a daemon and an attached client:
 - On Windows it is refused as `not_supported_on_platform`.
