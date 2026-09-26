@@ -4812,7 +4812,8 @@ async fn a_call_waiting_on_a_dying_session_still_owns_its_own_session_died() {
         .daemon
         .attach_hub()
         .secrets()
-        .matches_outstanding(&s.id, &raised));
+        .submission_bounds(&s.id, &raised)
+        .is_some());
 
     pty.exit(7);
 

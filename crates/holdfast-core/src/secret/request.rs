@@ -754,9 +754,15 @@ impl SecretSlots {
     /// The call's `max_secret_bytes` and `append_newline`, as the
     /// submitting connection needs them.
     ///
-    /// `None` when the id names no outstanding request — which the
-    /// caller must already have established through
-    /// [`matches_outstanding`](Self::matches_outstanding).
+    /// `None` when the id names no outstanding request.
+    ///
+    /// **A read, not a claim.** Whether a submission is the one that
+    /// fulfils the request is decided afterwards by [`take`](Self::take)'s
+    /// `expect_id`, under the lock that acts on it: two clients answering
+    /// the same prompt must produce one write, and a check here followed
+    /// by a clear is exactly what both could pass.
+    /// `the_two_renderings_of_the_id_check_agree` pins the two to the same
+    /// answer.
     pub fn submission_bounds(
         &self,
         session_id: &str,
@@ -768,28 +774,6 @@ impl SecretSlots {
             .then_some((raised.max_secret_bytes, raised.append_newline))
     }
 
-    /// **The single authority on "does this `request_id` name the
-    /// session's current outstanding request?"**
-    ///
-    /// The attach handler answers a `false` with
-    /// `ProtocolError { reason: "unknown_request_id" }`; 0.0.10's
-    /// `POST /api/sessions/:id/secret` answers it with `409 conflict`
-    /// (§18.5). **Two renderings, one check** — 0.0.10 calls this and
-    /// does not re-implement it, which is the whole reason it is a named
-    /// function rather than a comparison inlined in a frame handler.
-    ///
-    /// **The plan for this milestone said to rewire the attach handler's
-    /// `unknown_request_id` branch through this function, and doing so
-    /// would open a race the branch was written to avoid.** That branch
-    /// closes the request *and* decides who fulfils it in one atomic
-    /// step, because two clients answering the same prompt must produce
-    /// one write; a `matches_outstanding` check followed by a `take` is
-    /// exactly the check-then-clear both could pass. So the attach path
-    /// keeps [`take`](Self::take)'s `expect_id`, which **is** this
-    /// predicate evaluated under the lock that acts on it, and
-    /// `the_two_renderings_of_the_id_check_agree` pins the two to the
-    /// same answer. 0.0.10's HTTP path has no atomic action to fuse —
-    /// it validates, then forwards — so it calls this one.
     /// Whether this session's request already has a tool call waiting on
     /// it — the exact condition that makes a further call collide.
     ///
@@ -830,13 +814,6 @@ impl SecretSlots {
     ) -> Option<u64> {
         let episode = raised.claim_episode()?;
         self.inner.lock().answer_for(session_id, episode)
-    }
-
-    pub fn matches_outstanding(&self, session_id: &str, request_id: &str) -> bool {
-        self.inner
-            .lock()
-            .get(session_id)
-            .is_some_and(|r| r.request.request_id == request_id)
     }
 
     /// Take the request out of the slot, whole — **including the waiting
@@ -1120,7 +1097,7 @@ mod tests {
         assert_eq!(a.raised_by, RaisedBy::ToolCall);
         assert!(a.raised_here, "the raising call is the one that broadcasts");
         assert_eq!(a.prompt_text, "sudo password");
-        assert!(slots.matches_outstanding(S, &a.request_id));
+        assert!(slots.submission_bounds(S, &a.request_id).is_some());
     }
 
     #[test]
@@ -1175,7 +1152,7 @@ mod tests {
 
         // The first caller's request is untouched: still outstanding,
         // same id, and its receiver has not been resolved.
-        assert!(slots.matches_outstanding(S, &first.request_id));
+        assert!(slots.submission_bounds(S, &first.request_id).is_some());
         let mut rx = first.rx;
         assert!(
             rx.try_recv().is_err(),
@@ -1424,8 +1401,12 @@ mod tests {
         assert!(slots.close_on_caller_timeout(S, &b.request_id).is_some());
     }
 
-    /// The read-only predicate and the atomic one must not be able to
-    /// disagree — that is what makes it honest to call them one check.
+    /// The read-only check and the atomic one must not be able to
+    /// disagree. The attach handler reads the cap through
+    /// `submission_bounds` and then fulfils through `take`'s `expect_id`;
+    /// if the first said "not outstanding" while the second took the
+    /// request, the submission would be held to the operator's ceiling
+    /// instead of the waiting call's narrower `max_secret_bytes`.
     #[test]
     fn the_two_renderings_of_the_id_check_agree() {
         for (label, expect) in [("the outstanding id", true), ("secreq_notours", false)] {
@@ -1437,7 +1418,7 @@ mod tests {
                 label.to_string()
             };
             assert_eq!(
-                slots.matches_outstanding(S, &id),
+                slots.submission_bounds(S, &id).is_some(),
                 expect,
                 "the read-only rendering disagreed for {label}"
             );
@@ -1449,7 +1430,7 @@ mod tests {
         }
         // And on a session with no request at all, both say no.
         let empty = SecretSlots::new();
-        assert!(!empty.matches_outstanding(S, "secreq_anything"));
+        assert!(empty.submission_bounds(S, "secreq_anything").is_none());
         assert!(empty.take(S, Some("secreq_anything")).is_none());
     }
 
@@ -1557,7 +1538,7 @@ mod tests {
             slots.take_if_unadopted(S).is_none(),
             "the janitor took a slot §5.1's answer owns"
         );
-        assert!(slots.matches_outstanding(S, &a.request_id));
+        assert!(slots.submission_bounds(S, &a.request_id).is_some());
         let mut rx = a.rx;
         assert!(
             rx.try_recv().is_err(),
@@ -1768,7 +1749,7 @@ mod tests {
         // Nothing was disturbed: the waiting call is unanswered and can
         // still close its own request, which is what proves the refusals
         // above did not half-take it.
-        assert!(slots.matches_outstanding(S, &raised.request_id));
+        assert!(slots.submission_bounds(S, &raised.request_id).is_some());
         let mut rx = a.rx;
         assert!(
             rx.try_recv().is_err(),
