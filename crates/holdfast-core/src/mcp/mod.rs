@@ -430,6 +430,15 @@ pub struct HoldfastServer {
     /// raise fans out to nobody and the waiting call runs out its
     /// deadline, which is the correct answer rather than a special case.
     pub attach_hub: Arc<crate::attach::hub::AttachHub>,
+    /// Where `[terminal] shell_history_file = "per_session"` puts each
+    /// session's history file (GH #252): the instance's
+    /// `RuntimePaths::history_dir`, handed down the way the audit path is.
+    ///
+    /// `None` on a server built without an instance — a test's, or one
+    /// whose runtime directory could not be resolved — and there a
+    /// `per_session` config refuses `start_session` rather than keep a
+    /// record nowhere. See [`HoldfastServer::with_history_dir`].
+    pub history_dir: Option<PathBuf>,
     /// **`#[cfg(test)]` — where §9.6's arming path can be held still.**
     ///
     /// `None` for every caller that is not one of the three GH #106 rows;
@@ -604,6 +613,7 @@ impl HoldfastServer {
             audit_open_error,
             capabilities,
             attach_hub: Arc::new(crate::attach::hub::AttachHub::new()),
+            history_dir: None,
             // `None`, so every row that does not ask for the window pays
             // nothing and takes no scheduler yield: all four sites are
             // behind an `Option`.
@@ -618,6 +628,14 @@ impl HoldfastServer {
     #[cfg(test)]
     pub(crate) fn with_autofill_arm_gate(mut self, gate: &Arc<ArmGate>) -> Self {
         self.autofill_arm_gate = Some(Arc::clone(gate));
+        self
+    }
+
+    /// The directory `per_session` shell history files go in (GH #252).
+    /// The daemon passes its instance's `history_dir`, `serve_stdio` the
+    /// one `RuntimePaths::discover` names.
+    pub fn with_history_dir(mut self, dir: Option<PathBuf>) -> Self {
+        self.history_dir = dir;
         self
     }
 
@@ -906,10 +924,10 @@ pub async fn serve_stdio() -> anyhow::Result<()> {
     //
     // Fails open exactly as before: no resolvable runtime directory means
     // no audit path, which this transport already tolerates (see above).
-    let audit_path = crate::daemon::paths::RuntimePaths::discover()
-        .ok()
-        .map(|p| p.audit_log());
-    let server = HoldfastServer::with_audit_path_and_config(audit_path, &config);
+    let paths = crate::daemon::paths::RuntimePaths::discover().ok();
+    let audit_path = paths.as_ref().map(|p| p.audit_log());
+    let server = HoldfastServer::with_audit_path_and_config(audit_path, &config)
+        .with_history_dir(paths.map(|p| p.history_dir()));
     let service = server.serve(rmcp::transport::stdio()).await?;
     service.waiting().await?;
     Ok(())

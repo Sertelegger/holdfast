@@ -24,12 +24,12 @@
 //! — a published key this loader did not model would give an operator
 //! who copied the example verbatim a daemon that refuses to start and an
 //! error naming the *spec's* key as the typo. At the revision this file
-//! was written against that is **43 keys across 7 tables**: `[limits]`
-//! 17, `[terminal]` 5, `[prompts]` 4, `[security]` 5, `[ui]` 4,
+//! was written against that is **44 keys across 7 tables**: `[limits]`
+//! 17, `[terminal]` 6, `[prompts]` 4, `[security]` 5, `[ui]` 4,
 //! `[notifications]` 3, `[daemon]` 5. Read the breakdown, never the
-//! total — 43 was also the pre-rev-48 count across *eight* tables, so a
-//! check against the sum agrees with two revisions while being wrong
-//! against both.
+//! total — 43, the count before `shell_history_file`, was also the
+//! pre-rev-48 count across *eight* tables, so a check against the sum
+//! agrees with two revisions while being wrong against both.
 //!
 //! **"Honoured in 0.0.5? no" means parsed, validated and unread — it
 //! does not mean absent** (REQ-CFG-004's second clause). Each such field
@@ -518,6 +518,18 @@ pub struct TerminalConfig {
     pub terminal_query_replies_per_min: u32,
     #[serde(default = "d_shell_integration")]
     pub shell_integration: bool,
+    /// `none` | `per_session` (GH #252): where a session's shell keeps its
+    /// command history. `none` keeps it off disk. `per_session` points
+    /// every session at `<log dir>/history/<session_id>.history` —
+    /// `0600`, in a `0700` directory, kept after the session ends — so an
+    /// operator can read what an agent ran; the file is created up front
+    /// for bash and zsh sessions, and for any other only if a shell it
+    /// starts saves one. fish sessions stay private either way. A session
+    /// started with `shell_integration: false` gets the environment
+    /// alone, so an rc file that sets `HISTFILE` itself wins for bash and
+    /// zsh. See `session::launch::history_defaults`.
+    #[serde(default = "d_shell_history_file")]
+    pub shell_history_file: String,
 }
 
 /// §8.6's prompt-detection knobs.
@@ -1141,6 +1153,9 @@ fn d_terminal_query_replies_per_min() -> u32 {
 fn d_shell_integration() -> bool {
     true
 }
+fn d_shell_history_file() -> String {
+    "none".into()
+}
 fn d_settle_threshold_ms() -> u64 {
     250
 }
@@ -1235,6 +1250,9 @@ pub const SECRET_PROVIDERS: [&str; 3] = ["prompt", "keychain", "both"];
 /// §4.5's screen-tracking modes, matching `screen::ScreenTracking`.
 pub const SCREEN_TRACKING_MODES: [&str; 3] = ["off", "adaptive", "on"];
 
+/// `[terminal] shell_history_file`'s values (GH #252).
+pub const SHELL_HISTORY_FILE_MODES: [&str; 2] = ["none", "per_session"];
+
 macro_rules! table_default {
     ($t:ty { $($field:ident : $d:ident),* $(,)? } $( ; $($extra:ident),* )? ) => {
         impl Default for $t {
@@ -1274,6 +1292,7 @@ table_default!(TerminalConfig {
     terminal_queries: d_terminal_queries,
     terminal_query_replies_per_min: d_terminal_query_replies_per_min,
     shell_integration: d_shell_integration,
+    shell_history_file: d_shell_history_file,
 });
 
 table_default!(PromptsConfig {
@@ -1534,6 +1553,11 @@ impl Config {
             "terminal.screen_tracking_default",
             &self.terminal.screen_tracking_default,
             &SCREEN_TRACKING_MODES,
+        )?;
+        one_of(
+            "terminal.shell_history_file",
+            &self.terminal.shell_history_file,
+            &SHELL_HISTORY_FILE_MODES,
         )?;
         nonzero(
             "terminal.terminal_query_replies_per_min",
@@ -1962,6 +1986,19 @@ mod tests {
         assert!(e.to_string().contains("limmits"), "{e}");
     }
 
+    /// GH #252. `none` by default, `per_session` on request, and anything
+    /// else refused by name — a misspelt opt-in that silently kept history
+    /// off would leave an operator believing a record existed.
+    #[test]
+    fn shell_history_file_is_none_unless_set_and_refuses_other_values() {
+        assert_eq!(Config::default().terminal.shell_history_file, "none");
+        let on = parse_str("[terminal]\nshell_history_file = \"per_session\"\n").expect("loads");
+        assert_eq!(on.terminal.shell_history_file, "per_session");
+        let e =
+            parse_str("[terminal]\nshell_history_file = \"per-session\"\n").expect_err("refused");
+        assert!(e.to_string().contains("terminal.shell_history_file"), "{e}");
+    }
+
     #[test]
     fn the_published_example_config_loads() {
         // Two assertions, deliberately separate: a fixture that is not
@@ -1977,15 +2014,15 @@ mod tests {
             .collect();
         let total: usize = per_table.iter().map(|(_, n)| n).sum();
         assert_eq!(
-            total, 43,
+            total, 44,
             "§10.2's key count moved; per-table: {per_table:?}"
         );
-        // The breakdown, never the sum: 43 was also the pre-rev-48 total
-        // across *eight* tables, so a check against the total agrees with
-        // two revisions of §10.2 while being wrong against both.
+        // The breakdown, never the sum: a total agrees with any revision of
+        // §10.2 that moved a key between tables, and 43 was the total of
+        // two different revisions.
         for (table, want) in [
             ("limits", 17),
-            ("terminal", 5),
+            ("terminal", 6),
             ("prompts", 4),
             ("security", 5),
             ("ui", 4),

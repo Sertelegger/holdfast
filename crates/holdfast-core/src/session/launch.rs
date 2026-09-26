@@ -78,11 +78,12 @@
 //! list the paragraph above argues against as a *fix*; as a fallback for
 //! the paths the fix cannot reach, it is strictly better than nothing.
 //!
-//! ## Defaults every session gets (GH #239)
+//! ## Defaults every session gets (GH #239, GH #252)
 //!
-//! [`PAGER_DEFAULTS`], and `PWD` set to the directory the session really
-//! starts in. Both are applied after the inherited environment and before
-//! the call's own `env`, so a caller that sets any of them wins.
+//! [`PAGER_DEFAULTS`], `PWD` set to the directory the session really
+//! starts in, and the shell-history policy of [`history_defaults`]. All
+//! are applied after the inherited environment and before the call's own
+//! `env`, so a caller that sets any of them wins.
 
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
@@ -329,8 +330,141 @@ pub const PAGER_DEFAULTS: [(&str, &str); 4] = [
     ("SYSTEMD_PAGER", "cat"),
 ];
 
-/// The variables Holdfast sets for every session — [`PAGER_DEFAULTS`], and
-/// `PWD` naming `cwd` — minus any the call's own `env` sets.
+/// Where a session's shell keeps its command history (GH #252).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum History<'a> {
+    /// Nowhere: `[terminal] shell_history_file = "none"`, the default.
+    Discard,
+    /// A file of the session's own under the daemon's state directory:
+    /// `shell_history_file = "per_session"`.
+    File(&'a str),
+}
+
+/// The variable that carries a session's history file past the shell's rc
+/// files, which run after the environment is read and may assign
+/// `HISTFILE` themselves. The integration snippet (`detect::shell`)
+/// assigns it back; empty means nowhere.
+pub const HISTFILE_CARRIER: &str = "HOLDFAST_HISTFILE";
+
+/// zsh's `HISTORY_IGNORE`: a pattern matching the integration snippet and
+/// nothing a user is likely to type. See [`history_defaults`].
+pub const ZSH_HISTORY_IGNORE: &str = "*HOLDFAST_SHELL_INTEGRATION*";
+
+/// History a session's other interactive programs would keep under
+/// `$HOME`, switched off (GH #252). Each measured through a PTY with a
+/// fresh `HOME`, against a control run without it that wrote the file:
+///
+/// | Variable | Program, version measured |
+/// |---|---|
+/// | `MYSQL_HISTFILE=/dev/null` | MariaDB client 15.1 (10.11) and Oracle `mysql` 8.0 |
+/// | `PSQL_HISTORY=/dev/null` | psql 16 |
+/// | `NODE_REPL_HISTORY=` (empty) | node 22 |
+/// | `SQLITE_HISTORY=/dev/null` | sqlite3 3.45 |
+/// | `PYTHON_HISTORY=/dev/null` | Python 3.13, PyREPL and basic REPL |
+/// | `SHELL_SESSIONS_DISABLE=1` | macOS Terminal's per-session history; not measured |
+///
+/// **Python 3.12 and older ignore `PYTHON_HISTORY`** and still write
+/// `~/.python_history` (measured on 3.12.3); nothing in the environment
+/// reaches them. An empty `PYTHON_HISTORY` would not do either: 3.13 reads
+/// an empty value as unset. sqlite3 finds its default file through the
+/// password database rather than `$HOME`, so a session's own `HOME` does
+/// not move it, and only the variable keeps it off disk.
+///
+/// `SHELL_SESSIONS_DISABLE` is Apple's documented off switch for
+/// `/etc/zshrc_Apple_Terminal` and `/etc/bashrc_Apple_Terminal`, which save
+/// each Terminal window's history under `~/.zsh_sessions/` or
+/// `~/.bash_sessions/` whatever `HISTFILE` says. A session inherits
+/// `TERM_PROGRAM=Apple_Terminal` from a daemon started in Terminal (GH
+/// #229), so it is set everywhere; nothing else reads it.
+pub const CLIENT_HISTORY_DEFAULTS: [(&str, &str); 6] = [
+    ("MYSQL_HISTFILE", "/dev/null"),
+    ("PSQL_HISTORY", "/dev/null"),
+    ("NODE_REPL_HISTORY", ""),
+    ("SQLITE_HISTORY", "/dev/null"),
+    ("PYTHON_HISTORY", "/dev/null"),
+    ("SHELL_SESSIONS_DISABLE", "1"),
+];
+
+/// The shell-history policy, as environment (GH #252).
+///
+/// Without one, a session's shell wrote the agent's commands — and any
+/// secret admitted at a readline prompt, and Holdfast's integration
+/// snippet — into the operator's own history file: on `exit`, on EOF, on
+/// the `SIGHUP` a graceful `terminate` or a daemon crash delivers, and
+/// after every command for common bash and zsh configurations.
+///
+/// - **`HISTFILE=/dev/null`**, not an empty `HISTFILE`, and one value for
+///   bash and zsh because a bash session can start a zsh. Measured on
+///   bash 5.2.21 and zsh 5.9: both save nothing to disk under either
+///   value, but an rc that assigns conditionally (`[ -z "$HISTFILE" ] &&
+///   HISTFILE=…`) keeps `/dev/null` and replaces the empty string, zsh
+///   prints *failed to write history file* at every exit when an rc set
+///   `SAVEHIST` and left `HISTFILE` empty, and bash prints *history: :
+///   cannot create* at every prompt when an rc's `PROMPT_COMMAND` runs
+///   `history -a`. Neither shell writes through a temporary file beside a
+///   `HISTFILE` that is not a regular file: as uid 0 in a user namespace,
+///   with the real `/dev/null` bind-mounted into a writable directory,
+///   bash's exit, `SIGHUP`, `history -w`, `history -a` and
+///   `HISTFILESIZE=1`, and zsh's exit and `SIGHUP` under `SAVEHIST`,
+///   `inc_append_history`, `share_history` and `no_hist_save_by_copy`,
+///   left it a character device with nothing created beside it.
+/// - **[`HISTFILE_CARRIER`]**, for the snippet, whose own `HISTFILE`
+///   assignment is what overrides an rc file that hard-sets one. It
+///   carries a `HISTFILE` the call set itself, so that choice survives
+///   the snippet the way the call's choice of every other default does.
+/// - **`fish_history=`**, an empty session name: fish keeps nothing on
+///   disk under it (measured on 3.7.0, 4.0.2 and 4.9.3) and prints no
+///   banner. A fish Holdfast spawns itself also gets
+///   `detect::shell::FISH_HISTORY_INIT`, which re-asserts it after
+///   config.fish and makes any fish started inside the session private;
+///   a call whose own `env` sets `fish_history` gets neither, so its
+///   choice stands. What still reaches disk is a fish started inside a
+///   bash or zsh session, or through a wrapper Holdfast does not
+///   recognise (`env fish`), whose config.fish sets `fish_history`.
+/// - **`HISTORY_IGNORE`**, [`ZSH_HISTORY_IGNORE`]. zsh's
+///   `inc_append_history` and `share_history` write a line when it is
+///   entered, before it runs, so the snippet's own line reached the rc's
+///   history file whenever `hist_ignore_space` was off (measured). The
+///   pattern matches only lines that name the snippet's guard variable,
+///   so a history file zsh rewrites keeps every other line (measured).
+///
+/// - **[`CLIENT_HISTORY_DEFAULTS`]**, for the REPLs and database clients
+///   that keep a history file of their own, in either mode: they are not
+///   the shell history a per-session file records.
+///
+/// With shell integration off only this environment applies, so an rc
+/// file that assigns `HISTFILE` itself wins for bash and zsh.
+pub fn history_defaults(
+    history: History<'_>,
+    explicit: &[(String, String)],
+) -> Vec<(String, String)> {
+    let set_by_caller = |key: &str| {
+        explicit
+            .iter()
+            .find(|(k, _)| k == key)
+            .map(|(_, v)| v.as_str())
+    };
+    let file = match history {
+        History::Discard => None,
+        History::File(path) => Some(path),
+    };
+    let carried = set_by_caller("HISTFILE").or(file).unwrap_or("");
+    [
+        ("HISTFILE", file.unwrap_or("/dev/null")),
+        (HISTFILE_CARRIER, carried),
+        ("fish_history", ""),
+        ("HISTORY_IGNORE", ZSH_HISTORY_IGNORE),
+    ]
+    .into_iter()
+    .chain(CLIENT_HISTORY_DEFAULTS)
+    .filter(|(k, _)| set_by_caller(k).is_none())
+    .map(|(k, v)| (k.to_string(), v.to_string()))
+    .collect()
+}
+
+/// The variables Holdfast sets for every session — [`PAGER_DEFAULTS`],
+/// `PWD` naming `cwd`, and [`history_defaults`] — minus any the call's own
+/// `env` sets.
 ///
 /// **`PWD`, because the inherited one names somebody else's directory.**
 /// A shell re-derives it when it disagrees with the real working
@@ -341,7 +475,11 @@ pub const PAGER_DEFAULTS: [(&str, &str); 4] = [
 ///
 /// Returned in a fixed order, so the child's environment and anything
 /// derived from it compare between runs.
-pub fn session_defaults(cwd: Option<&str>, explicit: &[(String, String)]) -> Vec<(String, String)> {
+pub fn session_defaults(
+    cwd: Option<&str>,
+    history: History<'_>,
+    explicit: &[(String, String)],
+) -> Vec<(String, String)> {
     let set_by_caller = |key: &str| explicit.iter().any(|(k, _)| k == key);
     let mut out: Vec<(String, String)> = PAGER_DEFAULTS
         .iter()
@@ -353,6 +491,7 @@ pub fn session_defaults(cwd: Option<&str>, explicit: &[(String, String)]) -> Vec
             out.push(("PWD".to_string(), cwd.to_string()));
         }
     }
+    out.extend(history_defaults(history, explicit));
     out
 }
 
@@ -564,27 +703,86 @@ mod tests {
     /// over each one individually.
     #[test]
     fn the_callers_env_outranks_every_default() {
-        let all = session_defaults(Some("/b"), &[]);
+        let all = session_defaults(Some("/b"), History::Discard, &[]);
+        let pairs = |v: &[(&str, &str)]| -> Vec<(String, String)> {
+            v.iter()
+                .map(|(k, v)| ((*k).to_string(), (*v).to_string()))
+                .collect()
+        };
         assert_eq!(
             all,
-            vec![
-                ("PAGER".to_string(), "cat".to_string()),
-                ("GIT_PAGER".to_string(), "cat".to_string()),
-                ("MANPAGER".to_string(), "cat".to_string()),
-                ("SYSTEMD_PAGER".to_string(), "cat".to_string()),
-                ("PWD".to_string(), "/b".to_string()),
-            ]
+            pairs(&[
+                ("PAGER", "cat"),
+                ("GIT_PAGER", "cat"),
+                ("MANPAGER", "cat"),
+                ("SYSTEMD_PAGER", "cat"),
+                ("PWD", "/b"),
+                ("HISTFILE", "/dev/null"),
+                ("HOLDFAST_HISTFILE", ""),
+                ("fish_history", ""),
+                ("HISTORY_IGNORE", "*HOLDFAST_SHELL_INTEGRATION*"),
+                ("MYSQL_HISTFILE", "/dev/null"),
+                ("PSQL_HISTORY", "/dev/null"),
+                ("NODE_REPL_HISTORY", ""),
+                ("SQLITE_HISTORY", "/dev/null"),
+                ("PYTHON_HISTORY", "/dev/null"),
+                ("SHELL_SESSIONS_DISABLE", "1"),
+            ])
         );
-        let explicit = vec![
-            ("GIT_PAGER".to_string(), "less".to_string()),
-            ("PWD".to_string(), "/elsewhere".to_string()),
-        ];
-        let keys: Vec<String> = session_defaults(Some("/b"), &explicit)
+        let explicit = pairs(&[
+            ("GIT_PAGER", "less"),
+            ("PWD", "/elsewhere"),
+            ("fish_history", "work"),
+            ("PYTHON_HISTORY", "/tmp/py"),
+        ]);
+        let keys: Vec<String> = session_defaults(Some("/b"), History::Discard, &explicit)
             .into_iter()
             .map(|(k, _)| k)
             .collect();
-        assert_eq!(keys, ["PAGER", "MANPAGER", "SYSTEMD_PAGER"]);
+        assert_eq!(
+            keys,
+            [
+                "PAGER",
+                "MANPAGER",
+                "SYSTEMD_PAGER",
+                "HISTFILE",
+                "HOLDFAST_HISTFILE",
+                "HISTORY_IGNORE",
+                "MYSQL_HISTFILE",
+                "PSQL_HISTORY",
+                "NODE_REPL_HISTORY",
+                "SQLITE_HISTORY",
+                "SHELL_SESSIONS_DISABLE"
+            ]
+        );
         // No directory, no `PWD` to set.
-        assert!(!session_defaults(None, &[]).iter().any(|(k, _)| k == "PWD"));
+        assert!(!session_defaults(None, History::Discard, &[])
+            .iter()
+            .any(|(k, _)| k == "PWD"));
+    }
+
+    /// GH #252: a session history file is both `HISTFILE` and what the
+    /// snippet re-applies, and a `HISTFILE` the call set itself is carried
+    /// instead, so the snippet does not undo the caller's choice.
+    #[test]
+    fn the_history_file_is_carried_past_the_rc_files() {
+        let get = |v: &[(String, String)], key: &str| {
+            v.iter().find(|(k, _)| k == key).map(|(_, v)| v.clone())
+        };
+        let per_session = history_defaults(History::File("/s/h/sess_1.history"), &[]);
+        assert_eq!(
+            get(&per_session, "HISTFILE").as_deref(),
+            Some("/s/h/sess_1.history")
+        );
+        assert_eq!(
+            get(&per_session, HISTFILE_CARRIER).as_deref(),
+            Some("/s/h/sess_1.history")
+        );
+        let own = vec![("HISTFILE".to_string(), "/tmp/mine".to_string())];
+        for history in [History::Discard, History::File("/s/h/sess_1.history")] {
+            let d = history_defaults(history, &own);
+            assert_eq!(get(&d, "HISTFILE"), None, "the call's HISTFILE stands");
+            assert_eq!(get(&d, HISTFILE_CARRIER).as_deref(), Some("/tmp/mine"));
+        }
     }
 }

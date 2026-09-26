@@ -374,7 +374,8 @@ impl Daemon {
                 &config,
                 clock.clone(),
                 capabilities,
-            ),
+            )
+            .with_history_dir(Some(paths.history_dir())),
             paths,
             // On the daemon's own clock, not `Instant::now()`. §7.3's
             // window falls back to this when no client has ever

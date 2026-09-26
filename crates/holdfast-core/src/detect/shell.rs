@@ -35,7 +35,75 @@ impl Shell {
             Self::Fish => FISH_INTEGRATION,
         }
     }
+
+    /// Arguments Holdfast puts **ahead of** the caller's own when it spawns
+    /// this shell: `-C` [`FISH_HISTORY_INIT`] for fish, so it never writes
+    /// or reads a history file (GH #252; the whole policy is
+    /// `session::launch::history_defaults`).
+    ///
+    /// Ahead, because an option after a script operand is the script's
+    /// argument rather than fish's. Applied whether or not the snippet is
+    /// typed, since it is not typed: it is how fish is started.
+    pub fn spawn_args(self) -> &'static [&'static str] {
+        match self {
+            Self::Fish => &["-C", FISH_HISTORY_INIT],
+            Self::Bash | Self::Zsh => &[],
+        }
+    }
 }
+
+/// What Holdfast puts ahead of the caller's arguments when it spawns
+/// `command args` with the call's own `env` (GH #252): the recognised
+/// shell's [`Shell::spawn_args`], unless the call sets `fish_history`
+/// itself — that choice then stands, as a `HISTFILE` the call sets does
+/// for bash and zsh.
+pub fn history_spawn_args(
+    command: &str,
+    args: &[String],
+    env: &[(String, String)],
+) -> &'static [&'static str] {
+    if env.iter().any(|(k, _)| k == "fish_history") {
+        return &[];
+    }
+    detect_shell(command, args).map_or(&[], Shell::spawn_args)
+}
+
+/// fish's half of the history policy (GH #252), run by `-C`: after
+/// config.fish and before the first prompt. Measured on fish 3.7.0, 4.0.2
+/// and 4.9.3, with no config and with one that sets `fish_history`
+/// globally, universally or from a `PWD` handler, through `exit`, EOF,
+/// `SIGHUP` and `SIGKILL`: nothing reached disk, and the operator's
+/// existing history file was not read.
+///
+/// - **`fish_history` empty**, which keeps history in memory only. Here
+///   and not only in the environment, because config.fish runs after the
+///   environment is read and its own assignment would win.
+/// - **Pinned empty** by `__holdfast_history`, for configuration that
+///   re-points it later — a per-directory history plugin does, on every
+///   `cd`.
+/// - **`fish_private_mode` exported**, so a fish started inside the session
+///   is private whatever its own config.fish says. At the first prompt and
+///   not here, because the default `fish_greeting` announces private mode:
+///   by then this session's greeting has run (fish runs `fish_prompt`
+///   handlers in the order they were defined, and the greeting's comes
+///   first), so its output starts as a plain fish's does. A nested fish
+///   prints the announcement; a fish that ran the handlers in another order
+///   would too, and would still keep nothing.
+///
+/// **Not `--private`**, which this was until measured: every session's
+/// output began *fish is running in private mode, history will not be
+/// persisted*; with a config.fish that sets `fish_history`, the session
+/// read the operator's history file and offered its lines as
+/// autosuggestions, into output the agent reads; and its
+/// `fish_private_mode` is not exported, so a nested fish under that config
+/// wrote its history.
+pub const FISH_HISTORY_INIT: &str = concat!(
+    "set -g fish_history ''; ",
+    "function __holdfast_history --on-variable fish_history; ",
+    "if test -n \"$fish_history\"; set -g fish_history ''; end; end; ",
+    "function __holdfast_private --on-event fish_prompt; ",
+    "set -gx fish_private_mode 1; functions -e __holdfast_private; end",
+);
 
 /// Recognise a shell from a `start_session` command line.
 ///
@@ -173,6 +241,25 @@ pub fn detect_shell(command: &str, args: &[String]) -> Option<Shell> {
 /// variables between the elements of an *array* `PROMPT_COMMAND`, so a
 /// user whose hooks live at indices ≥ 1 is unaffected in both.
 const BASH_INTEGRATION: &str = concat!(
+    // GH #252, ahead of the guard so it runs even when the snippet yields
+    // to the user's own markers. `HOLDFAST_HISTFILE` carries the session's
+    // history file past the rc files; empty, history goes to `/dev/null`.
+    // An assignment rather than `unset`: with `HISTFILE` unset, `history
+    // -a` in an rc's `PROMPT_COMMAND` appends to `~/.history` (measured).
+    //
+    // With a session file: `__holdfast_h` appends after every command,
+    // prepended to `PROMPT_COMMAND` for the reason `__holdfast_d` is and
+    // handing on `$?` the same way; no `HISTFILESIZE`, which truncates the
+    // file when bash saves at exit (Debian's rc sets 2000); and
+    // `histappend`, defensively. Without it, the save at exit rewrites the
+    // file from the in-memory list whenever more commands are unsaved than
+    // `HISTSIZE` holds, which the per-command append prevents unless
+    // something replaces `PROMPT_COMMAND` mid-session — so no row in
+    // `tests/shell_history.rs` can tell it apart, and none claims to.
+    r#" HISTFILE=${HOLDFAST_HISTFILE:-/dev/null}; if [ -n "${HOLDFAST_HISTFILE-}" ]; then "#,
+    r#"unset HISTFILESIZE; shopt -s histappend; __holdfast_h() { history -a; return "${1:-0}"; }; "#,
+    r#"[[ "${PROMPT_COMMAND-}" == *__holdfast_h* ]] || "#,
+    r#"PROMPT_COMMAND='__holdfast_h "$?"'"${PROMPT_COMMAND:+; $PROMPT_COMMAND}"; fi; "#,
     r#"if [ -z "${HOLDFAST_SHELL_INTEGRATION-}" ] && [[ "${PS1-}" != *"133;A"* ]]; then "#,
     r#"HOLDFAST_SHELL_INTEGRATION=1; "#,
     r#"__holdfast_p() { [[ "${PS0-}" == *"133;C;holdfast=1"* ]] || PS0='\e]133;C;holdfast=1\a'"${PS0-}"; "#,
@@ -236,6 +323,17 @@ const BASH_INTEGRATION: &str = concat!(
 /// re-wrap above depends on the true order, and it was measured rather
 /// than taken from here.
 const ZSH_INTEGRATION: &str = concat!(
+    // GH #252, ahead of the guard for bash's reason. `/dev/null` and not
+    // `unset`, for bash's reason too and one of zsh's own: oh-my-zsh and
+    // prezto assign `HISTFILE` only when it is empty, so an unset one is
+    // re-armed by `source ~/.zshrc`, and an unset variable is not exported,
+    // so `exec zsh` and a nested zsh start without it (measured). A session
+    // history file needs `SAVEHIST` (0 by default) and is appended per
+    // command, and both limits are raised whatever an rc set them to: zsh
+    // trims the file to `SAVEHIST` as it appends, `SIGKILL` or not.
+    r#" if [[ -n ${HOLDFAST_HISTFILE-} ]]; then HISTFILE=$HOLDFAST_HISTFILE; "#,
+    r#"SAVEHIST=1000000000; HISTSIZE=1000000000; "#,
+    r#"setopt inc_append_history; else HISTFILE=/dev/null; fi; "#,
     r#"if [ -z "${HOLDFAST_SHELL_INTEGRATION-}" ] && [[ "${PS1-}" != *"133;A"* ]]; then "#,
     r#"HOLDFAST_SHELL_INTEGRATION=1; "#,
     r#"__holdfast_preexec() { printf '\033]133;C;holdfast=1\007' }; "#,
@@ -315,7 +413,9 @@ const ZSH_INTEGRATION: &str = concat!(
 /// measured repair (capture `$status` first, re-assert it immediately
 /// before the call) is not applied by this milestone.
 const FISH_INTEGRATION: &str = concat!(
-    r#"if not set -q HOLDFAST_SHELL_INTEGRATION; "#,
+    // The leading space keeps the line out of fish's history (GH #252);
+    // `FISH_HISTORY_INIT` keeps everything else out.
+    r#" if not set -q HOLDFAST_SHELL_INTEGRATION; "#,
     r#"set -g HOLDFAST_SHELL_INTEGRATION 1; "#,
     r#"functions -q __holdfast_orig_fish_prompt; "#,
     r#"or functions -c fish_prompt __holdfast_orig_fish_prompt; "#,
@@ -471,7 +571,10 @@ mod tests {
     /// mistake for behaviour.
     #[test]
     fn the_bash_completion_emitter_restores_the_status_it_reported() {
-        let s = Shell::Bash.integration_snippet();
+        let snippet = Shell::Bash.integration_snippet();
+        // `__holdfast_d`'s body alone: `__holdfast_h` returns the same way.
+        let at = snippet.find("__holdfast_d() {").expect("__holdfast_d");
+        let s = &snippet[at..at + snippet[at..].find("}; ").expect("its end")];
         assert!(
             s.contains(r#"return "${1:-0}""#),
             "__holdfast_d must hand $? on to the rest of PROMPT_COMMAND: {s}"
@@ -510,6 +613,65 @@ mod tests {
             s.contains("HOLDFAST_SHELL_INTEGRATION"),
             "REQ-PD-005's self-guard was removed too: {s}"
         );
+    }
+
+    /// GH #252 at the string level: every snippet starts with a space, so
+    /// a shell that ignores space-led lines never records it, and the bash
+    /// and zsh history clauses run **before** the double-injection guard,
+    /// which would otherwise skip them for a user whose own configuration
+    /// already emits markers. `tests/shell_history.rs` in the `holdfast`
+    /// crate is what runs them against rc files.
+    #[test]
+    fn every_snippet_starts_with_a_space_and_sets_history_before_its_guard() {
+        for s in [Shell::Bash, Shell::Zsh, Shell::Fish] {
+            let snippet = s.integration_snippet();
+            assert!(snippet.starts_with(' '), "{}: {snippet}", s.as_str());
+        }
+        let guard = "HOLDFAST_SHELL_INTEGRATION";
+        let bash = Shell::Bash.integration_snippet();
+        let set = bash
+            .find("HISTFILE=${HOLDFAST_HISTFILE:-/dev/null}")
+            .expect("bash assigns HISTFILE");
+        assert!(set < bash.find(guard).unwrap(), "{bash}");
+        // A per-session file's per-command append too: a user whose own
+        // configuration emits markers still gets it.
+        let append = bash.find("history -a").expect("bash appends per command");
+        assert!(append < bash.find(guard).unwrap(), "{bash}");
+        let zsh = Shell::Zsh.integration_snippet();
+        let set = zsh
+            .find("else HISTFILE=/dev/null;")
+            .expect("zsh assigns HISTFILE");
+        assert!(set < zsh.find(guard).unwrap(), "{zsh}");
+        for snippet in [bash, zsh] {
+            let unsets_histfile = snippet.match_indices("unset HISTFILE").any(|(at, word)| {
+                !snippet[at + word.len()..].starts_with(|c: char| c.is_alphanumeric() || c == '_')
+            });
+            assert!(
+                !unsets_histfile,
+                "an unset HISTFILE is re-armed by a conditional rc and not \
+                 inherited by `exec`: {snippet}"
+            );
+        }
+    }
+
+    #[test]
+    fn only_fish_is_spawned_with_history_arguments() {
+        assert_eq!(Shell::Fish.spawn_args(), ["-C", FISH_HISTORY_INIT]);
+        assert!(Shell::Bash.spawn_args().is_empty());
+        assert!(Shell::Zsh.spawn_args().is_empty());
+
+        let none: &[(String, String)] = &[];
+        let own = [("fish_history".to_string(), "work".to_string())];
+        assert_eq!(
+            history_spawn_args("/usr/bin/fish", &args(&["-l"]), none),
+            Shell::Fish.spawn_args()
+        );
+        assert!(
+            history_spawn_args("fish", &[], &own).is_empty(),
+            "the call's own fish_history must stand"
+        );
+        assert!(history_spawn_args("fish", &args(&["-c", "ls"]), none).is_empty());
+        assert!(history_spawn_args("bash", &[], none).is_empty());
     }
 
     #[test]

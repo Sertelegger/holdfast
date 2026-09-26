@@ -4,7 +4,7 @@
 use super::envelope::{self, Status};
 use super::{caller, detection, offload, schema, HoldfastServer};
 use crate::detect::{
-    detect_shell, DetectionConfig, InteractionMode, PatternSet, PromptPattern,
+    detect_shell, DetectionConfig, InteractionMode, PatternSet, PromptPattern, Shell,
     DEFAULT_SETTLE_THRESHOLD_MS,
 };
 use crate::output::ansi::AnsiMode;
@@ -17,6 +17,7 @@ use crate::request::RequestContext;
 use crate::screen::{ScreenCapture, ScreenConfig, ScreenTracking};
 use crate::secret::binding::{Autofill, Resolved};
 use crate::secret::{CancelReason, RaisedBy, Resolution, SlotSnapshot, SlotTake};
+use crate::session::launch::History;
 use crate::session::SecretWrite;
 use crate::session::{new_session_id, wait, Session, SessionConfig, WriteRequest};
 use rmcp::handler::server::wrapper::Parameters;
@@ -240,7 +241,9 @@ pub struct StartSessionArgs {
     #[serde(default)]
     pub settle_threshold_ms: Option<u64>,
     /// Inject OSC 133 shell integration when the command is bash, zsh,
-    /// or fish. Defaults to true.
+    /// or fish. Defaults to true. `false` also skips the snippet's history
+    /// line, so an rc file that sets `HISTFILE` decides where bash and zsh
+    /// save history.
     #[serde(default)]
     pub shell_integration: Option<bool>,
     /// Answer the closed terminal-query set (Primary Device Attributes
@@ -290,7 +293,22 @@ impl HoldfastServer {
         // directory come from (GH #46, GH #55).
         let launch = self.resolve_launch(&args)?;
         let mut cfg = PtySpawnConfig::new(&launch.command);
-        cfg.args = launch.args.clone();
+        // GH #252: fish is spawned with `Shell::spawn_args`' history
+        // policy ahead of the caller's arguments, whether or not the
+        // snippet will be typed — unless the call's own `env` names a
+        // `fish_history`, which then stands, as a `HISTFILE` it sets does
+        // for bash and zsh. The argv that runs is what the audit row
+        // records; the session reports the caller's, as it reports none of
+        // the environment defaults below.
+        cfg.args =
+            crate::detect::shell::history_spawn_args(&launch.command, &launch.args, &launch.env)
+                .iter()
+                .map(|a| a.to_string())
+                .chain(launch.args.iter().cloned())
+                .collect();
+        // Issued before the spawn because a per-session history file is
+        // named by it (GH #252); `new_session_id` is pure.
+        let session_id = new_session_id();
 
         // `portable-pty` silently *discards* a cwd that is not an existing
         // directory and falls back to $HOME, so an unvalidated cwd means
@@ -397,13 +415,39 @@ impl HoldfastServer {
         // daemon, the daemon's own minus the spawning client's identity
         // otherwise, and `None` — inherit — in-process, where this process
         // *is* the client's. The defaults (`PAGER=cat` and its three
-        // siblings, and `PWD`) sit between the two, so an inherited pager
-        // loses to them and the call's own `env` beats them both. They go
-        // into `cfg.env` ahead of `launch.env` rather than into the base,
-        // because in-process there is no base to put them in; a later
-        // entry for the same key replaces an earlier one at the spawn.
+        // siblings, `PWD`, and the shell-history policy) sit between the
+        // two, so an inherited pager loses to them and the call's own
+        // `env` beats them both. They go into `cfg.env` ahead of
+        // `launch.env` rather than into the base, because in-process there
+        // is no base to put them in; a later entry for the same key
+        // replaces an earlier one at the spawn.
         let base_env = host.base_env(profiled, std::env::vars_os());
-        cfg.env = crate::session::launch::session_defaults(cfg.cwd.as_deref(), &launch.env);
+        let history_file = match self.config.terminal.shell_history_file.as_str() {
+            "per_session" => {
+                let file = self
+                    .history_dir
+                    .as_ref()
+                    .map(|dir| dir.join(format!("{session_id}.history")))
+                    .and_then(|p| p.into_os_string().into_string().ok());
+                match file {
+                    Some(f) => Some(f),
+                    None => {
+                        return Err(ErrorData::internal_error(
+                            "[terminal] shell_history_file = \"per_session\", and this server \
+                             has no state directory to keep the session's history file in"
+                                .to_string(),
+                            None,
+                        ))
+                    }
+                }
+            }
+            _ => None,
+        };
+        let history = history_file
+            .as_deref()
+            .map_or(History::Discard, History::File);
+        cfg.env =
+            crate::session::launch::session_defaults(cfg.cwd.as_deref(), history, &launch.env);
         cfg.env.extend(launch.env.iter().cloned());
 
         if let Some(c) = args.cols {
@@ -538,9 +582,42 @@ impl HoldfastServer {
             Err(e) => return envelope::from_error(&e),
         };
 
+        // GH #252's `per_session` file, `0600` in a `0700` directory: no
+        // shell creates the directory, and the file's mode is Holdfast's
+        // to set rather than each shell's. Created up front only for bash
+        // and zsh, the shells the snippet points at it; any other session
+        // is pointed at it too, and leaves no empty file unless a shell it
+        // starts saves something (`prepare_history_file`). After the
+        // reservation, so a refused call leaves no file behind.
+        let mut created_history_file = false;
+        if let Some(file) = &history_file {
+            let posix_shell = matches!(
+                detect_shell(&launch.command, &launch.args),
+                Some(Shell::Bash | Shell::Zsh)
+            );
+            match crate::daemon::paths::prepare_history_file(
+                std::path::Path::new(file),
+                posix_shell,
+            ) {
+                Ok(created) => created_history_file = created,
+                Err(e) => {
+                    return Err(ErrorData::internal_error(
+                        format!(
+                            "[terminal] shell_history_file = \"per_session\", and this \
+                             session's history file could not be created: {e}"
+                        ),
+                        None,
+                    ))
+                }
+            }
+        }
+
         let backend = match InProcessPty::spawn_with_base_env(&cfg, base_env.as_deref()) {
             Ok(b) => Arc::new(b) as Arc<dyn PtyBackend>,
             Err(e) => {
+                if let (true, Some(file)) = (created_history_file, &history_file) {
+                    let _ = std::fs::remove_file(file);
+                }
                 // `brief` matters here: portable-pty's spawn error embeds
                 // the whole $PATH, which would land in the transcript.
                 //
@@ -561,7 +638,7 @@ impl HoldfastServer {
         };
 
         let session = Session::new(
-            new_session_id(),
+            session_id,
             args.name.clone(),
             launch.command.clone(),
             launch.args.clone(),
@@ -7236,6 +7313,87 @@ mod tests {
         assert_eq!(clean["held_back"], json!(false), "{clean}");
         assert_eq!(clean["held_back_cause"], Value::Null, "{clean}");
 
+        kill_everything(&server).await;
+    }
+
+    /// GH #252's opt-in, in-process. `per_session` with nowhere to put the
+    /// file refuses the call rather than keep the record nowhere. A bash
+    /// session's file is created `0600` in a `0700` directory before the
+    /// child exists — under a forced `022` umask, so neither mode can be
+    /// the environment's. A program that is not bash or zsh gets the
+    /// directory and no file, and a bash that fails to spawn takes the
+    /// file it was given with it. `tests/shell_history.rs` in the
+    /// `holdfast` crate is what shows a shell writing to it.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_per_session_history_file_is_created_or_the_call_is_refused() {
+        use std::os::unix::fs::PermissionsExt;
+        let _umask = crate::daemon::paths::ForcedUmask::loose();
+
+        let mut config = crate::config::Config::default();
+        config.terminal.shell_history_file = "per_session".into();
+        let args = |command: &str, args: &[&str]| StartSessionArgs {
+            command: Some(command.into()),
+            args: args.iter().map(|a| (*a).to_string()).collect(),
+            ..Default::default()
+        };
+        let bash = || args("bash", &["--norc", "--noprofile"]);
+
+        let nowhere = HoldfastServer::with_audit_path_and_config(None, &config);
+        let refused = nowhere.start_session(Parameters(bash())).await;
+        assert!(refused.is_err(), "{refused:?}");
+        assert!(
+            nowhere.registry.all().is_empty(),
+            "a refused call left a session"
+        );
+
+        let dir = tempfile::tempdir().unwrap();
+        let history = dir.path().join("history");
+        let server = HoldfastServer::with_audit_path_and_config(None, &config)
+            .with_history_dir(Some(history.clone()));
+        let started = row(
+            "start_session",
+            &server.start_session(Parameters(bash())).await.unwrap(),
+        )
+        .data;
+        let id = started["session_id"].as_str().expect("session_id");
+        let file = history.join(format!("{id}.history"));
+        let mode = |p: &std::path::Path| std::fs::metadata(p).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode(&file), 0o600, "{}", file.display());
+        assert_eq!(mode(&history), 0o700, "{}", history.display());
+
+        let sh = row(
+            "start_session",
+            &server
+                .start_session(Parameters(args("sh", &["-c", "sleep 30"])))
+                .await
+                .unwrap(),
+        );
+        assert!(sh.data["session_id"].is_string(), "{}", sh.whole);
+
+        let failed = row(
+            "start_session",
+            &server
+                .start_session(Parameters(args("/nonexistent/holdfast-test/bash", &[])))
+                .await
+                .unwrap(),
+        );
+        assert_eq!(
+            failed.whole["structuredContent"]["status"], "spawn_failed",
+            "{}",
+            failed.whole
+        );
+
+        let mut left: Vec<String> = std::fs::read_dir(&history)
+            .unwrap()
+            .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+            .collect();
+        left.sort();
+        assert_eq!(
+            left,
+            [format!("{id}.history")],
+            "only the bash session that started keeps a file"
+        );
         kill_everything(&server).await;
     }
 }

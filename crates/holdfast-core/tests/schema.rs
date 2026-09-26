@@ -3921,6 +3921,7 @@ async fn every_declared_status_is_returned_by_a_real_response() {
             // chose.
             capabilities: small.capabilities,
             attach_hub: std::sync::Arc::clone(&small.attach_hub),
+            history_dir: small.history_dir.clone(),
         };
         let (_first, _) = start_bash(&server_one).await;
         note(&body(

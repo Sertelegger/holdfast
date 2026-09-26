@@ -4,8 +4,9 @@
 # Two shapes of shortfall. One census, because they are one defect:
 #
 #   1. A ROW THAT DID NOT RUN. Eight rows of
-#      crates/holdfast-core/tests/detection.rs, and REQ-TS-008's row in
-#      crates/holdfast-core/tests/screen.rs, early-`return` when their host
+#      crates/holdfast-core/tests/detection.rs, REQ-TS-008's row in
+#      crates/holdfast-core/tests/screen.rs, and the fish row of
+#      crates/holdfast/tests/shell_history.rs early-`return` when their host
 #      requirement is unmet. libtest reports every one of them as `ok` and
 #      swallows the explanation unless the runner is asked to show a
 #      PASSING test's output (`--show-output` under cargo test,
@@ -245,9 +246,17 @@ set -uo pipefail
 #   longer true and stood here until 2026-09-20**: a fish 3.7.0 in the
 #   `test` job retires the record above and leaves this one exactly where
 #   it is, because 3.7.0 is what this row's SECOND skip arm is for.
+#
+#   shell_history.rs's fish row (GH #252) — exempt HERE for the same reason
+#   as the one above, and measured by the same job: `fish-req-ts-008` runs
+#   it against its PPA fish and fails on a skip. It passes on fish 3.7.0
+#   and 4.9.3 (measured 2026-09-26, after fish moved from `--private` to
+#   `-C`; the PPA's 4.8.x is measured by that job). RETIRED BY: any fish in
+#   the `test` job's apt line.
 EXPECTED=(
   "fish_integration_emits_the_measured_marker_stream_and_exact_exit_codes|skipping: fish not installed — the fish snippet remains"
   "only_answering_da1_takes_fish_to_its_first_prompt|skipping: fish not installed — REQ-TS-008's three arms need|skipping: fish not installed at a version this row measures"
+  "fish_keeps_nothing_in_home_however_a_session_ends|skipping: fish not installed — fish's shell-history rows"
 )
 
 # Every assertion this pipeline tolerates being gated OFF, keyed on the id
@@ -764,6 +773,22 @@ successes:
 
 test result: ok. 34 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 8.00s
 
+     Running tests/shell_history.rs (/repo/target/debug/deps/shell_history-0000000000000004)
+
+running 3 tests
+test fish_keeps_nothing_in_home_however_a_session_ends ... ok
+
+successes:
+
+---- fish_keeps_nothing_in_home_however_a_session_ends stdout ----
+skipping: fish not installed — fish's shell-history rows are not measured
+
+
+successes:
+    fish_keeps_nothing_in_home_however_a_session_ends
+
+test result: ok. 3 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 20.00s
+
      Running tests/stress_write_path.rs (/repo/target/debug/deps/stress_write_path-0000000000000002)
 
 running 1 test
@@ -823,7 +848,7 @@ FIXTURE
   # THE SHAPE CI ACTUALLY PRODUCES SINCE THE `test` JOB MOVED TO NEXTEST,
   # transcribed from a real `cargo nextest run --workspace --locked
   # --no-fail-fast --success-output immediate --no-output-indent` of this
-  # workspace and trimmed to the three rows this file has entries for. The
+  # workspace and trimmed to the four rows this file has entries for. The
   # timings and the `not-asserted: ` line are the hosted runner's; the
   # counters are the excerpt's own, so the fixture is self-consistent.
   #
@@ -845,8 +870,8 @@ FIXTURE
     Finished `test` profile [unoptimized + debuginfo] target(s) in 41.02s
 ────────────
  Nextest run ID 00000000-0000-0000-0000-000000000000 with nextest profile: default
-    Starting 5 tests across 3 binaries
-        PASS [   0.019s] (   1/5) holdfast-core::detection the_pty_matrix_runs_every_host_dependent_row_but_the_two_it_names
+    Starting 6 tests across 4 binaries
+        PASS [   0.019s] (   1/6) holdfast-core::detection the_pty_matrix_runs_every_host_dependent_row_but_the_two_it_names
 ── stdout ──
 
 running 1 test
@@ -855,7 +880,7 @@ test the_pty_matrix_runs_every_host_dependent_row_but_the_two_it_names ... ok
 test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 22 filtered out; finished in 0.01s
 
 
-        PASS [   0.091s] (   2/5) holdfast-core::detection fish_integration_emits_the_measured_marker_stream_and_exact_exit_codes
+        PASS [   0.091s] (   2/6) holdfast-core::detection fish_integration_emits_the_measured_marker_stream_and_exact_exit_codes
 ── stdout ──
 
 running 1 test
@@ -866,7 +891,7 @@ test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 22 filtered out; fin
 ── stderr ──
 skipping: fish not installed — the fish snippet remains UNVERIFIED by this suite (fish version: none)
 
-        PASS [   0.009s] (   3/5) holdfast-core::screen the_all_but_da1_fixture_answers_every_probe_except_primary_da
+        PASS [   0.009s] (   3/6) holdfast-core::screen the_all_but_da1_fixture_answers_every_probe_except_primary_da
 ── stdout ──
 
 running 1 test
@@ -875,7 +900,7 @@ test the_all_but_da1_fixture_answers_every_probe_except_primary_da ... ok
 test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 18 filtered out; finished in 0.00s
 
 
-        PASS [   0.068s] (   4/5) holdfast-core::screen only_answering_da1_takes_fish_to_its_first_prompt
+        PASS [   0.068s] (   4/6) holdfast-core::screen only_answering_da1_takes_fish_to_its_first_prompt
 ── stdout ──
 
 running 1 test
@@ -886,7 +911,18 @@ test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 18 filtered out; fin
 ── stderr ──
 skipping: fish not installed — REQ-TS-008's three arms need fish >= 4.0 (REQ-TST-007)
 
-        PASS [ 127.700s] (   5/5) holdfast-core::stress_write_path tier_b_stays_off_and_the_control_path_stays_responsive_under_load
+        PASS [   0.012s] (   5/6) holdfast::shell_history fish_keeps_nothing_in_home_however_a_session_ends
+── stdout ──
+
+running 1 test
+test fish_keeps_nothing_in_home_however_a_session_ends ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 2 filtered out; finished in 0.01s
+
+── stderr ──
+skipping: fish not installed — fish's shell-history rows are not measured
+
+        PASS [ 127.700s] (   6/6) holdfast-core::stress_write_path tier_b_stays_off_and_the_control_path_stays_responsive_under_load
 ── stdout ──
 
 running 1 test
@@ -898,7 +934,7 @@ test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; fini
 not-asserted: stress_write_path::control_path_p99 cores=2 min_cores=8 — §11.4's p99 needs >= 8 cores to be a statement about Holdfast rather than about the scheduler; this box has 2. Measured anyway: p99 1.109297052s, max 1.109297052s, 17 samples, 2343186436 bytes streamed.
 
 ────────────
-     Summary [ 128.104s] 5 tests run: 5 passed, 0 skipped
+     Summary [ 128.116s] 6 tests run: 6 passed, 0 skipped
 FIXTURE
 
   # A nextest log that cannot be about detection.rs at all: the binary's
@@ -948,7 +984,7 @@ FIXTURE
   expect "a cargo-shaped log is CLEAN under CI's strictness" \
     ci.log 1 0 "SKIP CENSUS OK"
   expect "...and it says what did NOT run, rather than reading as full coverage" \
-    ci.log 1 0 "2 tolerated skip(s), 1 tolerated non-assertion(s)"
+    ci.log 1 0 "3 tolerated skip(s), 1 tolerated non-assertion(s)"
   expect "...and it names the gated assertion in the listing" \
     ci.log 1 0 "not-asserted: stress_write_path::control_path_p99 cores=2 min_cores=8"
 
@@ -960,7 +996,7 @@ FIXTURE
   expect "the nextest log CI produces today is CLEAN under CI's strictness" \
     nextest.log 1 0 "SKIP CENSUS OK"
   expect "...and it too says what did NOT run" \
-    nextest.log 1 0 "2 tolerated skip(s), 1 tolerated non-assertion(s)"
+    nextest.log 1 0 "3 tolerated skip(s), 1 tolerated non-assertion(s)"
   expect "...and its gated assertion parses, id and both core counts" \
     nextest.log 1 0 "not-asserted: stress_write_path::control_path_p99 cores=2 min_cores=8"
   expect "a nextest log that never names the detection binary certifies nothing" \
@@ -982,7 +1018,7 @@ FIXTURE
   expect "the COLOURISED log CI actually writes is CLEAN too" \
     nx-color.log 1 0 "SKIP CENSUS OK"
   expect "...and its rows, skips and gated assertion all still parse under SGR" \
-    nx-color.log 1 0 "2 tolerated skip(s), 1 tolerated non-assertion(s)"
+    nx-color.log 1 0 "3 tolerated skip(s), 1 tolerated non-assertion(s)"
 
   # THE TWO DEMONSTRATIONS THE BRIEF ASKS FOR.
   expect "a gated assertion nobody agreed to FAILS" \

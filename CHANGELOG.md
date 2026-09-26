@@ -580,6 +580,9 @@ is cut, named and published is in
 
 ### Security
 
+- **A session's shell no longer writes the agent's commands into your shell
+  history** ([#252]); `[terminal] shell_history_file = "per_session"` keeps
+  them in `~/.holdfast/logs/history/<session_id>.history` instead.
 - **Database URLs outside the old scheme list, and several common credential
   spellings, went out raw; they are redacted now** ([#244]).
   `database-connection-password` takes the TLS schemes (`rediss://`,
@@ -3019,3 +3022,4 @@ residuals that are known and accepted.
 [#232]: https://github.com/Sertelegger/holdfast/issues/232
 [#233]: https://github.com/Sertelegger/holdfast/issues/233
 [#237]: https://github.com/Sertelegger/holdfast/issues/237
+[#252]: https://github.com/Sertelegger/holdfast/issues/252
