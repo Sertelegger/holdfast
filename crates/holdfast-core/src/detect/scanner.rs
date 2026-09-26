@@ -277,6 +277,17 @@ fn columns_prefix(line: &str, columns: isize) -> usize {
         .map_or(line.len(), |(i, _)| i)
 }
 
+/// The text a capture spells. A capture holds one `char` per byte of the
+/// echo, and the echo is UTF-8, so the bytes are collected back and
+/// decoded — the command field is text, and `é` read a byte at a time is
+/// `Ã©`. A sequence the capture cut short (`COMMAND_CAPTURE_MAX`, a repaint
+/// that kept part of a line) decodes as `U+FFFD`.
+fn decode_capture(capture: &str) -> String {
+    // Every `char` in a capture is at most `U+00FF`, so none is truncated.
+    let bytes: Vec<u8> = capture.chars().map(|c| c as u8).collect();
+    String::from_utf8_lossy(&bytes).into_owned()
+}
+
 /// Terminal modes observed so far, plus whether each was ever observed at
 /// all — availability, not just current value, decides which detection
 /// tier can answer (§8.4). Two of the three `saw_*` flags do that;
@@ -345,7 +356,10 @@ pub struct ModeScanner {
     seq_start: u64,
     /// Bytes consumed by the sequence being parsed, against `SEQUENCE_MAX`.
     seq_len: usize,
-    /// Echoed command line, accumulated between OSC 133 `B` and `C`.
+    /// Echoed command line, accumulated between OSC 133 `B` and `C`: one
+    /// `char` per byte of the echo, so `U+0080..=U+00FF` stand for the
+    /// bytes of a UTF-8 sequence, and `decode_capture` reads it back as
+    /// the text it spells at `C`.
     capture: Option<String>,
     /// A bare `\r` was seen inside the capture and the overwrite it
     /// promises has not been observed yet. See `capture_return`.
@@ -912,8 +926,17 @@ impl ModeScanner {
         // before it, exactly as it did when the truncate happened on the
         // `\r` itself.
         self.resolve_capture_return();
+        // One backspace un-draws one character, and a character the echo
+        // wrote as UTF-8 is its lead byte and every continuation byte after
+        // it. zsh echoes a first key, backspaces over it and redraws the
+        // line, so popping a single byte leaves `Ã` in front of a command
+        // that begins with `é`.
         if let Some(cap) = self.capture.as_mut() {
-            cap.pop();
+            while let Some(c) = cap.pop() {
+                if !('\u{80}'..='\u{bf}').contains(&c) {
+                    break;
+                }
+            }
         }
     }
 
@@ -1254,7 +1277,10 @@ impl ModeScanner {
             b'C' => {
                 // `None` when no `B` armed the capture: the text was not
                 // seen, which is not the same as an empty line.
-                let command = self.capture.take().map(|c| c.trim().to_string());
+                let command = self
+                    .capture
+                    .take()
+                    .map(|c| decode_capture(&c).trim().to_string());
                 // A debt the repaint never repaid: the line's front went
                 // to a `\r` and is not in `command`.
                 let truncated = self.capture_debt > 0;
@@ -2199,6 +2225,52 @@ mod tests {
                 },
                 "{what}"
             );
+        }
+    }
+
+    /// The command field is the text that was typed, not the bytes of its
+    /// echo read one to a character. `éé=1; echo ok` typed a key at a time
+    /// at `LC_ALL=C.UTF-8`, verbatim from `B` (bash 5.3 from its prompt)
+    /// to `C`: zsh echoes the first key, backspaces over it and redraws,
+    /// and bash 5.3 steps over the `é`s already drawn, a column for each.
+    #[test]
+    fn a_command_is_the_text_its_echo_spells() {
+        for (what, raw, want) in [
+            (
+                "echoed plainly",
+                "\x1b]133;A\x07$ \x1b]133;B\x07echo héllo wörld\r\n\x1b]133;C\x07",
+                "echo héllo wörld",
+            ),
+            (
+                "zsh, backspacing over a first key of two bytes",
+                "\x1b]133;B;holdfast=1\x07\x1b[K\x1b[?2004hé\x08éé=1; echo ok\x1b[?2004l\
+                 \r\r\n\x1b]133;C;holdfast=1\x07",
+                "éé=1; echo ok",
+            ),
+            (
+                "bash 5.3, stepping over two-byte characters a column at a time",
+                "\x1b[?2004h\x1b]133;A;holdfast=1\x07⬢ [x] ❯ \x1b]133;B;holdfast=1\x07\
+                 \r\x1b]133;A;holdfast=1\x07⬢ [x] ❯ \x1b]133;B;holdfast=1\x07é\
+                 \r\x1b]133;A;holdfast=1\x07⬢ [x] ❯ \x1b]133;B;holdfast=1\x07\x1b[Cé\
+                 \r\x1b]133;A;holdfast=1\x07⬢ [x] ❯ \x1b]133;B;holdfast=1\x07\x1b[C\x1b[C=\
+                 \r\x1b]133;A;holdfast=1\x07⬢ [x] ❯ \x1b]133;B;holdfast=1\x07\
+                 \x1b[C\x1b[C\x1b[C1; echo ok\r\n\x1b[?2004l\r\x1b]133;C;holdfast=1\x07",
+                "éé=1; echo ok",
+            ),
+        ] {
+            let want = Osc133::OutputStart {
+                command: Some(want.into()),
+                truncated: false,
+            };
+            let raw = raw.as_bytes();
+            let (_, ev) = scan(raw);
+            assert_eq!(last_command(&ev), want, "{what}");
+            let mut s = ModeScanner::new();
+            let mut ev = Vec::new();
+            for (i, b) in raw.iter().enumerate() {
+                ev.extend(s.feed(std::slice::from_ref(b), i as u64, None));
+            }
+            assert_eq!(last_command(&ev), want, "{what}, fed a byte at a time");
         }
     }
 
