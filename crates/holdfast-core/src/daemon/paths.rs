@@ -306,6 +306,87 @@ pub fn open_log_append(path: &Path) -> io::Result<std::fs::File> {
         .open(path)
 }
 
+/// Make ready a `per_session` shell history file (GH #252): its directory
+/// created `0700`, or an existing one brought to `0700`, and — when
+/// `create` — the file itself created `0600`. Answers whether it created
+/// the file, which is then the caller's to remove if the session never
+/// starts.
+///
+/// **The directory is refused, not repaired, unless it is a real
+/// directory this user owns.** A symlink would put every session's
+/// history wherever it points, and a directory another user owns can be
+/// loosened again by them after any `chmod` here. One that is merely
+/// loose — a `0777` left by an older install or a hand-made directory — is
+/// tightened: the files in it are named by fresh session ids, so nothing
+/// planted beforehand can be one of them.
+///
+/// **The file is new or the call fails** (`O_CREAT|O_EXCL`, which follows
+/// no symlink, and `O_NOFOLLOW` besides), so nothing already at the path —
+/// a link, or another session's file — is written through or reused.
+///
+/// `create` is false for a session whose program is not bash or zsh: the
+/// session is still pointed at the file, and a shell started inside it
+/// creates it only if it saves something (bash and zsh create a history
+/// file `0600`), so a `sh -c true` leaves no empty file behind.
+#[cfg(unix)]
+pub fn prepare_history_file(file: &Path, create: bool) -> io::Result<bool> {
+    use std::os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt};
+
+    let dir = file.parent().ok_or_else(|| {
+        io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!("{} has no directory", file.display()),
+        )
+    })?;
+    if std::fs::symlink_metadata(dir).is_err() {
+        create_owner_only(dir)?;
+    }
+    let md = std::fs::symlink_metadata(dir)?;
+    let me = crate::daemon::peer::current_uid();
+    if !md.is_dir() || md.uid() != me {
+        return Err(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            format!(
+                "{d} is not a directory owned by this user (uid {me}), so another \
+                 local user could read or redirect the session history files in it. \
+                 Remove it and Holdfast recreates it {DIR_MODE:o}.",
+                d = dir.display()
+            ),
+        ));
+    }
+    if md.mode() & 0o777 != DIR_MODE {
+        std::fs::set_permissions(dir, std::fs::Permissions::from_mode(DIR_MODE))?;
+    }
+    if !create {
+        return Ok(false);
+    }
+    std::fs::OpenOptions::new()
+        .append(true)
+        .create_new(true)
+        .mode(LOG_MODE)
+        .custom_flags(libc::O_NOFOLLOW)
+        .open(file)?;
+    Ok(true)
+}
+
+/// The Windows arm: the directory and the file with the ACL they inherit,
+/// as [`open_log_append`]'s Windows arm, and the file new or the call
+/// fails.
+#[cfg(windows)]
+pub fn prepare_history_file(file: &Path, create: bool) -> io::Result<bool> {
+    if let Some(dir) = file.parent() {
+        create_owner_only(dir)?;
+    }
+    if !create {
+        return Ok(false);
+    }
+    std::fs::OpenOptions::new()
+        .append(true)
+        .create_new(true)
+        .open(file)?;
+    Ok(true)
+}
+
 /// Say once per process that the mode bits this module is named for are not
 /// being applied.
 ///
@@ -1906,6 +1987,56 @@ mod tests {
 
     fn mode_of(path: &Path) -> u32 {
         std::fs::metadata(path).unwrap().permissions().mode() & 0o777
+    }
+
+    /// GH #252's per-session history file: created `0600` in a directory
+    /// created `0700`, under a forced `022` umask so neither mode can be
+    /// the environment's; a `0777` directory tightened; a directory that
+    /// is a symlink refused; and a file that already exists — a link to
+    /// somewhere else, or another session's file — neither followed nor
+    /// reused.
+    #[test]
+    fn a_history_file_is_new_and_owner_only_in_an_owner_only_directory() {
+        use std::os::unix::fs::symlink;
+
+        let root = temp_dir("hist");
+        let _scoped = Scoped(root.clone());
+        let _umask = ForcedUmask::loose();
+
+        let dir = root.join("logs").join("history");
+        let file = dir.join("sess_1.history");
+        assert!(prepare_history_file(&file, true).unwrap());
+        assert_eq!(mode_of(&file), LOG_MODE);
+        assert_eq!(mode_of(&dir), DIR_MODE);
+        assert_eq!(mode_of(dir.parent().unwrap()), DIR_MODE);
+
+        let other = dir.join("sess_2.history");
+        assert!(!prepare_history_file(&other, false).unwrap());
+        assert!(!other.exists(), "create = false created the file");
+
+        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o777)).unwrap();
+        assert!(prepare_history_file(&dir.join("sess_3.history"), true).unwrap());
+        assert_eq!(mode_of(&dir), DIR_MODE, "a 0777 directory stayed loose");
+
+        std::fs::write(&file, "kept").unwrap();
+        prepare_history_file(&file, true).expect_err("an existing file was reused");
+        assert_eq!(std::fs::read_to_string(&file).unwrap(), "kept");
+
+        let target = root.join("elsewhere");
+        std::fs::write(&target, "").unwrap();
+        let link = dir.join("sess_4.history");
+        symlink(&target, &link).unwrap();
+        prepare_history_file(&link, true).expect_err("a symlink was followed");
+        assert_eq!(std::fs::read_to_string(&target).unwrap(), "");
+
+        let real = root.join("real");
+        std::fs::create_dir(&real).unwrap();
+        let linked_dir = root.join("linked");
+        symlink(&real, &linked_dir).unwrap();
+        let err = prepare_history_file(&linked_dir.join("sess_5.history"), true)
+            .expect_err("a symlinked directory was used");
+        assert_eq!(err.kind(), std::io::ErrorKind::PermissionDenied, "{err}");
+        assert_eq!(std::fs::read_dir(&real).unwrap().count(), 0);
     }
 
     #[test]

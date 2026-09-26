@@ -890,6 +890,12 @@ const BASH_OWN_MARKERS_RC: &str = "PS1='\\[\\e]133;A\\a\\]$ \\[\\e]133;B\\a\\]'\
 fn a_per_session_history_file_keeps_what_the_agent_ran_and_home_keeps_nothing() {
     use std::os::unix::fs::PermissionsExt;
 
+    // The daemon inherits this process's umask, and `022` clears no bit of
+    // `0600` or `0700`: the modes asserted below are then Holdfast's, not
+    // a strict runner's.
+    // SAFETY: `umask` cannot fail; this test is its own process under
+    // nextest and creates everything else with an explicit mode.
+    unsafe { libc::umask(0o022) };
     let inst = Instance::new("per-session");
     inst.write_config("[terminal]\nshell_history_file = \"per_session\"\n");
     let mut shim = Shim::launch(&inst);

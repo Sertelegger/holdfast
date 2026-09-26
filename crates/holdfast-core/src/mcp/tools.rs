@@ -4,7 +4,7 @@
 use super::envelope::{self, Status};
 use super::{caller, detection, offload, schema, HoldfastServer};
 use crate::detect::{
-    detect_shell, DetectionConfig, InteractionMode, PatternSet, PromptPattern,
+    detect_shell, DetectionConfig, InteractionMode, PatternSet, PromptPattern, Shell,
     DEFAULT_SETTLE_THRESHOLD_MS,
 };
 use crate::output::ansi::AnsiMode;
@@ -579,26 +579,40 @@ impl HoldfastServer {
             Err(e) => return envelope::from_error(&e),
         };
 
-        // GH #252's `per_session` file, created here, `0600` in a `0700`
-        // directory: no shell creates the directory, and the file's mode
-        // is Holdfast's to set rather than each shell's. After the
+        // GH #252's `per_session` file, `0600` in a `0700` directory: no
+        // shell creates the directory, and the file's mode is Holdfast's
+        // to set rather than each shell's. Created up front only for bash
+        // and zsh, the shells the snippet points at it; any other session
+        // is pointed at it too, and leaves no empty file unless a shell it
+        // starts saves something (`prepare_history_file`). After the
         // reservation, so a refused call leaves no file behind.
+        let mut created_history_file = false;
         if let Some(file) = &history_file {
-            if let Err(e) = crate::daemon::paths::open_log_append(std::path::Path::new(file)) {
-                return Err(ErrorData::internal_error(
-                    format!(
-                        "[terminal] shell_history_file = \"per_session\", and this session's \
-                         history file could not be created: {e}"
-                    ),
-                    None,
-                ));
+            let posix_shell = matches!(
+                detect_shell(&launch.command, &launch.args),
+                Some(Shell::Bash | Shell::Zsh)
+            );
+            match crate::daemon::paths::prepare_history_file(
+                std::path::Path::new(file),
+                posix_shell,
+            ) {
+                Ok(created) => created_history_file = created,
+                Err(e) => {
+                    return Err(ErrorData::internal_error(
+                        format!(
+                            "[terminal] shell_history_file = \"per_session\", and this \
+                             session's history file could not be created: {e}"
+                        ),
+                        None,
+                    ))
+                }
             }
         }
 
         let backend = match InProcessPty::spawn_with_base_env(&cfg, base_env.as_deref()) {
             Ok(b) => Arc::new(b) as Arc<dyn PtyBackend>,
             Err(e) => {
-                if let Some(file) = &history_file {
+                if let (true, Some(file)) = (created_history_file, &history_file) {
                     let _ = std::fs::remove_file(file);
                 }
                 // `brief` matters here: portable-pty's spawn error embeds
@@ -7275,26 +7289,31 @@ mod tests {
         kill_everything(&server).await;
     }
 
-    /// GH #252's opt-in, in-process: `per_session` with nowhere to put the
-    /// file refuses the call rather than keep the record nowhere, and with
-    /// a directory it creates `<session_id>.history` `0600` before the
-    /// child exists. `tests/shell_history.rs` in the `holdfast` crate is
-    /// what shows a shell writing to it.
+    /// GH #252's opt-in, in-process. `per_session` with nowhere to put the
+    /// file refuses the call rather than keep the record nowhere. A bash
+    /// session's file is created `0600` in a `0700` directory before the
+    /// child exists — under a forced `022` umask, so neither mode can be
+    /// the environment's. A program that is not bash or zsh gets the
+    /// directory and no file, and a bash that fails to spawn takes the
+    /// file it was given with it. `tests/shell_history.rs` in the
+    /// `holdfast` crate is what shows a shell writing to it.
     #[cfg(unix)]
     #[tokio::test]
     async fn a_per_session_history_file_is_created_or_the_call_is_refused() {
         use std::os::unix::fs::PermissionsExt;
+        let _umask = crate::daemon::paths::ForcedUmask::loose();
 
         let mut config = crate::config::Config::default();
         config.terminal.shell_history_file = "per_session".into();
-        let args = || StartSessionArgs {
-            command: Some("sh".into()),
-            args: vec!["-c".into(), "sleep 30".into()],
+        let args = |command: &str, args: &[&str]| StartSessionArgs {
+            command: Some(command.into()),
+            args: args.iter().map(|a| (*a).to_string()).collect(),
             ..Default::default()
         };
+        let bash = || args("bash", &["--norc", "--noprofile"]);
 
         let nowhere = HoldfastServer::with_audit_path_and_config(None, &config);
-        let refused = nowhere.start_session(Parameters(args())).await;
+        let refused = nowhere.start_session(Parameters(bash())).await;
         assert!(refused.is_err(), "{refused:?}");
         assert!(
             nowhere.registry.all().is_empty(),
@@ -7307,7 +7326,7 @@ mod tests {
             .with_history_dir(Some(history.clone()));
         let started = row(
             "start_session",
-            &server.start_session(Parameters(args())).await.unwrap(),
+            &server.start_session(Parameters(bash())).await.unwrap(),
         )
         .data;
         let id = started["session_id"].as_str().expect("session_id");
@@ -7315,6 +7334,39 @@ mod tests {
         let mode = |p: &std::path::Path| std::fs::metadata(p).unwrap().permissions().mode() & 0o777;
         assert_eq!(mode(&file), 0o600, "{}", file.display());
         assert_eq!(mode(&history), 0o700, "{}", history.display());
+
+        let sh = row(
+            "start_session",
+            &server
+                .start_session(Parameters(args("sh", &["-c", "sleep 30"])))
+                .await
+                .unwrap(),
+        );
+        assert!(sh.data["session_id"].is_string(), "{}", sh.whole);
+
+        let failed = row(
+            "start_session",
+            &server
+                .start_session(Parameters(args("/nonexistent/holdfast-test/bash", &[])))
+                .await
+                .unwrap(),
+        );
+        assert_eq!(
+            failed.whole["structuredContent"]["status"], "spawn_failed",
+            "{}",
+            failed.whole
+        );
+
+        let mut left: Vec<String> = std::fs::read_dir(&history)
+            .unwrap()
+            .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+            .collect();
+        left.sort();
+        assert_eq!(
+            left,
+            [format!("{id}.history")],
+            "only the bash session that started keeps a file"
+        );
         kill_everything(&server).await;
     }
 }
