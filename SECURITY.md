@@ -576,11 +576,22 @@ mechanisms prevent it:
   - a zsh `HISTORY_IGNORE` that matches the snippet;
   - the history files of common REPLs and database clients switched off:
     `PYTHON_HISTORY=/dev/null`, `NODE_REPL_HISTORY=` (empty),
-    `PSQL_HISTORY=/dev/null`, `MYSQL_HISTFILE=/dev/null` and
-    `SQLITE_HISTORY=/dev/null`;
-  - `SHELL_SESSIONS_DISABLE=1`, for macOS Terminal's per-window history.
+    `TS_NODE_HISTORY=` (one space), `PSQL_HISTORY=/dev/null`,
+    `MYSQL_HISTFILE=/dev/null`, `MARIADB_HISTFILE=/dev/null` and
+    `SQLITE_HISTORY=` (empty). On Windows `PYTHON_HISTORY` and
+    `PSQL_HISTORY` are `nul`, because a native program opens `/dev/null`
+    as `\dev\null` on the current drive;
+  - `SHELL_SESSIONS_DISABLE=1`, for macOS Terminal's per-window zsh
+    history.
 
-  A call's own `env` overrides any of them.
+  A call's own `env` overrides any of them. `SQLITE_HISTORY` is empty
+  rather than `/dev/null` because libedit `fchmod`s the history file it
+  saves to `0600`, which as root would change `/dev/null` itself. node's
+  value is empty rather than `/dev/null` because node 24 and later print
+  *Could not open history file* at every REPL start when it is a device.
+  ts-node treats an empty value as its default file, so it gets a space,
+  which node trims to empty. MariaDB 11 reads `MARIADB_HISTFILE` before
+  `MYSQL_HISTFILE`, and 10.x reads only the second, so both are set.
 - **The integration snippet**, for bash and zsh. It begins with a space
   and runs after the rc files, and sets `HISTFILE` again. The value is
   `/dev/null`, or a `HISTFILE` the call set itself, which the snippet
@@ -588,11 +599,24 @@ mechanisms prevent it:
   `/dev/null` and does not unset the variable, for two reasons:
   oh-my-zsh and prezto re-arm an empty `HISTFILE` when the rc is sourced
   again, and a nested shell or `exec` does not inherit an unset one.
+  In zsh it also sets `SAVEHIST=0` and unsets `hist_save_by_copy`. With
+  `SAVEHIST` set by an rc, zsh saves at exit and locks first by creating
+  `/dev/null.LOCK`. As any user but root that fails, and *zsh: locking
+  failed for /dev/null: permission denied* appeared in the session's
+  output at every `exit`, EOF and `exec zsh`. As root the lock succeeds,
+  and under `unsetopt append_history` zsh wrote `/dev/null.new` and
+  renamed it over `/dev/null`, leaving a regular `0666` file of the
+  agent's commands (simulated as uid 0 in a user namespace).
 - **fish's init command.** A fish that Holdfast starts runs a `-C` command
-  after config.fish. It empties `fish_history`, keeps it empty, and exports
-  `fish_private_mode` at the first prompt so that any fish started inside
-  the session is private too. It is not applied if the call's `env` sets
-  `fish_history`.
+  after config.fish. It empties `fish_history`, and keeps it empty when
+  configuration later re-points it or erases it. An erased `fish_history`
+  is fish's default session, which reads the operator's history file and
+  on fish 3.7 rewrites it. The command also exports `fish_private_mode` at
+  the first prompt, so any fish started inside the session saves nothing.
+  It is not applied if the call's `env` sets a non-empty `fish_history`.
+  That fish starts as a plain fish with the call's value, and a
+  config.fish that sets `fish_history` overrides it. An empty value from
+  the call is Holdfast's own default, and gets the init command.
 - **No hangup for tcsh and csh.** A tcsh that receives a hangup saves its
   history, and no environment variable reaches its `savehist`. So
   `terminate` and `daemon stop` send tcsh and csh `SIGTERM`, which an
@@ -612,14 +636,21 @@ The record is kept for convenience; it is not an audit trail:
 - The call's `env` can point `HISTFILE` somewhere else.
 - The rc's own options decide what is recorded. For example, Debian's
   `HISTCONTROL=ignoreboth` and zsh's `hist_ignore_space` drop commands
-  that begin with a space.
+  that begin with a space. Without such an option, each bash file begins
+  with the snippet's own line.
+- zsh records a command when it is entered, not when it finishes.
 - Anything in the list below that re-points `HISTFILE` takes the rest of
   the session's commands with it.
+- An rc sourced again that sets `HISTFILESIZE` truncates the file to that
+  size when bash exits (measured: `HISTFILESIZE=3` left three lines).
 - A `PROMPT_COMMAND` replaced mid-session removes the per-command append.
   Commands after that reach the file only if bash saves at exit or on a
-  hangup.
+  hangup, and then only the last `HISTSIZE` of them. `histappend`, which
+  the snippet sets, is what keeps that save from rewriting the file and
+  losing everything recorded before.
 
-fish sessions stay private in both modes.
+fish sessions keep nothing on disk in either mode, and get no per-session
+file.
 
 **What still reaches disk.** Unless marked otherwise, each item was
 measured on bash 5.2, zsh 5.9, fish 3.7.0 and 4.9.3, tcsh 6.24, mksh R59c
@@ -634,9 +665,10 @@ and Python 3.12.
   - `HISTFILE` is `readonly`, in bash or zsh. The snippet's assignment
     then fails, and `HISTFILE: readonly variable` appears in the
     session's output.
-- **H2. A zsh started inside a session under an rc that sets `HISTFILE`
-  unconditionally.** macOS's `/etc/zshrc` sets one for every zsh, so on
-  a Mac any nested zsh writes `~/.zsh_history`.
+- **H2. A zsh started inside a session, or by `exec zsh`, under an rc that
+  sets `HISTFILE` unconditionally.** macOS's `/etc/zshrc` sets one for
+  every zsh, so on a Mac any nested or exec'd zsh writes `~/.zsh_history`,
+  and a per-session record stops at that point.
 - **H3. mksh under an rc that sets `HISTFILE`.** mksh has no Holdfast
   snippet, so only the environment reaches it. ksh93 honours
   `HISTFILE=/dev/null`, and mksh keeps no history file unless one is set.
@@ -649,27 +681,77 @@ and Python 3.12.
   inside a bash or zsh session, and a fish started through a wrapper such
   as `env fish`, when its config.fish sets `fish_history`. Only the empty
   `fish_history` in the environment reaches that fish, and config.fish
-  overrides it. A fish nested inside a fish that Holdfast started is
-  private.
+  overrides it. A fish nested inside a fish that Holdfast started saves
+  nothing, but see H10. The same holds for a fish whose call set a
+  non-empty `fish_history`.
 - **H6. The snippet's own line, under a user-set zsh `HISTORY_IGNORE`.**
   The user's value replaces Holdfast's. So under `inc_append_history` or
   `share_history`, without `hist_ignore_space`, the snippet's own line
   reaches the history file that the rc names. The agent's commands do
   not.
-- **H7. Python 3.12 and older.** They ignore `PYTHON_HISTORY`, so their
-  REPL writes `~/.python_history`. An empty `PYTHON_HISTORY` does not help
-  either, because 3.13 treats empty as unset. Any program with its own
-  history file that is not listed above keeps writing it. sqlite3 finds
-  its default file through the password database, not `$HOME`, so only
-  `SQLITE_HISTORY` keeps it off disk.
+- **H7. REPLs that the environment does not reach.**
+  - Python 3.12 and older ignore `PYTHON_HISTORY`, so their REPL writes
+    `~/.python_history`. An empty `PYTHON_HISTORY` does not help either,
+    because 3.13 treats empty as unset.
+  - As root, a Python 3.13 basic REPL linked against libedit saves its
+    history to `PYTHON_HISTORY=/dev/null` through libedit, which
+    `fchmod`s it to `0600`, leaving `/dev/null` unwritable by every other
+    user. Homebrew builds Python 3.13 on macOS against libedit
+    (`--with-readline=editline`). There is no empty value to use instead.
+    Reasoned from libedit's source; Linux's libedit made the same change
+    to a pty device this uid owned. PyREPL, 3.13's default REPL, writes
+    the file itself and changes no mode.
+  - A `.psqlrc` that runs `\set HISTFILE` overrides `PSQL_HISTORY`,
+    because psql reads the variable first. Read from psql's source.
+  - PowerShell's PSReadLine keeps `ConsoleHost_history.txt` and reads no
+    variable Holdfast sets. Not measured.
+  - Any other program with its own history file that is not listed above
+    keeps writing it. sqlite3 finds its default file through the password
+    database, not `$HOME`, so only `SQLITE_HISTORY` keeps it off disk.
 - **H8. macOS Terminal session history (not measured on a Mac).** Since
   GH #229, a session inherits `TERM_PROGRAM=Apple_Terminal` and
-  `TERM_SESSION_ID` from a daemon started in Terminal.
-  `/etc/zshrc_Apple_Terminal` and `/etc/bashrc_Apple_Terminal` then save
-  per-window history under `~/.zsh_sessions/` or `~/.bash_sessions/`,
-  whatever `HISTFILE` says. `SHELL_SESSIONS_DISABLE=1` is Apple's
-  documented off switch for this, and every session gets it. Nobody has
-  confirmed on a Mac that it takes effect.
+  `TERM_SESSION_ID` from a client started in Terminal.
+  `/etc/zshrc_Apple_Terminal` then saves per-window history under
+  `~/.zsh_sessions/`, whatever `HISTFILE` says.
+  `SHELL_SESSIONS_DISABLE=1` is Apple's documented off switch for it, and
+  every session gets it; nobody has confirmed on a Mac that it takes
+  effect. `/etc/bashrc_Apple_Terminal`, which a login bash sources, does
+  the same under `~/.bash_sessions/`, and it ignores the variable: only a
+  `~/.bash_sessions_disable` file turns it off. Both files need
+  `TERM_SESSION_ID`. Dropping that variable belongs with the other
+  terminal-identity variables a session inherits from its client.
+- **H9. zsh's `SAVEHIST` restored after the snippet has run.** The snippet sets `SAVEHIST=0` once.
+  `source ~/.zshrc`, `exec zsh` and a nested zsh each run an rc that sets
+  it again, and `HISTFILE` is still `/dev/null`, as with oh-my-zsh's and
+  prezto's conditional line. As any user but root, zsh then prints
+  *zsh: locking failed for /dev/null: permission denied* at exit and saves
+  nothing. As root:
+  - after `source ~/.zshrc`, `hist_save_by_copy` stays off, so zsh writes
+    into `/dev/null` itself, which is harmless;
+  - a zsh started by `exec zsh` or inside the session starts with zsh's
+    default `hist_save_by_copy`. Under an rc that unsets
+    `append_history`, it writes `/dev/null.new` and renames it over
+    `/dev/null`. That leaves a regular `0666` file holding its commands,
+    readable and writable by every user.
+
+  So does any zsh started with `shell_integration: false`, which gets no
+  snippet. Simulated as uid 0 in a user namespace with a regular file
+  standing in for `/dev/null`: the exec'd and nested shells replaced it
+  (new inode, the commands inside), and the re-sourced shell wrote into
+  it in place.
+- **H10. Reading the operator's history.** bash and zsh load the history
+  file that an rc names as they start, before the snippet runs, so the
+  operator's own history is in the session's memory. The agent can list
+  it with `history` or `fc -l`, and recall it with up-arrow, into output
+  it reads. Measured on bash 5.2 under an rc that sets `HISTFILE`, and on
+  zsh 5.9 under macOS's `/etc/zshrc` lines and an oh-my-zsh-style rc. On a
+  Mac that is every zsh session.
+
+  A fish nested inside a Holdfast fish session reads the history file its
+  own config.fish names in the same way. It offers the lines as
+  autosuggestions and lists them in `history`, and it can create an empty
+  file where there was none. Measured on fish 3.7.0, 4.0.2 and 4.9.3. A
+  fish that Holdfast starts reads nothing.
 
 #### The out-of-band secret channel
 

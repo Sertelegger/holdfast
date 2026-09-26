@@ -295,11 +295,11 @@ const BASH_INTEGRATION: &str = concat!(
     // prepended to `PROMPT_COMMAND` for the reason `__holdfast_d` is and
     // handing on `$?` the same way; no `HISTFILESIZE`, which truncates the
     // file when bash saves at exit (Debian's rc sets 2000); and
-    // `histappend`, defensively. Without it, the save at exit rewrites the
-    // file from the in-memory list whenever more commands are unsaved than
-    // `HISTSIZE` holds, which the per-command append prevents unless
-    // something replaces `PROMPT_COMMAND` mid-session — so no row in
-    // `tests/shell_history.rs` can tell it apart, and none claims to.
+    // `histappend`. Without it, the save at exit rewrites the file from the
+    // in-memory list whenever more commands are unsaved than `HISTSIZE`
+    // holds, which happens once the per-command append stops —
+    // `PROMPT_COMMAND` replaced mid-session — and loses everything recorded
+    // before; `bash-append-stopped` in `tests/shell_history.rs` is the row.
     r#" HISTFILE=${HOLDFAST_HISTFILE:-/dev/null}; if [ -n "${HOLDFAST_HISTFILE-}" ]; then "#,
     r#"unset HISTFILESIZE; shopt -s histappend; __holdfast_h() { history -a; return "${1:-0}"; }; "#,
     r#"[[ "${PROMPT_COMMAND-}" == *__holdfast_h* ]] || "#,
@@ -413,9 +413,12 @@ const ZSH_INTEGRATION: &str = concat!(
     // history file needs `SAVEHIST` (0 by default) and is appended per
     // command, and both limits are raised whatever an rc set them to: zsh
     // trims the file to `SAVEHIST` as it appends, `SIGKILL` or not.
+    // `/dev/null` gets `SAVEHIST=0`, so zsh never saves or locks it, and no
+    // `hist_save_by_copy`, for an rc sourced again that sets `SAVEHIST`: see
+    // `session::launch::history_defaults`.
     r#" if [[ -n ${HOLDFAST_HISTFILE-} ]]; then HISTFILE=$HOLDFAST_HISTFILE; "#,
     r#"SAVEHIST=1000000000; HISTSIZE=1000000000; "#,
-    r#"setopt inc_append_history; else HISTFILE=/dev/null; fi; "#,
+    r#"setopt inc_append_history; else HISTFILE=/dev/null; SAVEHIST=0; unsetopt hist_save_by_copy; fi; "#,
     r#"if [ -z "${HOLDFAST_SHELL_INTEGRATION-}" ] && [[ "${PS1-}" != *"133;A"* ]]; then "#,
     r#"HOLDFAST_SHELL_INTEGRATION=1; "#,
     r#"__holdfast_preexec() { printf '\033]133;C;holdfast=1\007' }; "#,

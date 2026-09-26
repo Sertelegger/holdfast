@@ -809,6 +809,20 @@ fn assert_no_leaks(ended: &[(Started, Ending)]) {
 fn available(cases: &[Case]) -> Vec<Case> {
     let mut out = Vec::new();
     for case in cases {
+        // macOS's `/etc/zshrc` assigns `HISTFILE` unconditionally, and a zsh
+        // the agent `exec`s reads it again after the snippet has run, so that
+        // zsh saves to `~/.zsh_history`, and a per-session record stops at
+        // the `exec`. No policy Holdfast types can reach a shell started
+        // after it; SECURITY.md registers the case (shell history, a nested
+        // or exec'd zsh). Linux's zsh ships no such line, so the row keeps
+        // the measurement there.
+        if cfg!(target_os = "macos") && case.before.iter().any(|(line, _)| *line == "exec zsh") {
+            eprintln!(
+                "not applicable on macOS: {} (its /etc/zshrc re-arms HISTFILE in an exec'd zsh)",
+                case.name
+            );
+            continue;
+        }
         if on_path(case.needs) {
             out.push(*case);
             continue;
@@ -995,7 +1009,6 @@ fn settled_output(shim: &mut Shim, s: &Started) -> String {
 /// output at `exit` and at EOF. The snippet's `SAVEHIST=0` is what stops it
 /// saving at all.
 #[test]
-#[ignore = "needs ZSH-SNIPPET-CHANGE"]
 fn zsh_ends_without_a_history_error_under_an_rc_that_saves_history() {
     let cases = available(&[BASH_AND_ZSH[4]]);
     let Some(case) = cases.first().copied() else {
