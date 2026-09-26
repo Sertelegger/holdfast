@@ -91,6 +91,9 @@ struct Case {
     integration: bool,
     /// Lines the agent types before the marker, each run to completion.
     before: &'static [&'static str],
+    /// Whether a graceful `terminate` or `daemon stop` hangs this shell up
+    /// (GH #234) rather than waiting out the grace for `SIGKILL`.
+    hung_up: bool,
     /// The program whose absence skips the case.
     needs: &'static str,
 }
@@ -103,6 +106,7 @@ const BASH_AND_ZSH: [Case; 7] = [
         files: &[],
         integration: true,
         before: &[],
+        hung_up: true,
         needs: "bash",
     },
     Case {
@@ -112,6 +116,7 @@ const BASH_AND_ZSH: [Case; 7] = [
         files: &[],
         integration: false,
         before: &[],
+        hung_up: true,
         needs: "bash",
     },
     Case {
@@ -121,6 +126,7 @@ const BASH_AND_ZSH: [Case; 7] = [
         files: &[(".bashrc", BASH_HARD_RC), (".history", "")],
         integration: true,
         before: &[],
+        hung_up: true,
         needs: "bash",
     },
     Case {
@@ -130,6 +136,7 @@ const BASH_AND_ZSH: [Case; 7] = [
         files: &[(".zshrc", "")],
         integration: true,
         before: &[],
+        hung_up: true,
         needs: "zsh",
     },
     Case {
@@ -139,6 +146,7 @@ const BASH_AND_ZSH: [Case; 7] = [
         files: &[(".zshrc", ZSH_OMZ_RC)],
         integration: true,
         before: &[],
+        hung_up: true,
         needs: "zsh",
     },
     Case {
@@ -148,6 +156,7 @@ const BASH_AND_ZSH: [Case; 7] = [
         files: &[(".zshrc", ZSH_CONDITIONAL_RC)],
         integration: true,
         before: &["source ~/.zshrc"],
+        hung_up: true,
         needs: "zsh",
     },
     Case {
@@ -157,6 +166,7 @@ const BASH_AND_ZSH: [Case; 7] = [
         files: &[(".zshrc", ZSH_CONDITIONAL_RC)],
         integration: true,
         before: &["exec zsh"],
+        hung_up: true,
         needs: "zsh",
     },
 ];
@@ -169,6 +179,7 @@ const FISH: [Case; 3] = [
         files: &[],
         integration: true,
         before: &[],
+        hung_up: true,
         needs: "fish",
     },
     Case {
@@ -178,6 +189,7 @@ const FISH: [Case; 3] = [
         files: &[(".config/fish/config.fish", "set -g fish_history fish\n")],
         integration: true,
         before: &[],
+        hung_up: true,
         needs: "fish",
     },
     Case {
@@ -187,9 +199,29 @@ const FISH: [Case; 3] = [
         files: &[],
         integration: true,
         before: &[],
+        hung_up: true,
         needs: "fish",
     },
 ];
+
+/// FreeBSD's default `.cshrc` history lines. tcsh reads nothing from the
+/// environment that could redirect `savehist`, so with these it saves its
+/// history on `exit`, on EOF and on a hangup — and Holdfast must never hang
+/// it up. The prompt is tcsh's compiled-in one, set so a system rc (macOS
+/// ships `/etc/csh.cshrc`) cannot change what the heuristic tier reads.
+const TCSH_SAVEHIST_RC: &str = "if ($?prompt) then\n  set prompt = '%# '\n  set history = 1000\n  \
+                                set savehist = (1000 merge)\nendif\n";
+
+const TCSH: Case = Case {
+    name: "tcsh-savehist",
+    command: "tcsh",
+    args: &[],
+    files: &[(".tcshrc", TCSH_SAVEHIST_RC)],
+    integration: true,
+    before: &[],
+    hung_up: false,
+    needs: "tcsh",
+};
 
 /// How a session ends.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -207,6 +239,15 @@ const SESSION_ENDINGS: [Ending; 4] = [
     Ending::Eof,
     Ending::Terminate,
     Ending::ForceTerminate,
+];
+
+const ALL_ENDINGS: [Ending; 6] = [
+    Ending::Exit,
+    Ending::Eof,
+    Ending::Terminate,
+    Ending::ForceTerminate,
+    Ending::DaemonStop,
+    Ending::DaemonKill,
 ];
 
 fn on_path(program: &str) -> bool {
@@ -576,12 +617,15 @@ fn end(shim: &mut Shim, s: &Started, how: Ending) {
         Ending::Exit => send(shim, s, "exit", true),
         Ending::Eof => send(shim, s, "\u{4}", false),
         Ending::Terminate | Ending::ForceTerminate => {
+            // A shell that is not hung up sits out the whole grace, so
+            // give it a short one.
+            let grace = if s.case.hung_up { 10 } else { 2 };
             let r = shim.call(
                 "terminate",
                 json!({
                     "session": s.id,
                     "force": how == Ending::ForceTerminate,
-                    "timeout_secs": 10,
+                    "timeout_secs": grace,
                 }),
             );
             assert_eq!(r["status"], "ok", "{}: terminate: {r}", s.case.name);
@@ -655,15 +699,21 @@ fn available(cases: &[Case]) -> Vec<Case> {
     out
 }
 
-/// Run `cases` through every ending: those a session reaches by itself or
+/// Run `cases` through every ending.
+fn every_ending(tag: &str, cases: &[Case]) {
+    run_endings(tag, cases, &ALL_ENDINGS);
+}
+
+/// Run `cases` through `endings`: those a session reaches by itself or
 /// through `terminate` on one daemon, then `daemon stop` and a killed
 /// daemon on one each.
-fn every_ending(tag: &str, cases: &[Case]) {
+fn run_endings(tag: &str, cases: &[Case], endings: &[Ending]) {
     let mut ended = Vec::new();
+    let mut instances = Vec::new();
 
     let inst = Instance::new(tag);
     let mut shim = Shim::launch(&inst);
-    for how in SESSION_ENDINGS {
+    for how in SESSION_ENDINGS.into_iter().filter(|h| endings.contains(h)) {
         for case in cases {
             let s = start(&inst, &mut shim, *case, &format!("{how:?}"));
             end(&mut shim, &s, how);
@@ -671,43 +721,50 @@ fn every_ending(tag: &str, cases: &[Case]) {
         }
     }
     shim.kill();
+    instances.push(inst);
 
     // `holdfast daemon stop`: a graceful stop, which hangs every idle
     // shell up (GH #234).
-    let stop = Instance::new(&format!("{tag}-stop"));
-    let mut shim = Shim::launch(&stop);
-    let live: Vec<Started> = cases
-        .iter()
-        .map(|c| start(&stop, &mut shim, *c, "DaemonStop"))
-        .collect();
-    let (code, out, err) = stop.run(&["daemon", "stop"]);
-    assert_eq!(code, 0, "daemon stop: {out} {err}");
-    for s in live {
-        await_gone(&s);
-        ended.push((s, Ending::DaemonStop));
+    if endings.contains(&Ending::DaemonStop) {
+        let stop = Instance::new(&format!("{tag}-stop"));
+        let mut shim = Shim::launch(&stop);
+        let live: Vec<Started> = cases
+            .iter()
+            .map(|c| start(&stop, &mut shim, *c, "DaemonStop"))
+            .collect();
+        let (code, out, err) = stop.run(&["daemon", "stop"]);
+        assert_eq!(code, 0, "daemon stop: {out} {err}");
+        for s in live {
+            await_gone(&s);
+            ended.push((s, Ending::DaemonStop));
+        }
+        shim.kill();
+        instances.push(stop);
     }
-    shim.kill();
 
     // A daemon that dies: the kernel hangs up each session's shell when
     // the PTY master closes with it.
-    let crash = Instance::new(&format!("{tag}-kill"));
-    let mut shim = Shim::launch(&crash);
-    let live: Vec<Started> = cases
-        .iter()
-        .map(|c| start(&crash, &mut shim, *c, "DaemonKill"))
-        .collect();
-    let daemon = crash.daemon_pid().expect("holdfast.pid");
-    // SAFETY: a pid read from this instance's own pid file.
-    assert_eq!(unsafe { libc::kill(daemon as i32, libc::SIGKILL) }, 0);
-    for s in live {
-        await_gone(&s);
-        ended.push((s, Ending::DaemonKill));
+    if endings.contains(&Ending::DaemonKill) {
+        let crash = Instance::new(&format!("{tag}-kill"));
+        let mut shim = Shim::launch(&crash);
+        let live: Vec<Started> = cases
+            .iter()
+            .map(|c| start(&crash, &mut shim, *c, "DaemonKill"))
+            .collect();
+        let daemon = crash.daemon_pid().expect("holdfast.pid");
+        // SAFETY: a pid read from this instance's own pid file.
+        assert_eq!(unsafe { libc::kill(daemon as i32, libc::SIGKILL) }, 0);
+        for s in live {
+            await_gone(&s);
+            ended.push((s, Ending::DaemonKill));
+        }
+        shim.kill();
+        instances.push(crash);
     }
-    shim.kill();
 
     assert_no_leaks(&ended);
     // Held to here so every `HOME` is still on disk for the assertion.
-    drop((inst, stop, crash));
+    drop(instances);
 }
 
 #[test]
@@ -736,6 +793,29 @@ fn fish_keeps_nothing_in_home_however_a_session_ends() {
         .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
         .unwrap_or_default();
     eprintln!("shell-history measured against {version}");
+}
+
+/// tcsh, which Holdfast neither hangs up nor reaches through the
+/// environment: a graceful `terminate` and `daemon stop` send it `SIGTERM`,
+/// which an interactive tcsh ignores, and then `SIGKILL`, on which it saves
+/// nothing. Its `exit`, EOF and the kernel's hangup when the daemon dies
+/// all save `~/.history` under a `savehist` rc; those are the csh family's
+/// registered residual (SECURITY.md) and are not rows.
+#[test]
+fn tcsh_is_never_hung_up_so_holdfast_ending_it_saves_nothing() {
+    let cases = available(&[TCSH]);
+    if cases.is_empty() {
+        return;
+    }
+    run_endings(
+        "tcsh",
+        &cases,
+        &[
+            Ending::Terminate,
+            Ending::ForceTerminate,
+            Ending::DaemonStop,
+        ],
+    );
 }
 
 /// `[terminal] shell_history_file = "per_session"`: each session's shell

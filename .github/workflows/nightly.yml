@@ -151,7 +151,7 @@ jobs:
       - name: Install the shells and helpers the test suite spawns by name
         run: |
           sudo apt-get update -qq
-          sudo apt-get install -y -qq --no-install-recommends zsh dash less python3
+          sudo apt-get install -y -qq --no-install-recommends zsh dash less python3 tcsh
       # Without this the flake hunt repeats a configuration in which the
       # §8.7 PyREPL row never runs: ubuntu-24.04's own python3 is 3.12.3,
       # whose readline REPL drives no bracketed paste. See ci.yml's probe

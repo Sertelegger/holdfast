@@ -49,10 +49,15 @@ pub type SessionId = String;
 /// may be handling `SIGTERM` itself, and a hangup would cut that short.
 /// Wrong in the conservative direction, this costs the old behaviour: the
 /// escalation to `SIGKILL` after the grace.
+///
+/// **`tcsh` and `csh` are left out, and keep that escalation.** Both save
+/// their history on a hangup when an rc sets `savehist` — FreeBSD's
+/// default `.cshrc` does — and nothing in the environment reaches
+/// `savehist` or `histfile`, so a hangup would write the agent's commands
+/// to `~/.history` (GH #252; measured: tcsh 6.24 wrote it on a graceful
+/// `terminate`, and nothing on a `SIGKILL`).
 fn is_interactive_shell(command: &str, args: &[String]) -> bool {
-    const SHELLS: [&str; 9] = [
-        "bash", "zsh", "fish", "sh", "dash", "ksh", "mksh", "tcsh", "csh",
-    ];
+    const SHELLS: [&str; 7] = ["bash", "zsh", "fish", "sh", "dash", "ksh", "mksh"];
     const TAKES_A_VALUE: [&str; 8] = [
         "-o",
         "+o",
@@ -119,6 +124,9 @@ mod interactive_shell_tests {
             ("python3", &[][..]),
             ("bash", &["-lc", "make"][..]),
             ("/usr/bin/env", &[][..]),
+            // GH #252: a hung-up tcsh or csh saves its history.
+            ("tcsh", &[][..]),
+            ("/bin/csh", &["-l"][..]),
         ] {
             assert!(!is_interactive_shell(command, &args(a)), "{command} {a:?}");
         }
