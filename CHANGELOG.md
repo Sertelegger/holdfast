@@ -1208,6 +1208,10 @@ is cut, named and published is in
   Also corrected in passing: `shell.rs` said zsh runs `precmd_functions`
   before the bare `precmd`. zsh 5.9 does the reverse, measured.
 
+- **bash 5.3 at a multibyte prompt recorded a key-by-key command from its last
+  redisplay on** (`echo HOLDFAST` as `o HOLDFAST`): its readline redraws the
+  prompt, markers and all; a redraw no longer restarts the capture ([#220]).
+
 - **Once the daemon stopped, every open client answered `daemon_unreachable`
   until something else started one** ([#231]). `holdfast daemon stop` is the
   only way to load a new build, so this was every upgrade. The shim now
