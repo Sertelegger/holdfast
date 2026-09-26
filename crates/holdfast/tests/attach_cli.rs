@@ -92,8 +92,23 @@ impl TestDaemon {
     /// A session on a **real** PTY running a real shell — the only way to
     /// observe `stty size` and a termios `ECHO` drop.
     fn real_session(&self, command: &str, args: &[&str]) -> Arc<Session> {
+        self.real_session_with_env(command, args, &[])
+    }
+
+    /// [`real_session`](Self::real_session), with `env` set on top of this
+    /// process's environment.
+    fn real_session_with_env(
+        &self,
+        command: &str,
+        args: &[&str],
+        env: &[(&str, &str)],
+    ) -> Arc<Session> {
         let mut cfg = PtySpawnConfig::new(command);
         cfg.args = args.iter().map(|a| (*a).to_string()).collect();
+        cfg.env = env
+            .iter()
+            .map(|(k, v)| ((*k).to_string(), (*v).to_string()))
+            .collect();
         let pty = InProcessPty::spawn(&cfg).expect("spawn a real child");
         let s = Session::new(
             new_session_id(),
@@ -1973,7 +1988,17 @@ async fn attach_says_it_attached_and_how_to_leave() {
     // so the banner would arrive from the fallback timer and the ordering
     // would be untested — which is how the first version of this test
     // passed against a banner no human could see.
-    let s = d.real_session("bash", &["--norc", "--noprofile"]);
+    //
+    // **`PS1` is pinned** so that the prompt the rows below look for is
+    // this test's and not the runner's bash release: `--norc` bash draws
+    // `\s-\v\$ `, which is `bash-5.2$ ` on one runner and `bash-5.3$ ` on
+    // the next.
+    const PROMPT: &str = "attached-shell$";
+    let s = d.real_session_with_env(
+        "bash",
+        &["--norc", "--noprofile"],
+        &[("PS1", &format!("{PROMPT} "))],
+    );
 
     let mut term = Term::spawn(d.paths.dir(), &["attach", &s.id], 80, 24);
     let seen = term.wait_for(b"attached to", 15);
@@ -2006,7 +2031,7 @@ async fn attach_says_it_attached_and_how_to_leave() {
     // repaint has had its chance: the notice on row 0, the prompt still
     // on screen, and the cursor after the prompt, where the child's next
     // write lands.
-    term.wait_for(b"bash-5.2$", 15);
+    term.wait_for(PROMPT.as_bytes(), 15);
     std::thread::sleep(Duration::from_millis(500));
     let mut screen = vt100::Parser::new(24, 80, 0);
     screen.process(&term.snapshot());
@@ -2019,7 +2044,7 @@ async fn attach_says_it_attached_and_how_to_leave() {
     let (row, col) = screen.screen().cursor_position();
     let prompt = screen.screen().contents_between(row, 0, row, 80);
     assert!(
-        prompt.trim_end().ends_with("bash-5.2$"),
+        prompt.trim_end().ends_with(PROMPT),
         "the prompt is not on the cursor's row: {prompt:?}\n{}",
         screen.screen().contents()
     );
