@@ -368,12 +368,18 @@ pub struct ModeScanner {
     repaint_columns: isize,
     /// The command line, and its debt, still on screen behind a prompt
     /// that an `A` has started drawing again in front of it. Held from that
-    /// `A` to its `B`. See `line_behind_a_redrawn_prompt`.
+    /// `A` to the marker after it, which puts it back only if it is the
+    /// `B`. See `line_behind_a_redrawn_prompt`.
     redrawn: Option<(String, usize)>,
     /// The armed return is a redrawn prompt's `B`, not a `\r`: the repaint
     /// resumes `repaint_columns` into the command rather than into the row.
     /// See `resume_redrawn_line`.
     redraw_resume: bool,
+    /// The capture, and its debt, as they stood when the most recent bare
+    /// `\r` on the line's row was applied — the line that `\r` began
+    /// writing over. Cleared at a newline and at every marker. See
+    /// `line_behind_a_redrawn_prompt`.
+    line_at_return: Option<(String, usize)>,
     /// Last OSC 133 marker letter seen (`A`/`B`/`C`/`D`), for the T1 state.
     last_marker: Option<u8>,
     /// Per marker letter (`A`, `B`, `C`, `D`), whether a **foreign** marker
@@ -442,6 +448,7 @@ impl ModeScanner {
             repaint_columns: 0,
             redrawn: None,
             redraw_resume: false,
+            line_at_return: None,
             last_marker: None,
             foreign_letters: [false; 4],
             holdfast_letters: [false; 4],
@@ -816,6 +823,7 @@ impl ModeScanner {
                 self.repaint_columns = 0;
                 return;
             }
+            self.line_at_return = Some((cap.clone(), self.capture_debt));
             let dropped = cap.len() - keep;
             cap.truncate(keep);
             self.capture_debt = self.capture_debt.max(dropped);
@@ -888,6 +896,7 @@ impl ModeScanner {
     }
 
     fn capture_newline(&mut self) {
+        self.line_at_return = None;
         if let Some(cap) = self.capture.as_mut() {
             if cap.len() < COMMAND_CAPTURE_MAX {
                 cap.push('\n');
@@ -908,34 +917,51 @@ impl ModeScanner {
         }
     }
 
-    /// The command line still on screen behind a prompt this `A` starts
-    /// drawing again, with its debt — or `None` when the `A` begins a new
-    /// line.
+    /// The command line still on screen behind a prompt that this `A` or
+    /// `B` is part of drawing again, with its debt — or `None` when the
+    /// marker begins a new line.
     ///
     /// **A line editor may repaint the prompt, markers and all, without
     /// ending the line.** bash 5.3's readline does it at every redisplay
     /// of a prompt holding multibyte characters as well as `\[`…`\]`
     /// invisible ones, and a prompt carrying these markers always holds
-    /// the second: `\r`, the whole `PS1` again (so OSC 133 `A` and `B`
-    /// again), then `CSI n C` over the part of the line that is already
-    /// drawn, then only the new keys. Measured with `⬢ [x] ❯ ` and `echo`
-    /// typed a key at a time: `\r` `A` `⬢ [x] ❯ ` `B`
-    /// `\x1b[C\x1b[C\x1b[C` `o`. Restarting the capture at that `B` keeps
-    /// `o` and loses `ech`, which are still on the screen. bash 5.2 echoes
-    /// the same keys plainly, and bash 5.3 does too at a prompt that lacks
-    /// either kind of character.
+    /// the second. It redraws the prompt's **last row**: `\r`, that row,
+    /// then `CSI n C` over the part of the line that is already drawn,
+    /// then only the new keys. Measured with `⬢ [x] ❯ ` and `echo` typed a
+    /// key at a time: `\r` `A` `⬢ [x] ❯ ` `B` `\x1b[C\x1b[C\x1b[C` `o`.
+    /// Restarting the capture at that `B` keeps `o` and loses `ech`, which
+    /// are still on the screen. bash 5.2 echoes the same keys plainly, and
+    /// bash 5.3 does too at a prompt that lacks either kind of character.
     ///
-    /// Two conditions tell a repaint from a new prompt. The capture is
-    /// **open** — a `B` and no `C` or `D` since — so the line was never
-    /// submitted or abandoned. And the `A` is **armed**: it came after a
-    /// bare `\r`, so it is being drawn over the line's own row. A prompt
-    /// drawn after a newline, which is where every new prompt goes, does
-    /// not qualify and restarts the capture as before.
-    fn line_behind_a_redrawn_prompt(&mut self) -> Option<(String, usize)> {
-        if !self.capture_return_pending {
-            return None;
-        }
-        self.capture.take().map(|line| (line, self.capture_debt))
+    /// **The last row need not carry the `A`, or begin with it.** A prompt
+    /// of several rows — starship's default shape, `\n…\n❯ ` — has its `A`
+    /// on an earlier row, so its redraw is `\r` `❯ ` `B` and nothing else;
+    /// readline's `show-mode-in-prompt` writes the mode string in front of
+    /// `PS1`, so its redraw is `\r` `(ins)` `A` … `B`. So both markers ask,
+    /// and the line is the capture as it stood at the `\r`, before the
+    /// prompt's own text was written over it (`line_at_return`).
+    ///
+    /// Three conditions tell a redraw from a new prompt. The capture is
+    /// **open** — a `B` and no `A`, `C` or `D` since — so the line was
+    /// never submitted or abandoned. A bare **`\r`** has come since, so the
+    /// prompt is being drawn over the line's own row. And the line holds
+    /// **no newline**, because a line that has been ended is not being
+    /// redrawn: fish draws its next prompt after a Ctrl-C or a syntax
+    /// error with no `C` and no `D`, so the capture is still open, but
+    /// after the `^C` or the error report and a newline — and read as a
+    /// redraw, the abandoned line and the report become the front of the
+    /// next command. A prompt drawn after a newline, which is where every
+    /// new prompt goes, fails both of the last two and restarts the
+    /// capture as before.
+    fn line_behind_a_redrawn_prompt(&self) -> Option<(String, usize)> {
+        let capture = self.capture.as_ref()?;
+        let line = if self.capture_return_pending {
+            // Nothing has been written over the line since the `\r`.
+            Some((capture.clone(), self.capture_debt))
+        } else {
+            self.line_at_return.clone()
+        };
+        line.filter(|(line, _)| !line.contains('\n'))
     }
 
     /// At the `B` that ends a redrawn prompt, put back the line the prompt
@@ -946,16 +972,8 @@ impl ModeScanner {
     /// a count of the line's own columns, and those survive
     /// (`resolve_capture_return`). Written text replaces the rest, exactly
     /// as after a `\r`; a repaint that writes nothing before the line ends
-    /// leaves all of it, as a `\r` never written over does. Only an `A`
-    /// immediately in front of this `B` counts: one that a `C` or `D`
-    /// separates from it began something else.
-    fn resume_redrawn_line(&mut self) {
-        let Some((line, debt)) = self.redrawn.take() else {
-            return;
-        };
-        if self.last_marker != Some(b'A') {
-            return;
-        }
+    /// leaves all of it, as a `\r` never written over does.
+    fn resume_redrawn_line(&mut self, (line, debt): (String, usize)) {
         self.capture = Some(line);
         self.capture_debt = debt;
         self.capture_return_pending = true;
@@ -1188,19 +1206,24 @@ impl ModeScanner {
             self.foreign_letters[slot] = true;
         }
         // Read before the reset below takes the armed `\r` it depends on.
-        let redrawn = if kind == b'A' {
-            self.line_behind_a_redrawn_prompt()
-        } else {
-            None
+        let behind = match kind {
+            b'A' | b'B' => self.line_behind_a_redrawn_prompt(),
+            _ => None,
         };
+        // What an `A` found behind it is put back by the `B` right after
+        // that `A` and by no later one: any other marker in between began
+        // something else.
+        let carried = self.redrawn.take();
         // Every modelled marker begins or ends a capture, so none of them
         // may inherit an armed `\r` — or an unpaid discard — from the span
         // before it.
         self.capture_return_pending = false;
+        self.redraw_resume = false;
         self.repaint_columns = 0;
+        self.line_at_return = None;
         let marker = match kind {
             b'A' => {
-                self.redrawn = redrawn;
+                self.redrawn = behind;
                 self.capture = None;
                 self.capture_debt = 0;
                 self.prompt_columns = 0;
@@ -1223,7 +1246,9 @@ impl ModeScanner {
                 } else {
                     self.tail.columns()
                 };
-                self.resume_redrawn_line();
+                if let Some(line) = behind.or(carried) {
+                    self.resume_redrawn_line(line);
+                }
                 Osc133::CommandStart
             }
             b'C' => {
@@ -1867,17 +1892,23 @@ mod tests {
 
     #[test]
     fn a_second_command_start_restarts_the_capture() {
-        // `B` always begins a fresh command line; it does not resume an
-        // open one. Reusing the capture concatenates two prompts' worth of
-        // echo into a single command ("onetwo").
-        let (_, ev) = scan(b"\x1b]133;B\x07one\x1b]133;B\x07two\r\n\x1b]133;C\x07");
-        assert_eq!(
-            ev[2].marker,
-            Osc133::OutputStart {
-                command: Some("two".into()),
-                truncated: false,
-            }
-        );
+        // A `B` with no `\r` in front of it begins a fresh command line; it
+        // does not resume an open one, however far the cursor then steps.
+        // Reusing the capture concatenates two prompts' worth of echo into
+        // a single command ("onetwo").
+        for raw in [
+            &b"\x1b]133;B\x07one\x1b]133;B\x07two\r\n\x1b]133;C\x07"[..],
+            b"\x1b]133;B\x07one\x1b]133;B\x07\x1b[3Ctwo\r\n\x1b]133;C\x07",
+        ] {
+            let (_, ev) = scan(raw);
+            assert_eq!(
+                ev[2].marker,
+                Osc133::OutputStart {
+                    command: Some("two".into()),
+                    truncated: false,
+                }
+            );
+        }
     }
 
     /// bash 5.3 at `⬢ [x] ❯ `, `LC_ALL=C.UTF-8`: `echo this is a long
@@ -1950,6 +1981,12 @@ mod tests {
                 "echo hello",
             ),
             (
+                "a net step backwards keeps none of it",
+                &b"\x1b]133;A\x07$ \x1b]133;B\x07echo hullo\
+                   \r\x1b]133;A\x07$ \x1b]133;B\x07\x1b[2C\x1b[3Dls\r\n\x1b]133;C\x07"[..],
+                "ls",
+            ),
+            (
                 "a prompt after a newline is a new line",
                 &b"\x1b]133;A\x07$ \x1b]133;B\x07one\r\n\x1b]133;A\x07$ \x1b]133;B\x07\
                    \x1b[3Ctwo\r\n\x1b]133;C\x07"[..],
@@ -1972,6 +2009,22 @@ mod tests {
                 &b"\x1b]133;A\x07$ \x1b]133;B\x07echo hi\r\x1b]133;A\x07$ \x1b]133;B\x07\
                    \r\x1b[C\x1b[Cls\r\n\x1b]133;C\x07"[..],
                 "ls",
+            ),
+            (
+                "a last row drawn after a newline is a new line",
+                &b"\x1b]133;B\x07one^C\r\n\r> \x1b]133;B\x07\x1b[3Ctwo\r\n\x1b]133;C\x07"[..],
+                "two",
+            ),
+            (
+                "a `\\r` on an earlier row does not make a `B` a redraw",
+                &b"\x1b]133;B\x07one\rX\r\n> \x1b]133;B\x07\x1b[3Ctwo\r\n\x1b]133;C\x07"[..],
+                "two",
+            ),
+            (
+                "a `\\r` before an earlier `B` does not make a later one a redraw",
+                &b"\x1b]133;B\x07one\r> \x1b]133;B\x07two\x1b]133;B\x07\x1b[3Cthree\
+                   \r\n\x1b]133;C\x07"[..],
+                "three",
             ),
         ] {
             let (_, ev) = scan(raw);
@@ -2024,6 +2077,125 @@ mod tests {
                 Osc133::OutputStart {
                     command: Some(want.into()),
                     truncated,
+                },
+                "{what}"
+            );
+        }
+    }
+
+    /// bash 5.3 redraws a prompt's **last row** only, so a prompt of
+    /// several rows redraws with no `A` in front of its `B`, and one led by
+    /// readline's `show-mode-in-prompt` string redraws with text in front
+    /// of its `A`. `echo HOLDFAST_TYPED` typed a key at a time at
+    /// `LC_ALL=C.UTF-8`, verbatim from the prompt to `C`.
+    #[test]
+    fn a_prompt_redrawn_from_its_last_row_keeps_the_line() {
+        let want = Osc133::OutputStart {
+            command: Some("echo HOLDFAST_TYPED".into()),
+            truncated: false,
+        };
+        for (what, raw) in [
+            (
+                "two rows",
+                "\x1b[?2004h\x1b]133;A;holdfast=1\x07top line ⬢\r\n[x] ❯ \x1b]133;B;holdfast=1\x07\
+                 \r[x] ❯ \x1b]133;B;holdfast=1\x07e\
+                 \r[x] ❯ \x1b]133;B;holdfast=1\x07\x1b[Ccho HOLDFAST_TYPED\
+                 \r\n\x1b[?2004l\r\x1b]133;C;holdfast=1\x07",
+            ),
+            (
+                "starship's shape: an empty row, a status row, then `❯ `",
+                "\x1b[?2004h\x1b]133;A;holdfast=1\x07\r\n\x1b[1;36m~/src\x1b[0m on \x1b[35m main\x1b[0m\
+                 \r\n\x1b[32m❯\x1b[0m \x1b]133;B;holdfast=1\x07\
+                 \r\x1b[32m❯\x1b[0m \x1b]133;B;holdfast=1\x07e\
+                 \r\x1b[32m❯\x1b[0m \x1b]133;B;holdfast=1\x07\x1b[Ccho HOLDFAST_TYPED\
+                 \r\n\x1b[?2004l\r\x1b]133;C;holdfast=1\x07",
+            ),
+            (
+                "the mode string in front of the `A`",
+                "\x1b[?2004h(ins)\x1b]133;A;holdfast=1\x07⬢ [x] ❯ \x1b]133;B;holdfast=1\x07\
+                 \r(ins)\x1b]133;A;holdfast=1\x07⬢ [x] ❯ \x1b]133;B;holdfast=1\x07e\
+                 \r(ins)\x1b]133;A;holdfast=1\x07⬢ [x] ❯ \x1b]133;B;holdfast=1\x07\x1b[Cc\
+                 \r(ins)\x1b]133;A;holdfast=1\x07⬢ [x] ❯ \x1b]133;B;holdfast=1\x07\x1b[C\x1b[Ch\
+                 \r(ins)\x1b]133;A;holdfast=1\x07⬢ [x] ❯ \x1b]133;B;holdfast=1\x07\
+                 \x1b[C\x1b[C\x1b[Co HOLDFAST_TYPED\r\n\x1b[?2004l\r\x1b]133;C;holdfast=1\x07",
+            ),
+            (
+                "the mode string on the last of two rows",
+                "\x1b[?2004h\x1b]133;A;holdfast=1\x07top line ⬢\r\n(ins)[x] ❯ \x1b]133;B;holdfast=1\x07\
+                 \r(ins)[x] ❯ \x1b]133;B;holdfast=1\x07e\
+                 \r(ins)[x] ❯ \x1b]133;B;holdfast=1\x07\x1b[Ccho HOLDFAST_TYPED\
+                 \r\n\x1b[?2004l\r\x1b]133;C;holdfast=1\x07",
+            ),
+        ] {
+            let raw = raw.as_bytes();
+            let (_, ev) = scan(raw);
+            assert_eq!(last_command(&ev), want, "{what}");
+            let mut s = ModeScanner::new();
+            let mut ev = Vec::new();
+            for (i, b) in raw.iter().enumerate() {
+                ev.extend(s.feed(std::slice::from_ref(b), i as u64, None));
+            }
+            assert_eq!(last_command(&ev), want, "{what}, fed a byte at a time");
+        }
+    }
+
+    /// fish ends a line with no `C` and no `D` when Ctrl-C cancels it or it
+    /// fails to parse. It prints `^C`, or its error report, and a newline,
+    /// then its missing-newline mark — `⏎`, spaces to the last column,
+    /// `\r⏎ \r` — and then the next prompt, all over a capture that is
+    /// still open. fish 3.7.0 at an 80-column PTY, verbatim from the
+    /// abandoned line's prompt to the next command's `C`, but for the
+    /// window title, which is shortened.
+    #[test]
+    fn a_line_the_shell_abandoned_is_not_the_front_of_the_next() {
+        const PROMPT: &[u8] =
+            b"\x1b]133;A;holdfast=1\x07\x1b(B\x1b[mdev@host ~/src> \x1b]133;B;holdfast=1\x07";
+        let mark = [
+            &b"\x1b[2m\xe2\x8f\x8e\x1b(B\x1b[m"[..],
+            &[b' '; 79],
+            b"\r\xe2\x8f\x8e \r\x1b[K",
+        ]
+        .concat();
+        let next: &[u8] = b"\x1b[K\r\x1b[16Cecho \r\x1b[21CSECOND\r\x1b[27C\x1b[11Decho SECOND\
+            \r\x1b[27C\r\n\x1b[30m\x1b(B\x1b[m\x1b]133;C;holdfast=1\x07";
+        let cancelled = [
+            PROMPT,
+            b"\x1b[K\r\x1b[16Cecho \r\x1b[21CCANCELLED\r\x1b[30C\x1b[14Decho CANCELLED\
+              \r\x1b[30C^C\x1b[30m\x1b(B\x1b[m\r\n",
+            &mark,
+            PROMPT,
+            next,
+        ]
+        .concat();
+        // fish keeps a line that failed to parse, and redraws it — a real
+        // redraw, over an open capture with no newline in it — before the
+        // Ctrl-C that clears it.
+        let unparsed = [
+            PROMPT,
+            b"\x1b[K\r\x1b[16Cecho \r\x1b[21C)\r\x1b[22C\r\n\
+              fish: Unexpected ')' for unopened parenthesis\r\necho )\r\n     ^\r\n",
+            &mark,
+            PROMPT,
+            b"echo )\x1b[K\r\x1b[22C\x1b]0;~/src\x07\x1b[30m\x1b(B\x1b[m\r",
+            PROMPT,
+            b"echo )\x1b[K\r\x1b[22C\x08\x08\x08\x08\x08\x08echo )\r\x1b[22C^C\x1b[30m\x1b(B\x1b[m\r\n",
+            &mark,
+            PROMPT,
+            next,
+        ]
+        .concat();
+        for (what, raw) in [("Ctrl-C", cancelled), ("a syntax error", unparsed)] {
+            let (_, ev) = scan(&raw);
+            let starts: Vec<_> = ev
+                .iter()
+                .filter(|e| matches!(e.marker, Osc133::OutputStart { .. }))
+                .collect();
+            assert_eq!(starts.len(), 1, "{what}: only the second line ran");
+            assert_eq!(
+                starts[0].marker,
+                Osc133::OutputStart {
+                    command: Some("echo SECOND".into()),
+                    truncated: false,
                 },
                 "{what}"
             );
