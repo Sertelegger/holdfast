@@ -2041,25 +2041,34 @@ mod tests {
     }
 
     /// The ownership half of the refusal, made before anything is changed.
-    /// `/` stands in for a directory another user owns: it is root's
-    /// wherever this runs unprivileged, and there its `chmod` fails, so a
-    /// build without the check fails this test on the message rather than
-    /// by touching `/`.
+    /// Unprivileged, `/` is the directory another user owns: its `chmod`
+    /// fails there, so a build without the check fails this test on the
+    /// message rather than by touching `/`. As root, a directory of the
+    /// test's own given to `nobody`, which a build without the check would
+    /// tighten and write into.
     #[test]
-    #[allow(clippy::print_stderr)] // the skip line, read by `ci-skip-census.sh`
     fn a_history_directory_another_user_owns_is_refused_before_it_is_touched() {
         use std::os::unix::fs::MetadataExt;
 
         let me = crate::daemon::peer::current_uid();
-        let before = std::fs::symlink_metadata("/").unwrap();
-        if before.uid() == me {
-            eprintln!(
-                "skipping: this process owns `/` (uid {me}) — the history directory \
-                 ownership refusal is not measured"
-            );
-            return;
-        }
-        let err = prepare_history_file(Path::new("/holdfast-test-sess_1.history"), true)
+        let mut _scoped = None;
+        let dir = if std::fs::symlink_metadata("/").unwrap().uid() != me {
+            PathBuf::from("/")
+        } else {
+            let dir = temp_dir("hist-other");
+            _scoped = Some(Scoped(dir.clone()));
+            std::fs::create_dir_all(&dir).unwrap();
+            if let Err(e) = std::os::unix::fs::chown(&dir, Some(65534), Some(65534)) {
+                crate::diag!(
+                    "skipping: uid {me} owns `/` and cannot give a directory away ({e}) — \
+                     the history directory ownership refusal is not measured"
+                );
+                return;
+            }
+            dir
+        };
+        let before = std::fs::symlink_metadata(&dir).unwrap();
+        let err = prepare_history_file(&dir.join("sess_1.history"), true)
             .expect_err("a directory another user owns was used");
         assert_eq!(err.kind(), std::io::ErrorKind::PermissionDenied, "{err}");
         assert!(
@@ -2067,10 +2076,9 @@ mod tests {
                 .contains("is not a directory owned by this user"),
             "refused for another reason, so after trying to change it: {err}"
         );
-        assert_eq!(
-            std::fs::symlink_metadata("/").unwrap().mode(),
-            before.mode()
-        );
+        let after = std::fs::symlink_metadata(&dir).unwrap();
+        assert_eq!(after.mode(), before.mode(), "{}", dir.display());
+        assert!(!dir.join("sess_1.history").exists());
     }
 
     #[test]
