@@ -408,8 +408,8 @@ const INERT: &[(&str, Inert, &str)] = &[
     // ---- [limits]
     (
         "limits.output_buffer_bytes",
-        Inert::NamedElsewhere,
-        "GH #128's repro. The live value is SessionConfig::buffer_capacity, which crates/holdfast-core/src/mcp/tools.rs:394 never sets, so it falls through to the hardcoded twin registry::DEFAULT_BUFFER_BYTES (crates/holdfast-core/src/session/registry.rs:64, also 1 MiB). The other mentions are doc comments and one operator-facing error string in daemon/server.rs.",
+        Inert::NeverNamed,
+        "GH #128's repro. The live value is SessionConfig::buffer_capacity, which crates/holdfast-core/src/mcp/tools.rs:394 never sets, so it falls through to the hardcoded twin registry::DEFAULT_BUFFER_BYTES (crates/holdfast-core/src/session/registry.rs:64, also 1 MiB). The other mentions are doc comments.",
     ),
     (
         "limits.read_output_default_max_bytes",
