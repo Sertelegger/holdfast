@@ -95,8 +95,8 @@ pub fn detect_shell(command: &str, args: &[String]) -> Option<Shell> {
 /// appends to index 0 — the one element it does run. **Residual:** a hook
 /// appended to `PROMPT_COMMAND` *after* the snippet ran — `eval "$(starship
 /// init bash)"` typed into a live session — runs after `__holdfast_p` and
-/// defeats it again. That is what `osc133_source: "holdfast_degraded"`
-/// exists to report.
+/// defeats it again. That is what `command_capture: "missing"`, and a
+/// history entry's `command: null`, exist to report.
 ///
 /// **Joined with a newline, never `; `** (review of GH #220). The call is
 /// appended to text the user wrote, and a separator has to be valid after

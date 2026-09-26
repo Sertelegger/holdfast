@@ -76,13 +76,23 @@ pub enum Osc133 {
     /// `C` — the command was submitted; what follows is its output.
     /// `command` is the text echoed between `B` and `C`.
     ///
+    /// **`None` means nothing was captured**: no `B` armed the capture
+    /// since the last `A`, `C` or `D`, whichever source's markers are in
+    /// use. That is a different fact from `Some("")`, a capture that ran
+    /// and saw no echo, and the two must not collapse into one value — a
+    /// history of empty strings reads as commands with no text rather
+    /// than as commands whose text was never seen.
+    ///
     /// `truncated` says the echo capture is **missing its front**: a bare
     /// `\r` discarded text that was never repainted (see
     /// `ModeScanner::resolve_capture_return`), so `command` is a tail
     /// whose front was dropped *before* any redactor could see it. The
     /// text is still carried — §8.5.1 rule 5's injection-line suppression
     /// matches on it as a suffix — but no consumer may present it.
-    OutputStart { command: String, truncated: bool },
+    OutputStart {
+        command: Option<String>,
+        truncated: bool,
+    },
     /// `D;<code>` — the command finished.
     CommandDone { exit_code: Option<i32> },
 }
@@ -93,6 +103,13 @@ pub enum Osc133 {
 /// *injected* — a session can carry `shell_integration: Some(Fish)` with
 /// `Osc133Source::External`, meaning the snippet is installed and firing
 /// and its markers are being dropped on arrival (§8.5.1).
+///
+/// **Source only, and deliberately not capture health.** Whether the
+/// markers in use still frame the command line is a second, independent
+/// question — a prompt framework can regenerate the prompt over any
+/// source's `A`/`B` (GH #220) — and one value cannot carry both. It is
+/// answered per history entry (`command: None`) and by
+/// `CommandHistory::command_capture`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Osc133Source {
     /// Every marker seen so far carries `holdfast=1`. The ordinary case.
@@ -104,23 +121,6 @@ pub enum Osc133Source {
     /// *partial* foreign integration. Reachable only because §8.5.1's rule
     /// yields per letter rather than per source.
     Mixed,
-    /// Every marker seen carries `holdfast=1` — but the **most recent
-    /// command's `C` arrived with no `B` in front of it** since the marker
-    /// that closed the one before. Holdfast's snippet is installed and its
-    /// `C`/`D` fire; its prompt markers are not reaching the terminal,
-    /// because something regenerates the prompt after Holdfast wrapped it
-    /// (GH #220: starship rewrites `PS1` at every prompt).
-    ///
-    /// **What it costs, which is why it is not `holdfast`.** With no `B`
-    /// the echo capture never arms, so every `get_command_history` entry
-    /// reports `command: ""` beside an exit code that is still correct —
-    /// a well-formed history an agent cannot match to its commands. Before
-    /// this value existed the session said `holdfast`, the one answer a
-    /// caller checks to decide to trust that history. The snippet now
-    /// re-wraps the prompt every cycle, so reaching this means a prompt
-    /// framework has defeated *that* too, and this is what makes the next
-    /// one visible rather than silent.
-    HoldfastDegraded,
 }
 
 impl Osc133Source {
@@ -129,7 +129,6 @@ impl Osc133Source {
             Self::Holdfast => "holdfast",
             Self::External => "external",
             Self::Mixed => "mixed",
-            Self::HoldfastDegraded => "holdfast_degraded",
         }
     }
 }
@@ -372,15 +371,18 @@ pub struct ModeScanner {
     /// is decided by the reader thread, which is the only place that knows
     /// (§8.3, REQ-PD-025).
     foreground: Option<i32>,
-    /// Whether a `B` has been used since the last `C` or `D` — the span a
-    /// command's `C` should find a `B` in. See `prompt_markers_missing`.
-    b_since_boundary: bool,
-    /// The most recent **Holdfast-tagged** `C` arrived with no `B` in
-    /// front of it (GH #220). What `Osc133Source::HoldfastDegraded` reports.
+    /// The most recent `C` found no capture armed — no `B` since the last
+    /// `A`, `C` or `D` — so its `OutputStart` carried `command: None`
+    /// (GH #220). See `prompt_markers_missing`.
+    ///
+    /// **Any source's `C`.** The capture is armed by whichever `B` is in
+    /// use, so a foreign integration whose prompt is regenerated out from
+    /// under its `A`/`B` loses its command text, and its `A` after each
+    /// `D`, exactly as Holdfast's does.
     ///
     /// The most recent, not sticky: a prompt framework that defeats the
     /// wrapping does so at every prompt, and a session that recovers — the
-    /// user resets `PS1` by hand — should stop saying it is degraded.
+    /// user resets `PS1` by hand — should stop saying it is missing.
     prompt_markers_missing: bool,
     /// The foreground group sampled at the most recent `A`, `B` or `D`:
     /// the markers a shell emits while it holds the terminal and is about
@@ -418,7 +420,6 @@ impl ModeScanner {
             holdfast_letters: [false; 4],
             pending_cr: false,
             foreground: None,
-            b_since_boundary: false,
             prompt_markers_missing: false,
             prompt_owner: None,
         }
@@ -449,7 +450,6 @@ impl ModeScanner {
         let any_holdfast = (0..4).any(|i| self.holdfast_letters[i] && !self.foreign_letters[i]);
         match (any_holdfast, any_foreign) {
             (false, false) => None,
-            (true, false) if self.prompt_markers_missing => Some(Osc133Source::HoldfastDegraded),
             (true, false) => Some(Osc133Source::Holdfast),
             (false, true) => Some(Osc133Source::External),
             (true, true) => Some(Osc133Source::Mixed),
@@ -1044,7 +1044,7 @@ impl ModeScanner {
     /// foreign integration may be partial — measured, fish 4.0.2 emits `A`,
     /// `C` and `D` and never `B` — and whole-source suppression would then
     /// discard Holdfast's `B` along with the rest, leaving the echo capture no
-    /// `B..C` span and `get_command_history` reporting `command: ""` for
+    /// `B..C` span and `get_command_history` reporting `command: null` for
     /// every entry. Yielding per letter keeps exactly the letters the
     /// foreign emitter does not supply, which is why `osc133_source` needs
     /// a `mixed` value at all.
@@ -1105,7 +1105,6 @@ impl ModeScanner {
             b'B' => {
                 self.capture = Some(String::new());
                 self.capture_debt = 0;
-                self.b_since_boundary = true;
                 // **The column the command starts at.** `tail` holds the
                 // printable bytes since the last `\r`/`\n`, which at `B`
                 // is the prompt's final row — exactly the width a repaint
@@ -1123,24 +1122,23 @@ impl ModeScanner {
                 Osc133::CommandStart
             }
             b'C' => {
-                let command = self.capture.take().unwrap_or_default().trim().to_string();
+                // `None` when no `B` armed the capture: the text was not
+                // seen, which is not the same as an empty line.
+                let command = self.capture.take().map(|c| c.trim().to_string());
                 // A debt the repaint never repaid: the line's front went
                 // to a `\r` and is not in `command`.
                 let truncated = self.capture_debt > 0;
                 self.capture_debt = 0;
-                // GH #220: Holdfast's own `C` with no `B` since the last
-                // boundary means its prompt wrapping is being overwritten.
-                // A *foreign* `C` says nothing about Holdfast's snippet.
-                if is_holdfast {
-                    self.prompt_markers_missing = !self.b_since_boundary;
-                }
-                self.b_since_boundary = false;
+                // GH #220: a `C` with no capture armed means the prompt
+                // markers that frame the command line are not arriving —
+                // for whichever source is in use, since the capture is
+                // armed by whichever `B` is.
+                self.prompt_markers_missing = command.is_none();
                 Osc133::OutputStart { command, truncated }
             }
             b'D' => {
                 self.capture = None;
                 self.capture_debt = 0;
-                self.b_since_boundary = false;
                 // `D` alone means "finished, status unknown"; `D;<n>`
                 // carries it.
                 let exit_code = rest[1..]
@@ -1205,8 +1203,8 @@ impl ModeScanner {
         Some((marker, is_holdfast))
     }
 
-    /// Whether the most recent Holdfast-tagged `C` arrived with no `B` in
-    /// front of it (GH #220). See `prompt_markers_missing`.
+    /// Whether the most recent `C`, from any source, found no capture
+    /// armed (GH #220). See `prompt_markers_missing`.
     pub fn prompt_markers_missing(&self) -> bool {
         self.prompt_markers_missing
     }
@@ -1456,7 +1454,7 @@ mod tests {
         assert_eq!(
             ev[0].marker,
             Osc133::OutputStart {
-                command: "ls".into(),
+                command: Some("ls".into()),
                 truncated: false,
             },
             "a well-formed sequence under SEQUENCE_MAX leaked into the \
@@ -1578,7 +1576,7 @@ mod tests {
         assert_eq!(
             ev[2].marker,
             Osc133::OutputStart {
-                command: "echo hi".into(),
+                command: Some("echo hi".into()),
                 truncated: false,
             }
         );
@@ -1604,7 +1602,7 @@ mod tests {
         assert_eq!(
             ev[1].marker,
             Osc133::OutputStart {
-                command: "echo hello".into(),
+                command: Some("echo hello".into()),
                 truncated: false,
             }
         );
@@ -1616,7 +1614,7 @@ mod tests {
         assert_eq!(
             ev[1].marker,
             Osc133::OutputStart {
-                command: "real command".into(),
+                command: Some("real command".into()),
                 truncated: false,
             }
         );
@@ -1669,7 +1667,7 @@ mod tests {
             assert_eq!(
                 ev[1].marker,
                 Osc133::OutputStart {
-                    command: want.into(),
+                    command: Some(want.into()),
                     truncated: false,
                 },
                 "fish repaint lost the command"
@@ -1685,7 +1683,7 @@ mod tests {
         assert_eq!(
             ev[1].marker,
             Osc133::OutputStart {
-                command: "real command".into(),
+                command: Some("real command".into()),
                 truncated: false,
             },
             "a carriage return that was written over must still discard"
@@ -1712,14 +1710,14 @@ mod tests {
         assert_eq!(
             ev[1].marker,
             Osc133::OutputStart {
-                command: "first".into(),
+                command: Some("first".into()),
                 truncated: false,
             }
         );
         assert_eq!(
             ev.last().unwrap().marker,
             Osc133::OutputStart {
-                command: "echo hello".into(),
+                command: Some("echo hello".into()),
                 truncated: false,
             },
             "a carriage return armed in one span fired inside the next"
@@ -1734,7 +1732,7 @@ mod tests {
         assert_eq!(
             ev[0].marker,
             Osc133::OutputStart {
-                command: "echo hi".into(),
+                command: Some("echo hi".into()),
                 truncated: false,
             }
         );
@@ -1755,7 +1753,7 @@ mod tests {
         assert_eq!(
             ev[0].marker,
             Osc133::OutputStart {
-                command: "real".into(),
+                command: Some("real".into()),
                 truncated: false,
             },
             "the carriage return did not carry across the chunk boundary"
@@ -1771,7 +1769,7 @@ mod tests {
         assert_eq!(
             ev[2].marker,
             Osc133::OutputStart {
-                command: "two".into(),
+                command: Some("two".into()),
                 truncated: false,
             }
         );
@@ -1784,7 +1782,7 @@ mod tests {
         assert_eq!(
             ev[2].marker,
             Osc133::OutputStart {
-                command: "ls".into(),
+                command: Some("ls".into()),
                 truncated: false,
             }
         );
@@ -1821,7 +1819,7 @@ mod tests {
         assert_eq!(
             ev[0].marker,
             Osc133::OutputStart {
-                command: String::new(),
+                command: None,
                 truncated: false,
             }
         );
@@ -2304,9 +2302,11 @@ mod tests {
         }
     }
 
-    /// GH #220: `osc133_source` said `holdfast` for a session whose history
-    /// was all `command: ""`, because Holdfast's `C` and `D` kept arriving
-    /// after starship had regenerated `PS1` out from under its `A`/`B`.
+    /// GH #220: a prompt regenerated over the `A`/`B` markers (starship
+    /// rewrites `PS1` at every prompt) leaves every `C` with no capture
+    /// armed. The text is then not captured, and the history said
+    /// `command: ""` — the spelling of an empty line — while `osc133_source`
+    /// said `holdfast`, the one answer a caller checked before trusting it.
     mod prompt_markers_missing {
         use super::*;
 
@@ -2316,59 +2316,141 @@ mod tests {
         const REGENERATED: &[u8] = b"\x1b]133;D;0;holdfast=1\x07user@host ~ \xe2\x9d\xaf \
             echo hi\r\n\x1b]133;C;holdfast=1\x07hi\r\n\x1b]133;D;0;holdfast=1\x07";
 
+        fn output_start(ev: &[Osc133Event]) -> &Osc133 {
+            &ev.iter()
+                .find(|e| matches!(e.marker, Osc133::OutputStart { .. }))
+                .expect("a `C`")
+                .marker
+        }
+
         #[test]
-        fn a_holdfast_c_with_no_b_before_it_degrades_the_source() {
+        fn a_c_with_no_b_before_it_captured_nothing_and_says_so() {
             let mut s = ModeScanner::new();
             s.feed(b"\x1b]133;D;0;holdfast=1\x07", 0, None);
-            assert_eq!(
-                s.osc133_source(),
-                Some(Osc133Source::Holdfast),
+            assert!(
+                !s.prompt_markers_missing(),
                 "nothing is known to be missing until a command is submitted"
             );
-            s.feed(&REGENERATED[21..], 21, None);
-            assert_eq!(s.osc133_source(), Some(Osc133Source::HoldfastDegraded));
-            assert_eq!(Osc133Source::HoldfastDegraded.as_str(), "holdfast_degraded");
+            let ev = s.feed(&REGENERATED[21..], 21, None);
+            assert_eq!(
+                *output_start(&ev),
+                Osc133::OutputStart {
+                    command: None,
+                    truncated: false,
+                },
+                "an uncaptured command must not read as an empty one"
+            );
+            assert!(s.prompt_markers_missing());
+            // The source is a separate question and its answer is unchanged:
+            // every marker in use is still Holdfast's.
+            assert_eq!(s.osc133_source(), Some(Osc133Source::Holdfast));
         }
 
         /// The negative that keeps this from reading every session as
-        /// degraded, and the recovery: the next command with a `B` in
-        /// front of it says `holdfast` again.
+        /// missing, and the recovery: the next command with a `B` in front
+        /// of it is captured again.
         #[test]
-        fn a_c_with_its_b_is_not_degraded_and_a_session_that_recovers_says_so() {
+        fn a_c_with_its_b_is_captured_and_a_session_that_recovers_says_so() {
             let mut s = ModeScanner::new();
             s.feed(REGENERATED, 0, None);
-            assert_eq!(s.osc133_source(), Some(Osc133Source::HoldfastDegraded));
-            s.feed(
+            assert!(s.prompt_markers_missing());
+            let ev = s.feed(
                 b"\x1b]133;A;holdfast=1\x07$ \x1b]133;B;holdfast=1\x07ls\r\n\x1b]133;C;holdfast=1\x07",
                 500,
                 None,
             );
-            assert_eq!(s.osc133_source(), Some(Osc133Source::Holdfast));
+            assert_eq!(
+                *output_start(&ev),
+                Osc133::OutputStart {
+                    command: Some("ls".into()),
+                    truncated: false,
+                }
+            );
             assert!(!s.prompt_markers_missing());
         }
 
-        /// A foreign `C` with no `B` says nothing about Holdfast's snippet —
-        /// fish 4.0.2 marks with `A`, `C`, `D` and never `B` — so it cannot
-        /// set the flag. (The source is `mixed` there for its own reason.)
+        /// **Capture does not depend on whose markers are in use.** The
+        /// capture is armed by whichever `B` survives §8.5.1's yielding, so
+        /// a foreign integration whose prompt is regenerated away loses its
+        /// text exactly as Holdfast's does — and the same `B` in front of
+        /// the `C` keeps it, under each source.
         #[test]
-        fn a_foreign_c_with_no_b_does_not_set_the_flag() {
-            let mut s = ModeScanner::new();
-            s.feed(b"\x1b]133;D;0;holdfast=1\x07\x1b]133;C\x07", 0, None);
-            assert!(!s.prompt_markers_missing());
+        fn a_c_with_no_b_captures_nothing_under_every_source() {
+            // (source, a cycle whose `C` has its `B`, then a `C` with none)
+            let rows: [(Osc133Source, &[u8], &[u8]); 3] = [
+                (
+                    Osc133Source::Holdfast,
+                    b"\x1b]133;A;holdfast=1\x07$ \x1b]133;B;holdfast=1\x07ls\r\n\
+                      \x1b]133;C;holdfast=1\x07\x1b]133;D;0;holdfast=1\x07",
+                    b"$ ls\r\n\x1b]133;C;holdfast=1\x07",
+                ),
+                (
+                    Osc133Source::External,
+                    b"\x1b]133;A\x07$ \x1b]133;B\x07ls\r\n\x1b]133;C\x07\x1b]133;D;0\x07",
+                    b"$ ls\r\n\x1b]133;C\x07",
+                ),
+                // Holdfast's `A`/`B` and a foreign `C`/`D`: a partial
+                // foreign integration.
+                (
+                    Osc133Source::Mixed,
+                    b"\x1b]133;A;holdfast=1\x07$ \x1b]133;B;holdfast=1\x07ls\r\n\
+                      \x1b]133;C\x07\x1b]133;D;0\x07",
+                    b"$ ls\r\n\x1b]133;C\x07",
+                ),
+            ];
+            for (source, framed, bare) in rows {
+                let mut s = ModeScanner::new();
+                let ev = s.feed(framed, 0, None);
+                assert_eq!(
+                    *output_start(&ev),
+                    Osc133::OutputStart {
+                        command: Some("ls".into()),
+                        truncated: false,
+                    },
+                    "{source:?}"
+                );
+                assert!(!s.prompt_markers_missing(), "{source:?}");
+                let ev = s.feed(bare, framed.len() as u64, None);
+                assert_eq!(
+                    *output_start(&ev),
+                    Osc133::OutputStart {
+                        command: None,
+                        truncated: false,
+                    },
+                    "{source:?}"
+                );
+                assert!(s.prompt_markers_missing(), "{source:?}");
+                assert_eq!(
+                    s.osc133_source(),
+                    Some(source),
+                    "capture health reached the source"
+                );
+            }
         }
 
-        /// The `D` boundary is load-bearing: a `B` from the *previous*
+        /// The boundaries are load-bearing: a `B` from the *previous*
         /// prompt cycle must not vouch for a `C` after the `D` that closed
-        /// it.
+        /// it, nor after an `A` that began a prompt with no `B` of its own.
         #[test]
         fn a_b_from_an_earlier_cycle_does_not_vouch_for_a_later_c() {
-            let mut s = ModeScanner::new();
-            s.feed(
-                b"\x1b]133;B;holdfast=1\x07\x1b]133;D;0;holdfast=1\x07\x1b]133;C;holdfast=1\x07",
-                0,
-                None,
-            );
-            assert!(s.prompt_markers_missing());
+            for boundary in [
+                &b"\x1b]133;D;0;holdfast=1\x07"[..],
+                b"\x1b]133;A;holdfast=1\x07",
+            ] {
+                let mut s = ModeScanner::new();
+                s.feed(b"\x1b]133;B;holdfast=1\x07", 0, None);
+                s.feed(boundary, 100, None);
+                let ev = s.feed(b"ls\r\n\x1b]133;C;holdfast=1\x07", 200, None);
+                assert_eq!(
+                    *output_start(&ev),
+                    Osc133::OutputStart {
+                        command: None,
+                        truncated: false,
+                    },
+                    "{boundary:?}"
+                );
+                assert!(s.prompt_markers_missing(), "{boundary:?}");
+            }
         }
 
         #[test]
@@ -2405,7 +2487,7 @@ mod tests {
         assert_eq!(
             ev.last().unwrap().marker,
             Osc133::OutputStart {
-                command: "echo short".into(),
+                command: Some("echo short".into()),
                 truncated: false,
             },
             "a complete command was refused because the prompt was measured in bytes"
@@ -2421,7 +2503,7 @@ mod tests {
         assert_eq!(
             ev.last().unwrap().marker,
             Osc133::OutputStart {
-                command: "ODNN7EXAMPLE".into(),
+                command: Some("ODNN7EXAMPLE".into()),
                 truncated: true,
             }
         );

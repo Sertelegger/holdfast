@@ -649,8 +649,9 @@ jcheck "the §18.2a vocabularies reach the wire" \
     | .Status.enum, .InteractionMode.enum, .DetectionTier.enum,
       .ScreenTracking.enum, .SessionState.enum, .HeldBackCause.enum]
    + [tool("status").outputSchema["$defs"].ShellIntegration.enum,
-      tool("status").outputSchema["$defs"].Osc133Source.enum]' \
-  '[["ok","timeout","session_died","secret_provided","secret_cancelled","session_not_found","name_taken","limit_reached","spawn_failed","not_supported_on_platform","unavailable"],["AtPrompt","Executing","AwaitingSecret","Fullscreen","Exited"],["semantic","terminal_mode","heuristic"],["off","on"],["Starting","Running","Exited","Dead"],["in_flight_secret","incomplete_escape"],["bash","zsh","fish"],["holdfast","external","mixed","holdfast_degraded"]]'
+      tool("status").outputSchema["$defs"].Osc133Source.enum,
+      tool("status").outputSchema["$defs"].CommandCapture.enum]' \
+  '[["ok","timeout","session_died","secret_provided","secret_cancelled","session_not_found","name_taken","limit_reached","spawn_failed","not_supported_on_platform","unavailable"],["AtPrompt","Executing","AwaitingSecret","Fullscreen","Exited"],["semantic","terminal_mode","heuristic"],["off","on"],["Starting","Running","Exited","Dead"],["in_flight_secret","incomplete_escape"],["bash","zsh","fish"],["holdfast","external","mixed"],["captured","missing"]]'
 
 # GH #195: `held_back` is two rules and the response named which for
 # neither, so an agent could not tell §4.1's boundary from REQ-O-008's
@@ -934,12 +935,14 @@ jcheck "list_sessions returns the session start_session created" \
 # only correct answer and it is only reachable if the snippet ran, was
 # tagged, and was not discarded. `null` means no marker ever arrived --
 # which the tier-1 check above already contradicts, so a disagreement
-# between them localises the defect.
+# between them localises the defect. `command_capture` rides with it for
+# the same reason: the history checks above read text off every entry, so
+# anything but `captured` contradicts them.
 jcheck "status answers about the named session" \
   'data(3).session_id as $id
    | data(8) | [.id == $id, .name, .command, .state, .shell_integration,
-                .osc133_source, .command_count]' \
-  '[true,"smoke","bash","Running","bash","holdfast",4]'
+                .osc133_source, .command_capture, .command_count]' \
+  '[true,"smoke","bash","Running","bash","holdfast","captured",4]'
 
 check "terminate reports ok" '"already_exited":false'
 

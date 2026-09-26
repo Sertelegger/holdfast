@@ -10,7 +10,7 @@ pub use registry::{Retention, SessionRegistry};
 use crate::attach::secret::SecretBytes;
 use crate::buffer::{BufferRead, OutputBuffer};
 use crate::clock::Clock;
-use crate::detect::history::{CommandEntry, CommandHistory, DEFAULT_MAX_ENTRIES};
+use crate::detect::history::{CommandCapture, CommandEntry, CommandHistory, DEFAULT_MAX_ENTRIES};
 use crate::detect::{
     Detection, DetectionConfig, InteractionMode, Osc133Source, PromptDetector, Shell,
 };
@@ -1736,6 +1736,14 @@ impl Session {
 
     pub fn history_truncated(&self) -> bool {
         self.history.lock().truncated_at_tail()
+    }
+
+    /// Whether the newest history entry has its command text (§18.2a
+    /// `command_capture`). A different question from `osc133_source`:
+    /// that is whose markers are in use, this is whether they still frame
+    /// the command line. `None` until the first entry is recorded.
+    pub fn command_capture(&self) -> Option<CommandCapture> {
+        self.history.lock().command_capture()
     }
 
     pub fn command_history(&self, since_index: u64, limit: usize) -> Vec<CommandEntry> {
@@ -4171,7 +4179,7 @@ mod tests {
         assert!(!s.history_truncated());
         let entries = s.command_history(0, 10);
         assert_eq!(entries.len(), 1);
-        assert_eq!(entries[0].command, "echo hi");
+        assert_eq!(entries[0].command.as_deref(), Some("echo hi"));
         assert_eq!(entries[0].exit_code, Some(0));
 
         // The cursors must address the session's own buffer: reading the

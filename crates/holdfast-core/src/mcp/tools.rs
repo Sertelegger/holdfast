@@ -1940,6 +1940,10 @@ impl HoldfastServer {
     /// yields 47), and non-ASCII bytes are recorded as Latin-1. A truncated
     /// tail looks exactly like a complete shorter command, with no ellipsis
     /// and no error, so do not read `command` as a transcript of what ran.
+    /// `command` is null when no text was captured at all, because the
+    /// prompt's markers did not arrive (a prompt framework that regenerates
+    /// the prompt can do this); the exit code and output span are still
+    /// exact. `status` reports it for the newest entry as `command_capture`.
     #[tool(
         annotations(
             title = "List commands run, with exit codes",
@@ -1991,7 +1995,11 @@ impl HoldfastServer {
                     // redactor at an output boundary — with shell
                     // integration on by default for bash/zsh/fish, in the
                     // default configuration.
-                    "command": redact_str(&self.processor.rules, &e.command),
+                    //
+                    // `null` when no `B` armed the capture (GH #220): the
+                    // text was never seen, which `""` would misreport as an
+                    // empty command.
+                    "command": e.command.as_deref().map(|c| redact_str(&self.processor.rules, c)),
                     "exit_code": e.exit_code,
                     "started_at_unix_ms": e.started_at_unix_ms,
                     "duration_ms": e.duration_ms,
@@ -4321,6 +4329,11 @@ fn session_record(session: &Session, rules: &RuleSet) -> serde_json::Value {
         // neither this nor a null for it: §5.2 does not list it there, and
         // it would be null at every call by construction.
         "osc133_source": session.osc133_source().map(|s| s.as_str()),
+        // Whether the newest history entry has its command text (§18.2a,
+        // GH #220): a second question beside the source, with its own
+        // answer under every source, so neither field can stand in for
+        // the other.
+        "command_capture": session.command_capture().map(|c| c.as_str()),
         "command_count": session.command_count(),
         "started_at_unix_secs": unix_secs(session.created_at),
         "last_activity_unix_ms": session.last_activity_ms(),
@@ -6069,6 +6082,7 @@ mod tests {
             "truncated to its tail",
             "80 columns",
             "Latin-1",
+            "null when no text was captured",
         ] {
             assert!(
                 description.contains(needle),
