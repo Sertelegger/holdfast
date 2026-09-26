@@ -17,6 +17,7 @@ use crate::request::RequestContext;
 use crate::screen::{ScreenCapture, ScreenConfig, ScreenTracking};
 use crate::secret::binding::{Autofill, Resolved};
 use crate::secret::{CancelReason, RaisedBy, Resolution, SlotSnapshot, SlotTake};
+use crate::session::launch::History;
 use crate::session::SecretWrite;
 use crate::session::{new_session_id, wait, Session, SessionConfig, WriteRequest};
 use rmcp::handler::server::wrapper::Parameters;
@@ -290,7 +291,19 @@ impl HoldfastServer {
         // directory come from (GH #46, GH #55).
         let launch = self.resolve_launch(&args)?;
         let mut cfg = PtySpawnConfig::new(&launch.command);
-        cfg.args = launch.args.clone();
+        // GH #252: fish is spawned `--private`, ahead of the caller's
+        // arguments, whether or not the snippet will be typed. The argv
+        // that runs is what the audit row records; the session reports the
+        // caller's, as it reports none of the environment defaults below.
+        cfg.args = detect_shell(&launch.command, &launch.args)
+            .map_or(&[][..], |shell| shell.spawn_args())
+            .iter()
+            .map(|a| a.to_string())
+            .chain(launch.args.iter().cloned())
+            .collect();
+        // Issued before the spawn because a per-session history file is
+        // named by it (GH #252); `new_session_id` is pure.
+        let session_id = new_session_id();
 
         // `portable-pty` silently *discards* a cwd that is not an existing
         // directory and falls back to $HOME, so an unvalidated cwd means
@@ -397,13 +410,39 @@ impl HoldfastServer {
         // daemon, the daemon's own minus the spawning client's identity
         // otherwise, and `None` — inherit — in-process, where this process
         // *is* the client's. The defaults (`PAGER=cat` and its three
-        // siblings, and `PWD`) sit between the two, so an inherited pager
-        // loses to them and the call's own `env` beats them both. They go
-        // into `cfg.env` ahead of `launch.env` rather than into the base,
-        // because in-process there is no base to put them in; a later
-        // entry for the same key replaces an earlier one at the spawn.
+        // siblings, `PWD`, and the shell-history policy) sit between the
+        // two, so an inherited pager loses to them and the call's own
+        // `env` beats them both. They go into `cfg.env` ahead of
+        // `launch.env` rather than into the base, because in-process there
+        // is no base to put them in; a later entry for the same key
+        // replaces an earlier one at the spawn.
         let base_env = host.base_env(profiled, std::env::vars_os());
-        cfg.env = crate::session::launch::session_defaults(cfg.cwd.as_deref(), &launch.env);
+        let history_file = match self.config.terminal.shell_history_file.as_str() {
+            "per_session" => {
+                let file = self
+                    .history_dir
+                    .as_ref()
+                    .map(|dir| dir.join(format!("{session_id}.history")))
+                    .and_then(|p| p.into_os_string().into_string().ok());
+                match file {
+                    Some(f) => Some(f),
+                    None => {
+                        return Err(ErrorData::internal_error(
+                            "[terminal] shell_history_file = \"per_session\", and this server \
+                             has no state directory to keep the session's history file in"
+                                .to_string(),
+                            None,
+                        ))
+                    }
+                }
+            }
+            _ => None,
+        };
+        let history = history_file
+            .as_deref()
+            .map_or(History::Discard, History::File);
+        cfg.env =
+            crate::session::launch::session_defaults(cfg.cwd.as_deref(), history, &launch.env);
         cfg.env.extend(launch.env.iter().cloned());
 
         if let Some(c) = args.cols {
@@ -538,9 +577,28 @@ impl HoldfastServer {
             Err(e) => return envelope::from_error(&e),
         };
 
+        // GH #252's `per_session` file, created here, `0600` in a `0700`
+        // directory: no shell creates the directory, and the file's mode
+        // is Holdfast's to set rather than each shell's. After the
+        // reservation, so a refused call leaves no file behind.
+        if let Some(file) = &history_file {
+            if let Err(e) = crate::daemon::paths::open_log_append(std::path::Path::new(file)) {
+                return Err(ErrorData::internal_error(
+                    format!(
+                        "[terminal] shell_history_file = \"per_session\", and this session's \
+                         history file could not be created: {e}"
+                    ),
+                    None,
+                ));
+            }
+        }
+
         let backend = match InProcessPty::spawn_with_base_env(&cfg, base_env.as_deref()) {
             Ok(b) => Arc::new(b) as Arc<dyn PtyBackend>,
             Err(e) => {
+                if let Some(file) = &history_file {
+                    let _ = std::fs::remove_file(file);
+                }
                 // `brief` matters here: portable-pty's spawn error embeds
                 // the whole $PATH, which would land in the transcript.
                 //
@@ -561,7 +619,7 @@ impl HoldfastServer {
         };
 
         let session = Session::new(
-            new_session_id(),
+            session_id,
             args.name.clone(),
             launch.command.clone(),
             launch.args.clone(),

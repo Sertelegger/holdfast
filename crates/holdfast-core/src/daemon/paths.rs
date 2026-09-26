@@ -1075,6 +1075,19 @@ impl RuntimePaths {
         self.log_dir.join("daemon.log")
     }
 
+    /// `<log dir>/history/`: one shell history file per session when
+    /// `[terminal] shell_history_file = "per_session"` (GH #252).
+    ///
+    /// Under the log directory because that is the one Holdfast keeps
+    /// across logins — the runtime directory is tmpfs on most Linux
+    /// systems — and it moves with an explicit instance the same way. A
+    /// subdirectory, so the retention sweep, which matches file-name
+    /// prefixes in the log directory itself, never reaches it: the files
+    /// are kept until the operator removes them.
+    pub fn history_dir(&self) -> PathBuf {
+        self.log_dir.join("history")
+    }
+
     /// §9.4's audit trail, in the same directory as `daemon.log` and for
     /// the same reason.
     ///
@@ -2102,6 +2115,10 @@ mod tests {
         assert_eq!(
             p.audit_log(),
             PathBuf::from("/tmp/holdfast-instance/logs/audit.log")
+        );
+        assert_eq!(
+            p.history_dir(),
+            PathBuf::from("/tmp/holdfast-instance/logs/history")
         );
         // Both logs, not just the one §7.1 names. `audit::default_path()`
         // has no environment override, so if the audit log did not follow

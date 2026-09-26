@@ -368,6 +368,11 @@ const EFFECTIVE: &[(&str, &str)] = &[
         "security.secret_input_max_timeout_secs",
         "crates/holdfast-core/src/mcp/tools.rs:1767 — request_secret_input refuses a timeout_secs above it.",
     ),
+    // ---- [terminal]
+    (
+        "terminal.shell_history_file",
+        "crates/holdfast-core/src/mcp/tools.rs:420 — start_session reads it; per_session gives the session a HISTFILE of its own under RuntimePaths::history_dir (GH #252).",
+    ),
     // ---- [daemon]
     (
         "daemon.idle_shutdown_after_secs",

@@ -1,0 +1,734 @@
+//! GH #252: a session's shell keeps nothing in the history files under
+//! `$HOME`, however the session ends — and, when the operator opts in, it
+//! keeps everything in a file of the session's own instead.
+//!
+//! Every way a session can end is here, because each one reaches the shell
+//! differently and a shell saves its history on some of them and not
+//! others: `exit`, EOF, a graceful `terminate` (which hangs the idle shell
+//! up), a forced one (`SIGKILL`), `holdfast daemon stop`, and a daemon that
+//! is itself `SIGKILL`ed (the kernel hangs the shell up when the PTY master
+//! closes). Each against the configurations measured to write history:
+//!
+//! - bash with no rc of its own, with shell integration on and off — off is
+//!   the row that only the environment (`HISTFILE=/dev/null`) protects;
+//! - bash with an rc that hard-sets `HISTFILE`, `histappend` and
+//!   `PROMPT_COMMAND="history -a"`, which writes after every command, and
+//!   an existing `~/.history`, which is where `history -a` goes once
+//!   `HISTFILE` is unset — the reason the snippet assigns rather than
+//!   unsets;
+//! - zsh with an empty `~/.zshrc`, which on macOS still reads
+//!   `/etc/zshrc`'s `HISTFILE` and `SAVEHIST`;
+//! - zsh with an oh-my-zsh-style history block, `inc_append_history` and
+//!   `share_history` without `hist_ignore_space`, which writes each line
+//!   before it runs;
+//! - fish, as Holdfast spawns it, with and without a config that sets
+//!   `fish_history` itself, and fish started through `env`, which Holdfast
+//!   does not recognise and so reaches only through the environment.
+//!
+//! Every session gets its own `HOME`, and the assertion is over **every
+//! file** under it rather than over the names a shell is expected to use:
+//! a history written somewhere unexpected is the failure this exists for.
+//!
+//! Nothing here waits without a deadline, and a deadline that expires
+//! panics rather than counting as a pass.
+#![cfg(unix)]
+
+use serde_json::{json, Value};
+use std::collections::BTreeMap;
+use std::io::{BufRead, BufReader, Write};
+use std::path::{Path, PathBuf};
+use std::process::{Child, Command, Stdio};
+use std::sync::mpsc::{self, Receiver, RecvTimeoutError};
+use std::time::{Duration, Instant};
+
+const BIN: &str = env!("CARGO_BIN_EXE_holdfast");
+
+/// How long the shim may take to answer one request. The first call of a
+/// shim includes a daemon spawn, and the suite runs in parallel.
+const RESPONSE_TIMEOUT: Duration = Duration::from_secs(60);
+
+/// How long a shell may take to run the marker command or reach a prompt.
+/// zsh's `compinit` alone takes seconds on a slow filesystem.
+const SHELL_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// What the agent types, and what must never reach a file. The `''` keeps
+/// the typed line's echo from matching the needle the output is polled for.
+const MARK: &str = "HISTMARK_";
+
+/// Text only Holdfast's integration snippet contains. The snippet reaching
+/// a history file is part of GH #252 too.
+const SNIPPET_MARKS: [&str; 2] = ["HOLDFAST_SHELL_INTEGRATION", "HOLDFAST_HISTFILE"];
+
+const BASH_HARD_RC: &str =
+    "HISTFILE=~/.bash_history\nshopt -s histappend\nPROMPT_COMMAND=\"history -a\"\n";
+
+/// oh-my-zsh's history settings, minus `hist_ignore_space`, which would
+/// keep the snippet's own line out and so hide the case `HISTORY_IGNORE`
+/// exists for.
+const ZSH_OMZ_RC: &str = "HISTFILE=~/.zsh_history\nHISTSIZE=10000\nSAVEHIST=10000\n\
+                          setopt share_history inc_append_history\n";
+
+/// One shell configuration.
+#[derive(Clone, Copy)]
+struct Case {
+    name: &'static str,
+    command: &'static str,
+    args: &'static [&'static str],
+    /// Files written into the session's `HOME` first, relative to it.
+    files: &'static [(&'static str, &'static str)],
+    integration: bool,
+    /// The program whose absence skips the case.
+    needs: &'static str,
+}
+
+const BASH_AND_ZSH: [Case; 5] = [
+    Case {
+        name: "bash-no-rc",
+        command: "bash",
+        args: &[],
+        files: &[],
+        integration: true,
+        needs: "bash",
+    },
+    Case {
+        name: "bash-no-rc-unintegrated",
+        command: "bash",
+        args: &[],
+        files: &[],
+        integration: false,
+        needs: "bash",
+    },
+    Case {
+        name: "bash-hard-rc",
+        command: "bash",
+        args: &[],
+        files: &[(".bashrc", BASH_HARD_RC), (".history", "")],
+        integration: true,
+        needs: "bash",
+    },
+    Case {
+        name: "zsh-system-rc",
+        command: "zsh",
+        args: &[],
+        files: &[(".zshrc", "")],
+        integration: true,
+        needs: "zsh",
+    },
+    Case {
+        name: "zsh-omz",
+        command: "zsh",
+        args: &[],
+        files: &[(".zshrc", ZSH_OMZ_RC)],
+        integration: true,
+        needs: "zsh",
+    },
+];
+
+const FISH: [Case; 3] = [
+    Case {
+        name: "fish-default",
+        command: "fish",
+        args: &[],
+        files: &[],
+        integration: true,
+        needs: "fish",
+    },
+    Case {
+        name: "fish-config-sets-history",
+        command: "fish",
+        args: &[],
+        files: &[(".config/fish/config.fish", "set -g fish_history fish\n")],
+        integration: true,
+        needs: "fish",
+    },
+    Case {
+        name: "fish-through-env",
+        command: "env",
+        args: &["fish"],
+        files: &[],
+        integration: true,
+        needs: "fish",
+    },
+];
+
+/// How a session ends.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Ending {
+    Exit,
+    Eof,
+    Terminate,
+    ForceTerminate,
+    DaemonStop,
+    DaemonKill,
+}
+
+const SESSION_ENDINGS: [Ending; 4] = [
+    Ending::Exit,
+    Ending::Eof,
+    Ending::Terminate,
+    Ending::ForceTerminate,
+];
+
+fn on_path(program: &str) -> bool {
+    std::env::var_os("PATH").is_some_and(|path| {
+        std::env::split_paths(&path).any(|dir| {
+            let p = dir.join(program);
+            std::fs::metadata(&p).is_ok_and(|m| m.is_file())
+        })
+    })
+}
+
+/// Whether every host-dependent row must run, as `detection.rs` reads it.
+fn require_all() -> bool {
+    std::env::var("HOLDFAST_REQUIRE_ALL_SHELLS").as_deref() == Ok("1")
+}
+
+/// One private daemon instance, with a home of its own, stopped and removed
+/// on drop.
+struct Instance {
+    dir: PathBuf,
+}
+
+impl Instance {
+    fn new(tag: &str) -> Self {
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .subsec_nanos();
+        // `/tmp`, not `target/`: a socket path must fit `sun_path`.
+        let dir = PathBuf::from(format!(
+            "/tmp/holdfast-hist-{tag}-{}-{nanos}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        for d in [
+            dir.clone(),
+            dir.with_extension("home"),
+            dir.with_extension("xdg"),
+        ] {
+            use std::os::unix::fs::DirBuilderExt;
+            std::fs::DirBuilder::new()
+                .recursive(true)
+                .mode(0o700)
+                .create(&d)
+                .unwrap();
+        }
+        Self { dir }
+    }
+
+    /// The instance's own `HOME`: the shim's, and so the base every
+    /// session's environment is built on (GH #229).
+    fn home(&self) -> PathBuf {
+        self.dir.with_extension("home")
+    }
+
+    /// A `holdfast` command with an environment of this test's making only,
+    /// so no `HISTFILE`, `PROMPT_COMMAND`, `ZDOTDIR` or `fish_history` of
+    /// the developer's reaches a session through the shim.
+    fn cmd(&self) -> Command {
+        let mut c = Command::new(BIN);
+        c.env_clear();
+        if let Some(path) = std::env::var_os("PATH") {
+            c.env("PATH", path);
+        }
+        c.env("HOME", self.home());
+        c.env("HOLDFAST_RUNTIME_DIR", &self.dir);
+        c.env("XDG_CONFIG_HOME", self.dir.with_extension("xdg"));
+        c
+    }
+
+    fn write_config(&self, body: &str) {
+        let dir = self.dir.with_extension("xdg").join("holdfast");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("config.toml"), body).unwrap();
+    }
+
+    fn run(&self, args: &[&str]) -> (i32, String, String) {
+        let mut child = self
+            .cmd()
+            .args(args)
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .expect("run holdfast");
+        let deadline = Instant::now() + Duration::from_secs(60);
+        loop {
+            if let Some(status) = child.try_wait().expect("wait") {
+                let out = child.wait_with_output().expect("output");
+                return (
+                    status.code().unwrap_or(-1),
+                    String::from_utf8_lossy(&out.stdout).into_owned(),
+                    String::from_utf8_lossy(&out.stderr).into_owned(),
+                );
+            }
+            if Instant::now() >= deadline {
+                let _ = child.kill();
+                let _ = child.wait();
+                panic!("`holdfast {}` did not exit within 60s", args.join(" "));
+            }
+            std::thread::sleep(Duration::from_millis(25));
+        }
+    }
+
+    fn daemon_pid(&self) -> Option<u32> {
+        let text = std::fs::read_to_string(self.dir.join("holdfast.pid")).ok()?;
+        text.split_whitespace().next()?.parse().ok()
+    }
+}
+
+impl Drop for Instance {
+    fn drop(&mut self) {
+        let _ = self
+            .cmd()
+            .args(["daemon", "stop", "--force"])
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status();
+        std::thread::sleep(Duration::from_millis(150));
+        for d in [
+            self.dir.clone(),
+            self.dir.with_extension("home"),
+            self.dir.with_extension("xdg"),
+        ] {
+            let _ = std::fs::remove_dir_all(d);
+        }
+    }
+}
+
+/// A `holdfast mcp` process driven over stdio with raw JSON-RPC.
+struct Shim {
+    child: Child,
+    lines: Receiver<String>,
+    next_id: u64,
+}
+
+impl Shim {
+    fn launch(inst: &Instance) -> Self {
+        let mut child = inst
+            .cmd()
+            .current_dir(inst.home())
+            .arg("mcp")
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::null())
+            .spawn()
+            .expect("spawn holdfast mcp");
+        let stdout = child.stdout.take().unwrap();
+        let (tx, lines) = mpsc::channel();
+        std::thread::spawn(move || {
+            for line in BufReader::new(stdout).lines() {
+                let Ok(line) = line else { return };
+                if tx.send(line).is_err() {
+                    return;
+                }
+            }
+        });
+        let mut shim = Self {
+            child,
+            lines,
+            next_id: 1,
+        };
+        let init = shim.request(
+            "initialize",
+            json!({
+                "protocolVersion": "2025-06-18",
+                "capabilities": {},
+                "clientInfo": { "name": "holdfast-test", "version": "0" }
+            }),
+        );
+        assert!(init["result"].is_object(), "{init}");
+        shim.send(&json!({"jsonrpc": "2.0", "method": "notifications/initialized"}));
+        shim
+    }
+
+    fn send(&mut self, msg: &Value) {
+        let stdin = self.child.stdin.as_mut().unwrap();
+        writeln!(stdin, "{msg}").unwrap();
+        stdin.flush().unwrap();
+    }
+
+    fn request(&mut self, method: &str, params: Value) -> Value {
+        let id = self.next_id;
+        self.next_id += 1;
+        self.send(&json!({"jsonrpc": "2.0", "id": id, "method": method, "params": params}));
+        let deadline = Instant::now() + RESPONSE_TIMEOUT;
+        loop {
+            let line = match self
+                .lines
+                .recv_timeout(deadline.saturating_duration_since(Instant::now()))
+            {
+                Ok(line) => line,
+                Err(RecvTimeoutError::Timeout) => {
+                    panic!("the shim did not answer `{method}` within {RESPONSE_TIMEOUT:?}")
+                }
+                Err(RecvTimeoutError::Disconnected) => {
+                    panic!("the shim closed stdout before answering `{method}`")
+                }
+            };
+            if line.trim().is_empty() {
+                continue;
+            }
+            let value: Value = serde_json::from_str(line.trim())
+                .unwrap_or_else(|e| panic!("non-JSON-RPC on the MCP transport: {line:?} ({e})"));
+            if value["id"] == json!(id) {
+                return value;
+            }
+        }
+    }
+
+    /// A tool call's envelope.
+    fn call(&mut self, tool: &str, arguments: Value) -> Value {
+        let resp = self.request(
+            "tools/call",
+            json!({ "name": tool, "arguments": arguments }),
+        );
+        resp["result"]["structuredContent"].clone()
+    }
+
+    fn kill(mut self) {
+        let _ = self.child.kill();
+        let _ = self.child.wait();
+    }
+}
+
+/// A started session, and the `HOME` it was given.
+struct Started {
+    case: Case,
+    id: String,
+    pid: u32,
+    home: PathBuf,
+}
+
+/// Start `case` in a fresh `HOME` under `inst`, type the marker, and wait
+/// until the shell has run it and is back at its prompt.
+fn start(inst: &Instance, shim: &mut Shim, case: Case, label: &str) -> Started {
+    let home = inst.home().join(format!("{}-{label}", case.name));
+    std::fs::create_dir_all(&home).unwrap();
+    for (rel, body) in case.files {
+        let path = home.join(rel);
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(&path, body).unwrap();
+    }
+    let h = home.to_str().unwrap().to_string();
+    let env: BTreeMap<&str, String> = [
+        ("HOME", h.clone()),
+        ("ZDOTDIR", h.clone()),
+        ("XDG_CONFIG_HOME", format!("{h}/.config")),
+        ("XDG_DATA_HOME", format!("{h}/.local/share")),
+        // Debian's `/etc/zsh/zshrc` runs `compinit` unless told not to, and
+        // on a slow filesystem that is most of a shell's start-up. It sets
+        // no history option either way; macOS's `/etc/zshrc` ignores it.
+        ("skip_global_compinit", "1".to_string()),
+    ]
+    .into_iter()
+    .collect();
+    let started = shim.call(
+        "start_session",
+        json!({
+            "command": case.command,
+            "args": case.args,
+            "cwd": h,
+            "env": env,
+            "shell_integration": case.integration,
+        }),
+    );
+    assert_eq!(started["status"], "ok", "{}: {started}", case.name);
+    let id = started["data"]["session_id"].as_str().unwrap().to_string();
+    let pid = started["data"]["pid"].as_u64().expect("pid") as u32;
+    let s = Started {
+        case,
+        id,
+        pid,
+        home,
+    };
+    let mark = format!("{MARK}{}", case.name.replace('-', "_"));
+    let (head, tail) = mark.split_at(MARK.len());
+    send(shim, &s, &format!("echo {head}''{tail}"), true);
+    await_output(shim, &s, &mark);
+    await_prompt(shim, &s);
+    s
+}
+
+fn send(shim: &mut Shim, s: &Started, data: &str, newline: bool) {
+    let r = shim.call(
+        "send_input",
+        json!({ "session": s.id, "data": data, "append_newline": newline }),
+    );
+    assert_eq!(r["status"], "ok", "{}: send_input: {r}", s.case.name);
+}
+
+fn await_output(shim: &mut Shim, s: &Started, needle: &str) {
+    let deadline = Instant::now() + SHELL_TIMEOUT;
+    loop {
+        let r = shim.call(
+            "read_output",
+            json!({ "session": s.id, "since_cursor": 0, "max_bytes": 262144 }),
+        );
+        let out = r["data"]["output"].as_str().unwrap_or_default().to_string();
+        if out.contains(needle) {
+            return;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "{}: `{needle}` never appeared; output: {out:?}",
+            s.case.name
+        );
+        std::thread::sleep(Duration::from_millis(100));
+    }
+}
+
+/// Wait for the shell to be reading a new command line, so an EOF typed
+/// next lands on an empty line rather than in the middle of a command.
+fn await_prompt(shim: &mut Shim, s: &Started) {
+    let deadline = Instant::now() + SHELL_TIMEOUT;
+    loop {
+        let r = shim.call("status", json!({ "session": s.id }));
+        if r["data"]["interaction_mode"] == "AtPrompt" {
+            return;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "{}: never back at a prompt: {r}",
+            s.case.name
+        );
+        std::thread::sleep(Duration::from_millis(100));
+    }
+}
+
+/// Whether `pid` is gone or a zombie. A zombie has already written
+/// whatever it was going to, and a container whose pid 1 does not reap
+/// keeps an orphan's zombie forever.
+fn gone(pid: u32) -> bool {
+    // SAFETY: signal 0 checks existence and delivers nothing.
+    if unsafe { libc::kill(pid as i32, 0) } != 0 {
+        return true;
+    }
+    Command::new("ps")
+        .args(["-o", "stat=", "-p", &pid.to_string()])
+        .output()
+        .map(|o| String::from_utf8_lossy(&o.stdout).trim().starts_with('Z'))
+        .unwrap_or(false)
+}
+
+fn await_gone(s: &Started) {
+    let deadline = Instant::now() + SHELL_TIMEOUT;
+    while !gone(s.pid) {
+        assert!(
+            Instant::now() < deadline,
+            "{}: the shell (pid {}) outlived its session",
+            s.case.name,
+            s.pid
+        );
+        std::thread::sleep(Duration::from_millis(50));
+    }
+}
+
+/// End one session from inside it or through `terminate`.
+fn end(shim: &mut Shim, s: &Started, how: Ending) {
+    match how {
+        Ending::Exit => send(shim, s, "exit", true),
+        Ending::Eof => send(shim, s, "\u{4}", false),
+        Ending::Terminate | Ending::ForceTerminate => {
+            let r = shim.call(
+                "terminate",
+                json!({
+                    "session": s.id,
+                    "force": how == Ending::ForceTerminate,
+                    "timeout_secs": 10,
+                }),
+            );
+            assert_eq!(r["status"], "ok", "{}: terminate: {r}", s.case.name);
+        }
+        Ending::DaemonStop | Ending::DaemonKill => unreachable!("ends every session at once"),
+    }
+    await_gone(s);
+}
+
+/// Every file under `home` that holds the marker or the snippet.
+fn leaks(home: &Path) -> Vec<String> {
+    let mut found = Vec::new();
+    let mut stack = vec![home.to_path_buf()];
+    while let Some(dir) = stack.pop() {
+        let Ok(entries) = std::fs::read_dir(&dir) else {
+            continue;
+        };
+        for entry in entries.flatten() {
+            let path = entry.path();
+            let Ok(meta) = std::fs::symlink_metadata(&path) else {
+                continue;
+            };
+            if meta.is_dir() {
+                stack.push(path);
+            } else if meta.is_file() {
+                let text =
+                    String::from_utf8_lossy(&std::fs::read(&path).unwrap_or_default()).into_owned();
+                for needle in std::iter::once(MARK).chain(SNIPPET_MARKS) {
+                    if text.contains(needle) {
+                        found.push(format!("{} holds {needle}: {text:?}", path.display()));
+                    }
+                }
+            }
+        }
+    }
+    found
+}
+
+fn assert_no_leaks(ended: &[(Started, Ending)]) {
+    let mut all = Vec::new();
+    for (s, how) in ended {
+        for leak in leaks(&s.home) {
+            all.push(format!("{} / {how:?}: {leak}", s.case.name));
+        }
+    }
+    assert!(
+        all.is_empty(),
+        "shell history reached $HOME:\n{}",
+        all.join("\n")
+    );
+}
+
+/// The cases whose shells this host has, announcing any it skips.
+fn available(cases: &[Case]) -> Vec<Case> {
+    let mut out = Vec::new();
+    for case in cases {
+        if on_path(case.needs) {
+            out.push(*case);
+            continue;
+        }
+        assert!(
+            !require_all(),
+            "HOLDFAST_REQUIRE_ALL_SHELLS=1 and {} is not installed",
+            case.needs
+        );
+        eprintln!(
+            "skipping: {} not installed — shell-history case {} not measured",
+            case.needs, case.name
+        );
+    }
+    out
+}
+
+/// Run `cases` through every ending: those a session reaches by itself or
+/// through `terminate` on one daemon, then `daemon stop` and a killed
+/// daemon on one each.
+fn every_ending(tag: &str, cases: &[Case]) {
+    let mut ended = Vec::new();
+
+    let inst = Instance::new(tag);
+    let mut shim = Shim::launch(&inst);
+    for how in SESSION_ENDINGS {
+        for case in cases {
+            let s = start(&inst, &mut shim, *case, &format!("{how:?}"));
+            end(&mut shim, &s, how);
+            ended.push((s, how));
+        }
+    }
+    shim.kill();
+
+    // `holdfast daemon stop`: a graceful stop, which hangs every idle
+    // shell up (GH #234).
+    let stop = Instance::new(&format!("{tag}-stop"));
+    let mut shim = Shim::launch(&stop);
+    let live: Vec<Started> = cases
+        .iter()
+        .map(|c| start(&stop, &mut shim, *c, "DaemonStop"))
+        .collect();
+    let (code, out, err) = stop.run(&["daemon", "stop"]);
+    assert_eq!(code, 0, "daemon stop: {out} {err}");
+    for s in live {
+        await_gone(&s);
+        ended.push((s, Ending::DaemonStop));
+    }
+    shim.kill();
+
+    // A daemon that dies: the kernel hangs up each session's shell when
+    // the PTY master closes with it.
+    let crash = Instance::new(&format!("{tag}-kill"));
+    let mut shim = Shim::launch(&crash);
+    let live: Vec<Started> = cases
+        .iter()
+        .map(|c| start(&crash, &mut shim, *c, "DaemonKill"))
+        .collect();
+    let daemon = crash.daemon_pid().expect("holdfast.pid");
+    // SAFETY: a pid read from this instance's own pid file.
+    assert_eq!(unsafe { libc::kill(daemon as i32, libc::SIGKILL) }, 0);
+    for s in live {
+        await_gone(&s);
+        ended.push((s, Ending::DaemonKill));
+    }
+    shim.kill();
+
+    assert_no_leaks(&ended);
+    // Held to here so every `HOME` is still on disk for the assertion.
+    drop((inst, stop, crash));
+}
+
+#[test]
+fn bash_and_zsh_keep_nothing_in_home_however_a_session_ends() {
+    let cases = available(&BASH_AND_ZSH);
+    every_ending("sh", &cases);
+}
+
+/// fish in its own row, because CI's `test` job has no fish and its
+/// `fish-req-ts-008` job runs exactly this row against fish 4.
+#[test]
+fn fish_keeps_nothing_in_home_however_a_session_ends() {
+    if !on_path("fish") {
+        assert!(
+            !require_all(),
+            "HOLDFAST_REQUIRE_ALL_SHELLS=1 and fish is not installed"
+        );
+        eprintln!("skipping: fish not installed — fish's shell-history rows are not measured");
+        return;
+    }
+    every_ending("fish", &FISH);
+}
+
+/// `[terminal] shell_history_file = "per_session"`: each session's shell
+/// writes its history to `<log dir>/history/<session_id>.history`, `0600`
+/// in a `0700` directory, one command at a time — so a forced `terminate`,
+/// which gives the shell no chance to save, still leaves the record — and
+/// the file outlives the session. `$HOME` still gets nothing.
+#[test]
+fn a_per_session_history_file_keeps_what_the_agent_ran_and_home_keeps_nothing() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let inst = Instance::new("per-session");
+    inst.write_config("[terminal]\nshell_history_file = \"per_session\"\n");
+    let mut shim = Shim::launch(&inst);
+    let cases: Vec<Case> = available(&BASH_AND_ZSH)
+        .into_iter()
+        .filter(|c| c.integration)
+        .collect();
+    let mut ended = Vec::new();
+    for case in cases {
+        let s = start(&inst, &mut shim, case, "PerSession");
+        send(&mut shim, &s, "echo second''_command", true);
+        await_output(&mut shim, &s, "second_command");
+        await_prompt(&mut shim, &s);
+        end(&mut shim, &s, Ending::ForceTerminate);
+        ended.push((s, Ending::ForceTerminate));
+    }
+    shim.kill();
+
+    let dir = inst.dir.join("logs").join("history");
+    let mode = |p: &Path| std::fs::metadata(p).unwrap().permissions().mode() & 0o777;
+    assert_eq!(mode(&dir), 0o700, "{}", dir.display());
+    for (s, _) in &ended {
+        let file = dir.join(format!("{}.history", s.id));
+        let text = std::fs::read_to_string(&file)
+            .unwrap_or_else(|e| panic!("{}: no {}: {e}", s.case.name, file.display()));
+        assert_eq!(mode(&file), 0o600, "{}", file.display());
+        for needle in [MARK, "second''_command"] {
+            assert!(
+                text.contains(needle),
+                "{}: {} lacks {needle}: {text:?}",
+                s.case.name,
+                file.display()
+            );
+        }
+    }
+    assert_no_leaks(&ended);
+}

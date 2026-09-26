@@ -35,6 +35,20 @@ impl Shell {
             Self::Fish => FISH_INTEGRATION,
         }
     }
+
+    /// Arguments Holdfast puts **ahead of** the caller's own when it spawns
+    /// this shell: `--private` for fish, so it never writes its history
+    /// file (GH #252; the whole policy is `session::launch::history_defaults`).
+    ///
+    /// Ahead, because an option after a script operand is the script's
+    /// argument rather than fish's. Applied whether or not the snippet is
+    /// typed, since it is not typed: it is how fish is started.
+    pub fn spawn_args(self) -> &'static [&'static str] {
+        match self {
+            Self::Fish => &["--private"],
+            Self::Bash | Self::Zsh => &[],
+        }
+    }
 }
 
 /// Recognise a shell from a `start_session` command line.
@@ -173,12 +187,19 @@ pub fn detect_shell(command: &str, args: &[String]) -> Option<Shell> {
 /// variables between the elements of an *array* `PROMPT_COMMAND`, so a
 /// user whose hooks live at indices ≥ 1 is unaffected in both.
 const BASH_INTEGRATION: &str = concat!(
+    // GH #252, ahead of the guard so it runs even when the snippet yields
+    // to the user's own markers. `HOLDFAST_HISTFILE` carries the session's
+    // history file past the rc files; empty, history goes to `/dev/null`.
+    // An assignment rather than `unset`: with `HISTFILE` unset, `history
+    // -a` in an rc's `PROMPT_COMMAND` appends to `~/.history` (measured).
+    r#" HISTFILE=${HOLDFAST_HISTFILE:-/dev/null}; [ -z "${HOLDFAST_HISTFILE-}" ] || shopt -s histappend; "#,
     r#"if [ -z "${HOLDFAST_SHELL_INTEGRATION-}" ] && [[ "${PS1-}" != *"133;A"* ]]; then "#,
     r#"HOLDFAST_SHELL_INTEGRATION=1; "#,
     r#"__holdfast_p() { [[ "${PS0-}" == *"133;C;holdfast=1"* ]] || PS0='\e]133;C;holdfast=1\a'"${PS0-}"; "#,
     r#"[[ "${PS1-}" == *"133;B;holdfast=1"* ]] || PS1='\[\e]133;A;holdfast=1\a\]'"${PS1-}"'\[\e]133;B;holdfast=1\a\]'; }; "#,
     r#"__holdfast_p; "#,
-    r#"__holdfast_d() { printf '\033]133;D;%s;holdfast=1\007' "${1:-0}"; return "${1:-0}"; }; "#,
+    r#"__holdfast_d() { printf '\033]133;D;%s;holdfast=1\007' "${1:-0}"; "#,
+    r#"[ -z "${HOLDFAST_HISTFILE-}" ] || history -a; return "${1:-0}"; }; "#,
     r#"PROMPT_COMMAND='__holdfast_d "$?"'"${PROMPT_COMMAND:+; $PROMPT_COMMAND}"; "#,
     r#"if (( BASH_VERSINFO[0] * 100 + BASH_VERSINFO[1] >= 501 && ${#PROMPT_COMMAND[@]} > 1 )); then "#,
     r#"if [[ ${PROMPT_COMMAND[-1]} == __bp_interactive_mode ]]; then "#,
@@ -236,6 +257,12 @@ const BASH_INTEGRATION: &str = concat!(
 /// re-wrap above depends on the true order, and it was measured rather
 /// than taken from here.
 const ZSH_INTEGRATION: &str = concat!(
+    // GH #252, ahead of the guard for bash's reason. zsh has no default
+    // history file, so `unset` saves nothing; a session history file needs
+    // `SAVEHIST` (0 by default) and is appended per command.
+    r#" if [[ -n ${HOLDFAST_HISTFILE-} ]]; then HISTFILE=$HOLDFAST_HISTFILE; "#,
+    r#"(( SAVEHIST > 0 )) || SAVEHIST=10000; (( HISTSIZE >= SAVEHIST )) || HISTSIZE=$SAVEHIST; "#,
+    r#"setopt inc_append_history; else unset HISTFILE; fi; "#,
     r#"if [ -z "${HOLDFAST_SHELL_INTEGRATION-}" ] && [[ "${PS1-}" != *"133;A"* ]]; then "#,
     r#"HOLDFAST_SHELL_INTEGRATION=1; "#,
     r#"__holdfast_preexec() { printf '\033]133;C;holdfast=1\007' }; "#,
@@ -315,7 +342,9 @@ const ZSH_INTEGRATION: &str = concat!(
 /// measured repair (capture `$status` first, re-assert it immediately
 /// before the call) is not applied by this milestone.
 const FISH_INTEGRATION: &str = concat!(
-    r#"if not set -q HOLDFAST_SHELL_INTEGRATION; "#,
+    // The leading space keeps the line out of fish's history (GH #252);
+    // `--private` (`Shell::spawn_args`) keeps everything else out.
+    r#" if not set -q HOLDFAST_SHELL_INTEGRATION; "#,
     r#"set -g HOLDFAST_SHELL_INTEGRATION 1; "#,
     r#"functions -q __holdfast_orig_fish_prompt; "#,
     r#"or functions -c fish_prompt __holdfast_orig_fish_prompt; "#,
@@ -510,6 +539,40 @@ mod tests {
             s.contains("HOLDFAST_SHELL_INTEGRATION"),
             "REQ-PD-005's self-guard was removed too: {s}"
         );
+    }
+
+    /// GH #252 at the string level: every snippet starts with a space, so
+    /// a shell that ignores space-led lines never records it, and the bash
+    /// and zsh history clauses run **before** the double-injection guard,
+    /// which would otherwise skip them for a user whose own configuration
+    /// already emits markers. `tests/shell_history.rs` in the `holdfast`
+    /// crate is what runs them against rc files.
+    #[test]
+    fn every_snippet_starts_with_a_space_and_sets_history_before_its_guard() {
+        for s in [Shell::Bash, Shell::Zsh, Shell::Fish] {
+            let snippet = s.integration_snippet();
+            assert!(snippet.starts_with(' '), "{}: {snippet}", s.as_str());
+        }
+        let guard = "HOLDFAST_SHELL_INTEGRATION";
+        let bash = Shell::Bash.integration_snippet();
+        let set = bash
+            .find("HISTFILE=${HOLDFAST_HISTFILE:-/dev/null}")
+            .expect("bash assigns HISTFILE");
+        assert!(set < bash.find(guard).unwrap(), "{bash}");
+        assert!(
+            !bash.contains("unset HISTFILE"),
+            "unset sends `history -a` to ~/.history: {bash}"
+        );
+        let zsh = Shell::Zsh.integration_snippet();
+        let unset = zsh.find("unset HISTFILE").expect("zsh unsets HISTFILE");
+        assert!(unset < zsh.find(guard).unwrap(), "{zsh}");
+    }
+
+    #[test]
+    fn only_fish_is_spawned_with_history_arguments() {
+        assert_eq!(Shell::Fish.spawn_args(), ["--private"]);
+        assert!(Shell::Bash.spawn_args().is_empty());
+        assert!(Shell::Zsh.spawn_args().is_empty());
     }
 
     #[test]

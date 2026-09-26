@@ -516,6 +516,14 @@ pub struct TerminalConfig {
     pub terminal_query_replies_per_min: u32,
     #[serde(default = "d_shell_integration")]
     pub shell_integration: bool,
+    /// `none` | `per_session` (GH #252): where a session's shell keeps its
+    /// command history. `none` keeps it off disk. `per_session` gives
+    /// every session `<log dir>/history/<session_id>.history` — `0600`, in
+    /// a `0700` directory, kept after the session ends — so an operator
+    /// can read what an agent ran. fish sessions stay private either way.
+    /// See `session::launch::history_defaults`.
+    #[serde(default = "d_shell_history_file")]
+    pub shell_history_file: String,
 }
 
 /// §8.6's prompt-detection knobs.
@@ -1134,6 +1142,9 @@ fn d_terminal_query_replies_per_min() -> u32 {
 fn d_shell_integration() -> bool {
     true
 }
+fn d_shell_history_file() -> String {
+    "none".into()
+}
 fn d_settle_threshold_ms() -> u64 {
     250
 }
@@ -1228,6 +1239,9 @@ pub const SECRET_PROVIDERS: [&str; 3] = ["prompt", "keychain", "both"];
 /// §4.5's screen-tracking modes, matching `screen::ScreenTracking`.
 pub const SCREEN_TRACKING_MODES: [&str; 3] = ["off", "adaptive", "on"];
 
+/// `[terminal] shell_history_file`'s values (GH #252).
+pub const SHELL_HISTORY_FILE_MODES: [&str; 2] = ["none", "per_session"];
+
 macro_rules! table_default {
     ($t:ty { $($field:ident : $d:ident),* $(,)? } $( ; $($extra:ident),* )? ) => {
         impl Default for $t {
@@ -1267,6 +1281,7 @@ table_default!(TerminalConfig {
     terminal_queries: d_terminal_queries,
     terminal_query_replies_per_min: d_terminal_query_replies_per_min,
     shell_integration: d_shell_integration,
+    shell_history_file: d_shell_history_file,
 });
 
 table_default!(PromptsConfig {
@@ -1521,6 +1536,11 @@ impl Config {
             "terminal.screen_tracking_default",
             &self.terminal.screen_tracking_default,
             &SCREEN_TRACKING_MODES,
+        )?;
+        one_of(
+            "terminal.shell_history_file",
+            &self.terminal.shell_history_file,
+            &SHELL_HISTORY_FILE_MODES,
         )?;
         nonzero(
             "terminal.terminal_query_replies_per_min",
@@ -1947,6 +1967,19 @@ mod tests {
             "deny_unknown_fields applies at the top level as well as inside each table",
         );
         assert!(e.to_string().contains("limmits"), "{e}");
+    }
+
+    /// GH #252. `none` by default, `per_session` on request, and anything
+    /// else refused by name — a misspelt opt-in that silently kept history
+    /// off would leave an operator believing a record existed.
+    #[test]
+    fn shell_history_file_is_none_unless_set_and_refuses_other_values() {
+        assert_eq!(Config::default().terminal.shell_history_file, "none");
+        let on = parse_str("[terminal]\nshell_history_file = \"per_session\"\n").expect("loads");
+        assert_eq!(on.terminal.shell_history_file, "per_session");
+        let e =
+            parse_str("[terminal]\nshell_history_file = \"per-session\"\n").expect_err("refused");
+        assert!(e.to_string().contains("terminal.shell_history_file"), "{e}");
     }
 
     #[test]
