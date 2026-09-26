@@ -2580,7 +2580,7 @@ mod tests {
     /// **GH #195's reproduction, on the corpus the issue was filed
     /// against: this repository's own documentation.**
     ///
-    /// `CHANGELOG.md` contains `-----BEGIN RSA PRIVATE KEY-----` as
+    /// The changelog contains `-----BEGIN RSA PRIVATE KEY-----` as
     /// **prose**, in the paragraph describing this very holdback rule.
     /// `private-key-block` is anchored at both ends, the opening anchor is
     /// found, `-----END` never arrives, and before 0.0.8 the read stopped
@@ -2589,12 +2589,16 @@ mod tests {
     /// pinning at 42,758, and reads 3 through 9 returning **zero bytes
     /// with the cursor frozen**.
     ///
-    /// The file is read from disk rather than synthesised, and that is
-    /// the point: a fixture spelling the anchor out is a fixture that
-    /// passes when somebody reverts the fix and edits the fixture. This
-    /// one goes red if the corpus stops containing the shape *or* if the
-    /// shape stops being handled, and the first assertion tells the two
-    /// apart.
+    /// The changelog half is `tests/fixtures/prose/changelog-0.0.8-long.md`,
+    /// a byte-for-byte copy of `CHANGELOG.md` as it stood before its
+    /// entries were capped at three lines. The live file's entries are too
+    /// short to carry the anchor, and a frozen copy is a corpus that does
+    /// not move under the row. It is still real prose rather than
+    /// synthesised, and that is the point: a fixture spelling the anchor
+    /// out is a fixture that passes when somebody reverts the fix and edits
+    /// the fixture. This one goes red if the corpus stops containing the
+    /// shape *or* if the shape stops being handled, and the first assertion
+    /// tells the two apart.
     ///
     /// **Since GH #242 the prose anchors are not masked at all**, and the
     /// row asserts that as well as the drain. #195's fix made the loop
@@ -2608,13 +2612,16 @@ mod tests {
     /// masked on the same loop.
     #[test]
     fn the_documented_read_loop_drains_this_repositorys_own_changelog() {
-        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-            .join("..")
-            .join("..");
+        let manifest = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+        let root = manifest.join("..").join("..");
         let mut buf = Vec::new();
-        for name in ["CHANGELOG.md", "README.md", "ROADMAP.md"] {
+        for path in [
+            manifest.join("tests/fixtures/prose/changelog-0.0.8-long.md"),
+            root.join("README.md"),
+            root.join("ROADMAP.md"),
+        ] {
             buf.extend_from_slice(
-                &std::fs::read(root.join(name)).expect("the repository's own docs"),
+                &std::fs::read(&path).unwrap_or_else(|e| panic!("read {}: {e}", path.display())),
             );
         }
         // The row is about a corpus that contains the shape. If it stops
