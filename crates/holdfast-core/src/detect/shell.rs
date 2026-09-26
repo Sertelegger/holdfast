@@ -277,7 +277,7 @@ const ZSH_INTEGRATION: &str = concat!(
 ///   such feature. It is strictly worse than the bug.
 /// - Declining on fish 4.0–4.2 leaves the session with **no `B` marker at
 ///   all** (fish emits `A`, `C` and `D` there and never `B`), so the echo
-///   capture has no span and `get_command_history` reports `command: ""`
+///   capture has no span and `get_command_history` reports `command: null`
 ///   for every entry — permanently, and not disableable by the user
 ///   because the flag is not there. That is precisely the partial-foreign
 ///   -integration case §8.5.1's per-letter yielding exists for, reached

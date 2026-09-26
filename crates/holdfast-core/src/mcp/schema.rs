@@ -210,14 +210,17 @@ pub enum ShellIntegration {
 /// markers are being dropped on arrival. Null until the first marker
 /// arrives, which is genuinely all Holdfast knows before the first prompt
 /// cycle. Whether the markers in use still capture command text is
-/// `CommandCapture`'s question, not this one's.
-///
-/// A **field** of its own rather than a fourth value on
-/// `ShellIntegration`, because it answers a different question: "which
-/// shell Holdfast injected for" and "whose markers are in use" are two,
-/// and `mixed` is a state no value of the first could express. The same
-/// rule — one question per field — is why `CommandCapture` is not a
-/// value of this one.
+/// `command_capture`'s question, not this one's.
+//
+// Everything in `///` above is published as this type's `description` in
+// `status`'s and `list_sessions`'s output schemas, so it says what the
+// value means to an agent and nothing else; the design rationale is here.
+//
+// A field of its own rather than a fourth value on `ShellIntegration`,
+// because it answers a different question: "which shell Holdfast injected
+// for" and "whose markers are in use" are two, and `mixed` is a state no
+// value of the first could express. The same rule — one question per
+// field — is why `CommandCapture` is not a value of this one.
 #[derive(Debug, Serialize, schemars::JsonSchema)]
 #[serde(rename_all = "snake_case")]
 pub enum Osc133Source {
@@ -227,17 +230,37 @@ pub enum Osc133Source {
 }
 
 /// Whether the session's newest `get_command_history` entry has its
-/// command text (§18.2a, GH #220): `captured`, or `missing` when no `B`
-/// marker armed the echo capture before that command's `C` and its
-/// `command` is null. Null until the first entry is recorded.
+/// command text (§18.2a): `captured`, or `missing` when that entry's
+/// OSC 133 `C` marker had no `B` marker in front of it, so its `command`
+/// is null. Null until the first entry is recorded.
 ///
-/// **Its own field, not a fourth `Osc133Source` value**, because it is a
-/// second question with its own answer under every source: a prompt
-/// framework that regenerates the prompt over the `A`/`B` markers loses
-/// the text whether those markers are Holdfast's, a foreign
-/// integration's, or a mix. One value could not say `external` and
-/// `missing` at once. The variants carry no doc comments on purpose: one
-/// would turn this `enum` into a `oneOf` in the published schema.
+/// `missing` has two causes. A prompt whose `B` marker does not arrive —
+/// one a prompt framework such as starship regenerates over the shell
+/// integration's markers, one a hook added to `PROMPT_COMMAND` after the
+/// session started rewrites, or a foreign integration that emits no `B` —
+/// leaves the entry the command's own, with its exit code and output span
+/// exact. A program that printed a `C` marker in its own output opens an
+/// entry that is not a command: it takes the exit code and the rest of the
+/// output of the command that printed it, whose own entry stays open.
+///
+/// It describes the last command recorded and cannot predict the next,
+/// and it changes only when an entry is recorded. After a program has
+/// printed a `C` marker, later commands can stop being recorded at all;
+/// while `command_count` does not grow as commands run, this field is
+/// stale.
+//
+// Everything in `///` above is published as this type's `description`,
+// so it says what the value means to an agent; the design rationale is
+// here. The freeze in its last paragraph is §8.5.1 rule 3's permanent
+// yield, GH #265.
+//
+// Its own field, not a fourth `Osc133Source` value, because it is a
+// second question with its own answer under every source: a prompt
+// framework that regenerates the prompt over the `A`/`B` markers loses
+// the text whether those markers are Holdfast's, a foreign integration's,
+// or a mix, and one value could not say `external` and `missing` at once
+// (GH #220). The variants carry no doc comments on purpose: one would
+// turn this `enum` into a `oneOf` in the published schema.
 #[derive(Debug, Serialize, schemars::JsonSchema)]
 #[serde(rename_all = "snake_case")]
 pub enum CommandCapture {
@@ -549,7 +572,8 @@ pub struct SessionRecord {
     /// Whose markers the session is using (§8.5.1). Null until the first
     /// marker arrives.
     pub osc133_source: Option<Osc133Source>,
-    /// Whether the newest history entry has its command text. Null until
+    /// Whether the newest history entry has its command text. It describes
+    /// the last command recorded and cannot predict the next. Null until
     /// the first entry is recorded.
     pub command_capture: Option<CommandCapture>,
     pub command_count: Option<u64>,

@@ -50,11 +50,13 @@ pub struct CommandEntry {
     /// quietly wrong, and it changes no detection decision.
     ///
     /// **`None` means the text was not captured**, and is never spelled
-    /// `""`: no `B` armed the capture before this command's `C`, so there
-    /// was no echo span to read (GH #220 — a prompt framework regenerating
-    /// the prompt over the `A`/`B` markers, for whichever source supplies
-    /// them). `Some("")` is a different fact, a capture that ran and saw
-    /// no echo. The entry's exit code and output span are unaffected.
+    /// `""`: this command's `C` had no `B` in front of it — none since the
+    /// last `A`, `C` or `D` — so there was no echo span to read. A prompt
+    /// regenerated over the `A`/`B` markers does that, for whichever source
+    /// supplies them (GH #220), and so does a foreign `C` in a program's
+    /// output, which opens an entry of its own (GH #265). `Some("")` is a
+    /// different fact, a capture that ran and saw no echo. The entry's exit
+    /// code and output span are unaffected.
     pub command: Option<String>,
     /// **`None` does not mean "still running".** `D` may arrive with no
     /// code at all — the shell reports the command finished and says
@@ -93,11 +95,18 @@ pub struct CommandEntry {
 /// surfaces cannot disagree and a line the ring suppressed — §8.5.1 rule
 /// 5's injection line, which a `B`-less foreign emitter marks with a
 /// `C` no `B` preceded — says nothing about the commands after it.
+///
+/// **It changes only when an entry is recorded**, open or closed. So it
+/// describes the last command and cannot predict the next: it lags one
+/// command behind a prompt that has just broken, and after a foreign `C`,
+/// once §8.5.1 rule 3 discards Holdfast's own `C` for the rest of the
+/// session, no entry arrives to change it (GH #265).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CommandCapture {
     /// The newest entry's `command` holds the echo captured for it.
     Captured,
-    /// The newest entry's `command` is `None`: no `B` armed the capture.
+    /// The newest entry's `command` is `None`: its `C` had no `B` in front
+    /// of it.
     Missing,
 }
 
@@ -146,8 +155,8 @@ pub struct CommandHistory {
     /// arming it elsewhere would silently close somebody else's entry.
     suppress_next_done: bool,
     /// Whether any `B` has arrived in this session, which is what decides
-    /// whether an *empty* capture means "the capture was lost" or "there
-    /// was never a span to capture from". See `apply`.
+    /// whether an uncaptured `C` (`command: None`) means "the capture was
+    /// lost" or "there was never a span to capture from". See `apply`.
     seen_command_start: bool,
 }
 
@@ -196,9 +205,10 @@ impl CommandHistory {
         self.evicted
     }
 
-    /// Whether the newest entry's command text was captured. **`None`
-    /// until the first entry is recorded**: before a command has run there
-    /// is nothing to have captured, and answering then would be a guess.
+    /// Whether the newest entry's command text was captured, whether that
+    /// entry is still open or already closed. **`None` until the first
+    /// entry is recorded**: before a command has run there is nothing to
+    /// have captured, and answering then would be a guess.
     pub fn command_capture(&self) -> Option<CommandCapture> {
         self.entries.back().map(|e| match e.command {
             Some(_) => CommandCapture::Captured,
@@ -609,7 +619,7 @@ mod tests {
     /// **kept**, because fish supplies none to yield to. That kept `B` is
     /// the only thing that arms the echo capture, so it is what gives
     /// `command` its `B..C` span. A whole-*source* rule would have
-    /// discarded it along with the rest and left `command: ""` for every
+    /// discarded it along with the rest and left `command: null` for every
     /// entry on every fish 4.0–4.2 session — the same loss declining costs
     /// there, reached by a different route.
     ///
@@ -920,11 +930,11 @@ mod tests {
     /// verbatim proof that `B` is missing — `mixed` is only reachable
     /// because Holdfast's `B` had nothing to yield to). Nothing arms the echo
     /// capture before the snippet installs itself, so the injection line's
-    /// `C` carries an **empty** command and the suffix test in §8.5.1 rule
-    /// 5 has no text to compare.
+    /// `C` carries **no** command (`None`) and the suffix test in §8.5.1
+    /// rule 5 has no text to compare.
     ///
     /// Driven against the real 4571-byte capture, the suffix test alone
-    /// left the snippet as entry 0 with `command: ""` and `exit_code: 0`,
+    /// left the snippet as entry 0 with no command text and `exit_code: 0`,
     /// ahead of the three real commands — REQ-DM-009's "never an entry"
     /// failing on precisely the shell the requirement was written for. So
     /// the rule identifies the line by the session's structure as well: a
@@ -1103,7 +1113,7 @@ mod tests {
     /// The marker shape is the one the dogfood pass measured under
     /// starship: the injection line's bare `D`, prompts carrying no marker
     /// at all, and Holdfast's own tagged `C`/`D` around each command. The
-    /// first `C` has an empty capture and no `B` has ever been seen, which
+    /// first `C` has no capture armed and no `B` has ever been seen, which
     /// is exactly what `never_had_a_span` was written to recognise — in a
     /// *foreign* emitter. Measured before the fix: 3 entries for 4
     /// commands, the first command's exit code 3 gone, every later entry
