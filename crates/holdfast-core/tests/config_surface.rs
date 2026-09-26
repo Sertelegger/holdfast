@@ -522,7 +522,7 @@ const INERT: &[(&str, Inert, &str)] = &[
     (
         "security.strict_confirmation",
         Inert::NeverNamed,
-        "Doc says \"Unread — 0.0.8\". §9.3.1's strict mode is not built, so REQ-CFG-006's HOLDFAST_STRICT_CONFIRMATION latch has nothing to tighten either.",
+        "Doc says \"Unread — not built\". §9.3.1's strict mode is not built, so REQ-CFG-006's HOLDFAST_STRICT_CONFIRMATION latch has nothing to tighten either.",
     ),
     // ---- [ui]
     (

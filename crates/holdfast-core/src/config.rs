@@ -673,7 +673,9 @@ pub struct SecurityConfig {
     /// (see `write_secret_if_unread`), not a missing check here.
     #[serde(default = "d_autofill_on_echo_off")]
     pub autofill_on_echo_off: bool,
-    /// **Unread — 0.0.8.**
+    /// **Unread — not built.** §9.3.1's strict mode tightens the
+    /// dangerous-command preflight, which is not built and not scheduled
+    /// to a version.
     #[serde(default = "d_strict_confirmation")]
     pub strict_confirmation: bool,
     /// §9.6's operator bindings. **Read** by `secret::binding::select`.
