@@ -19,19 +19,19 @@ pub struct CommandEntry {
     /// **Best-effort, and never the command of record.** This is
     /// reconstructed from the terminal *echo* between the OSC 133 `B` and `C`
     /// markers — the bytes the line editor happened to paint — not from
-    /// anything the shell reports about what it ran. It is wrong in two
-    /// measured ways.
+    /// anything the shell reports about what it ran. It can be wrong in two
+    /// directions: it can lose part of the line, and it can hold text that
+    /// is not the command.
     ///
     /// A command longer than the terminal width loses its front: 125
     /// characters typed at 80 columns leaves 47, with the leading 78 gone.
-    /// The line editor's wrap redraw emits `\r` followed by `\x1b[K`, which
-    /// is a *within-line reposition*; a scanner with no grid and no cursor
-    /// cannot distinguish that from a fresh line, so it discards everything
-    /// before it. That is not a defect in the capture rules and must not be
-    /// fixed there — modelling it is exactly the cursor arithmetic tier A
-    /// is defined not to do (tier B, 0.0.4).
+    /// The line editor's wrap redraw emits `\r` followed by `\x1b[K`, and the
+    /// capture discards what a `\r` returns over. The scanner counts only the
+    /// cursor motion that decides how much of a redrawn line survives (see
+    /// `detect::scanner`); it keeps no grid, so it cannot put a lost front
+    /// back.
     ///
-    /// **So that case is refused instead of reported.** Truncation is the
+    /// **So a detected loss is refused instead of reported.** Truncation is the
     /// dangerous half twice over: a tail *looks like a whole command*, and
     /// the front is dropped inside the scanner, long before this field is
     /// redacted — so `export K=AKIAIOSF` + wrap + `ODNN7EXAMPLE` yields a
@@ -40,14 +40,14 @@ pub struct CommandEntry {
     /// scanner reports the capture truncated this field is
     /// `[REDACTED:unresolved]` — the reserved pseudo-kind's own meaning,
     /// "the bytes are withheld and no rule claimed them" — rather than a
-    /// plausible-looking tail. Anything else this field carries is a
-    /// capture the scanner saw whole.
+    /// plausible-looking tail. A loss the scanner does not detect is still
+    /// reported as whole: a continuation at least as long as the lost front,
+    /// and a repaint that resumes inside the command, as history recall does
+    /// (GH #271). Motion the capture does not model can also leave text that
+    /// was not run in the line (GH #272, GH #273).
     ///
-    /// Non-ASCII bytes are also recorded as Latin-1 rather than decoded
-    /// UTF-8 (`echo café` → `echo cafÃ©`), because the capture maps each
-    /// byte to a codepoint. That one is a genuine bug, fixable one layer
-    /// down in the scanner's capture buffer; it is loudly wrong rather than
-    /// quietly wrong, and it changes no detection decision.
+    /// The capture is decoded as UTF-8, so a non-ASCII command reads as it
+    /// was typed (GH #270).
     ///
     /// **`None` means the text was not captured**, and is never spelled
     /// `""`: this command's `C` had no `B` in front of it — none since the
@@ -55,8 +55,10 @@ pub struct CommandEntry {
     /// regenerated over the `A`/`B` markers does that, for whichever source
     /// supplies them (GH #220), and so does a foreign `C` in a program's
     /// output, which opens an entry of its own (GH #265). `Some("")` is a
-    /// different fact, a capture that ran and saw no echo. The entry's exit
-    /// code and output span are unaffected.
+    /// different fact, a capture that ran and saw no echo. Under a
+    /// regenerated prompt the entry's exit code and output span are exact;
+    /// an entry opened by a foreign `C` is not a command at all, and takes
+    /// the exit code and output of the command that printed it (GH #265).
     pub command: Option<String>,
     /// **`None` does not mean "still running".** `D` may arrive with no
     /// code at all — the shell reports the command finished and says
