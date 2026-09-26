@@ -192,14 +192,26 @@ const BASH_INTEGRATION: &str = concat!(
     // history file past the rc files; empty, history goes to `/dev/null`.
     // An assignment rather than `unset`: with `HISTFILE` unset, `history
     // -a` in an rc's `PROMPT_COMMAND` appends to `~/.history` (measured).
-    r#" HISTFILE=${HOLDFAST_HISTFILE:-/dev/null}; [ -z "${HOLDFAST_HISTFILE-}" ] || shopt -s histappend; "#,
+    //
+    // With a session file: `__holdfast_h` appends after every command,
+    // prepended to `PROMPT_COMMAND` for the reason `__holdfast_d` is and
+    // handing on `$?` the same way; no `HISTFILESIZE`, which truncates the
+    // file when bash saves at exit (Debian's rc sets 2000); and
+    // `histappend`, defensively. Without it, the save at exit rewrites the
+    // file from the in-memory list whenever more commands are unsaved than
+    // `HISTSIZE` holds, which the per-command append prevents unless
+    // something replaces `PROMPT_COMMAND` mid-session — so no row in
+    // `tests/shell_history.rs` can tell it apart, and none claims to.
+    r#" HISTFILE=${HOLDFAST_HISTFILE:-/dev/null}; if [ -n "${HOLDFAST_HISTFILE-}" ]; then "#,
+    r#"unset HISTFILESIZE; shopt -s histappend; __holdfast_h() { history -a; return "${1:-0}"; }; "#,
+    r#"[[ "${PROMPT_COMMAND-}" == *__holdfast_h* ]] || "#,
+    r#"PROMPT_COMMAND='__holdfast_h "$?"'"${PROMPT_COMMAND:+; $PROMPT_COMMAND}"; fi; "#,
     r#"if [ -z "${HOLDFAST_SHELL_INTEGRATION-}" ] && [[ "${PS1-}" != *"133;A"* ]]; then "#,
     r#"HOLDFAST_SHELL_INTEGRATION=1; "#,
     r#"__holdfast_p() { [[ "${PS0-}" == *"133;C;holdfast=1"* ]] || PS0='\e]133;C;holdfast=1\a'"${PS0-}"; "#,
     r#"[[ "${PS1-}" == *"133;B;holdfast=1"* ]] || PS1='\[\e]133;A;holdfast=1\a\]'"${PS1-}"'\[\e]133;B;holdfast=1\a\]'; }; "#,
     r#"__holdfast_p; "#,
-    r#"__holdfast_d() { printf '\033]133;D;%s;holdfast=1\007' "${1:-0}"; "#,
-    r#"[ -z "${HOLDFAST_HISTFILE-}" ] || history -a; return "${1:-0}"; }; "#,
+    r#"__holdfast_d() { printf '\033]133;D;%s;holdfast=1\007' "${1:-0}"; return "${1:-0}"; }; "#,
     r#"PROMPT_COMMAND='__holdfast_d "$?"'"${PROMPT_COMMAND:+; $PROMPT_COMMAND}"; "#,
     r#"if (( BASH_VERSINFO[0] * 100 + BASH_VERSINFO[1] >= 501 && ${#PROMPT_COMMAND[@]} > 1 )); then "#,
     r#"if [[ ${PROMPT_COMMAND[-1]} == __bp_interactive_mode ]]; then "#,
@@ -263,9 +275,10 @@ const ZSH_INTEGRATION: &str = concat!(
     // re-armed by `source ~/.zshrc`, and an unset variable is not exported,
     // so `exec zsh` and a nested zsh start without it (measured). A session
     // history file needs `SAVEHIST` (0 by default) and is appended per
-    // command.
+    // command, and both limits are raised whatever an rc set them to: zsh
+    // trims the file to `SAVEHIST` as it appends, `SIGKILL` or not.
     r#" if [[ -n ${HOLDFAST_HISTFILE-} ]]; then HISTFILE=$HOLDFAST_HISTFILE; "#,
-    r#"(( SAVEHIST > 0 )) || SAVEHIST=10000; (( HISTSIZE >= SAVEHIST )) || HISTSIZE=$SAVEHIST; "#,
+    r#"SAVEHIST=1000000000; HISTSIZE=1000000000; "#,
     r#"setopt inc_append_history; else HISTFILE=/dev/null; fi; "#,
     r#"if [ -z "${HOLDFAST_SHELL_INTEGRATION-}" ] && [[ "${PS1-}" != *"133;A"* ]]; then "#,
     r#"HOLDFAST_SHELL_INTEGRATION=1; "#,
@@ -563,14 +576,21 @@ mod tests {
             .find("HISTFILE=${HOLDFAST_HISTFILE:-/dev/null}")
             .expect("bash assigns HISTFILE");
         assert!(set < bash.find(guard).unwrap(), "{bash}");
+        // A per-session file's per-command append too: a user whose own
+        // configuration emits markers still gets it.
+        let append = bash.find("history -a").expect("bash appends per command");
+        assert!(append < bash.find(guard).unwrap(), "{bash}");
         let zsh = Shell::Zsh.integration_snippet();
         let set = zsh
             .find("else HISTFILE=/dev/null;")
             .expect("zsh assigns HISTFILE");
         assert!(set < zsh.find(guard).unwrap(), "{zsh}");
         for snippet in [bash, zsh] {
+            let unsets_histfile = snippet.match_indices("unset HISTFILE").any(|(at, word)| {
+                !snippet[at + word.len()..].starts_with(|c: char| c.is_alphanumeric() || c == '_')
+            });
             assert!(
-                !snippet.contains("unset HISTFILE"),
+                !unsets_histfile,
                 "an unset HISTFILE is re-armed by a conditional rc and not \
                  inherited by `exec`: {snippet}"
             );

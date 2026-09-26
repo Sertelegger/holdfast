@@ -818,6 +818,69 @@ fn tcsh_is_never_hung_up_so_holdfast_ending_it_saves_nothing() {
     );
 }
 
+/// The per-session rows beyond `BASH_AND_ZSH`'s, each with the ending
+/// that exposes it.
+///
+/// - a bash whose own configuration emits OSC 133, so the snippet yields
+///   its markers — its per-command append must not yield with them;
+/// - a bash and a zsh with history limits of 3, below the six commands a
+///   row runs: bash truncates its file to `HISTFILESIZE` when it saves at
+///   exit, and without `histappend` that save overwrites the file with the
+///   three-entry list; zsh trims to `SAVEHIST` as it appends;
+/// - a bash with shell integration off, where only `HISTFILE` in the
+///   environment names the file and the shell writes it when it exits.
+const PER_SESSION_EXTRA: [(Case, Ending); 4] = [
+    (
+        Case {
+            name: "bash-own-markers",
+            command: "bash",
+            args: &[],
+            files: &[(".bashrc", BASH_OWN_MARKERS_RC)],
+            integration: true,
+            before: &[],
+            hung_up: true,
+            needs: "bash",
+        },
+        Ending::ForceTerminate,
+    ),
+    (
+        Case {
+            name: "bash-small-limits",
+            command: "bash",
+            args: &[],
+            files: &[(
+                ".bashrc",
+                "HISTFILE=~/.bash_history\nHISTSIZE=3\nHISTFILESIZE=3\n",
+            )],
+            integration: true,
+            before: &[],
+            hung_up: true,
+            needs: "bash",
+        },
+        Ending::Exit,
+    ),
+    (
+        Case {
+            name: "zsh-small-limits",
+            command: "zsh",
+            args: &[],
+            files: &[(".zshrc", "HISTSIZE=3\nSAVEHIST=3\n")],
+            integration: true,
+            before: &[],
+            hung_up: true,
+            needs: "zsh",
+        },
+        Ending::ForceTerminate,
+    ),
+    (BASH_AND_ZSH[1], Ending::Exit),
+];
+
+/// A user's own complete OSC 133 integration, untagged, which Holdfast's
+/// snippet yields to.
+const BASH_OWN_MARKERS_RC: &str = "PS1='\\[\\e]133;A\\a\\]$ \\[\\e]133;B\\a\\]'\n\
+                                   PS0='\\e]133;C\\a'\n\
+                                   PROMPT_COMMAND='printf \"\\e]133;D;%s\\a\" \"$?\"'\n";
+
 /// `[terminal] shell_history_file = "per_session"`: each session's shell
 /// writes its history to `<log dir>/history/<session_id>.history`, `0600`
 /// in a `0700` directory, one command at a time — so a forced `terminate`,
@@ -830,33 +893,42 @@ fn a_per_session_history_file_keeps_what_the_agent_ran_and_home_keeps_nothing() 
     let inst = Instance::new("per-session");
     inst.write_config("[terminal]\nshell_history_file = \"per_session\"\n");
     let mut shim = Shim::launch(&inst);
-    let cases: Vec<Case> = available(&BASH_AND_ZSH)
-        .into_iter()
+    let rows: Vec<(Case, Ending)> = BASH_AND_ZSH
+        .iter()
         .filter(|c| c.integration)
+        .map(|c| (*c, Ending::ForceTerminate))
+        .chain(PER_SESSION_EXTRA)
         .collect();
+    let commands: Vec<String> = (2..=6).map(|n| format!("echo command''_{n}")).collect();
     let mut ended = Vec::new();
-    for case in cases {
+    for (case, how) in rows {
+        if available(&[case]).is_empty() {
+            continue;
+        }
         let s = start(&inst, &mut shim, case, "PerSession");
-        send(&mut shim, &s, "echo second''_command", true);
-        await_output(&mut shim, &s, "second_command");
-        await_prompt(&mut shim, &s);
-        end(&mut shim, &s, Ending::ForceTerminate);
-        ended.push((s, Ending::ForceTerminate));
+        for command in &commands {
+            send(&mut shim, &s, command, true);
+            let printed = command.trim_start_matches("echo ").replace("''", "");
+            await_output(&mut shim, &s, &printed);
+            await_prompt(&mut shim, &s);
+        }
+        end(&mut shim, &s, how);
+        ended.push((s, how));
     }
     shim.kill();
 
     let dir = inst.dir.join("logs").join("history");
     let mode = |p: &Path| std::fs::metadata(p).unwrap().permissions().mode() & 0o777;
     assert_eq!(mode(&dir), 0o700, "{}", dir.display());
-    for (s, _) in &ended {
+    for (s, how) in &ended {
         let file = dir.join(format!("{}.history", s.id));
         let text = std::fs::read_to_string(&file)
             .unwrap_or_else(|e| panic!("{}: no {}: {e}", s.case.name, file.display()));
         assert_eq!(mode(&file), 0o600, "{}", file.display());
-        for needle in [MARK, "second''_command"] {
+        for needle in std::iter::once(MARK).chain(commands.iter().map(String::as_str)) {
             assert!(
                 text.contains(needle),
-                "{}: {} lacks {needle}: {text:?}",
+                "{} / {how:?}: {} lacks {needle}: {text:?}",
                 s.case.name,
                 file.display()
             );
