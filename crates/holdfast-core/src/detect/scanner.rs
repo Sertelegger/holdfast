@@ -911,6 +911,11 @@ impl ModeScanner {
 
     fn capture_newline(&mut self) {
         self.line_at_return = None;
+        // A redrawn prompt's `B` arms a repaint from the command's first
+        // column. A newline moves the cursor off that row, so what follows
+        // it is not that repaint, and a line resumed from the start of the
+        // next row would read as rewritten whole and owe nothing.
+        self.redraw_resume = false;
         if let Some(cap) = self.capture.as_mut() {
             if cap.len() < COMMAND_CAPTURE_MAX {
                 cap.push('\n');
@@ -2088,6 +2093,13 @@ mod tests {
                    \r\x1b]133;A\x07$ \x1b]133;B\x07ls\r\n\x1b]133;C\x07"[..],
                 "ls",
                 false,
+            ),
+            (
+                "a newline after the redrawn prompt leaves the front owed",
+                &b"\x1b]133;A\x07$ \x1b]133;B\x07export K=AKIAIOSF\rODNN7EXAMPLE\
+                   \r\x1b]133;A\x07$ \x1b]133;B\x07\nzz\r\n\x1b]133;C\x07"[..],
+                "ODNN7EXAMPLE\nzz",
+                true,
             ),
             (
                 "a step into a line that owed nothing owes nothing",
