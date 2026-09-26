@@ -2,9 +2,10 @@
 //! PTY byte stream that tracks bracketed paste, the alternate screen, the
 //! window title, and OSC 133 semantic markers.
 //!
-//! It allocates no grid and keeps no history beyond a 512-byte tail line,
-//! so it runs unconditionally on every output chunk. Tier B (full VT100
-//! emulation) is 0.0.4.
+//! It allocates no grid and keeps no history beyond a 512-byte tail line
+//! and the command line being echoed (`COMMAND_CAPTURE_MAX`, plus the one
+//! copy of it a prompt redraw may put back), so it runs unconditionally on
+//! every output chunk. Tier B (full VT100 emulation) is 0.0.4.
 //!
 //! The scanner is also where escape sequences are recognised, so the tail
 //! line it maintains is naturally free of them. That is *not* the
@@ -371,9 +372,8 @@ pub struct ModeScanner {
     capture_debt: usize,
     /// How wide the prompt row was when OSC 133 `B` arrived — the column
     /// the *command* starts at. `0` means unknown (no prompt was drawn, or
-    /// the tail line had already evicted bytes off its front), and the
-    /// unknown case falls back to the length test. See
-    /// `settle_capture_debt`.
+    /// the tail line had already evicted bytes off its front), and then
+    /// only the length test can settle a debt. See `settle_capture_debt`.
     prompt_columns: usize,
     /// Net cursor motion, in columns, between a bare `\r` inside a capture
     /// and the first byte it repaints: `+n` for `CSI n C`, `-n` for
@@ -777,9 +777,10 @@ impl ModeScanner {
     ///
     /// Deferring costs nothing on the shells that were already right: bash
     /// and zsh submit with `\r\r\n`, and a `\r` run ending in `\n` never
-    /// arms this at all (see `ground`). It is also not cursor arithmetic —
-    /// no column is tracked and no CSI is interpreted — so it stays inside
-    /// tier A. What it does not model is an *erase*: a `\r` followed by
+    /// arms this at all (see `ground`). Arming tracks no column; the only
+    /// cursor arithmetic the capture does is `apply_csi`'s net count of
+    /// `CSI C`/`CSI D` between an armed return and the first byte written
+    /// over it. What it does not model is an *erase*: a `\r` followed by
     /// `\x1b[K` and no text really did blank the line, and the capture will
     /// keep what was there. That is the same class of best-effort the
     /// `command` field already documents, and it fails toward reporting
@@ -877,23 +878,29 @@ impl ModeScanner {
     /// 133 `B`, and `repaint_columns` is the net `CSI C`/`CSI D` motion
     /// since the `\r`.
     ///
-    /// **The length test stays, as the fallback for an unknown prompt
-    /// width** — no OSC 133 `A`, a prompt row that lost bytes off the
-    /// front of the tail line, or a prompt of zero width. Every stream in
-    /// this tree's fish, bash and zsh corpora that settled by length before
-    /// still settles.
+    /// **The length test stays, as the fallback whenever the column test
+    /// does not settle** — an unknown prompt width (no OSC 133 `A`, a
+    /// prompt row that lost bytes off the front of the tail line, a prompt
+    /// of zero width), and every repaint that stepped less than the
+    /// prompt's width. Every stream in this tree's fish, bash and zsh
+    /// corpora that settled by length before still settles.
     ///
-    /// Two residuals, named rather than implied. A shell that repaints
-    /// from column 0 by **re-echoing the prompt** is not recognised and
-    /// keeps its debt — the fail-safe direction, and no shell in the
-    /// measured corpus does it. And a wrapped line whose *first* row is
-    /// the one repainted settles even though later rows hold the rest;
-    /// that is the same best-effort class `CommandEntry::command` already
-    /// documents.
+    /// Three residuals, named rather than implied, and the length test is
+    /// behind two of them because it cannot tell a rewrite from a longer
+    /// tail. A wrap redraw whose continuation row is at least as long as
+    /// the front it lost settles, and the tail is reported whole. A shell
+    /// that repaints from column 0 by **re-echoing the prompt** is not
+    /// recognised: a shorter line keeps its debt, the fail-safe direction,
+    /// and a full-length one settles with the prompt's text in the
+    /// command; no shell in the measured corpus does it. And a wrapped line
+    /// whose *first* row is the one repainted settles even though later
+    /// rows hold the rest; that is the same best-effort class
+    /// `CommandEntry::command` already documents.
     ///
-    /// Length rather than content throughout: the discarded bytes are not
-    /// kept, and keeping them to compare would hold a copy of the secret
-    /// this exists to withhold.
+    /// Length rather than content throughout: nothing compares what the
+    /// repaint wrote with what went. The discarded line is kept only until
+    /// its row ends (`line_at_return`), to be put back if the `\r` turns
+    /// out to be a redrawn prompt's.
     fn settle_capture_debt(&mut self) {
         if self.capture_debt == 0 {
             return;
