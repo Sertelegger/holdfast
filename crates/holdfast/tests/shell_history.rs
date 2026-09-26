@@ -26,11 +26,14 @@
 //!   `~/.zsh_history` whenever the session's `HISTFILE` is unset;
 //! - fish, as Holdfast spawns it, with and without shell integration and
 //!   a config that sets `fish_history` itself — at start-up, or on every
-//!   `cd` as a per-directory history plugin does — and a fish the agent
-//!   starts inside a fish session; and fish started through `env`, which
-//!   Holdfast does not recognise and so reaches only through the
-//!   environment;
+//!   `cd` as a per-directory history plugin does — or erases it at every
+//!   prompt, and a fish the agent starts inside a fish session; and fish
+//!   started through `env`, which Holdfast does not recognise and so
+//!   reaches only through the environment;
 //! - tcsh with a `savehist` rc, for the endings Holdfast brings about.
+//!
+//! A zsh whose history goes nowhere must also say nothing about it at exit,
+//! which is `zsh_ends_without_a_history_error_under_an_rc_that_saves_history`.
 //!
 //! Every session gets its own `HOME`, and the assertion is over **every
 //! file** under it rather than over the names a shell is expected to use:
@@ -181,7 +184,7 @@ const BASH_AND_ZSH: [Case; 7] = [
     },
 ];
 
-const FISH: [Case; 5] = [
+const FISH: [Case; 6] = [
     Case {
         name: "fish-default",
         command: "fish",
@@ -196,9 +199,12 @@ const FISH: [Case; 5] = [
         name: "fish-config-sets-history",
         command: "fish",
         args: &[],
-        files: &[(".config/fish/config.fish", FISH_SETS_HISTORY)],
+        files: &[
+            (".config/fish/config.fish", FISH_SETS_HISTORY),
+            (".local/share/fish/fish_history", FISH_OPERATOR_HISTORY),
+        ],
         integration: true,
-        before: &[],
+        before: &[("history | cat", "")],
         hung_up: true,
         needs: "fish",
     },
@@ -222,6 +228,19 @@ const FISH: [Case; 5] = [
         ],
         integration: true,
         before: &[("cd /", ""), ("history | cat", "")],
+        hung_up: true,
+        needs: "fish",
+    },
+    Case {
+        name: "fish-config-erases-history",
+        command: "fish",
+        args: &[],
+        files: &[
+            (".config/fish/config.fish", FISH_ERASES_HISTORY),
+            (".local/share/fish/fish_history", FISH_OPERATOR_HISTORY),
+        ],
+        integration: true,
+        before: &[("history | cat", "")],
         hung_up: true,
         needs: "fish",
     },
@@ -251,11 +270,19 @@ const FISH_OPERATOR_HISTORY: &str = "- cmd: echo OPERATORS_OWN_HISTORY\n  when: 
 const FISH_REPOINTS_HISTORY: &str =
     "function per_dir_history --on-variable PWD\n  set -g fish_history fish\nend\n";
 
+/// A config.fish that erases `fish_history` at every prompt, which leaves
+/// fish on its default session: the operator's own history file, read into
+/// the output and, on fish 3.7, rewritten by `history save`.
+const FISH_ERASES_HISTORY: &str =
+    "function erase_history --on-event fish_prompt\n  set -e fish_history\nend\n";
+
 /// A fish the agent starts inside a fish session, under a config.fish that
 /// names its own history session. Holdfast types nothing into it, so what
-/// keeps it private is the session's exported `fish_private_mode`. Only
-/// endings that reach both shells at once: an `exit` would end the inner
-/// one alone.
+/// keeps it private is the session's exported `fish_private_mode`. Private
+/// is not unread: it still reads the history its config.fish names, which
+/// SECURITY.md registers, so this row gives it none of the operator's to
+/// read. Only endings that reach both shells at once: an `exit` would end
+/// the inner one alone.
 const FISH_NESTED: Case = Case {
     name: "fish-nested",
     command: "fish",
@@ -941,6 +968,57 @@ fn tcsh_is_never_hung_up_so_holdfast_ending_it_saves_nothing() {
     );
 }
 
+/// Everything the session has printed, once it has stopped printing: the
+/// last of a shell's output can arrive after the shell has gone.
+fn settled_output(shim: &mut Shim, s: &Started) -> String {
+    let deadline = Instant::now() + SHELL_TIMEOUT;
+    let mut last = output(shim, s);
+    loop {
+        std::thread::sleep(Duration::from_millis(300));
+        let now = output(shim, s);
+        if now == last {
+            return now;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "{}: output never settled",
+            s.case.name
+        );
+        last = now;
+    }
+}
+
+/// A zsh whose history goes to `/dev/null` says nothing about it as it
+/// ends. Under an rc that sets `SAVEHIST`, zsh locks the history file
+/// before it saves by creating `/dev/null.LOCK`, which fails, and it
+/// printed *zsh: locking failed for /dev/null: permission denied* into the
+/// output at `exit` and at EOF. The snippet's `SAVEHIST=0` is what stops it
+/// saving at all.
+#[test]
+#[ignore = "needs ZSH-SNIPPET-CHANGE"]
+fn zsh_ends_without_a_history_error_under_an_rc_that_saves_history() {
+    let cases = available(&[BASH_AND_ZSH[4]]);
+    let Some(case) = cases.first().copied() else {
+        return;
+    };
+    assert_eq!(case.name, "zsh-omz");
+    let inst = Instance::new("zsh-quiet");
+    let mut shim = Shim::launch(&inst);
+    for how in [Ending::Exit, Ending::Eof] {
+        let s = start(&inst, &mut shim, case, &format!("Quiet{how:?}"));
+        let before = output(&mut shim, &s).len();
+        end(&mut shim, &s, how);
+        let out = settled_output(&mut shim, &s);
+        let ending = out.get(before..).unwrap_or(&out);
+        assert!(
+            !ending.contains("zsh:"),
+            "{} / {how:?}: zsh complained as it ended: {ending:?}",
+            case.name
+        );
+    }
+    shim.kill();
+}
+
 /// The per-session rows beyond `BASH_AND_ZSH`'s, each with the ending
 /// that exposes it.
 ///
@@ -951,8 +1029,10 @@ fn tcsh_is_never_hung_up_so_holdfast_ending_it_saves_nothing() {
 ///   exit, and without `histappend` that save overwrites the file with the
 ///   three-entry list; zsh trims to `SAVEHIST` as it appends;
 /// - a bash with shell integration off, where only `HISTFILE` in the
-///   environment names the file and the shell writes it when it exits.
-const PER_SESSION_EXTRA: [(Case, Ending); 4] = [
+///   environment names the file and the shell writes it when it exits;
+/// - [`BASH_APPEND_STOPPED`], whose per-command append stops after the
+///   marker.
+const PER_SESSION_EXTRA: [(Case, Ending); 5] = [
     (
         Case {
             name: "bash-own-markers",
@@ -971,10 +1051,7 @@ const PER_SESSION_EXTRA: [(Case, Ending); 4] = [
             name: "bash-small-limits",
             command: "bash",
             args: &[],
-            files: &[(
-                ".bashrc",
-                "HISTFILE=~/.bash_history\nHISTSIZE=3\nHISTFILESIZE=3\n",
-            )],
+            files: &[(".bashrc", BASH_SMALL_LIMITS_RC)],
             integration: true,
             before: &[],
             hung_up: true,
@@ -996,7 +1073,32 @@ const PER_SESSION_EXTRA: [(Case, Ending); 4] = [
         Ending::ForceTerminate,
     ),
     (BASH_AND_ZSH[1], Ending::Exit),
+    (BASH_APPEND_STOPPED, Ending::Exit),
 ];
+
+const BASH_SMALL_LIMITS_RC: &str = "HISTFILE=~/.bash_history\nHISTSIZE=3\nHISTFILESIZE=3\n";
+
+/// A bash whose per-command append stops once the marker is recorded, with
+/// limits of 3 — fewer than the commands typed after it. [`STOP_THE_APPEND`]
+/// shadows the `history` builtin, so the snippet's `history -a` does
+/// nothing, as happens when something replaces `PROMPT_COMMAND`
+/// mid-session; bash's own save at exit does not go through it. That save
+/// is then all that writes: with `histappend` it appends the last three
+/// commands, and without it bash rewrites the file from its three-entry
+/// list, losing the marker and everything else recorded before.
+const BASH_APPEND_STOPPED: Case = Case {
+    name: "bash-append-stopped",
+    command: "bash",
+    args: &[],
+    files: &[(".bashrc", BASH_SMALL_LIMITS_RC)],
+    integration: true,
+    before: &[],
+    hung_up: true,
+    needs: "bash",
+};
+
+/// Typed into [`BASH_APPEND_STOPPED`] once its marker is recorded.
+const STOP_THE_APPEND: &str = "history() { :; }";
 
 /// A user's own complete OSC 133 integration, untagged, which Holdfast's
 /// snippet yields to.
@@ -1035,6 +1137,10 @@ fn a_per_session_history_file_keeps_what_the_agent_ran_and_home_keeps_nothing() 
             continue;
         }
         let s = start(&inst, &mut shim, case, "PerSession");
+        if case.name == BASH_APPEND_STOPPED.name {
+            send(&mut shim, &s, STOP_THE_APPEND, true);
+            await_prompt(&mut shim, &s);
+        }
         for command in &commands {
             send(&mut shim, &s, command, true);
             let printed = command.trim_start_matches("echo ").replace("''", "");
@@ -1054,6 +1160,21 @@ fn a_per_session_history_file_keeps_what_the_agent_ran_and_home_keeps_nothing() 
         let text = std::fs::read_to_string(&file)
             .unwrap_or_else(|e| panic!("{}: no {}: {e}", s.case.name, file.display()));
         assert_eq!(mode(&file), 0o600, "{}", file.display());
+        if s.case.name == BASH_APPEND_STOPPED.name {
+            // The first command after the stop is absent, or the append
+            // never stopped and this row measured nothing; the last is
+            // present, or bash never saved at exit.
+            let (first, last) = (&commands[0], &commands[commands.len() - 1]);
+            assert!(
+                text.contains(MARK)
+                    && !text.contains(first.as_str())
+                    && text.contains(last.as_str()),
+                "{} / {how:?}: {} should hold the marker and {last}, and not {first}: {text:?}",
+                s.case.name,
+                file.display()
+            );
+            continue;
+        }
         for needle in std::iter::once(MARK).chain(commands.iter().map(String::as_str)) {
             assert!(
                 text.contains(needle),
@@ -1063,5 +1184,32 @@ fn a_per_session_history_file_keeps_what_the_agent_ran_and_home_keeps_nothing() 
             );
         }
     }
+
+    // A fish session is pointed at its file and gets none: its history
+    // never reaches one, so creating it would leave an empty file per
+    // session. A stand-in named `fish`, because Holdfast recognises the
+    // program by name and the file is made before the program runs; it
+    // measures the same where no fish is installed.
+    let stand_in = inst.home().join("stand-in").join("fish");
+    std::fs::create_dir_all(stand_in.parent().unwrap()).unwrap();
+    std::fs::write(&stand_in, "#!/bin/sh\nexec cat\n").unwrap();
+    std::fs::set_permissions(&stand_in, std::fs::Permissions::from_mode(0o755)).unwrap();
+    let mut shim = Shim::launch(&inst);
+    let started = shim.call(
+        "start_session",
+        json!({ "command": stand_in, "cwd": inst.home() }),
+    );
+    assert_eq!(started["status"], "ok", "{started}");
+    let id = started["data"]["session_id"].as_str().unwrap().to_string();
+    let r = shim.call("terminate", json!({ "session": id, "force": true }));
+    assert_eq!(r["status"], "ok", "{r}");
+    shim.kill();
+    let file = dir.join(format!("{id}.history"));
+    assert!(
+        !file.exists(),
+        "a fish session was given {}",
+        file.display()
+    );
+
     assert_no_leaks(&ended);
 }

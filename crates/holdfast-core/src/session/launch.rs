@@ -357,9 +357,11 @@ pub const ZSH_HISTORY_IGNORE: &str = "*HOLDFAST_SHELL_INTEGRATION*";
 /// | Variable | Program, version measured |
 /// |---|---|
 /// | `MYSQL_HISTFILE=/dev/null` | MariaDB client 15.1 (10.11) and Oracle `mysql` 8.0 |
+/// | `MARIADB_HISTFILE=/dev/null` | MariaDB client 15.2 (11.4.7 and 11.8.3) |
 /// | `PSQL_HISTORY=/dev/null` | psql 16 |
-/// | `NODE_REPL_HISTORY=` (empty) | node 22 |
-/// | `SQLITE_HISTORY=/dev/null` | sqlite3 3.45 |
+/// | `NODE_REPL_HISTORY=` (empty) | node 22, 24 and 26 |
+/// | `TS_NODE_HISTORY=` (one space) | ts-node 10.9.2 on node 22, 24 and 26 |
+/// | `SQLITE_HISTORY=` (empty) | sqlite3 3.45, readline and libedit builds |
 /// | `PYTHON_HISTORY=/dev/null` | Python 3.13, PyREPL and basic REPL |
 /// | `SHELL_SESSIONS_DISABLE=1` | macOS Terminal's per-session history; not measured |
 ///
@@ -370,20 +372,62 @@ pub const ZSH_HISTORY_IGNORE: &str = "*HOLDFAST_SHELL_INTEGRATION*";
 /// password database rather than `$HOME`, so a session's own `HOME` does
 /// not move it, and only the variable keeps it off disk.
 ///
+/// **Both `mysql` variables**, because MariaDB 11 reads
+/// `MARIADB_HISTFILE` first and 10.x only `MYSQL_HISTFILE`: a
+/// `MARIADB_HISTFILE` the client's environment carries would otherwise
+/// beat the other (11.4.7 wrote it, measured). **An empty `node` value and
+/// not `/dev/null`**: node 24 and later truncate the history file as they
+/// open it, which fails on a device, and print *Could not open history
+/// file* at every REPL start (measured on 24.21 and 26.10; 22 is silent).
+/// Empty costs one *Persistent history support disabled* notice, on an
+/// up-arrow before any line is entered. **A space for ts-node**, which
+/// ignores `NODE_REPL_HISTORY` and reads `TS_NODE_HISTORY ||
+/// ~/.ts_node_repl_history`, so an empty value is its default file
+/// (measured); node trims the space to the empty value that turns
+/// persistence off.
+///
+/// **Not `/dev/null` for sqlite3**, because libedit's history save
+/// `fchmod`s the file it wrote to `0600`: as root that would take
+/// `/dev/null` itself from `0666` to `0600` (measured on a pty device this
+/// uid owns, standing in for it: `crw-rw-rw-` became `crw-------`). An
+/// empty name opens nothing, and both builds stay silent. psql and both
+/// `mysql` clients compare their value with the null device and write
+/// nothing to it, so libedit never reaches it through them.
+///
+/// **[`NULL_DEVICE`] is `nul` on Windows**, where a native program opens
+/// `/dev/null` as `\dev\null` on the current drive: a real file wherever
+/// that directory exists (PyREPL wrote one, measured on a stand-in). The
+/// `mysql` value is compared as a string by both clients, so it stays.
+///
 /// `SHELL_SESSIONS_DISABLE` is Apple's documented off switch for
-/// `/etc/zshrc_Apple_Terminal` and `/etc/bashrc_Apple_Terminal`, which save
-/// each Terminal window's history under `~/.zsh_sessions/` or
-/// `~/.bash_sessions/` whatever `HISTFILE` says. A session inherits
-/// `TERM_PROGRAM=Apple_Terminal` from a daemon started in Terminal (GH
-/// #229), so it is set everywhere; nothing else reads it.
-pub const CLIENT_HISTORY_DEFAULTS: [(&str, &str); 6] = [
+/// `/etc/zshrc_Apple_Terminal`, which saves each Terminal window's history
+/// under `~/.zsh_sessions/` whatever `HISTFILE` says. A session inherits
+/// `TERM_PROGRAM=Apple_Terminal` and `TERM_SESSION_ID` from a client
+/// started in Terminal (GH #229), so it is set everywhere; nothing else
+/// reads it. **It does not reach `/etc/bashrc_Apple_Terminal`**, which a
+/// login bash sources: that one checks for a file,
+/// `~/.bash_sessions_disable`, and no variable turns it off.
+pub const CLIENT_HISTORY_DEFAULTS: [(&str, &str); 8] = [
     ("MYSQL_HISTFILE", "/dev/null"),
-    ("PSQL_HISTORY", "/dev/null"),
+    ("MARIADB_HISTFILE", "/dev/null"),
+    ("PSQL_HISTORY", NULL_DEVICE),
     ("NODE_REPL_HISTORY", ""),
-    ("SQLITE_HISTORY", "/dev/null"),
-    ("PYTHON_HISTORY", "/dev/null"),
+    ("TS_NODE_HISTORY", " "),
+    ("SQLITE_HISTORY", ""),
+    ("PYTHON_HISTORY", NULL_DEVICE),
     ("SHELL_SESSIONS_DISABLE", "1"),
 ];
+
+/// The null device, as a native program names it. `nul` is the spelling
+/// psql compares its history file with on Windows; the name is not
+/// case-sensitive there.
+#[cfg(not(windows))]
+pub const NULL_DEVICE: &str = "/dev/null";
+/// The null device, as a native program names it. `nul` is the spelling
+/// psql compares its history file with on Windows; the name is not
+/// case-sensitive there.
+#[cfg(windows)]
+pub const NULL_DEVICE: &str = "nul";
 
 /// The shell-history policy, as environment (GH #252).
 ///
@@ -401,13 +445,30 @@ pub const CLIENT_HISTORY_DEFAULTS: [(&str, &str); 6] = [
 ///   prints *failed to write history file* at every exit when an rc set
 ///   `SAVEHIST` and left `HISTFILE` empty, and bash prints *history: :
 ///   cannot create* at every prompt when an rc's `PROMPT_COMMAND` runs
-///   `history -a`. Neither shell writes through a temporary file beside a
+///   `history -a`. bash never writes through a temporary file beside a
 ///   `HISTFILE` that is not a regular file: as uid 0 in a user namespace,
 ///   with the real `/dev/null` bind-mounted into a writable directory,
-///   bash's exit, `SIGHUP`, `history -w`, `history -a` and
-///   `HISTFILESIZE=1`, and zsh's exit and `SIGHUP` under `SAVEHIST`,
-///   `inc_append_history`, `share_history` and `no_hist_save_by_copy`,
-///   left it a character device with nothing created beside it.
+///   its exit, `SIGHUP`, `history -w`, `history -a` and `HISTFILESIZE=1`
+///   left it a character device with nothing created beside it, as did
+///   zsh's exit and `SIGHUP` under `SAVEHIST` with its default
+///   `append_history`, `inc_append_history`, `share_history` and
+///   `no_hist_save_by_copy`.
+///
+///   **zsh with `SAVEHIST` set has two exceptions of its own, and the
+///   snippet is what closes them.** Before it saves, zsh locks by creating
+///   `/dev/null.LOCK`: as any user but root that fails, and zsh prints
+///   *locking failed for /dev/null: permission denied* at every exit, EOF
+///   and `exec zsh` under an rc that sets `SAVEHIST` — macOS's
+///   `/etc/zshrc` and oh-my-zsh do. As root it succeeds, and under
+///   `unsetopt append_history` zsh's default `hist_save_by_copy` writes
+///   `/dev/null.new` and renames it over `/dev/null`, leaving a regular
+///   `0666` file of the agent's commands (simulated as uid 0 in a user
+///   namespace). So the snippet's `/dev/null` branch also sets `SAVEHIST=0`,
+///   under which zsh saves nothing, and unsets `hist_save_by_copy` for an
+///   rc re-sourced later that sets `SAVEHIST` again. `exec zsh` and a
+///   nested zsh run their rc with neither, so the message comes back there,
+///   and as root they replace `/dev/null` as before; SECURITY.md registers
+///   both.
 /// - **[`HISTFILE_CARRIER`]**, for the snippet, whose own `HISTFILE`
 ///   assignment is what overrides an rc file that hard-sets one. It
 ///   carries a `HISTFILE` the call set itself, so that choice survives
@@ -416,11 +477,15 @@ pub const CLIENT_HISTORY_DEFAULTS: [(&str, &str); 6] = [
 ///   disk under it (measured on 3.7.0, 4.0.2 and 4.9.3) and prints no
 ///   banner. A fish Holdfast spawns itself also gets
 ///   `detect::shell::FISH_HISTORY_INIT`, which re-asserts it after
-///   config.fish and makes any fish started inside the session private;
-///   a call whose own `env` sets `fish_history` gets neither, so its
-///   choice stands. What still reaches disk is a fish started inside a
-///   bash or zsh session, or through a wrapper Holdfast does not
-///   recognise (`env fish`), whose config.fish sets `fish_history`.
+///   config.fish and makes any fish started inside the session save
+///   nothing. A call whose own `env` sets a non-empty `fish_history` gets
+///   neither: that fish starts as a plain fish with the call's value in its
+///   environment, which a config.fish that sets `fish_history` overrides.
+///   What still reaches disk is a fish started inside a bash or zsh
+///   session, or through a wrapper Holdfast does not recognise (`env
+///   fish`), whose config.fish sets `fish_history`; a fish started inside
+///   a fish session writes nothing but still reads the history its
+///   config.fish names.
 /// - **`HISTORY_IGNORE`**, [`ZSH_HISTORY_IGNORE`]. zsh's
 ///   `inc_append_history` and `share_history` write a line when it is
 ///   entered, before it runs, so the snippet's own line reached the rc's
@@ -722,10 +787,12 @@ mod tests {
                 ("fish_history", ""),
                 ("HISTORY_IGNORE", "*HOLDFAST_SHELL_INTEGRATION*"),
                 ("MYSQL_HISTFILE", "/dev/null"),
-                ("PSQL_HISTORY", "/dev/null"),
+                ("MARIADB_HISTFILE", "/dev/null"),
+                ("PSQL_HISTORY", NULL_DEVICE),
                 ("NODE_REPL_HISTORY", ""),
-                ("SQLITE_HISTORY", "/dev/null"),
-                ("PYTHON_HISTORY", "/dev/null"),
+                ("TS_NODE_HISTORY", " "),
+                ("SQLITE_HISTORY", ""),
+                ("PYTHON_HISTORY", NULL_DEVICE),
                 ("SHELL_SESSIONS_DISABLE", "1"),
             ])
         );
@@ -749,8 +816,10 @@ mod tests {
                 "HOLDFAST_HISTFILE",
                 "HISTORY_IGNORE",
                 "MYSQL_HISTFILE",
+                "MARIADB_HISTFILE",
                 "PSQL_HISTORY",
                 "NODE_REPL_HISTORY",
+                "TS_NODE_HISTORY",
                 "SQLITE_HISTORY",
                 "SHELL_SESSIONS_DISABLE"
             ]

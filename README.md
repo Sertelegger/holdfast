@@ -181,17 +181,21 @@ daemon stop` or a daemon crash. Every session starts with
 `HISTFILE=/dev/null`, an empty `fish_history` and a zsh `HISTORY_IGNORE`
 matching Holdfast's snippet. The integration snippet, which begins with a
 space, sets `HISTFILE=/dev/null` again in bash and zsh after your rc files
-have run. fish is started with an init command (`-C`) that keeps its
-history in memory whatever config.fish says, and makes any fish started
-inside the session private. tcsh and csh are never hung up, because a
-hung-up tcsh saves its history; they wait out `terminate`'s grace instead.
+have run, and zsh's `SAVEHIST=0`, so zsh does not try to lock and save
+`/dev/null` as it exits. fish is started with an init command (`-C`) that
+keeps its history in memory whatever config.fish sets or erases, and keeps
+any fish started inside the session from saving one. tcsh and csh are
+never hung up, because a hung-up tcsh saves its history; they wait out
+`terminate`'s grace instead.
 
 The REPLs and database clients that keep history files of their own start
 with them switched off: `PYTHON_HISTORY`, `NODE_REPL_HISTORY`,
-`PSQL_HISTORY`, `MYSQL_HISTFILE` and `SQLITE_HISTORY`, plus
-`SHELL_SESSIONS_DISABLE=1` for macOS Terminal's per-window history, which
-has not been measured on a Mac. A call's own `env` overrides any of these,
-`HISTFILE` and `fish_history` included.
+`TS_NODE_HISTORY`, `PSQL_HISTORY`, `MYSQL_HISTFILE`, `MARIADB_HISTFILE` and
+`SQLITE_HISTORY`, plus `SHELL_SESSIONS_DISABLE=1` for macOS Terminal's
+per-window zsh history, which has not been measured on a Mac. A call's own
+`env` overrides any of these, `HISTFILE` included. A non-empty
+`fish_history` in it starts fish without the init command, so a
+config.fish that sets `fish_history` overrides the call's value too.
 
 Except:
 
@@ -207,9 +211,20 @@ Except:
   as `env fish`, whose config.fish sets `fish_history`;
 - a zsh `HISTORY_IGNORE` of your own, which lets Holdfast's snippet line
   — not the agent's commands — into a history file your rc names;
+- as root, a zsh started inside a session or by `exec zsh`, under an rc
+  that sets `SAVEHIST` and unsets `append_history` without setting
+  `HISTFILE`: it replaces `/dev/null` with a file of its commands;
+- a login bash in macOS Terminal, whose per-window history under
+  `~/.bash_sessions/` only a `~/.bash_sessions_disable` file turns off;
 - Python 3.12 and older, which ignore `PYTHON_HISTORY` and write
-  `~/.python_history`, and any other program with a history file of its
-  own.
+  `~/.python_history`, a `.psqlrc` that sets `HISTFILE`, and any other
+  program with a history file of its own, PowerShell's PSReadLine among
+  them.
+
+Reading is not covered. bash and zsh load the history file your rc names
+as they start, before the snippet runs, so the agent can list your own
+history with `history` and recall it with up-arrow; a fish started inside
+a fish session reads the file its config.fish names the same way.
 
 If your rc's `PROMPT_COMMAND` re-reads the history file at every prompt
 (`history -a; history -c; history -r`), `HISTFILE=/dev/null` also empties
@@ -226,16 +241,18 @@ Each bash and zsh session then gets
 `~/.holdfast/logs/history/<session_id>.history`
 (`$HOLDFAST_RUNTIME_DIR/logs/history/` for an explicit instance): `0600`
 files in a `0700` directory, kept after their sessions end and never
-rotated or deleted by Holdfast. The shell appends each command as it
-finishes, so a forced `terminate` still leaves the record, and the snippet
-lifts bash's `HISTFILESIZE` and zsh's `SAVEHIST` so neither trims it. The
-files hold what the shell saw, unredacted. Any other session is pointed at
-the same path and gets a file only if a shell it starts saves one; fish
-sessions stay private either way.
+rotated or deleted by Holdfast. bash appends each command as it finishes
+and zsh as it is entered, so a forced `terminate` still leaves the record,
+and the snippet lifts bash's `HISTFILESIZE` and zsh's `SAVEHIST` so neither
+trims it. The files hold what the shell saw, unredacted. Any other session
+is pointed at the same path and gets a file only if a shell it starts
+saves one; fish sessions get none.
 
 It is a convenience record, not an audit trail. A call's own `env` can
 point `HISTFILE` somewhere else, your rc's history options still apply —
-Debian's `HISTCONTROL=ignoreboth` drops commands that begin with a space —
+Debian's `HISTCONTROL=ignoreboth` drops commands that begin with a space,
+and without it each bash file begins with the snippet's own line — an rc
+sourced again that sets `HISTFILESIZE` truncates the file when bash exits,
 and anything in the list above that re-points `HISTFILE` takes the rest of
 the session's commands with it.
 

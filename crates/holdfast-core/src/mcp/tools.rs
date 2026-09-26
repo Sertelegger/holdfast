@@ -296,8 +296,9 @@ impl HoldfastServer {
         // GH #252: fish is spawned with `Shell::spawn_args`' history
         // policy ahead of the caller's arguments, whether or not the
         // snippet will be typed — unless the call's own `env` names a
-        // `fish_history`, which then stands, as a `HISTFILE` it sets does
-        // for bash and zsh. The argv that runs is what the audit row
+        // non-empty `fish_history`, and that fish then starts as a plain
+        // one with the call's value (`history_spawn_args` says what
+        // config.fish does to it). The argv that runs is what the audit row
         // records; the session reports the caller's, as it reports none of
         // the environment defaults below.
         cfg.args =

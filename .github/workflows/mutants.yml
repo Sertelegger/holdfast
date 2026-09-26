@@ -130,10 +130,13 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
+      # The same list as ci.yml's `test` job, tcsh included: without it the
+      # shell-history tcsh row skips, and a skipped row's mutants read as
+      # MISSED (see the interpreter below).
       - name: Install the shells and helpers the test suite spawns by name
         run: |
           sudo apt-get update -qq
-          sudo apt-get install -y -qq --no-install-recommends zsh dash less python3
+          sudo apt-get install -y -qq --no-install-recommends zsh dash less python3 tcsh
       # The same interpreter ci.yml installs, for the same reason: without
       # it the §8.7 PyREPL row does not run, and a sweep whose baseline
       # skips a row reports every mutant only that row could kill as
