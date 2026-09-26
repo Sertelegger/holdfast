@@ -149,7 +149,10 @@ own right. Pass `shell_integration: false` to `start_session` to skip it.
 
 It is **typed into the session, never installed**: there is nothing to add
 to an rc file, and `crates/holdfast-core/src/detect/shell.rs` holds the only
-copy of each snippet. Anything else — `dash`, `sh`, a REPL, a plain
+copy of each snippet. bash's snippet is longer than macOS lets a line typed
+at start-up be, so for bash Holdfast types a short line that runs the
+snippet from `HOLDFAST_BASH_INTEGRATION`, which the session starts with and
+that line unsets. Anything else — `dash`, `sh`, a REPL, a plain
 program — degrades silently to `terminal_mode` or `heuristic`, with no
 configuration and no error.
 

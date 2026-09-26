@@ -552,6 +552,18 @@ impl HoldfastServer {
             output_broadcast_capacity: self.config.limits.output_broadcast_capacity,
             ..SessionConfig::default()
         };
+        // What the typed line needs (`Shell::injection_env`): bash's line
+        // evaluates its snippet from the environment. Only for a session
+        // whose line will be typed, and after the call's own `env`, so a
+        // key the call sets cannot replace the snippet.
+        if let Some(shell) = config.shell_integration {
+            cfg.env.extend(
+                shell
+                    .injection_env()
+                    .iter()
+                    .map(|(k, v)| ((*k).to_string(), (*v).to_string())),
+            );
+        }
 
         // **The slot and the name are claimed before the child exists**
         // (GH #131), which is what makes the comment sixty lines above

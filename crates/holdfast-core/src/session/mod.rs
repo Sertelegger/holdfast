@@ -1629,9 +1629,12 @@ impl Session {
 
         // Typed, not exported: rc files run after the environment is read
         // and would clobber an inherited PS1 (§8.5). A write failure here
-        // is not fatal — the session simply degrades to tier 2.
+        // is not fatal — the session simply degrades to tier 2. The line is
+        // `injection_line`, not the snippet: bash's evaluates a snippet the
+        // spawn put in its environment (`Shell::injection_env`), because
+        // macOS drops a typed line past 1024 bytes.
         if let Some(shell) = config.shell_integration {
-            let snippet = shell.integration_snippet();
+            let typed = shell.injection_line();
             // §8.5.1 rule 5 (REQ-DM-009): the ring needs to know which line
             // Holdfast typed, because "it emits no `C`" stops being true the
             // moment a foreign emitter is already installed — the user's
@@ -1641,11 +1644,8 @@ impl Session {
             // **Before the write, not after.** The reader thread is already
             // running; a snippet whose `C` arrived before `set_injection_line`
             // landed would be recorded.
-            session
-                .history
-                .lock()
-                .set_injection_line(snippet.to_string());
-            let mut line = snippet.as_bytes().to_vec();
+            session.history.lock().set_injection_line(typed.to_string());
+            let mut line = typed.as_bytes().to_vec();
             line.push(b'\n');
             let _ = backend.write(&line);
         }
@@ -4224,12 +4224,14 @@ mod tests {
         );
         assert_eq!(s.shell_integration, Some(Shell::Bash));
 
+        // The injection line and nothing else, submitted: bash's evaluates
+        // its snippet from the environment, which `detect::shell` pins.
         let written = String::from_utf8_lossy(&pty.written()).into_owned();
-        assert!(
-            written.contains("133;A"),
-            "no snippet was written: {written:?}"
+        assert_eq!(
+            written,
+            format!("{}\n", Shell::Bash.injection_line()),
+            "the injection line was not what was typed"
         );
-        assert!(written.ends_with('\n'), "the snippet was never submitted");
     }
 
     #[test]

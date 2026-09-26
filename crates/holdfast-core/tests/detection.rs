@@ -1920,6 +1920,28 @@ async fn bash_integration_emits_the_measured_marker_stream_and_exact_exit_codes(
     kill(&server, &id).await;
 }
 
+/// bash's typed line evaluates a snippet its environment carries, and
+/// unsets the carrier (`detect::shell::BASH_INJECTION_LINE`). The row above
+/// is the proof the snippet ran; this is the proof that nothing the agent
+/// runs afterwards inherits it, in the shell or in a child's environment.
+#[tokio::test]
+async fn bash_hands_the_carrier_of_its_snippet_to_nothing_the_agent_runs() {
+    let server = HoldfastServer::new();
+    let id = start(&server, bash()).await;
+    await_markers(&server, &id, 3).await;
+    let carrier = holdfast_core::detect::shell::BASH_INTEGRATION_CARRIER;
+    send(
+        &server,
+        &id,
+        &format!("echo CARRIER''=${{{carrier}-unset}}:$(env | grep -c '^{carrier}=')"),
+    )
+    .await;
+    await_markers(&server, &id, 7).await;
+    let out = raw(&server, &id).await;
+    assert!(out.contains("CARRIER=unset:0"), "{out:?}");
+    kill(&server, &id).await;
+}
+
 #[tokio::test]
 async fn zsh_integration_emits_the_measured_marker_stream_and_exact_exit_codes() {
     // REQ-PD-005. §8.5 requires the marker stream to be *identical* to
@@ -2214,10 +2236,9 @@ async fn a_prompt_that_already_emits_osc_133_meets_the_injected_snippet() {
     // — the second, quieter consequence of the collision (§8.5.1). The
     // pre-rev.-36 reason it stayed out was that it emitted no `C`, and that
     // reasoning stops holding exactly here.
+    let install = holdfast_core::detect::shell::BASH_INTEGRATION_CARRIER;
     assert!(
-        !commands
-            .iter()
-            .any(|c| c.contains("HOLDFAST_SHELL_INTEGRATION")),
+        !commands.iter().any(|c| c.contains(install)),
         "the install line became a history entry: {h}"
     );
 

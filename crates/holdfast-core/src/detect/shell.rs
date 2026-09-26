@@ -5,10 +5,13 @@
 //! setting environment variables, and that is the only mechanism that
 //! works: rc files run after the environment is read and would clobber an
 //! inherited `PS1`, whereas a line typed at the first prompt wraps
-//! whatever prompt the user actually ended up with.
+//! whatever prompt the user actually ended up with. What has to be typed is
+//! what *runs* the snippet, not its text: bash's typed line evaluates a
+//! snippet the environment carries, because the whole snippet is longer
+//! than macOS lets a typed line be (see [`BASH_INJECTION_LINE`]).
 //!
-//! Consequence, accepted for 0.0.2: the snippet is echoed by the shell and
-//! therefore appears once in the session's output buffer.
+//! Consequence, accepted for 0.0.2: the typed line is echoed by the shell
+//! and therefore appears once in the session's output buffer.
 
 /// Shells Holdfast knows how to integrate.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -27,12 +30,34 @@ impl Shell {
         }
     }
 
-    /// The snippet to type, without its trailing newline.
+    /// The code that integrates this shell, as one line without a trailing
+    /// newline. Complete in itself: typed at a prompt, it integrates the
+    /// shell that reads it. What Holdfast types at start-up is
+    /// [`Shell::injection_line`], which for bash evaluates this.
     pub fn integration_snippet(self) -> &'static str {
         match self {
             Self::Bash => BASH_INTEGRATION,
             Self::Zsh => ZSH_INTEGRATION,
             Self::Fish => FISH_INTEGRATION,
+        }
+    }
+
+    /// The line Holdfast types at start-up, without its trailing newline:
+    /// the snippet itself for zsh and fish, and [`BASH_INJECTION_LINE`] for
+    /// bash, whose snippet is too long to type (see there).
+    pub fn injection_line(self) -> &'static str {
+        match self {
+            Self::Bash => BASH_INJECTION_LINE,
+            Self::Zsh | Self::Fish => self.integration_snippet(),
+        }
+    }
+
+    /// The environment [`Shell::injection_line`] needs: bash's snippet,
+    /// under [`BASH_INTEGRATION_CARRIER`]. Nothing for zsh and fish.
+    pub fn injection_env(self) -> &'static [(&'static str, &'static str)] {
+        match self {
+            Self::Bash => &[(BASH_INTEGRATION_CARRIER, BASH_INTEGRATION)],
+            Self::Zsh | Self::Fish => &[],
         }
     }
 
@@ -277,6 +302,44 @@ const BASH_INTEGRATION: &str = concat!(
     r#"fi"#,
 );
 
+/// The environment variable that carries [`BASH_INTEGRATION`] into a bash
+/// session for [`BASH_INJECTION_LINE`] to evaluate.
+pub const BASH_INTEGRATION_CARRIER: &str = "HOLDFAST_BASH_INTEGRATION";
+
+/// What Holdfast types into a bash session: [`BASH_INTEGRATION`], evaluated
+/// from [`BASH_INTEGRATION_CARRIER`], which [`Shell::injection_env`] puts in
+/// the session's environment and this line unsets.
+///
+/// **The line is typed before bash's line editor has the terminal**, while
+/// the line discipline is still assembling a canonical line, and a
+/// canonical line has a limit. macOS's `MAX_CANON` is 1024 bytes, and macOS
+/// drops every byte past it, the newline included. bash then reads those
+/// 1024 bytes with the agent's first command appended, inside quotes and
+/// braces the cut left open, and prompts `> ` for their continuation.
+/// bash's snippet is longer than that; zsh's and fish's are typed whole.
+/// Linux does not drop: a 70 000-byte line typed at a bash still in its rc
+/// file arrived whole (measured, Linux 6.12), so only a Mac shows the cut.
+/// `every_injection_line_fits_in_one_canonical_line_on_macos` holds all
+/// three lines under the limit, with room to spare.
+///
+/// - **A variable and `eval`, not exported functions.** bash imports a
+///   `BASH_FUNC_<name>%%` variable as a function, but it exports each
+///   function it imports again, so every bash the agent starts would carry
+///   them, and `bash -p` imports none (both measured, bash 5.2). The
+///   variable is read once and unset by the line that reads it, so nothing
+///   the session starts afterwards inherits it.
+/// - **Not a file the line sources**, which would need a lifetime, a mode
+///   and a path every bash Holdfast starts can read.
+/// - **Not typed once bash has left canonical mode**, which would hold the
+///   injection, and the agent's first input behind it, until a transition
+///   the daemon would have to watch for and a bash without readline never
+///   makes.
+///
+/// `${…-}` keeps the line quiet under an rc's `set -u`. It starts with a
+/// space for the reason every snippet does.
+const BASH_INJECTION_LINE: &str =
+    r#" eval "${HOLDFAST_BASH_INTEGRATION-}"; unset HOLDFAST_BASH_INTEGRATION"#;
+
 /// zsh: `precmd` carries `D;<code>`, `preexec` carries `C`, and `PS1`
 /// carries `A`/`B` inside `%{…%}` so the markers are zero-width.
 /// `local s=$?` must be the first statement in `precmd`.
@@ -480,13 +543,64 @@ mod tests {
         // The snippet is typed at a prompt. An embedded newline would
         // submit a partial command.
         for s in [Shell::Bash, Shell::Zsh, Shell::Fish] {
-            let snippet = s.integration_snippet();
+            for snippet in [s.integration_snippet(), s.injection_line()] {
+                assert!(
+                    !snippet.contains('\n'),
+                    "{} snippet has a newline",
+                    s.as_str()
+                );
+                assert!(!snippet.contains('\r'), "{} snippet has a CR", s.as_str());
+            }
+        }
+    }
+
+    /// The most a line Holdfast types at start-up may be, newline included.
+    ///
+    /// The line reaches the terminal before the shell's line editor does,
+    /// while the line discipline is assembling a canonical line, and macOS
+    /// holds at most `MAX_CANON` bytes of one: 1024. It drops every byte
+    /// past that, the newline among them, and the shell then reads the
+    /// fragment with the agent's first command appended (see
+    /// `BASH_INJECTION_LINE`). The bound sits under 1024 rather than on it,
+    /// so that nothing rests on exactly how macOS counts the newline.
+    ///
+    /// FreeBSD's `<sys/syslimits.h>` declares a `MAX_CANON` of 255, which
+    /// zsh's and fish's lines exceed. No FreeBSD runs a session in CI, and
+    /// this bound says nothing about what FreeBSD's tty layer does with a
+    /// longer line.
+    const TYPED_LINE_BOUND: usize = 1000;
+
+    #[test]
+    fn every_injection_line_fits_in_one_canonical_line_on_macos() {
+        for s in [Shell::Bash, Shell::Zsh, Shell::Fish] {
+            let typed = s.injection_line().len() + 1;
             assert!(
-                !snippet.contains('\n'),
-                "{} snippet has a newline",
+                typed <= TYPED_LINE_BOUND,
+                "{}: {typed} bytes typed at start-up, over {TYPED_LINE_BOUND}; macOS \
+                 drops a canonical line's bytes past 1024",
                 s.as_str()
             );
-            assert!(!snippet.contains('\r'), "{} snippet has a CR", s.as_str());
+        }
+    }
+
+    /// bash types a line that evaluates its snippet from the variable the
+    /// spawn sets, and unsets it; zsh and fish type their snippets whole.
+    /// The line names the carrier as a literal, so this is what keeps it
+    /// and `BASH_INTEGRATION_CARRIER` the same name.
+    #[test]
+    fn the_bash_line_evaluates_the_snippet_its_environment_carries_and_unsets_it() {
+        assert_eq!(
+            Shell::Bash.injection_env(),
+            [(BASH_INTEGRATION_CARRIER, BASH_INTEGRATION)]
+        );
+        let c = BASH_INTEGRATION_CARRIER;
+        assert_eq!(
+            Shell::Bash.injection_line(),
+            format!(r#" eval "${{{c}-}}"; unset {c}"#)
+        );
+        for s in [Shell::Zsh, Shell::Fish] {
+            assert_eq!(s.injection_line(), s.integration_snippet());
+            assert!(s.injection_env().is_empty(), "{}", s.as_str());
         }
     }
 
@@ -623,9 +737,12 @@ mod tests {
     /// crate is what runs them against rc files.
     #[test]
     fn every_snippet_starts_with_a_space_and_sets_history_before_its_guard() {
+        // The typed line is what a shell records; bash's snippet keeps its
+        // space for a snippet typed by hand.
         for s in [Shell::Bash, Shell::Zsh, Shell::Fish] {
-            let snippet = s.integration_snippet();
-            assert!(snippet.starts_with(' '), "{}: {snippet}", s.as_str());
+            for snippet in [s.integration_snippet(), s.injection_line()] {
+                assert!(snippet.starts_with(' '), "{}: {snippet}", s.as_str());
+            }
         }
         let guard = "HOLDFAST_SHELL_INTEGRATION";
         let bash = Shell::Bash.integration_snippet();

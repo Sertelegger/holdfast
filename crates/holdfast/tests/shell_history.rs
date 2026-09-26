@@ -62,9 +62,14 @@ const SHELL_TIMEOUT: Duration = Duration::from_secs(30);
 /// the typed line's echo from matching the needle the output is polled for.
 const MARK: &str = "HISTMARK_";
 
-/// Text only Holdfast's integration snippet contains. The snippet reaching
-/// a history file is part of GH #252 too.
-const SNIPPET_MARKS: [&str; 2] = ["HOLDFAST_SHELL_INTEGRATION", "HOLDFAST_HISTFILE"];
+/// Text only Holdfast's integration snippets and the lines it types contain.
+/// Either reaching a history file is part of GH #252 too. bash's typed line
+/// names only the variable that carries its snippet.
+const SNIPPET_MARKS: [&str; 3] = [
+    "HOLDFAST_SHELL_INTEGRATION",
+    "HOLDFAST_HISTFILE",
+    "HOLDFAST_BASH_INTEGRATION",
+];
 
 const BASH_HARD_RC: &str =
     "HISTFILE=~/.bash_history\nshopt -s histappend\nPROMPT_COMMAND=\"history -a\"\n";
