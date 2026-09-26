@@ -521,7 +521,9 @@ pub struct TerminalConfig {
     /// every session `<log dir>/history/<session_id>.history` — `0600`, in
     /// a `0700` directory, kept after the session ends — so an operator
     /// can read what an agent ran. fish sessions stay private either way.
-    /// See `session::launch::history_defaults`.
+    /// A session started with `shell_integration: false` gets the
+    /// environment alone, so an rc file that sets `HISTFILE` itself wins
+    /// for bash and zsh. See `session::launch::history_defaults`.
     #[serde(default = "d_shell_history_file")]
     pub shell_history_file: String,
 }

@@ -241,7 +241,9 @@ pub struct StartSessionArgs {
     #[serde(default)]
     pub settle_threshold_ms: Option<u64>,
     /// Inject OSC 133 shell integration when the command is bash, zsh,
-    /// or fish. Defaults to true.
+    /// or fish. Defaults to true. `false` also skips the snippet's history
+    /// line, so an rc file that sets `HISTFILE` decides where bash and zsh
+    /// save history.
     #[serde(default)]
     pub shell_integration: Option<bool>,
     /// Answer the closed terminal-query set (Primary Device Attributes

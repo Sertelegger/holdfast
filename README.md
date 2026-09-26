@@ -163,6 +163,35 @@ is licensed by `read_output`'s own `tail_lines` / `tail_bytes` argument
 — a per-call opt-in `get_screen_state` does not have, and neither does
 `holdfast logs --tail`, which asks for the tail inside the holdback.
 
+### Shell history
+
+A session's shell writes no history file under `$HOME` (GH #252), however
+the session ends: `exit`, EOF, `terminate`, `holdfast daemon stop` or a
+daemon crash. Every session starts with `HISTFILE=/dev/null`, an empty
+`fish_history` and a zsh `HISTORY_IGNORE` matching Holdfast's snippet;
+fish is started `--private`; and the integration snippet, which begins
+with a space, sets `HISTFILE=/dev/null` in bash and unsets it in zsh
+after your rc files have run.
+
+To keep a record of what an agent ran instead, set
+
+```toml
+[terminal]
+shell_history_file = "per_session"
+```
+
+Each bash and zsh session then appends its history, one command at a
+time, to `~/.holdfast/logs/history/<session_id>.history`
+(`$HOLDFAST_RUNTIME_DIR/logs/history/` for an explicit instance): `0600`
+files in a `0700` directory, kept after their sessions end and never
+rotated or deleted by Holdfast. They hold what the shell saw, unredacted.
+fish sessions stay private either way.
+
+With `shell_integration: false` only the environment applies: an rc file
+that sets `HISTFILE` itself decides where bash and zsh save history — and
+macOS's `/etc/zshrc` sets one for every zsh — and a per-session file is
+written only when and if the shell saves its history on its own.
+
 ## Build and try it
 
 From a checkout, which is the only way in today — the paragraph after the
