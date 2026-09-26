@@ -247,6 +247,7 @@ pub(crate) mod out {
                     HANGUP_POLL_PERIOD,
                     poll_one,
                     std::thread::sleep,
+                    std::time::Instant::now,
                 );
                 if gone {
                     reader_gone();
@@ -320,7 +321,13 @@ pub(crate) mod out {
     ///
     /// `POLLNVAL` — a descriptor `poll` cannot wait on, or on macOS one
     /// whose filter could not be registered — ends the wait and not the
-    /// process: the next write decides there too.
+    /// process: the next write decides there too. A `poll` interrupted by
+    /// a signal is not an answer, and the wait goes on.
+    ///
+    /// `poll`, `pause` and `now` are [`poll_one`], `std::thread::sleep` and
+    /// `Instant::now` outside tests. A test passes its own, so that what
+    /// each poll answers and how long it took are values it chose rather
+    /// than ones the kernel and the scheduler did.
     #[cfg(unix)]
     fn wait_for_reader_to_leave(
         fd: libc::c_int,
@@ -328,9 +335,10 @@ pub(crate) mod out {
         period: std::time::Duration,
         mut poll: impl FnMut(&mut libc::pollfd, std::time::Duration) -> std::io::Result<libc::c_int>,
         mut pause: impl FnMut(std::time::Duration),
+        mut now: impl FnMut() -> std::time::Instant,
     ) -> bool {
         loop {
-            let started = std::time::Instant::now();
+            let started = now();
             let mut pfd = libc::pollfd {
                 fd,
                 events,
@@ -343,7 +351,7 @@ pub(crate) mod out {
                 Err(e) if e.kind() == std::io::ErrorKind::Interrupted => {}
                 Err(_) => return false,
             }
-            let rest = period.saturating_sub(started.elapsed());
+            let rest = period.saturating_sub(now().saturating_duration_since(started));
             if !rest.is_zero() {
                 pause(rest);
             }
@@ -399,6 +407,7 @@ pub(crate) mod out {
     #[cfg(all(test, unix))]
     mod tests {
         use super::*;
+        use std::cell::Cell;
         use std::io::{self, Write};
         use std::os::fd::AsRawFd;
         use std::os::unix::fs::OpenOptionsExt;
@@ -407,6 +416,35 @@ pub(crate) mod out {
         /// What a `poll` stand-in answers to end a wait it has seen enough of.
         fn stop() -> io::Result<libc::c_int> {
             Err(io::Error::from_raw_os_error(libc::EBADF))
+        }
+
+        fn ms(n: u64) -> Duration {
+            Duration::from_millis(n)
+        }
+
+        /// A clock that moves only when the test moves it: the `poll`
+        /// stand-in by how long that poll took, the `pause` stand-in by
+        /// how long it paused.
+        struct Clock {
+            origin: Instant,
+            elapsed: Cell<Duration>,
+        }
+
+        impl Clock {
+            fn new() -> Self {
+                Self {
+                    origin: Instant::now(),
+                    elapsed: Cell::new(Duration::ZERO),
+                }
+            }
+
+            fn now(&self) -> Instant {
+                self.origin + self.elapsed.get()
+            }
+
+            fn advance(&self, by: Duration) {
+                self.elapsed.set(self.elapsed.get() + by);
+            }
         }
 
         #[test]
@@ -452,6 +490,7 @@ pub(crate) mod out {
                     Ok(1)
                 },
                 |_| {},
+                Instant::now,
             );
             assert!(
                 gone,
@@ -481,6 +520,7 @@ pub(crate) mod out {
                     poll_one(pfd, timeout)
                 },
                 std::thread::sleep,
+                Instant::now,
             );
             assert!(gone, "this kernel never reported the reader leaving");
             assert!(
@@ -491,7 +531,8 @@ pub(crate) mod out {
 
         #[test]
         fn an_answer_the_wait_does_not_act_on_is_paced_not_spun() {
-            let period = Duration::from_millis(200);
+            let period = ms(200);
+            let clock = Clock::new();
             let mut polls = 0;
             let mut pauses = Vec::new();
             let gone = wait_for_reader_to_leave(
@@ -506,14 +547,119 @@ pub(crate) mod out {
                     pfd.revents = libc::POLLRDBAND;
                     Ok(1)
                 },
-                |d| pauses.push(d),
+                |d| {
+                    pauses.push(d);
+                    clock.advance(d);
+                },
+                || clock.now(),
             );
             assert!(!gone);
-            assert_eq!(pauses.len(), 5, "one pause per early answer: {pauses:?}");
-            assert!(
-                pauses.iter().all(|d| *d > period / 2),
-                "each pause is the rest of the period: {pauses:?}"
+            assert_eq!(
+                pauses, [period; 5],
+                "an answer that took no time is followed by the whole period"
             );
+        }
+
+        /// A poll that took part of the period is followed by the rest of
+        /// it; one that took all of it, or longer, by no pause at all.
+        #[test]
+        fn a_slow_answer_is_followed_by_only_the_rest_of_the_period() {
+            let took = [ms(50), ms(200), ms(300), ms(199)];
+            let clock = Clock::new();
+            let polls = Cell::new(0);
+            let mut pauses = Vec::new();
+            let gone = wait_for_reader_to_leave(
+                libc::STDOUT_FILENO,
+                libc::POLLRDBAND,
+                ms(200),
+                |pfd, _| {
+                    let Some(t) = took.get(polls.get()) else {
+                        return stop();
+                    };
+                    polls.set(polls.get() + 1);
+                    clock.advance(*t);
+                    pfd.revents = libc::POLLRDBAND;
+                    Ok(1)
+                },
+                |d| {
+                    pauses.push((polls.get(), d));
+                    clock.advance(d);
+                },
+                || clock.now(),
+            );
+            assert!(!gone);
+            assert_eq!(
+                pauses,
+                [(1, ms(150)), (4, ms(1))],
+                "(the poll a pause followed, the pause)"
+            );
+        }
+
+        /// A signal interrupting `poll` is not an answer: the wait goes on,
+        /// paced like any other retry.
+        #[test]
+        fn an_interrupted_poll_keeps_waiting() {
+            let period = ms(200);
+            let clock = Clock::new();
+            let mut polls = 0;
+            let mut pauses = Vec::new();
+            let gone = wait_for_reader_to_leave(
+                libc::STDOUT_FILENO,
+                libc::POLLRDBAND,
+                period,
+                |pfd, _| {
+                    polls += 1;
+                    match polls {
+                        1 => Err(io::Error::from_raw_os_error(libc::EINTR)),
+                        2 => {
+                            pfd.revents = libc::POLLHUP;
+                            Ok(1)
+                        }
+                        _ => stop(),
+                    }
+                },
+                |d| {
+                    pauses.push(d);
+                    clock.advance(d);
+                },
+                || clock.now(),
+            );
+            assert!(gone, "an interrupted poll ended the wait");
+            assert_eq!(polls, 2);
+            assert_eq!(pauses, [period]);
+        }
+
+        /// `POLLNVAL` ends the wait at the first answer that carries it,
+        /// and not as the reader leaving — even beside `POLLHUP` or
+        /// `POLLERR`.
+        #[test]
+        fn a_descriptor_poll_cannot_wait_on_ends_the_wait_at_once() {
+            for revents in [
+                libc::POLLNVAL,
+                libc::POLLNVAL | libc::POLLHUP,
+                libc::POLLNVAL | libc::POLLERR,
+            ] {
+                let clock = Clock::new();
+                let mut polls = 0;
+                let gone = wait_for_reader_to_leave(
+                    libc::STDOUT_FILENO,
+                    libc::POLLRDBAND,
+                    ms(200),
+                    |pfd, _| {
+                        polls += 1;
+                        match polls {
+                            1 => pfd.revents = revents,
+                            2 => pfd.revents = libc::POLLHUP,
+                            _ => return stop(),
+                        }
+                        Ok(1)
+                    },
+                    |d| clock.advance(d),
+                    || clock.now(),
+                );
+                assert!(!gone, "{revents:#x}: reported the reader gone");
+                assert_eq!(polls, 1, "{revents:#x}: polled again after it");
+            }
         }
 
         /// The descriptor that makes the pacing necessary, against this
@@ -556,6 +702,7 @@ pub(crate) mod out {
                     poll_one(pfd, timeout)
                 },
                 std::thread::sleep,
+                Instant::now,
             );
             assert!(!gone, "reported gone with the reader still open");
             assert!(polls <= 8, "{polls} polls in six periods: the wait spun");
