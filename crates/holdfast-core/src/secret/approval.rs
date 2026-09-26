@@ -44,10 +44,11 @@
 //! registry is where a later hand adds one**: 0.0.10 renders this same
 //! lifecycle at
 //! `GET /api/binding-approvals`, and the field crosses the HTTP API the
-//! moment it does. 0.0.8's revision found exactly this shape on
-//! `confirmation/list_pending`, whose `expires_at` had to become
-//! `expires_at_unix_secs` after it shipped; this is its sibling, named
-//! correctly before it exists. The tree's guard —
+//! moment it does. §7.4.1's `confirmation/list_pending` row had exactly
+//! this shape until spec rev. 47 renamed its `expires_at` to
+//! `expires_at_unix_secs`; that method belongs to the dangerous-command
+//! preflight, which is not built. This is its sibling, named correctly
+//! before it exists. The tree's guard —
 //! `no_declared_timestamp_carries_a_bare_name` in `tests/schema.rs` —
 //! walks `TOOLS` and **reaches neither a frame nor this struct**, so on
 //! these two surfaces the rule is held by reading rather than by a test.

@@ -4641,8 +4641,9 @@ fn the_attach_protocol_carries_no_confirmation_frame() {
     // dropped.** §7.5 now carries `ApproveBinding`, which is §9.6's
     // *binding* approval and not a confirmation redemption: §23.2
     // separates the two security subsystems on purpose (§17.5's
-    // lifecycle versus §17.2's, different trust models), and 0.0.8's
-    // `confirmation` kind still gets no frame of its own. A substring
+    // lifecycle versus §17.2's, different trust models), and §17.2's
+    // `confirmation` kind — the dangerous-command preflight's, which is
+    // not built — gets no frame of its own. A substring
     // ban cannot tell the two apart; a list of exactly which kinds may
     // contain the word can, and it is strictly stronger — an
     // `ApproveConfirmation` added later fails here where the old ban
@@ -4811,7 +4812,8 @@ async fn a_call_waiting_on_a_dying_session_still_owns_its_own_session_died() {
         .daemon
         .attach_hub()
         .secrets()
-        .matches_outstanding(&s.id, &raised));
+        .submission_bounds(&s.id, &raised)
+        .is_some());
 
     pty.exit(7);
 

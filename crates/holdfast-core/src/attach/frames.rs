@@ -507,8 +507,9 @@ pub enum ServerFrame {
     /// being *"a claim the value does not support"*. If a later milestone
     /// puts the deadline on this frame (0.0.10 renders the same lifecycle
     /// at `GET /api/binding-approvals`), it is `expires_at_unix_secs`, an
-    /// integer, from the first line it is written. §9.4's sibling defect
-    /// on `confirmation/list_pending` is what that rule was learned from.
+    /// integer, from the first line it is written. §7.4.1's
+    /// `confirmation/list_pending` row — specified for the dangerous-command
+    /// preflight, which is not built — carries its deadline the same way.
     ///
     /// **Between `SecretRequestClosed` and `ProtocolError`**, which is
     /// §7.5's order with `TransferProgress` (0.0.9) not yet present — see

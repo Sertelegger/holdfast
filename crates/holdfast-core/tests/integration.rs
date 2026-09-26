@@ -3452,9 +3452,9 @@ fn read_args(session: &str) -> ReadOutputArgs {
 async fn started_session(server: &HoldfastServer) -> String {
     // `..Default::default()`, not an exhaustive literal. 0.0.2 gave
     // `StartSessionArgs` four more fields and derived `Default` for
-    // exactly this reason; 0.0.4 adds `screen_tracking` and 0.0.8 adds
-    // more. Naming every field here is `error[E0063]: missing fields`
-    // today and a re-break every milestone after.
+    // exactly this reason; 0.0.4 added `screen_tracking` and 0.0.7
+    // `profile` and `vars`. Naming every field here is `error[E0063]:
+    // missing fields` today and a re-break every milestone after.
     let r = server
         .start_session(Parameters(StartSessionArgs {
             command: Some("bash".into()),

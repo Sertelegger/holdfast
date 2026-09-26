@@ -1980,8 +1980,8 @@ async fn write_response<W: tokio::io::AsyncWrite + Unpin>(
                 ErrorCode::FrameTooLarge,
                 format!(
                     "the response to this request was {len} bytes, over the {}-byte limit; \
-                     lower [limits] output_buffer_bytes or resource_read_max_bytes, or ask \
-                     for fewer bytes",
+                     ask for fewer bytes with `max_bytes`, or lower [limits] \
+                     resource_read_max_bytes",
                     frame::MAX_FRAME_BYTES
                 ),
             );

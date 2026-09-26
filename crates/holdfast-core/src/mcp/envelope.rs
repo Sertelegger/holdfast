@@ -20,7 +20,8 @@ pub enum Status {
     Timeout,
     SessionDied,
     // §18.1 puts `requires_confirmation` between `session_died` and
-    // these two; it is 0.0.8's, so on this tree they land adjacent.
+    // these two; it belongs to the dangerous-command preflight (§9.3),
+    // which is not built, so on this tree they land adjacent.
     SecretProvided,
     SecretCancelled,
     SessionNotFound,
@@ -28,7 +29,7 @@ pub enum Status {
     LimitReached,
     SpawnFailed,
     // §18.1 puts `confirmation_invalid` between `spawn_failed` and this
-    // one; also 0.0.8's, also absent here.
+    // one; also the preflight's, also absent here.
     NotSupportedOnPlatform,
     Unavailable,
 }
