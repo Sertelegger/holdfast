@@ -170,7 +170,7 @@ the session ends: `exit`, EOF, `terminate`, `holdfast daemon stop` or a
 daemon crash. Every session starts with `HISTFILE=/dev/null`, an empty
 `fish_history` and a zsh `HISTORY_IGNORE` matching Holdfast's snippet;
 fish is started `--private`; and the integration snippet, which begins
-with a space, sets `HISTFILE=/dev/null` in bash and unsets it in zsh
+with a space, sets `HISTFILE=/dev/null` in bash and zsh
 after your rc files have run.
 
 To keep a record of what an agent ran instead, set

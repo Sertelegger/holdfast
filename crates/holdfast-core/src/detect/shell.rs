@@ -257,12 +257,16 @@ const BASH_INTEGRATION: &str = concat!(
 /// re-wrap above depends on the true order, and it was measured rather
 /// than taken from here.
 const ZSH_INTEGRATION: &str = concat!(
-    // GH #252, ahead of the guard for bash's reason. zsh has no default
-    // history file, so `unset` saves nothing; a session history file needs
-    // `SAVEHIST` (0 by default) and is appended per command.
+    // GH #252, ahead of the guard for bash's reason. `/dev/null` and not
+    // `unset`, for bash's reason too and one of zsh's own: oh-my-zsh and
+    // prezto assign `HISTFILE` only when it is empty, so an unset one is
+    // re-armed by `source ~/.zshrc`, and an unset variable is not exported,
+    // so `exec zsh` and a nested zsh start without it (measured). A session
+    // history file needs `SAVEHIST` (0 by default) and is appended per
+    // command.
     r#" if [[ -n ${HOLDFAST_HISTFILE-} ]]; then HISTFILE=$HOLDFAST_HISTFILE; "#,
     r#"(( SAVEHIST > 0 )) || SAVEHIST=10000; (( HISTSIZE >= SAVEHIST )) || HISTSIZE=$SAVEHIST; "#,
-    r#"setopt inc_append_history; else unset HISTFILE; fi; "#,
+    r#"setopt inc_append_history; else HISTFILE=/dev/null; fi; "#,
     r#"if [ -z "${HOLDFAST_SHELL_INTEGRATION-}" ] && [[ "${PS1-}" != *"133;A"* ]]; then "#,
     r#"HOLDFAST_SHELL_INTEGRATION=1; "#,
     r#"__holdfast_preexec() { printf '\033]133;C;holdfast=1\007' }; "#,
@@ -559,13 +563,18 @@ mod tests {
             .find("HISTFILE=${HOLDFAST_HISTFILE:-/dev/null}")
             .expect("bash assigns HISTFILE");
         assert!(set < bash.find(guard).unwrap(), "{bash}");
-        assert!(
-            !bash.contains("unset HISTFILE"),
-            "unset sends `history -a` to ~/.history: {bash}"
-        );
         let zsh = Shell::Zsh.integration_snippet();
-        let unset = zsh.find("unset HISTFILE").expect("zsh unsets HISTFILE");
-        assert!(unset < zsh.find(guard).unwrap(), "{zsh}");
+        let set = zsh
+            .find("else HISTFILE=/dev/null;")
+            .expect("zsh assigns HISTFILE");
+        assert!(set < zsh.find(guard).unwrap(), "{zsh}");
+        for snippet in [bash, zsh] {
+            assert!(
+                !snippet.contains("unset HISTFILE"),
+                "an unset HISTFILE is re-armed by a conditional rc and not \
+                 inherited by `exec`: {snippet}"
+            );
+        }
     }
 
     #[test]

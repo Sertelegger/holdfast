@@ -21,6 +21,9 @@
 //! - zsh with an oh-my-zsh-style history block, `inc_append_history` and
 //!   `share_history` without `hist_ignore_space`, which writes each line
 //!   before it runs;
+//! - zsh with oh-my-zsh's and prezto's conditional `HISTFILE` line, after
+//!   the agent runs `source ~/.zshrc` or `exec zsh` — the line re-arms
+//!   `~/.zsh_history` whenever the session's `HISTFILE` is unset;
 //! - fish, as Holdfast spawns it, with and without a config that sets
 //!   `fish_history` itself, and fish started through `env`, which Holdfast
 //!   does not recognise and so reaches only through the environment.
@@ -68,6 +71,15 @@ const BASH_HARD_RC: &str =
 const ZSH_OMZ_RC: &str = "HISTFILE=~/.zsh_history\nHISTSIZE=10000\nSAVEHIST=10000\n\
                           setopt share_history inc_append_history\n";
 
+/// oh-my-zsh's and prezto's own history line: `HISTFILE` assigned only when
+/// it is empty. After an `unset HISTFILE` that re-arms `~/.zsh_history` on
+/// `source ~/.zshrc`, on `exec zsh` (oh-my-zsh's `omz reload`) and in a
+/// nested zsh, and `share_history` then writes every later line as it is
+/// typed.
+const ZSH_CONDITIONAL_RC: &str = "[ -z \"$HISTFILE\" ] && HISTFILE=\"$HOME/.zsh_history\"\n\
+                                  HISTSIZE=10000\nSAVEHIST=10000\n\
+                                  setopt share_history inc_append_history\n";
+
 /// One shell configuration.
 #[derive(Clone, Copy)]
 struct Case {
@@ -77,17 +89,20 @@ struct Case {
     /// Files written into the session's `HOME` first, relative to it.
     files: &'static [(&'static str, &'static str)],
     integration: bool,
+    /// Lines the agent types before the marker, each run to completion.
+    before: &'static [&'static str],
     /// The program whose absence skips the case.
     needs: &'static str,
 }
 
-const BASH_AND_ZSH: [Case; 5] = [
+const BASH_AND_ZSH: [Case; 7] = [
     Case {
         name: "bash-no-rc",
         command: "bash",
         args: &[],
         files: &[],
         integration: true,
+        before: &[],
         needs: "bash",
     },
     Case {
@@ -96,6 +111,7 @@ const BASH_AND_ZSH: [Case; 5] = [
         args: &[],
         files: &[],
         integration: false,
+        before: &[],
         needs: "bash",
     },
     Case {
@@ -104,6 +120,7 @@ const BASH_AND_ZSH: [Case; 5] = [
         args: &[],
         files: &[(".bashrc", BASH_HARD_RC), (".history", "")],
         integration: true,
+        before: &[],
         needs: "bash",
     },
     Case {
@@ -112,6 +129,7 @@ const BASH_AND_ZSH: [Case; 5] = [
         args: &[],
         files: &[(".zshrc", "")],
         integration: true,
+        before: &[],
         needs: "zsh",
     },
     Case {
@@ -120,6 +138,25 @@ const BASH_AND_ZSH: [Case; 5] = [
         args: &[],
         files: &[(".zshrc", ZSH_OMZ_RC)],
         integration: true,
+        before: &[],
+        needs: "zsh",
+    },
+    Case {
+        name: "zsh-conditional-rc-resourced",
+        command: "zsh",
+        args: &[],
+        files: &[(".zshrc", ZSH_CONDITIONAL_RC)],
+        integration: true,
+        before: &["source ~/.zshrc"],
+        needs: "zsh",
+    },
+    Case {
+        name: "zsh-conditional-rc-exec-zsh",
+        command: "zsh",
+        args: &[],
+        files: &[(".zshrc", ZSH_CONDITIONAL_RC)],
+        integration: true,
+        before: &["exec zsh"],
         needs: "zsh",
     },
 ];
@@ -131,6 +168,7 @@ const FISH: [Case; 3] = [
         args: &[],
         files: &[],
         integration: true,
+        before: &[],
         needs: "fish",
     },
     Case {
@@ -139,6 +177,7 @@ const FISH: [Case; 3] = [
         args: &[],
         files: &[(".config/fish/config.fish", "set -g fish_history fish\n")],
         integration: true,
+        before: &[],
         needs: "fish",
     },
     Case {
@@ -147,6 +186,7 @@ const FISH: [Case; 3] = [
         args: &["fish"],
         files: &[],
         integration: true,
+        before: &[],
         needs: "fish",
     },
 ];
@@ -443,6 +483,11 @@ fn start(inst: &Instance, shim: &mut Shim, case: Case, label: &str) -> Started {
         pid,
         home,
     };
+    // Typed back to back: the shell reads each line only once the one
+    // before it has finished, `exec` included.
+    for line in case.before {
+        send(shim, &s, line, true);
+    }
     let mark = format!("{MARK}{}", case.name.replace('-', "_"));
     let (head, tail) = mark.split_at(MARK.len());
     send(shim, &s, &format!("echo {head}''{tail}"), true);

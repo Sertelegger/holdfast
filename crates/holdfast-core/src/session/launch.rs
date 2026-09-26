@@ -383,9 +383,8 @@ pub const ZSH_HISTORY_IGNORE: &str = "*HOLDFAST_SHELL_INTEGRATION*";
 ///   on a fish it spawns itself (`Shell::spawn_args`) does not.
 /// - **`HISTORY_IGNORE`**, [`ZSH_HISTORY_IGNORE`]. zsh's
 ///   `inc_append_history` and `share_history` write a line when it is
-///   entered, before it runs, so the snippet's own `unset HISTFILE`
-///   reached the rc's history file whenever `hist_ignore_space` was off
-///   (measured). The pattern matches only lines that name the snippet's
+///   entered, before it runs, so the snippet's own line reached the rc's
+///   history file whenever `hist_ignore_space` was off (measured). The pattern matches only lines that name the snippet's
 ///   guard variable, so a history file zsh rewrites keeps every other
 ///   line (measured).
 ///
