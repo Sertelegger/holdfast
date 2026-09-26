@@ -1940,10 +1940,16 @@ impl HoldfastServer {
     /// yields 47), and non-ASCII bytes are recorded as Latin-1. A truncated
     /// tail looks exactly like a complete shorter command, with no ellipsis
     /// and no error, so do not read `command` as a transcript of what ran.
-    /// `command` is null when no text was captured at all, because the
-    /// prompt's markers did not arrive (a prompt framework that regenerates
-    /// the prompt can do this); the exit code and output span are still
-    /// exact. `status` reports it for the newest entry as `command_capture`.
+    /// `command` is null when no text was captured at all: the command's
+    /// `C` marker had no `B` marker in front of it. A prompt framework that
+    /// regenerates the prompt over the markers does this, as does a shell
+    /// integration that emits no `B`, and the exit code and output span are
+    /// still exact. A program that printed a `C` marker in its own output
+    /// does it too, and that entry is not a command: it carries the exit
+    /// code and the rest of the output of the command that printed it,
+    /// whose own entry stays open. `status` reports the newest entry's
+    /// state as `command_capture`, which describes the last command
+    /// recorded and cannot predict the next.
     #[tool(
         annotations(
             title = "List commands run, with exit codes",
@@ -6085,6 +6091,8 @@ mod tests {
             "80 columns",
             "Latin-1",
             "null when no text was captured",
+            "in its own output",
+            "cannot predict the next",
         ] {
             assert!(
                 description.contains(needle),
