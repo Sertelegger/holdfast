@@ -249,9 +249,10 @@ set -uo pipefail
 #
 #   shell_history.rs's fish row (GH #252) — exempt HERE for the same reason
 #   as the one above, and measured by the same job: `fish-req-ts-008` runs
-#   it against its PPA fish and fails on a skip. It passes on fish 3.7.0,
-#   4.8.1 and 4.9.3 (measured 2026-09-26). RETIRED BY: any fish in the
-#   `test` job's apt line.
+#   it against its PPA fish and fails on a skip. It passes on fish 3.7.0
+#   and 4.9.3 (measured 2026-09-26, after fish moved from `--private` to
+#   `-C`; the PPA's 4.8.x is measured by that job). RETIRED BY: any fish in
+#   the `test` job's apt line.
 EXPECTED=(
   "fish_integration_emits_the_measured_marker_stream_and_exact_exit_codes|skipping: fish not installed — the fish snippet remains"
   "only_answering_da1_takes_fish_to_its_first_prompt|skipping: fish not installed — REQ-TS-008's three arms need|skipping: fish not installed at a version this row measures"

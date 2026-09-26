@@ -37,19 +37,73 @@ impl Shell {
     }
 
     /// Arguments Holdfast puts **ahead of** the caller's own when it spawns
-    /// this shell: `--private` for fish, so it never writes its history
-    /// file (GH #252; the whole policy is `session::launch::history_defaults`).
+    /// this shell: `-C` [`FISH_HISTORY_INIT`] for fish, so it never writes
+    /// or reads a history file (GH #252; the whole policy is
+    /// `session::launch::history_defaults`).
     ///
     /// Ahead, because an option after a script operand is the script's
     /// argument rather than fish's. Applied whether or not the snippet is
     /// typed, since it is not typed: it is how fish is started.
     pub fn spawn_args(self) -> &'static [&'static str] {
         match self {
-            Self::Fish => &["--private"],
+            Self::Fish => &["-C", FISH_HISTORY_INIT],
             Self::Bash | Self::Zsh => &[],
         }
     }
 }
+
+/// What Holdfast puts ahead of the caller's arguments when it spawns
+/// `command args` with the call's own `env` (GH #252): the recognised
+/// shell's [`Shell::spawn_args`], unless the call sets `fish_history`
+/// itself — that choice then stands, as a `HISTFILE` the call sets does
+/// for bash and zsh.
+pub fn history_spawn_args(
+    command: &str,
+    args: &[String],
+    env: &[(String, String)],
+) -> &'static [&'static str] {
+    if env.iter().any(|(k, _)| k == "fish_history") {
+        return &[];
+    }
+    detect_shell(command, args).map_or(&[], Shell::spawn_args)
+}
+
+/// fish's half of the history policy (GH #252), run by `-C`: after
+/// config.fish and before the first prompt. Measured on fish 3.7.0, 4.0.2
+/// and 4.9.3, with no config and with one that sets `fish_history`
+/// globally, universally or from a `PWD` handler, through `exit`, EOF,
+/// `SIGHUP` and `SIGKILL`: nothing reached disk, and the operator's
+/// existing history file was not read.
+///
+/// - **`fish_history` empty**, which keeps history in memory only. Here
+///   and not only in the environment, because config.fish runs after the
+///   environment is read and its own assignment would win.
+/// - **Pinned empty** by `__holdfast_history`, for configuration that
+///   re-points it later — a per-directory history plugin does, on every
+///   `cd`.
+/// - **`fish_private_mode` exported**, so a fish started inside the session
+///   is private whatever its own config.fish says. At the first prompt and
+///   not here, because the default `fish_greeting` announces private mode:
+///   by then this session's greeting has run (fish runs `fish_prompt`
+///   handlers in the order they were defined, and the greeting's comes
+///   first), so its output starts as a plain fish's does. A nested fish
+///   prints the announcement; a fish that ran the handlers in another order
+///   would too, and would still keep nothing.
+///
+/// **Not `--private`**, which this was until measured: every session's
+/// output began *fish is running in private mode, history will not be
+/// persisted*; with a config.fish that sets `fish_history`, the session
+/// read the operator's history file and offered its lines as
+/// autosuggestions, into output the agent reads; and its
+/// `fish_private_mode` is not exported, so a nested fish under that config
+/// wrote its history.
+pub const FISH_HISTORY_INIT: &str = concat!(
+    "set -g fish_history ''; ",
+    "function __holdfast_history --on-variable fish_history; ",
+    "if test -n \"$fish_history\"; set -g fish_history ''; end; end; ",
+    "function __holdfast_private --on-event fish_prompt; ",
+    "set -gx fish_private_mode 1; functions -e __holdfast_private; end",
+);
 
 /// Recognise a shell from a `start_session` command line.
 ///
@@ -360,7 +414,7 @@ const ZSH_INTEGRATION: &str = concat!(
 /// before the call) is not applied by this milestone.
 const FISH_INTEGRATION: &str = concat!(
     // The leading space keeps the line out of fish's history (GH #252);
-    // `--private` (`Shell::spawn_args`) keeps everything else out.
+    // `FISH_HISTORY_INIT` keeps everything else out.
     r#" if not set -q HOLDFAST_SHELL_INTEGRATION; "#,
     r#"set -g HOLDFAST_SHELL_INTEGRATION 1; "#,
     r#"functions -q __holdfast_orig_fish_prompt; "#,
@@ -599,9 +653,22 @@ mod tests {
 
     #[test]
     fn only_fish_is_spawned_with_history_arguments() {
-        assert_eq!(Shell::Fish.spawn_args(), ["--private"]);
+        assert_eq!(Shell::Fish.spawn_args(), ["-C", FISH_HISTORY_INIT]);
         assert!(Shell::Bash.spawn_args().is_empty());
         assert!(Shell::Zsh.spawn_args().is_empty());
+
+        let none: &[(String, String)] = &[];
+        let own = [("fish_history".to_string(), "work".to_string())];
+        assert_eq!(
+            history_spawn_args("/usr/bin/fish", &args(&["-l"]), none),
+            Shell::Fish.spawn_args()
+        );
+        assert!(
+            history_spawn_args("fish", &[], &own).is_empty(),
+            "the call's own fish_history must stand"
+        );
+        assert!(history_spawn_args("fish", &args(&["-c", "ls"]), none).is_empty());
+        assert!(history_spawn_args("bash", &[], none).is_empty());
     }
 
     #[test]

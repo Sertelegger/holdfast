@@ -293,16 +293,19 @@ impl HoldfastServer {
         // directory come from (GH #46, GH #55).
         let launch = self.resolve_launch(&args)?;
         let mut cfg = PtySpawnConfig::new(&launch.command);
-        // GH #252: fish is spawned `--private`, ahead of the caller's
-        // arguments, whether or not the snippet will be typed. The argv
-        // that runs is what the audit row records; the session reports the
-        // caller's, as it reports none of the environment defaults below.
-        cfg.args = detect_shell(&launch.command, &launch.args)
-            .map_or(&[][..], |shell| shell.spawn_args())
-            .iter()
-            .map(|a| a.to_string())
-            .chain(launch.args.iter().cloned())
-            .collect();
+        // GH #252: fish is spawned with `Shell::spawn_args`' history
+        // policy ahead of the caller's arguments, whether or not the
+        // snippet will be typed — unless the call's own `env` names a
+        // `fish_history`, which then stands, as a `HISTFILE` it sets does
+        // for bash and zsh. The argv that runs is what the audit row
+        // records; the session reports the caller's, as it reports none of
+        // the environment defaults below.
+        cfg.args =
+            crate::detect::shell::history_spawn_args(&launch.command, &launch.args, &launch.env)
+                .iter()
+                .map(|a| a.to_string())
+                .chain(launch.args.iter().cloned())
+                .collect();
         // Issued before the spawn because a per-session history file is
         // named by it (GH #252); `new_session_id` is pure.
         let session_id = new_session_id();

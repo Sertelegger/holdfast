@@ -24,9 +24,13 @@
 //! - zsh with oh-my-zsh's and prezto's conditional `HISTFILE` line, after
 //!   the agent runs `source ~/.zshrc` or `exec zsh` — the line re-arms
 //!   `~/.zsh_history` whenever the session's `HISTFILE` is unset;
-//! - fish, as Holdfast spawns it, with and without a config that sets
-//!   `fish_history` itself, and fish started through `env`, which Holdfast
-//!   does not recognise and so reaches only through the environment.
+//! - fish, as Holdfast spawns it, with and without shell integration and
+//!   a config that sets `fish_history` itself — at start-up, or on every
+//!   `cd` as a per-directory history plugin does — and a fish the agent
+//!   starts inside a fish session; and fish started through `env`, which
+//!   Holdfast does not recognise and so reaches only through the
+//!   environment;
+//! - tcsh with a `savehist` rc, for the endings Holdfast brings about.
 //!
 //! Every session gets its own `HOME`, and the assertion is over **every
 //! file** under it rather than over the names a shell is expected to use:
@@ -89,8 +93,9 @@ struct Case {
     /// Files written into the session's `HOME` first, relative to it.
     files: &'static [(&'static str, &'static str)],
     integration: bool,
-    /// Lines the agent types before the marker, each run to completion.
-    before: &'static [&'static str],
+    /// Lines the agent types before the marker, each with text to wait for
+    /// in the output before typing on, or `""` to type straight on.
+    before: &'static [(&'static str, &'static str)],
     /// Whether a graceful `terminate` or `daemon stop` hangs this shell up
     /// (GH #234) rather than waiting out the grace for `SIGKILL`.
     hung_up: bool,
@@ -155,7 +160,7 @@ const BASH_AND_ZSH: [Case; 7] = [
         args: &[],
         files: &[(".zshrc", ZSH_CONDITIONAL_RC)],
         integration: true,
-        before: &["source ~/.zshrc"],
+        before: &[("source ~/.zshrc", "")],
         hung_up: true,
         needs: "zsh",
     },
@@ -165,13 +170,13 @@ const BASH_AND_ZSH: [Case; 7] = [
         args: &[],
         files: &[(".zshrc", ZSH_CONDITIONAL_RC)],
         integration: true,
-        before: &["exec zsh"],
+        before: &[("exec zsh", "")],
         hung_up: true,
         needs: "zsh",
     },
 ];
 
-const FISH: [Case; 3] = [
+const FISH: [Case; 5] = [
     Case {
         name: "fish-default",
         command: "fish",
@@ -186,9 +191,32 @@ const FISH: [Case; 3] = [
         name: "fish-config-sets-history",
         command: "fish",
         args: &[],
-        files: &[(".config/fish/config.fish", "set -g fish_history fish\n")],
+        files: &[(".config/fish/config.fish", FISH_SETS_HISTORY)],
         integration: true,
         before: &[],
+        hung_up: true,
+        needs: "fish",
+    },
+    Case {
+        name: "fish-config-sets-history-unintegrated",
+        command: "fish",
+        args: &[],
+        files: &[(".config/fish/config.fish", FISH_SETS_HISTORY)],
+        integration: false,
+        before: &[],
+        hung_up: true,
+        needs: "fish",
+    },
+    Case {
+        name: "fish-config-repoints-history",
+        command: "fish",
+        args: &[],
+        files: &[
+            (".config/fish/config.fish", FISH_REPOINTS_HISTORY),
+            (".local/share/fish/fish_history", FISH_OPERATOR_HISTORY),
+        ],
+        integration: true,
+        before: &[("cd /", ""), ("history | cat", "")],
         hung_up: true,
         needs: "fish",
     },
@@ -203,6 +231,39 @@ const FISH: [Case; 3] = [
         needs: "fish",
     },
 ];
+
+/// A config.fish that names its own history session, which beats the
+/// environment's empty `fish_history`.
+const FISH_SETS_HISTORY: &str = "set -g fish_history fish\n";
+
+/// What the operator's own fish history already holds. A session must not
+/// read it either: fish offers its lines as autosuggestions and lists them
+/// in `history`, and both land in the output the agent reads.
+const FISH_OPERATOR_HISTORY: &str = "- cmd: echo OPERATORS_OWN_HISTORY\n  when: 1\n";
+
+/// A per-directory history plugin's shape: `fish_history` re-pointed on
+/// every `cd`, after anything that ran at start-up.
+const FISH_REPOINTS_HISTORY: &str =
+    "function per_dir_history --on-variable PWD\n  set -g fish_history fish\nend\n";
+
+/// A fish the agent starts inside a fish session, under a config.fish that
+/// names its own history session. Holdfast types nothing into it, so what
+/// keeps it private is the session's exported `fish_private_mode`. Only
+/// endings that reach both shells at once: an `exit` would end the inner
+/// one alone.
+const FISH_NESTED: Case = Case {
+    name: "fish-nested",
+    command: "fish",
+    args: &[],
+    files: &[(".config/fish/config.fish", FISH_SETS_HISTORY)],
+    integration: true,
+    // fish 4 reads its terminal's answers at start-up and drops what was
+    // typed ahead of them, so the marker waits for the inner fish; its
+    // private-mode announcement is also the sign that it is private.
+    before: &[("fish", "fish is running in private mode")],
+    hung_up: false,
+    needs: "fish",
+};
 
 /// FreeBSD's default `.cshrc` history lines. tcsh reads nothing from the
 /// environment that could redirect `savehist`, so with these it saves its
@@ -524,17 +585,35 @@ fn start(inst: &Instance, shim: &mut Shim, case: Case, label: &str) -> Started {
         pid,
         home,
     };
-    // Typed back to back: the shell reads each line only once the one
-    // before it has finished, `exec` included.
-    for line in case.before {
+    // Typed back to back unless a line says otherwise: the shell reads
+    // each line only once the one before it has finished, `exec` included.
+    for (line, ready) in case.before {
         send(shim, &s, line, true);
+        if !ready.is_empty() {
+            await_output(shim, &s, ready);
+        }
     }
     let mark = format!("{MARK}{}", case.name.replace('-', "_"));
     let (head, tail) = mark.split_at(MARK.len());
     send(shim, &s, &format!("echo {head}''{tail}"), true);
     await_output(shim, &s, &mark);
     await_prompt(shim, &s);
+    let out = output(shim, &s);
+    assert!(
+        !out.contains("OPERATORS_OWN_HISTORY"),
+        "{}: the session read the operator's history: {out:?}",
+        case.name
+    );
     s
+}
+
+/// Everything the session has printed so far.
+fn output(shim: &mut Shim, s: &Started) -> String {
+    let r = shim.call(
+        "read_output",
+        json!({ "session": s.id, "since_cursor": 0, "max_bytes": 262144 }),
+    );
+    r["data"]["output"].as_str().unwrap_or_default().to_string()
 }
 
 fn send(shim: &mut Shim, s: &Started, data: &str, newline: bool) {
@@ -548,11 +627,7 @@ fn send(shim: &mut Shim, s: &Started, data: &str, newline: bool) {
 fn await_output(shim: &mut Shim, s: &Started, needle: &str) {
     let deadline = Instant::now() + SHELL_TIMEOUT;
     loop {
-        let r = shim.call(
-            "read_output",
-            json!({ "session": s.id, "since_cursor": 0, "max_bytes": 262144 }),
-        );
-        let out = r["data"]["output"].as_str().unwrap_or_default().to_string();
+        let out = output(shim, s);
         if out.contains(needle) {
             return;
         }
@@ -787,12 +862,31 @@ fn fish_keeps_nothing_in_home_however_a_session_ends() {
         return;
     }
     every_ending("fish", &FISH);
+    run_endings(
+        "fish-nested",
+        &[FISH_NESTED],
+        &[Ending::ForceTerminate, Ending::DaemonKill],
+    );
+    fish_starts_as_a_plain_fish_does();
     let version = Command::new("fish")
         .arg("--version")
         .output()
         .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
         .unwrap_or_default();
     eprintln!("shell-history measured against {version}");
+}
+
+/// A fish Holdfast spawns prints nothing a plain fish would not: no
+/// private-mode announcement from `fish_greeting`, which `--private` put at
+/// the top of every fish session's output.
+fn fish_starts_as_a_plain_fish_does() {
+    let inst = Instance::new("fish-greeting");
+    let mut shim = Shim::launch(&inst);
+    let s = start(&inst, &mut shim, FISH[0], "Greeting");
+    let out = output(&mut shim, &s);
+    assert!(!out.contains("private mode"), "{out:?}");
+    end(&mut shim, &s, Ending::ForceTerminate);
+    shim.kill();
 }
 
 /// tcsh, which Holdfast neither hangs up nor reaches through the
