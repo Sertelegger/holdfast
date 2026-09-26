@@ -1179,14 +1179,16 @@ mod tests {
     /// dies on the text that follows the header, so nothing is held and
     /// nothing is masked on its account.
     ///
-    /// The file is read from disk for the reason
+    /// The corpus is the frozen changelog snapshot, real prose rather than
+    /// a synthesised fixture, for the reasons
     /// `the_documented_read_loop_drains_this_repositorys_own_changelog`
-    /// gives, and the corpus carries `[REDACTED:unresolved]` as prose too,
-    /// so the assertion is that the stream adds none.
+    /// gives. It carries `[REDACTED:unresolved]` as prose too, so the
+    /// assertion is that the stream adds none.
     #[test]
     fn the_stream_masks_no_prose_anchor_in_this_repositorys_changelog() {
-        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../CHANGELOG.md");
-        let text = std::fs::read(path).expect("the repository's own changelog");
+        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("tests/fixtures/prose/changelog-0.0.8-long.md");
+        let text = std::fs::read(&path).unwrap_or_else(|e| panic!("read {}: {e}", path.display()));
         let anchors = |t: &[u8]| {
             t.windows(31)
                 .filter(|w| *w == b"-----BEGIN RSA PRIVATE KEY-----")

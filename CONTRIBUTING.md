@@ -266,6 +266,9 @@ Grep the value, not the key. `"outputSchema"` being present says nothing.
   ordered, and work that lands out of order usually has to be redone.
 - Say in the PR which of the four checks you ran, and — for a new test — which
   defect you injected to watch it fail.
+- A user-visible change gets a `CHANGELOG.md` entry under `## [Unreleased]`,
+  citing its issue. At most 3 lines per entry; the issue and the PR carry the
+  detail. `scripts/release-notes.sh --self-test` refuses a longer one.
 
 ## Releases
 

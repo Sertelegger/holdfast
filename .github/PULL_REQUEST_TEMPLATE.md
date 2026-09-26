@@ -24,3 +24,4 @@ Write "no test changes" if that's the case.
 - [ ] If an advertised number changed (a byte cap, a default, a threshold): the constant and the schema description it appears in moved together
 - [ ] If anything platform-gated changed: clippy is clean for `--target x86_64-pc-windows-gnu`
 - [ ] If this changes what Holdfast claims to support: `README.md`, `CHANGELOG.md`, and — for anything touching detection, signals, secrets, or output — `SECURITY.md` are updated
+- [ ] `CHANGELOG.md`: at most 3 lines per entry; the issue and the PR carry the detail

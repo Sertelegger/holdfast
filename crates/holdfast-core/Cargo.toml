@@ -26,16 +26,18 @@ protocols. The API tracks that binary's needs and is not yet stable.\
 # `tests/` builds and runs from one.
 #
 # **This started as `["/tests/*.rs", "/tests/wire-shape"]` and that was
-# wrong**, which is the whole reason the rule is now one named file. Three
+# wrong**, which is the whole reason the rule is now one named file. Five
 # `#[cfg(test)]` blocks in `src/` read files under `tests/` as data, and a
 # pattern that drops test *sources* silently takes two of them with it:
 #
-#   src/config.rs:1797 ............. include_str! tests/fixtures/example_config.toml
-#   src/secret/provider.rs:1658 .... reads tests/secrets.rs
-#   src/secret/binding.rs:3667 ..... reads tests/secrets.rs
+#   src/config.rs:1883 ................ include_str! tests/fixtures/example_config.toml
+#   src/secret/provider.rs:1658 ....... reads tests/secrets.rs
+#   src/secret/binding.rs:3667 ........ reads tests/secrets.rs
+#   src/output/mod.rs:2619 ............ reads tests/fixtures/prose/
+#   src/attach/redact_stream.rs:1186 .. reads tests/fixtures/prose/
 #
 # Only the first is an `include_str!` and so only the first fails at compile
-# time; the other two are `env!("CARGO_MANIFEST_DIR")` joins that panic at
+# time; the others are `env!("CARGO_MANIFEST_DIR")` joins that panic at
 # *run* time. Measured on the tarball built with the pattern above:
 #
 #   panicked at src/secret/provider.rs:1689:33: read
