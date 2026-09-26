@@ -542,7 +542,7 @@ pub struct Resolved {
     /// surface shows (§7.5, §7.6.3, §18.7).
     pub binding_name: String,
     /// The §9.6 config spelling, as [`super::ArgvProvider::as_str`] gives
-    /// it — the same string `binding_resolved` and (0.0.8's)
+    /// it — the same string `binding_resolved` and
     /// `BindingApprovalRequired` put on the wire.
     pub provider: String,
     /// How many times this binding has resolved **in this session**,
