@@ -22,6 +22,11 @@ Then, and only when there is something to say:
   measured from OSC 133 or a terminal mode, so `interaction_mode` on that row
   is a good guess and not a fact. A reader deciding whether to act on
   "AtPrompt" needs to know which one they have.
+- **Flag any session whose `command_capture` is `missing`.** Its newest
+  command history entry has no command text (`command: null`), because the
+  prompt's OSC 133 markers are not arriving — usually a prompt framework such
+  as starship regenerating the prompt. Exit codes and output spans are still
+  exact; what was typed is not in the history.
 - **Flag `AwaitingSecret`.** That session is blocked on a password prompt and
   must be answered with `request_secret_input`, never `send_input`.
 - **Flag sessions in `Exited`/`Dead` state that are still retained**, with

@@ -319,16 +319,18 @@ impl PromptDetector {
         // Between `D` and the next `A` a shell is drawing its prompt, and
         // answering `Executing` there is right because it is momentary —
         // `a_completed_command_is_not_yet_a_prompt`. When the prompt is
-        // being regenerated over Holdfast's wrapping, `A` never comes, so
-        // "momentary" becomes "for the rest of the session": every idle
-        // prompt reads `Executing` / `semantic` / 0.00 and a pattern-less
-        // wait runs out its deadline. bash ≥ 5.1 hides it behind the
-        // bracketed-paste rung above; a shell with the paste off does not.
+        // being regenerated over the `A`/`B` markers — Holdfast's or a
+        // foreign integration's, which a regenerated `PS1` loses alike —
+        // `A` never comes, so "momentary" becomes "for the rest of the
+        // session": every idle prompt reads `Executing` / `semantic` / 0.00
+        // and a pattern-less wait runs out its deadline. bash ≥ 5.1 hides
+        // it behind the bracketed-paste rung above; a shell with the paste
+        // off does not.
         //
         // Scoped as narrowly as the evidence: a `D` alone still means
-        // "between commands", and only a session that has already shown a
-        // `B`-less `C` loses the rung — to T2 and T3, which is where a
-        // session with no working T1 prompt signal belongs.
+        // "between commands", and only a session whose latest `C` found no
+        // `B` in front of it loses the rung — to T2 and T3, which is where
+        // a session with no working T1 prompt signal belongs.
         let t1_executing = t1
             && !(self.scanner.last_marker() == Some(b'D') && self.scanner.prompt_markers_missing());
 
@@ -1583,6 +1585,24 @@ mod tests {
             "{s:?}"
         );
 
+        // The same stream from a foreign integration: its `A`/`B` live in
+        // the prompt too, and a regenerated prompt loses them the same way.
+        let (mut d, start, now) = detector();
+        d.feed_at(
+            b"\x1b]133;D;0\x07user@host:~$ ls\r\n\x1b]133;C\x07\
+              out\r\n\x1b]133;D;0\x07user@host:~$ ",
+            0,
+            None,
+            start,
+        );
+        assert_eq!(d.osc133_source(), Some(Osc133Source::External));
+        let s = d.snapshot_at(true, ld(false, false), None, None, now);
+        assert_eq!(
+            (s.interaction_mode, s.detection_tier),
+            (InteractionMode::AtPrompt, DetectionTier::Heuristic),
+            "{s:?}"
+        );
+
         // The healthy session between the same `D` and its `A` — the state
         // `a_completed_command_is_not_yet_a_prompt` pins — is unchanged:
         // there the `D` is momentary, and a `B` in front of the `C` is
@@ -2815,7 +2835,7 @@ mod tests {
                     vec![
                         Osc133::CommandStart,
                         Osc133::OutputStart {
-                            command: "ls\nrm -rf /".into(),
+                            command: Some("ls\nrm -rf /".into()),
                             truncated: false,
                         }
                     ],
