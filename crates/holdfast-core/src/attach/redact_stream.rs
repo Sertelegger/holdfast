@@ -88,8 +88,7 @@ pub const STREAM_CARRY_BYTES: usize = 8192;
 /// nothing else; the benefit is that the residual matches the number the
 /// requirement states. It cannot be made unbounded: a window that never
 /// forgot its prefix would blacken an observer's stream for the rest of
-/// the session on `-----BEGIN CERTIFICATE-----`, which matches the
-/// prefix and can never match the pattern.
+/// the session on any candidate that stays believed and never completes.
 const WITHHOLD_WINDOW_BYTES: usize = 2 * STREAM_CARRY_BYTES;
 
 /// How much of the stream behind a join point a joining observer's
@@ -148,9 +147,14 @@ pub const RESUME_CONTEXT_BYTES: usize = if UNVOUCHED_CARRY_BYTES > WITHHOLD_WIND
 /// sliding window, after which streaming resumes mid-body — the same
 /// shape as REQ-O-011a's own *"a secret continuing above row 0 … is
 /// outside the window"*. (b) `-----BEGIN CERTIFICATE-----` matches
-/// `private-key-block`'s **prefix** and never its pattern, so a
-/// certificate dump costs one `[REDACTED:unresolved]` and up to
-/// `2 × STREAM_CARRY_BYTES` of dropped output before the stream recovers.
+/// `private-key-block`'s **prefix**, and the rule's automaton dies on the
+/// `-` after the label, so a certificate whose label arrives as plain
+/// text streams through unchanged at any chunk split. A label broken by a
+/// byte some view removes — an escape sequence inside `CERTIFICATE` —
+/// cannot be judged dead (`PrefixIndex::binary_in_flight`'s second
+/// guard), and the stripped view reads a well-formed PEM header, so that
+/// certificate is treated as a key: one `[REDACTED:unresolved]` in its
+/// place, and residual (a) once it outgrows the carry.
 /// Neither licenses going back to flushing raw.
 ///
 /// **A third residual is GH #142 at *this* boundary, and it is worse

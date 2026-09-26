@@ -447,7 +447,9 @@ pub struct LimitsConfig {
     #[serde(default = "d_max_concurrent_sessions")]
     pub max_concurrent_sessions: usize,
     /// `0` **disables** reaping for a session (REQ-S-004, §4.2). One of
-    /// the two keys in this file where zero is legal.
+    /// the two keys in this file where zero is a documented "disable"
+    /// value; `Config::validate` covers the keys that load at zero
+    /// without one.
     #[serde(default = "d_default_idle_timeout_secs")]
     pub default_idle_timeout_secs: u64,
     #[serde(default = "d_output_buffer_bytes")]
@@ -838,7 +840,10 @@ pub struct SessionProfile {
     pub cwd: Option<String>,
 }
 
-/// One operator-configured secret binding (§9.6). **Unread in 0.0.5.**
+/// One operator-configured secret binding (§9.6), read by
+/// [`crate::secret::select`]: the first binding in configured order whose
+/// [`profile`](Self::profile) the session carries, and whose
+/// [`match_prompt`](Self::match_prompt) admits the prompt when one is set.
 #[derive(Debug, Clone, PartialEq, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct SecretBinding {
@@ -1030,9 +1035,9 @@ pub struct AdapterPromptPattern {
 #[serde(deny_unknown_fields)]
 pub struct DaemonConfig {
     /// The client-less daemon exit (§7.3, REQ-D-006). **`0` disables
-    /// it** — the second of the two keys in this file where zero is
-    /// legal. §7.3 says the exit is *"configurable, can be disabled"*
-    /// and names no value; `0` is the spelling
+    /// it** — the second of the two keys in this file where zero is a
+    /// documented "disable" value. §7.3 says the exit is *"configurable,
+    /// can be disabled"* and names no value; `0` is the spelling
     /// `[limits] default_idle_timeout_secs` already uses for the same
     /// idea in the same file.
     #[serde(default = "d_idle_shutdown_after_secs")]
@@ -1317,13 +1322,19 @@ impl Config {
     /// prevent: the operator believes a limit is in force and it is not.
     pub fn validate(&self) -> Result<(), ConfigError> {
         let l = &self.limits;
-        // Zero is legal in exactly two places in this file, and both are
-        // documented "disable" values: `[limits] default_idle_timeout_secs`
-        // (REQ-S-004) and `[daemon] idle_shutdown_after_secs` (§7.3).
-        // A blanket `> 0` validator makes two documented capabilities
-        // unreachable. `[ui] ui_bridge_pinned_port = 0` is a third zero,
+        // Zero is a documented "disable" value for exactly two keys in
+        // this file: `[limits] default_idle_timeout_secs` (REQ-S-004) and
+        // `[daemon] idle_shutdown_after_secs` (§7.3). A blanket `> 0`
+        // validator makes two documented capabilities unreachable.
+        // `[ui] ui_bridge_pinned_port = 0` is a third documented zero,
         // but it is a port rather than a cap and §10.2's own comment
         // spells it as the default.
+        //
+        // **Those are not the only keys that load at zero.** Several
+        // have no `nonzero` floor below and no documented meaning for
+        // zero, and `limits.redaction_lookbehind_bytes` is one of them:
+        // at `0` a context rule loses its label at a read boundary and
+        // the value is returned unredacted (GH #171).
         nonzero("limits.max_concurrent_sessions", l.max_concurrent_sessions)?;
         nonzero("limits.output_buffer_bytes", l.output_buffer_bytes)?;
         nonzero(
@@ -1406,9 +1417,9 @@ impl Config {
         // (`daemon::server::write_response`) and it **rejects**, so a
         // buffer cap that reaches it guarantees every response built at
         // that size is refused at the wire — not a slow degradation, a
-        // hard failure on the first oversized read. This is the
-        // cross-check `write_response`'s doc comment names as still
-        // owed.
+        // hard failure on the first oversized read. `write_response`'s
+        // refusal is the runtime backstop; this is the startup check that
+        // keeps a configured cap from reaching it.
         //
         // **Do not size the headroom off the cap alone; redaction can
         // make the encoded body *larger* than the raw bytes that went

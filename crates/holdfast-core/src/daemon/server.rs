@@ -1939,12 +1939,13 @@ async fn peer_gone(stream: &UnixStream) {
 /// to go on.
 ///
 /// Not reachable at shipped defaults — the worst case is a few MiB
-/// against a 16 MiB cap — but reachable **through configuration alone**:
-/// `output_buffer_bytes` and `resource_read_max_bytes` take only
-/// `nonzero()`, with no ceiling and no cross-check against
-/// [`frame::MAX_FRAME_BYTES`]. A `Config::validate` clause requiring
-/// headroom under that cap is the other half of this fix and is still
-/// owed; it turns a runtime failure into a named startup rejection.
+/// against a 16 MiB cap. The two limits that could reach it through
+/// configuration, `output_buffer_bytes` and `resource_read_max_bytes`,
+/// are capped by `Config::validate` at [`frame::MAX_FRAME_BYTES`]` / 4`,
+/// which leaves room for redaction to grow a response; that check
+/// carries the growth arithmetic and refuses to start rather than fail
+/// here. This arm is the backstop if a response crosses the cap anyway,
+/// and it turns a dropped connection into a named refusal.
 ///
 /// **The refusal is safe to follow with a second frame**, and that is
 /// why it can be sent at all: `frame::encode` runs to completion before
@@ -2573,9 +2574,10 @@ mod tests {
     #[tokio::test]
     async fn an_oversized_response_is_refused_by_name_and_not_by_silence() {
         // Built here rather than provoked through a tool: the shipped
-        // limits cannot reach 16 MiB, and the configurations that can —
-        // `output_buffer_bytes`, `resource_read_max_bytes`, neither
-        // bounded above — are exactly what this guard is for.
+        // limits cannot reach 16 MiB, and `Config::validate` caps the two
+        // that could — `output_buffer_bytes`, `resource_read_max_bytes` —
+        // at a quarter of it. This guard is for a response that crosses
+        // the cap anyway.
         let over = Response::ok(
             7,
             &method::CborValue::Bytes(vec![0u8; frame::MAX_FRAME_BYTES]),

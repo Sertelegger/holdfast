@@ -38,7 +38,7 @@ pub const MIN_PREFIX_LEN: usize = 3;
 /// block) opts out.
 ///
 /// **Superseded for most rules by [`PrefixIndex::still_alive`] (GH #142)**
-/// and kept for the three places that outlive it: the nine
+/// and kept for the three places that outlive it: the
 /// `has_value_group` context rules on the raw stream (GH #152),
 /// [`trailing_value_run_start`], and the fallback when a rule's liveness
 /// automaton could not be built.
@@ -181,12 +181,14 @@ fn liveness_pattern(pattern: &str) -> Option<String> {
 /// keeps [`is_value_byte`], which holds strictly more.
 ///
 /// **Latent today, and that is why it is computed rather than noted.**
-/// The nine `has_value_group` context rules are exactly the ones whose
-/// declared prefixes sit inside their own match, and
-/// [`PrefixIndex::earliest_partial`] keeps them on [`is_value_byte`] for
-/// an unrelated reason (GH #152). Closing #152 by moving them across
-/// would land that false DEAD on a shipped rule against an ordinary
-/// env-var line, and a refusal computed here cannot be forgotten there.
+/// The shipped rules whose declared prefixes sit inside their own match
+/// are all `has_value_group` context rules
+/// (`the_liveness_automata_and_the_refusals_are_both_pinned` pins which),
+/// and [`PrefixIndex::earliest_partial`] keeps every context rule on
+/// [`is_value_byte`] for an unrelated reason (GH #152). Closing #152 by
+/// moving them across would land that false DEAD on a shipped rule
+/// against an ordinary env-var line, and a refusal computed here cannot
+/// be forgotten there.
 ///
 /// **What this proves, and what it does not — stated because the
 /// difference is the whole of it.** It proves the match cannot begin
@@ -1016,7 +1018,7 @@ impl PrefixIndex {
     /// measured there against a key it otherwise releases.
     ///
     /// **The `has_value_group` carve-out is untouched, and it is why GH
-    /// #152 stays open.** The nine context rules keep [`is_value_byte`],
+    /// #152 stays open.** The context rules keep [`is_value_byte`],
     /// because their patterns legitimately admit whitespace between the
     /// label and the value — so liveness reports `Password: ` alive, and
     /// a candidate that can still grow never dies at the end of a region
@@ -2784,7 +2786,7 @@ mod tests {
     /// mutation this exists for is indexing by `byte` where the map was
     /// keyed by `byte.to_ascii_lowercase()`: it is invisible on any
     /// lowercase input and silently un-indexes every `(?i)` rule — which
-    /// is all nine context rules — against uppercase output.
+    /// is most of the context rules — against uppercase output.
     #[test]
     fn every_first_byte_routes_to_the_bucket_the_map_held() {
         for (label, rules) in [

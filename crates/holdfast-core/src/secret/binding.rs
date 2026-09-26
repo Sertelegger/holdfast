@@ -64,9 +64,8 @@
 //! REQ-SEC-012 rests on**: nothing an agent writes may choose which
 //! binding fires or what is looked up. `redacted_command_line` chooses
 //! nothing and looks nothing up — it takes the session's command line and
-//! hands back a string to *show a human*. It is a sink, not a subject,
-//! and the two are kept apart deliberately; see its own doc for why
-//! unifying them would break the matcher.
+//! hands back a string to *show a human*. It is a sink, not a subject:
+//! nothing selects on a command line, redacted or not.
 //!
 //! [`Approval`]: crate::secret::Approval
 //!
@@ -273,11 +272,13 @@ use crate::session::Session;
 
 use super::provider::{resolve, ProviderError};
 
-/// The session's own command line, as a binding matches it.
+/// The session's own command line as one string: `command` then `args`,
+/// single spaces, **no shell quoting**.
 ///
-/// `command` then `args`, single spaces, **no shell quoting** — see the
-/// module header for why there is no quoting scheme and why this string
-/// exists only here.
+/// It exists to be shown, not matched. A binding selects on the session's
+/// operator-declared `profile`, narrowed by `match_prompt` (GH #46; the
+/// module header's "The two subjects"), and the one non-test caller is
+/// [`redacted_command_line`], which renders this line for a human.
 pub fn command_line(command: &str, args: &[String]) -> String {
     if args.is_empty() {
         return command.to_string();
@@ -292,7 +293,7 @@ pub fn command_line(command: &str, args: &[String]) -> String {
     line
 }
 
-/// The same line, for a **human** rather than for a matcher.
+/// [`command_line`], redacted and stripped for a **human** to read.
 ///
 /// §17.5's approval asks somebody to agree that *this command line* may
 /// receive *this credential*, so the line has to be on the frame. It also
@@ -326,14 +327,10 @@ pub fn command_line(command: &str, args: &[String]) -> String {
 /// let it do. Pinned by
 /// `an_unterminated_escape_in_one_argument_does_not_reach_the_next`.
 ///
-/// **Not what [`select`] matches against, and the two must not be
-/// unified.** The matcher reads the *unredacted, unstripped* join, for the
-/// same reason `match_prompt` reads the unredacted prompt line: matching a
-/// processed string would let the redactor silently switch an operator's
-/// binding off — or, worse here, switch a *different* one on. It is also
-/// what keeps the two honest about each other: an operator's pattern that
-/// admits an argument containing an escape sequence still selects, and the
-/// human is still shown a line they can read.
+/// **Not a subject of [`select`].** A binding selects on the session's
+/// `profile`, narrowed by `match_prompt` against the unredacted prompt
+/// line; neither this string nor the unredacted join is matched against,
+/// so redacting and stripping it here switches no binding on or off.
 ///
 /// [`one_line_for_display`]: crate::output::ansi::one_line_for_display
 pub fn redacted_command_line(
