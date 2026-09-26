@@ -24,12 +24,12 @@
 //! — a published key this loader did not model would give an operator
 //! who copied the example verbatim a daemon that refuses to start and an
 //! error naming the *spec's* key as the typo. At the revision this file
-//! was written against that is **43 keys across 7 tables**: `[limits]`
-//! 17, `[terminal]` 5, `[prompts]` 4, `[security]` 5, `[ui]` 4,
+//! was written against that is **44 keys across 7 tables**: `[limits]`
+//! 17, `[terminal]` 6, `[prompts]` 4, `[security]` 5, `[ui]` 4,
 //! `[notifications]` 3, `[daemon]` 5. Read the breakdown, never the
-//! total — 43 was also the pre-rev-48 count across *eight* tables, so a
-//! check against the sum agrees with two revisions while being wrong
-//! against both.
+//! total — 43, the count before `shell_history_file`, was also the
+//! pre-rev-48 count across *eight* tables, so a check against the sum
+//! agrees with two revisions while being wrong against both.
 //!
 //! **"Honoured in 0.0.5? no" means parsed, validated and unread — it
 //! does not mean absent** (REQ-CFG-004's second clause). Each such field
@@ -517,13 +517,15 @@ pub struct TerminalConfig {
     #[serde(default = "d_shell_integration")]
     pub shell_integration: bool,
     /// `none` | `per_session` (GH #252): where a session's shell keeps its
-    /// command history. `none` keeps it off disk. `per_session` gives
-    /// every session `<log dir>/history/<session_id>.history` — `0600`, in
-    /// a `0700` directory, kept after the session ends — so an operator
-    /// can read what an agent ran. fish sessions stay private either way.
-    /// A session started with `shell_integration: false` gets the
-    /// environment alone, so an rc file that sets `HISTFILE` itself wins
-    /// for bash and zsh. See `session::launch::history_defaults`.
+    /// command history. `none` keeps it off disk. `per_session` points
+    /// every session at `<log dir>/history/<session_id>.history` —
+    /// `0600`, in a `0700` directory, kept after the session ends — so an
+    /// operator can read what an agent ran; the file is created up front
+    /// for bash and zsh sessions, and for any other only if a shell it
+    /// starts saves one. fish sessions stay private either way. A session
+    /// started with `shell_integration: false` gets the environment
+    /// alone, so an rc file that sets `HISTFILE` itself wins for bash and
+    /// zsh. See `session::launch::history_defaults`.
     #[serde(default = "d_shell_history_file")]
     pub shell_history_file: String,
 }
@@ -1999,15 +2001,15 @@ mod tests {
             .collect();
         let total: usize = per_table.iter().map(|(_, n)| n).sum();
         assert_eq!(
-            total, 43,
+            total, 44,
             "§10.2's key count moved; per-table: {per_table:?}"
         );
-        // The breakdown, never the sum: 43 was also the pre-rev-48 total
-        // across *eight* tables, so a check against the total agrees with
-        // two revisions of §10.2 while being wrong against both.
+        // The breakdown, never the sum: a total agrees with any revision of
+        // §10.2 that moved a key between tables, and 43 was the total of
+        // two different revisions.
         for (table, want) in [
             ("limits", 17),
-            ("terminal", 5),
+            ("terminal", 6),
             ("prompts", 4),
             ("security", 5),
             ("ui", 4),

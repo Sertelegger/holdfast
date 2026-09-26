@@ -371,7 +371,7 @@ const EFFECTIVE: &[(&str, &str)] = &[
     // ---- [terminal]
     (
         "terminal.shell_history_file",
-        "crates/holdfast-core/src/mcp/tools.rs:420 — start_session reads it; per_session gives the session a HISTFILE of its own under RuntimePaths::history_dir (GH #252).",
+        "crates/holdfast-core/src/mcp/tools.rs:425 — start_session reads it; per_session gives the session a HISTFILE of its own under RuntimePaths::history_dir (GH #252).",
     ),
     // ---- [daemon]
     (

@@ -49,6 +49,17 @@ terminal_query_replies_per_min = 60
 # don't support it.
 shell_integration = true
 
+# Where a session's shell keeps its history (GH #252). "none" keeps it off
+# disk: every session starts with HISTFILE=/dev/null, an empty
+# fish_history and the REPL and database-client history files switched
+# off, fish is started with a -C that keeps its history in memory, and the
+# integration snippet re-applies the policy after the rc files.
+# "per_session" gives each bash/zsh session
+# <log dir>/history/<session_id>.history (0600, never rotated, NOT
+# redacted); fish stays private. With shell_integration off only the
+# environment applies, so an rc file that sets HISTFILE wins.
+shell_history_file = "none"
+
 [prompts]
 # Only used as the tier-3 fallback (§8.6); tiers 1 and 2 are deterministic.
 settle_threshold_ms = 250
