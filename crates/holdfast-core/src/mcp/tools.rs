@@ -2017,8 +2017,9 @@ impl HoldfastServer {
     ///
     /// **You will never see the value.** It travels client → daemon →
     /// PTY and enters no response, no log and no broadcast; what comes
-    /// back is a byte count. You cannot name a secret either: bindings
-    /// match the session's own command line and the observed prompt, and
+    /// back is a byte count. You cannot name a secret either: a binding
+    /// fires only for a session started from an operator-declared
+    /// `profile`, optionally narrowed by the observed prompt, and
     /// `prompt_text` reaches no lookup (§9.6, REQ-SEC-012).
     #[tool(
         annotations(
@@ -4493,8 +4494,9 @@ pub struct RequestSecretInputArgs {
     pub session: String,
     /// What is being asked for, e.g. "sudo password for deploy-user". At
     /// most 512 bytes of UTF-8 (§9.5). This reaches no credential lookup:
-    /// bindings match the session's own command line and the observed
-    /// prompt, never this string (§9.6, REQ-SEC-012).
+    /// bindings match the operator-declared `profile` the session was
+    /// started from, optionally narrowed by the observed prompt — never
+    /// this string (§9.6, REQ-SEC-012).
     pub prompt_text: String,
     /// Default true. §5.2's normalisation is the daemon's job, not the
     /// client's: exactly one trailing `\r\n` or `\n` is stripped from the
