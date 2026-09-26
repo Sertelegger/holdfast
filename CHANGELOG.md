@@ -1208,6 +1208,10 @@ is cut, named and published is in
   Also corrected in passing: `shell.rs` said zsh runs `precmd_functions`
   before the bare `precmd`. zsh 5.9 does the reverse, measured.
 
+- **bash 5.3 at a multibyte prompt recorded a key-by-key command from its last
+  redisplay on** (`echo HOLDFAST` as `o HOLDFAST`): its readline redraws the
+  prompt, markers and all; a redraw no longer restarts the capture ([#220]).
+
 - **Once the daemon stopped, every open client answered `daemon_unreachable`
   until something else started one** ([#231]). `holdfast daemon stop` is the
   only way to load a new build, so this was every upgrade. The shim now
@@ -1482,8 +1486,9 @@ is cut, named and published is in
   because it discarded its write errors; it now ends as soon as its reader has
   gone, including on a session that has stopped printing — `holdfast watch s
   | grep -m1 READY` no longer waits for the session's next output to notice.
-  `attach` is unchanged: its stdout is the terminal it holds in raw mode
-  ([#218]).
+  On macOS that holds for a pipe; a socket or a named FIFO there still waits
+  for the next write. `attach` is unchanged: its stdout is the terminal it
+  holds in raw mode ([#218]).
 
 - **The install documentation recommended routes that do not work, and left
   out the one that bites on every upgrade.** `plugin/README.md` said

@@ -230,43 +230,140 @@ pub(crate) mod out {
     /// answer: ask the kernel about the descriptor instead of the next
     /// write.
     ///
-    /// A thread in `poll(2)` on stdout with no events requested, which
-    /// still reports `POLLERR` — Linux's answer for a pipe whose reader has
-    /// closed — and `POLLHUP`, FreeBSD's for the same and everyone's for a
-    /// hung-up terminal or a socket whose peer has gone. A second's timeout
-    /// is what reaches a kernel that computes those at call time without
-    /// waking a sleeper for them; where a kernel reports neither for an
-    /// empty event set, the thread only ever times out, and the next write
-    /// decides, as it always did. `POLLNVAL` — a descriptor `poll` cannot
-    /// wait on — ends the thread, not the process, for the same reason.
+    /// A thread in `poll(2)` on stdout, asking for what
+    /// [`hangup_events`] says this descriptor needs, until `poll` reports
+    /// `POLLERR` or `POLLHUP` ([`wait_for_reader_to_leave`]). Where the
+    /// kernel reports neither, the thread only ever times out, and the next
+    /// write decides, as it always did.
     #[cfg(unix)]
     pub(crate) fn end_when_reader_leaves() {
+        let events = hangup_events(libc::STDOUT_FILENO);
         let spawned = std::thread::Builder::new()
             .name("stdout-reader-gone".into())
-            .spawn(|| loop {
-                let mut fd = libc::pollfd {
-                    fd: libc::STDOUT_FILENO,
-                    events: 0,
-                    revents: 0,
-                };
-                // SAFETY: one `pollfd`, owned by this frame, and a count of 1.
-                let rc = unsafe { libc::poll(&mut fd, 1, 1000) };
-                if rc < 0 {
-                    if std::io::Error::last_os_error().kind() == std::io::ErrorKind::Interrupted {
-                        continue;
-                    }
-                    return;
-                }
-                if fd.revents & libc::POLLNVAL != 0 {
-                    return;
-                }
-                if fd.revents & (libc::POLLERR | libc::POLLHUP) != 0 {
+            .spawn(move || {
+                let gone = wait_for_reader_to_leave(
+                    libc::STDOUT_FILENO,
+                    events,
+                    HANGUP_POLL_PERIOD,
+                    poll_one,
+                    std::thread::sleep,
+                );
+                if gone {
                     reader_gone();
                 }
             });
         // A thread that could not be started costs only the early exit;
         // the write path still ends the process on its next write.
         drop(spawned);
+    }
+
+    /// How long one `poll` waits, and the shortest interval between two.
+    /// A second is what reaches a kernel that computes `POLLERR`/`POLLHUP`
+    /// at call time without waking a sleeper for them.
+    #[cfg(unix)]
+    const HANGUP_POLL_PERIOD: std::time::Duration = std::time::Duration::from_secs(1);
+
+    /// The events to ask `poll` for on `fd` so that it reports the reader
+    /// leaving: `POLLRDBAND` on a pipe, and nothing on anything else.
+    ///
+    /// **An empty set is enough on Linux and FreeBSD, and is never
+    /// answered on macOS.** `POLLERR` and `POLLHUP` are output-only, and
+    /// Linux (`POLLERR`, for a pipe whose reader has closed) and FreeBSD
+    /// (`POLLHUP`) report them whatever was asked for. XNU's `poll` is
+    /// built on kqueue and registers a filter per *requested* event, so for
+    /// an empty set it registers none and the call can only time out
+    /// (`poll_nocancel`, `bsd/kern/sys_generic.c`). Any read-class event
+    /// registers `EVFILT_READ`, which on a pipe's write end is the
+    /// "neutered" filter: it fires only when the pipe dies, with `EV_EOF`,
+    /// and `poll` reports that as `POLLHUP` (`pipe_kqfilter`,
+    /// `bsd/kern/sys_pipe.c`, xnu-10002 for macOS 14 and xnu-7195 for
+    /// macOS 11 alike). `POLLRDBAND` is the read-class event no pipe ever
+    /// reports on Linux or FreeBSD, so asking for it changes nothing there;
+    /// coreutils asks for it for the same reason (`src/iopoll.c`, *"needed
+    /// for illumos, macOS"*).
+    ///
+    /// **A pipe only**, as coreutils also does, because on macOS the same
+    /// filter means something else on every other descriptor. On a socket
+    /// it fires with `EV_EOF` when the peer has only shut down its *write*
+    /// side — a reader still reading, reported gone. On a terminal it fires
+    /// on typed input that nobody here reads. So those keep the empty set
+    /// they always had: what Linux or FreeBSD report for it still ends the
+    /// wait, and macOS, which reports nothing, leaves them to the next
+    /// write.
+    #[cfg(unix)]
+    fn hangup_events(fd: libc::c_int) -> libc::c_short {
+        let mut st = std::mem::MaybeUninit::<libc::stat>::uninit();
+        // SAFETY: `fstat` writes one `stat` into the buffer it is given,
+        // which is read only when it reports success.
+        let is_pipe = unsafe { libc::fstat(fd, st.as_mut_ptr()) } == 0
+            && (unsafe { st.assume_init() }.st_mode & libc::S_IFMT) == libc::S_IFIFO;
+        if is_pipe {
+            libc::POLLRDBAND
+        } else {
+            0
+        }
+    }
+
+    /// Poll `fd` for `events` until its reader has gone (`true`) or `poll`
+    /// cannot wait on it (`false`), at most once per `period`.
+    ///
+    /// **The pacing is what makes asking for an event safe.** A *named*
+    /// FIFO is `S_IFIFO` too, and on macOS its `EVFILT_READ` is the vnode
+    /// filter, which fires whenever unread bytes sit in the FIFO and never
+    /// on the reader leaving (`filt_vnode_common`,
+    /// `bsd/vfs/vfs_vnops.c`). `holdfast watch s > fifo` behind a slow
+    /// reader can therefore make `poll` return at once, every time, with
+    /// an answer this loop does not act on; unpaced, that is one core spun
+    /// for as long as the reader lags. Paced, it is one wakeup a period,
+    /// which the timeout already costs, and the next write decides, as on
+    /// any descriptor the kernel says nothing about.
+    ///
+    /// `POLLNVAL` — a descriptor `poll` cannot wait on, or on macOS one
+    /// whose filter could not be registered — ends the wait and not the
+    /// process: the next write decides there too.
+    #[cfg(unix)]
+    fn wait_for_reader_to_leave(
+        fd: libc::c_int,
+        events: libc::c_short,
+        period: std::time::Duration,
+        mut poll: impl FnMut(&mut libc::pollfd, std::time::Duration) -> std::io::Result<libc::c_int>,
+        mut pause: impl FnMut(std::time::Duration),
+    ) -> bool {
+        loop {
+            let started = std::time::Instant::now();
+            let mut pfd = libc::pollfd {
+                fd,
+                events,
+                revents: 0,
+            };
+            match poll(&mut pfd, period) {
+                Ok(_) if pfd.revents & libc::POLLNVAL != 0 => return false,
+                Ok(_) if pfd.revents & (libc::POLLERR | libc::POLLHUP) != 0 => return true,
+                Ok(_) => {}
+                Err(e) if e.kind() == std::io::ErrorKind::Interrupted => {}
+                Err(_) => return false,
+            }
+            let rest = period.saturating_sub(started.elapsed());
+            if !rest.is_zero() {
+                pause(rest);
+            }
+        }
+    }
+
+    /// One `poll(2)` of one descriptor, for at most `timeout`.
+    #[cfg(unix)]
+    fn poll_one(
+        fd: &mut libc::pollfd,
+        timeout: std::time::Duration,
+    ) -> std::io::Result<libc::c_int> {
+        let ms = libc::c_int::try_from(timeout.as_millis()).unwrap_or(libc::c_int::MAX);
+        // SAFETY: one `pollfd`, owned by the caller, and a count of 1.
+        let rc = unsafe { libc::poll(fd, 1, ms) };
+        if rc < 0 {
+            Err(std::io::Error::last_os_error())
+        } else {
+            Ok(rc)
+        }
     }
 
     fn failed(e: &std::io::Error) -> ! {
@@ -297,6 +394,173 @@ pub(crate) mod out {
     #[cfg(not(unix))]
     fn reader_gone() -> ! {
         std::process::exit(i32::from(crate::commands::EXIT_FAILED))
+    }
+
+    #[cfg(all(test, unix))]
+    mod tests {
+        use super::*;
+        use std::io::{self, Write};
+        use std::os::fd::AsRawFd;
+        use std::os::unix::fs::OpenOptionsExt;
+        use std::time::{Duration, Instant};
+
+        /// What a `poll` stand-in answers to end a wait it has seen enough of.
+        fn stop() -> io::Result<libc::c_int> {
+            Err(io::Error::from_raw_os_error(libc::EBADF))
+        }
+
+        #[test]
+        fn only_a_pipe_is_asked_for_an_event() {
+            let (_r, w) = io::pipe().expect("pipe");
+            assert_eq!(hangup_events(w.as_raw_fd()), libc::POLLRDBAND);
+            let file = tempfile::tempfile().expect("tempfile");
+            assert_eq!(hangup_events(file.as_raw_fd()), 0, "a regular file");
+            let (sock, _peer) = std::os::unix::net::UnixStream::pair().expect("socketpair");
+            assert_eq!(hangup_events(sock.as_raw_fd()), 0, "a socket");
+            assert_eq!(hangup_events(-1), 0, "a descriptor fstat refuses");
+        }
+
+        /// **macOS's `poll`, on the one axis this code depends on, so that
+        /// a Linux run can fail the way a Mac does.** XNU registers a
+        /// kqueue filter per requested event and none for an empty set, so
+        /// a descriptor asked for nothing is never reported; asked for a
+        /// read-class event, a pipe's write end is reported `POLLHUP` once
+        /// its reader has gone (`poll_nocancel`, `pipe_kqfilter`). Linux
+        /// reports `POLLERR` for an empty set, which is why the real pipe
+        /// row below cannot catch a regression to one here and this row
+        /// can.
+        #[test]
+        fn a_reader_leaving_is_seen_by_a_poll_that_ignores_an_empty_event_set() {
+            const READ_CLASS: libc::c_short =
+                libc::POLLIN | libc::POLLRDNORM | libc::POLLPRI | libc::POLLRDBAND | libc::POLLHUP;
+            let (r, w) = io::pipe().expect("pipe");
+            drop(r);
+            let mut polls = 0;
+            let gone = wait_for_reader_to_leave(
+                w.as_raw_fd(),
+                hangup_events(w.as_raw_fd()),
+                Duration::from_millis(1),
+                |pfd, _| {
+                    polls += 1;
+                    if polls > 3 {
+                        return stop();
+                    }
+                    if pfd.events & READ_CLASS == 0 {
+                        return Ok(0);
+                    }
+                    pfd.revents = libc::POLLHUP;
+                    Ok(1)
+                },
+                |_| {},
+            );
+            assert!(
+                gone,
+                "a macOS kernel is never told to report the reader leaving"
+            );
+        }
+
+        /// The same, against this kernel: nothing while the reader is
+        /// there, and the verdict once it has gone.
+        #[test]
+        fn a_real_pipe_reports_its_reader_leaving_and_not_before() {
+            let (r, w) = io::pipe().expect("pipe");
+            let mut reader = Some(r);
+            let mut polls = 0;
+            let gone = wait_for_reader_to_leave(
+                w.as_raw_fd(),
+                hangup_events(w.as_raw_fd()),
+                Duration::from_millis(50),
+                |pfd, timeout| {
+                    polls += 1;
+                    if polls == 3 {
+                        reader = None;
+                    }
+                    if polls > 20 {
+                        return stop();
+                    }
+                    poll_one(pfd, timeout)
+                },
+                std::thread::sleep,
+            );
+            assert!(gone, "this kernel never reported the reader leaving");
+            assert!(
+                reader.is_none(),
+                "reported gone at poll {polls}, with the reader still open"
+            );
+        }
+
+        #[test]
+        fn an_answer_the_wait_does_not_act_on_is_paced_not_spun() {
+            let period = Duration::from_millis(200);
+            let mut polls = 0;
+            let mut pauses = Vec::new();
+            let gone = wait_for_reader_to_leave(
+                libc::STDOUT_FILENO,
+                libc::POLLRDBAND,
+                period,
+                |pfd, _| {
+                    polls += 1;
+                    if polls > 5 {
+                        return stop();
+                    }
+                    pfd.revents = libc::POLLRDBAND;
+                    Ok(1)
+                },
+                |d| pauses.push(d),
+            );
+            assert!(!gone);
+            assert_eq!(pauses.len(), 5, "one pause per early answer: {pauses:?}");
+            assert!(
+                pauses.iter().all(|d| *d > period / 2),
+                "each pause is the rest of the period: {pauses:?}"
+            );
+        }
+
+        /// The descriptor that makes the pacing necessary, against this
+        /// kernel: on macOS a named FIFO's read filter fires while unread
+        /// output sits in it, so an unpaced wait here spins.
+        #[test]
+        fn a_named_fifo_holding_unread_output_does_not_spin_the_wait() {
+            let dir = tempfile::tempdir().expect("tempdir");
+            let path = dir.path().join("fifo");
+            let c =
+                std::ffi::CString::new(std::os::unix::ffi::OsStrExt::as_bytes(path.as_os_str()))
+                    .expect("path");
+            // SAFETY: a NUL-terminated path that outlives the call.
+            assert_eq!(unsafe { libc::mkfifo(c.as_ptr(), 0o600) }, 0, "mkfifo");
+            // The reader first, and non-blocking, so opening the writer
+            // does not wait for one.
+            let reader = std::fs::OpenOptions::new()
+                .read(true)
+                .custom_flags(libc::O_NONBLOCK)
+                .open(&path)
+                .expect("open the reader");
+            let mut writer = std::fs::OpenOptions::new()
+                .write(true)
+                .open(&path)
+                .expect("open the writer");
+            writer.write_all(b"unread").expect("write");
+
+            let period = Duration::from_millis(50);
+            let end = Instant::now() + period * 6;
+            let mut polls = 0;
+            let gone = wait_for_reader_to_leave(
+                writer.as_raw_fd(),
+                hangup_events(writer.as_raw_fd()),
+                period,
+                |pfd, timeout| {
+                    if Instant::now() >= end {
+                        return stop();
+                    }
+                    polls += 1;
+                    poll_one(pfd, timeout)
+                },
+                std::thread::sleep,
+            );
+            assert!(!gone, "reported gone with the reader still open");
+            assert!(polls <= 8, "{polls} polls in six periods: the wait spun");
+            drop(reader);
+        }
     }
 }
 
