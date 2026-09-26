@@ -1603,6 +1603,28 @@ mod tests {
             "{s:?}"
         );
 
+        // The withdrawal is scoped to the `D`. The same broken session with
+        // its next command running — stopped after that command's `C`,
+        // which had no `B` either — is still `Executing` on the shell's own
+        // word: a running command is running whether or not its text was
+        // captured.
+        let (mut d, start, now) = detector();
+        d.feed_at(
+            b"\x1b]133;D;0;holdfast=1\x07user@host:~$ ls\r\n\x1b]133;C;holdfast=1\x07\
+              out\r\n\x1b]133;D;0;holdfast=1\x07user@host:~$ sleep 9\r\n\
+              \x1b]133;C;holdfast=1\x07",
+            0,
+            None,
+            start,
+        );
+        assert!(d.scanner.prompt_markers_missing(), "fixture: no `B`");
+        let s = d.snapshot_at(true, ld(false, false), None, None, now);
+        assert_eq!(
+            (s.interaction_mode, s.detection_tier),
+            (InteractionMode::Executing, DetectionTier::Semantic),
+            "{s:?}"
+        );
+
         // The healthy session between the same `D` and its `A` — the state
         // `a_completed_command_is_not_yet_a_prompt` pins — is unchanged:
         // there the `D` is momentary, and a `B` in front of the `C` is

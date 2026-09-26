@@ -1148,7 +1148,8 @@ mod tests {
     /// has its text is independent of whose markers are in use. Under each
     /// source a `C` with its `B` is captured and one without is not — the
     /// entry says so with `command: None`, never `""` — and
-    /// `command_capture` follows the newest entry in both directions.
+    /// `command_capture` follows the newest entry, open or closed, in both
+    /// directions.
     #[test]
     fn an_uncaptured_command_says_so_under_every_source() {
         // (source, a cycle whose `C` has its `B`, then a cycle with none)
@@ -1176,19 +1177,31 @@ mod tests {
             let mut sc = ModeScanner::new();
             let mut h = CommandHistory::new(100);
             assert_eq!(h.command_capture(), None, "{source}: before any command");
+            // The bare cycle arrives in two parts, so the answer is read
+            // while its command is still running as well as after its `D`:
+            // the newest entry speaks whether it is open or closed.
+            let d = bare
+                .windows(7)
+                .rposition(|w| w == b"\x1b]133;D")
+                .expect("fixture: the bare cycle ends in a `D`");
+            let (running, done) = bare.split_at(d);
             let mut at = 0u64;
-            for chunk in [framed, bare] {
+            for (chunk, want, open) in [
+                (framed, CommandCapture::Captured, false),
+                (running, CommandCapture::Missing, true),
+                (done, CommandCapture::Missing, false),
+            ] {
                 for ev in sc.feed(chunk, at, None) {
                     h.apply(&ev, 1_000);
                 }
                 at += chunk.len() as u64;
-                if chunk == framed {
-                    assert_eq!(
-                        h.command_capture(),
-                        Some(CommandCapture::Captured),
-                        "{source}"
-                    );
-                }
+                let newest = h.entries(0, 50).pop().expect("an entry");
+                assert_eq!(
+                    newest.output_end_cursor.is_none(),
+                    open,
+                    "{source}: fixture: {newest:?}"
+                );
+                assert_eq!(h.command_capture(), Some(want), "{source}: {newest:?}");
             }
             assert_eq!(sc.osc133_source().map(|s| s.as_str()), Some(source));
             let e = h.entries(0, 50);
