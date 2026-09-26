@@ -542,6 +542,7 @@ not a secret.
 | R17 | **Over-masks**: `watch` silently drops output that follows a long key | Output that arrives in the same PTY read as the END of a key, once `watch` has begun dropping output because more than 8 KiB of the key was unresolved at the end of an earlier read. How the output splits into PTY reads decides that, so it is timing-dependent | `printf 'before\n'; cat key.pem after.txt` with a 200-line key, a 30-line `after.txt` and `watch` attached: in 2 runs of 2, `watch` received 3 and 0 of the 30 lines, with no gap notice, while `read_output` showed all 30. As two commands, `cat key.pem; cat after.txt`, it dropped lines in 2 runs of 6. No run with a key under 8 KiB dropped anything | **Open**, GH #258 | Yes: emit the rest of the read once the key has been judged |
 | R18 | **Leaks** the tail of a token longer than 512 bytes, such as a JWT | Every rule but the private-key rule is judged over a window that reaches only the lookbehind (512 bytes by default) behind a read's start. So a read that begins more than that into a long token misses it: a `tail_bytes` read, `wait_for_pattern`'s `match.text`, a read from an arbitrary `since_cursor`, or the cursor read after one that saw the token partly arrived | `cat` a generated 1,027-byte JWT, then `read_output(tail_bytes: 400)`: the last 310 characters of the signature come back raw, with `redactions: {}`, with or without `apply_holdback: true`. `tail_bytes: 600` masks them. `wait_for_pattern(pattern: "[A-Za-z0-9_-]{300}\r\n")` returns 300 signature characters raw in `match.text` in one call, while the same response's `output_since_start` masks them. Print 600 bytes of the token, pause, then print the rest: the first cursor read masks what has arrived as `[REDACTED:unresolved]`, and the next returns the rest of the token raw. With 300 bytes before the pause, the token is held and then masked | **Open**, GH #261 | Yes: give token rules the backward search that private keys have |
 | R19 | **Over-masks** hex digests and base64 lines after a mention of a private-key header | A line that names a whole `…PRIVATE KEY-----` header without being a key, such as a `grep` hit, a code literal or a test fixture's name. Up to 16 KiB past the header, every line with a run of 48 or more base64-alphabet characters (letters, digits, `+`, `/`, `=`) is masked as `[REDACTED:unresolved]`: SHA-256 hex digests, the base64 part of a `sha512-` integrity string, base64 blobs. A 40-digit git object id is too short to qualify | `grep` a file for `-----BEGIN RSA PRIVATE KEY-----`, then run `sha256sum` over twelve files: all 12 digest lines are masked on the default cursor read, on a 1 KiB page and on the grid. Only `redact: false` shows them, and it also shows every real secret in the window | **Open**, GH #260 | Partly. Refusing hex-only runs and `sha256-`, `sha384-` and `sha512-` prefixes closes digests and integrity strings. A base64 blob has the alphabet of key body, and stays masked |
+| R20 | **Leaks** the tail of a recalled command in `get_command_history`, reported as complete | A line editor that answers a carriage return by moving the cursor forward past the prompt, which resumes inside the command, as bash does for history recall and fish does while typing. The capture discards the row, and the entry keeps only what was written after the resume, with `truncated: false`. A secret whose label or prefix sat before that column comes back as a bare tail that no rule matches | In bash, run `echo short`, then press Up, Up, Down, Enter: the entry reads `short` with `truncated: false`. fish typing `echo hello world` key by key records `d` | **Open**, GH #271 | Yes: treat the motion as resuming inside the command, or report `truncated: true` whenever a carriage return discards text no later write replaced |
 
 **Known, filed, and not yet a row.** Each of these is a leak:
 - **A partial token in a window title.** Metadata is matched for complete
@@ -561,9 +562,114 @@ not a secret.
 
 #### Shell history
 
-<!-- HISTORY-POLICY -->
-What Holdfast does about the history files of the shells it starts is tracked
-in GH #252.
+**By default, a session's shell writes nothing to the history files under
+`$HOME` (GH #252).** Without a policy, the agent's commands, a secret typed
+at a readline prompt, and Holdfast's own integration snippet all reached
+the operator's history. That happened on `exit`, on EOF, on the hangup that
+a graceful `terminate`, `holdfast daemon stop` or a daemon crash delivers,
+and after every command under common bash and zsh configurations. Four
+mechanisms prevent it:
+
+- **The environment.** Every session starts with these variables:
+  - `HISTFILE=/dev/null`;
+  - an empty `fish_history`;
+  - a zsh `HISTORY_IGNORE` that matches the snippet;
+  - the history files of common REPLs and database clients switched off:
+    `PYTHON_HISTORY=/dev/null`, `NODE_REPL_HISTORY=` (empty),
+    `PSQL_HISTORY=/dev/null`, `MYSQL_HISTFILE=/dev/null` and
+    `SQLITE_HISTORY=/dev/null`;
+  - `SHELL_SESSIONS_DISABLE=1`, for macOS Terminal's per-window history.
+
+  A call's own `env` overrides any of them.
+- **The integration snippet**, for bash and zsh. It begins with a space
+  and runs after the rc files, and sets `HISTFILE` again. The value is
+  `/dev/null`, or a `HISTFILE` the call set itself, which the snippet
+  carries past the rc files in `HOLDFAST_HISTFILE`. It assigns
+  `/dev/null` and does not unset the variable, for two reasons:
+  oh-my-zsh and prezto re-arm an empty `HISTFILE` when the rc is sourced
+  again, and a nested shell or `exec` does not inherit an unset one.
+- **fish's init command.** A fish that Holdfast starts runs a `-C` command
+  after config.fish. It empties `fish_history`, keeps it empty, and exports
+  `fish_private_mode` at the first prompt so that any fish started inside
+  the session is private too. It is not applied if the call's `env` sets
+  `fish_history`.
+- **No hangup for tcsh and csh.** A tcsh that receives a hangup saves its
+  history, and no environment variable reaches its `savehist`. So
+  `terminate` and `daemon stop` send tcsh and csh `SIGTERM`, which an
+  interactive tcsh ignores, and then `SIGKILL` after the grace period.
+
+**`[terminal] shell_history_file = "per_session"` keeps a record of what
+the agent ran.** Each bash and zsh session appends every command to
+`<log dir>/history/<session_id>.history`.
+- The file is `0600`, and is always created new. It is never written
+  through an existing file or link.
+- It lives in a `0700` directory. The daemon refuses the directory if it
+  is a symlink or belongs to another user.
+- Holdfast never rotates or deletes these files, and **does not redact
+  them**.
+
+The record is kept for convenience; it is not an audit trail:
+- The call's `env` can point `HISTFILE` somewhere else.
+- The rc's own options decide what is recorded. For example, Debian's
+  `HISTCONTROL=ignoreboth` and zsh's `hist_ignore_space` drop commands
+  that begin with a space.
+- Anything in the list below that re-points `HISTFILE` takes the rest of
+  the session's commands with it.
+- A `PROMPT_COMMAND` replaced mid-session removes the per-command append.
+  Commands after that reach the file only if bash saves at exit or on a
+  hangup.
+
+fish sessions stay private in both modes.
+
+**What still reaches disk.** Unless marked otherwise, each item was
+measured on bash 5.2, zsh 5.9, fish 3.7.0 and 4.9.3, tcsh 6.24, mksh R59c
+and Python 3.12.
+
+- **H1. A `HISTFILE` set after the snippet has run.** The snippet runs
+  once, at the first prompt, and cannot follow a shell that changes the
+  variable later. That happens when:
+  - an rc that hard-sets `HISTFILE` is sourced again;
+  - `exec bash` or a nested bash starts under such an rc;
+  - `PROMPT_COMMAND` assigns `HISTFILE`;
+  - `HISTFILE` is `readonly`, in bash or zsh. The snippet's assignment
+    then fails, and `HISTFILE: readonly variable` appears in the
+    session's output.
+- **H2. A zsh started inside a session under an rc that sets `HISTFILE`
+  unconditionally.** macOS's `/etc/zshrc` sets one for every zsh, so on
+  a Mac any nested zsh writes `~/.zsh_history`.
+- **H3. mksh under an rc that sets `HISTFILE`.** mksh has no Holdfast
+  snippet, so only the environment reaches it. ksh93 honours
+  `HISTFILE=/dev/null`, and mksh keeps no history file unless one is set.
+- **H4. tcsh and csh ending by `exit`, EOF or a daemon crash.** Under an
+  rc that sets `savehist`, as FreeBSD's default `.cshrc` does, tcsh
+  writes `~/.history` in three cases: when it exits on its own, at EOF,
+  and when the kernel hangs it up because the daemon died. This predates
+  GH #252.
+- **H5. A fish that Holdfast did not start.** This covers a fish started
+  inside a bash or zsh session, and a fish started through a wrapper such
+  as `env fish`, when its config.fish sets `fish_history`. Only the empty
+  `fish_history` in the environment reaches that fish, and config.fish
+  overrides it. A fish nested inside a fish that Holdfast started is
+  private.
+- **H6. The snippet's own line, under a user-set zsh `HISTORY_IGNORE`.**
+  The user's value replaces Holdfast's. So under `inc_append_history` or
+  `share_history`, without `hist_ignore_space`, the snippet's own line
+  reaches the history file that the rc names. The agent's commands do
+  not.
+- **H7. Python 3.12 and older.** They ignore `PYTHON_HISTORY`, so their
+  REPL writes `~/.python_history`. An empty `PYTHON_HISTORY` does not help
+  either, because 3.13 treats empty as unset. Any program with its own
+  history file that is not listed above keeps writing it. sqlite3 finds
+  its default file through the password database, not `$HOME`, so only
+  `SQLITE_HISTORY` keeps it off disk.
+- **H8. macOS Terminal session history (not measured on a Mac).** Since
+  GH #229, a session inherits `TERM_PROGRAM=Apple_Terminal` and
+  `TERM_SESSION_ID` from a daemon started in Terminal.
+  `/etc/zshrc_Apple_Terminal` and `/etc/bashrc_Apple_Terminal` then save
+  per-window history under `~/.zsh_sessions/` or `~/.bash_sessions/`,
+  whatever `HISTFILE` says. `SHELL_SESSIONS_DISABLE=1` is Apple's
+  documented off switch for this, and every session gets it. Nobody has
+  confirmed on a Mac that it takes effect.
 
 #### The out-of-band secret channel
 
