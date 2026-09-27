@@ -331,8 +331,20 @@ const BASH_INTEGRATION: &str = concat!(
     // history file past the rc files; empty, history goes to `/dev/null`.
     // An assignment rather than `unset`: with `HISTFILE` unset, `history
     // -a` in an rc's `PROMPT_COMMAND` appends to `~/.history` (measured).
-    // Skipped whole when `HISTFILE` is readonly: the policy cannot apply
-    // there (SECURITY.md, shell history, H1), and integration still can.
+    // Skipped whole when `HISTFILE` is readonly, the emptying below
+    // included: the policy cannot apply there (SECURITY.md, shell history,
+    // H1), and integration still can.
+    //
+    // Then the in-memory list is emptied (GH #274). bash has already read
+    // the file the rc named, so `history`, `fc -l`, up-arrow and `!!` would
+    // offer the operator's own history into output the agent reads; and
+    // it has already added the line that runs this, which leaves with it.
+    // `history -r` then reads what `HISTFILE` now names when that is a
+    // readable file: `/dev/null` is not, a new per-session file is empty,
+    // and a file the call named itself is loaded as bash would have loaded
+    // it at start. Tested rather than silenced, because `rbash` refuses the
+    // redirection that would silence it. `builtin`, so an rc's `history`
+    // alias or function cannot take either call.
     //
     // With a session file: `__holdfast_h` appends after every command,
     // prepended to `PROMPT_COMMAND` for the reason `__holdfast_d` is and
@@ -344,6 +356,7 @@ const BASH_INTEGRATION: &str = concat!(
     // `PROMPT_COMMAND` replaced mid-session — and loses everything recorded
     // before; `bash-append-stopped` in `tests/shell_history.rs` is the row.
     r#"if ! __holdfast_ro HISTFILE; then HISTFILE=${HOLDFAST_HISTFILE:-/dev/null}; "#,
+    r#"builtin history -c; if [[ -f $HISTFILE && -r $HISTFILE ]]; then builtin history -r || :; fi; "#,
     r#"if [ -n "${HOLDFAST_HISTFILE-}" ]; then "#,
     r#"__holdfast_ro HISTFILESIZE || unset HISTFILESIZE; shopt -s histappend; "#,
     r#"__holdfast_h() { history -a; return "${1:-0}"; }; "#,
@@ -485,9 +498,23 @@ const ZSH_INTEGRATION: &str = concat!(
     // `/dev/null` gets `SAVEHIST=0`, so zsh never saves or locks it, and no
     // `hist_save_by_copy`, for an rc sourced again that sets `SAVEHIST`: see
     // `session::launch::history_defaults`.
+    //
+    // First the in-memory list is cut (GH #274). zsh has read the file the
+    // rc named after the rc ran, so `fc -l`, up-arrow and `!!` offered the
+    // operator's own history into output the agent reads. zsh has no way
+    // to empty the list in place, and `HISTSIZE` cannot go below 1, so
+    // `HISTSIZE=1` keeps only the newest entry, the line running this, and
+    // the anonymous function puts the rc's value back. Not `fc -p`, which
+    // starts a new list but parks the old one on zsh's history stack,
+    // where `fc -P` brings it back and zsh saves it at exit (measured).
+    // A session file is then read with `fc -R`, which finds nothing in a
+    // new per-session file and loads a file the call named itself as zsh
+    // would have at start, and only when it is readable: `fc -R` on an
+    // unreadable file ends an `err_exit` shell.
     r#" if [[ ${(t)HISTFILE-}${(t)SAVEHIST-}${(t)HISTSIZE-} != *readonly* ]]; then "#,
+    r#"() { HISTSIZE=1; HISTSIZE=$1 } $HISTSIZE; "#,
     r#"if [[ -n ${HOLDFAST_HISTFILE-} ]]; then HISTFILE=$HOLDFAST_HISTFILE; "#,
-    r#"SAVEHIST=1000000000; HISTSIZE=1000000000; "#,
+    r#"SAVEHIST=1000000000; HISTSIZE=1000000000; [[ -r $HISTFILE ]] && fc -R; "#,
     r#"setopt inc_append_history; else HISTFILE=/dev/null; SAVEHIST=0; unsetopt hist_save_by_copy; fi; fi; "#,
     r#"if [ -z "${HOLDFAST_SHELL_INTEGRATION-}" ] && [[ "${PS1-}" != *"133;A"* && ${(t)PS1-} != *readonly* ]]; then "#,
     r#"HOLDFAST_SHELL_INTEGRATION=1; "#,
@@ -859,6 +886,29 @@ mod tests {
                  inherited by `exec`: {snippet}"
             );
         }
+    }
+
+    /// GH #274 at the string level: bash empties the list it read from the
+    /// rc's file once `HISTFILE` is re-pointed, and zsh cuts it to the line
+    /// running the snippet, both ahead of the guard; each then reads back a
+    /// file the call named. `tests/shell_history.rs` in the `holdfast` crate
+    /// is what lists and recalls through them.
+    #[test]
+    fn the_history_clauses_empty_the_list_the_rc_file_loaded() {
+        let guard = "HOLDFAST_SHELL_INTEGRATION";
+        let bash = Shell::Bash.integration_snippet();
+        let set = bash.find("HISTFILE=${HOLDFAST_HISTFILE").expect("set");
+        let clear = bash.find("builtin history -c;").expect("bash clears");
+        let read = bash.find("builtin history -r").expect("bash reads back");
+        assert!(set < clear && clear < read, "{bash}");
+        assert!(read < bash.find(guard).unwrap(), "{bash}");
+        let zsh = Shell::Zsh.integration_snippet();
+        let cut = zsh
+            .find("() { HISTSIZE=1; HISTSIZE=$1 } $HISTSIZE;")
+            .expect("zsh cuts the list and restores the limit");
+        let read = zsh.find("fc -R;").expect("zsh reads back");
+        assert!(cut < read && read < zsh.find(guard).unwrap(), "{zsh}");
+        assert!(!zsh.contains("fc -p"), "a parked list comes back: {zsh}");
     }
 
     /// Every assignment to a variable an rc can make readonly is behind a

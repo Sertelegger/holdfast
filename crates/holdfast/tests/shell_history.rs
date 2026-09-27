@@ -982,6 +982,190 @@ fn tcsh_is_never_hung_up_so_holdfast_ending_it_saves_nothing() {
     );
 }
 
+/// The operator's own bash history, which the rc names.
+const BASH_OPERATOR_HISTORY: &str = "echo OPERATORS_OWN_HISTORY_1\necho OPERATORS_OWN_HISTORY_2\n";
+
+/// The same in zsh's extended format, which oh-my-zsh's rc writes.
+const ZSH_OPERATOR_HISTORY: &str = ": 1700000000:0;echo OPERATORS_OWN_HISTORY_1\n\
+                                    : 1700000001:0;echo OPERATORS_OWN_HISTORY_2\n";
+
+/// Shells whose rc names a history file the operator has already filled.
+/// bash and zsh read it as they start, before the snippet runs (GH #274).
+const OPERATOR_HISTORY: [Case; 2] = [
+    Case {
+        name: "bash-operator-history",
+        command: "bash",
+        args: &[],
+        files: &[
+            (".bashrc", "HISTFILE=~/.bash_history\n"),
+            (".bash_history", BASH_OPERATOR_HISTORY),
+        ],
+        integration: true,
+        before: &[],
+        hung_up: true,
+        needs: "bash",
+    },
+    Case {
+        name: "zsh-operator-history",
+        command: "zsh",
+        args: &[],
+        files: &[
+            (".zshrc", ZSH_OMZ_RC),
+            (".zsh_history", ZSH_OPERATOR_HISTORY),
+        ],
+        integration: true,
+        before: &[],
+        hung_up: true,
+        needs: "zsh",
+    },
+];
+
+/// Poll until `needle` has appeared `n` times in the session's output.
+fn await_count(shim: &mut Shim, s: &Started, needle: &str, n: usize) {
+    let deadline = Instant::now() + SHELL_TIMEOUT;
+    loop {
+        let out = output(shim, s);
+        if out.matches(needle).count() >= n {
+            return;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "{}: `{needle}` never appeared {n} times; output: {out:?}",
+            s.case.name
+        );
+        std::thread::sleep(Duration::from_millis(100));
+    }
+}
+
+/// GH #274: bash and zsh read the history file an rc names as they start,
+/// before the snippet runs, so the operator's own history was in the
+/// session's memory, and `history`, `fc -l` and up-arrow put it into the
+/// output the agent reads. The snippet now empties that list in either
+/// mode — zsh keeps one entry, the line that ran the snippet — and reads
+/// back only what the session's own `HISTFILE` holds.
+///
+/// Emptying must not cost recall of what the agent typed afterwards, so
+/// each session recalls a command two back with up-arrow and the last with
+/// `!!`, and lists after that: its own commands present, none of the
+/// operator's. A per-session file keeps every command the agent ran and
+/// none of the operator's, and no longer starts with the snippet's line;
+/// the operator's file is untouched either way.
+#[test]
+fn bash_and_zsh_list_and_recall_none_of_the_operators_history() {
+    let cases = available(&OPERATOR_HISTORY);
+    for per_session in [false, true] {
+        let inst = Instance::new(if per_session { "op-ps" } else { "op" });
+        if per_session {
+            inst.write_config("[terminal]\nshell_history_file = \"per_session\"\n");
+        }
+        let mut shim = Shim::launch(&inst);
+        let mut ended = Vec::new();
+        for case in &cases {
+            let s = start(&inst, &mut shim, *case, "Operator");
+            send(&mut shim, &s, "echo RECALL''_ONE", true);
+            await_count(&mut shim, &s, "RECALL_ONE", 1);
+            await_prompt(&mut shim, &s);
+            send(&mut shim, &s, "echo RECALL''_TWO", true);
+            await_count(&mut shim, &s, "RECALL_TWO", 1);
+            await_prompt(&mut shim, &s);
+            // Two back: a list cut short keeps only the last.
+            send(&mut shim, &s, "\u{1b}[A", false);
+            send(&mut shim, &s, "\u{1b}[A", false);
+            send(&mut shim, &s, "\r", false);
+            await_count(&mut shim, &s, "RECALL_ONE", 2);
+            await_prompt(&mut shim, &s);
+            send(&mut shim, &s, "!!", true);
+            await_count(&mut shim, &s, "RECALL_ONE", 3);
+            await_prompt(&mut shim, &s);
+
+            let listed_from = output(&mut shim, &s).len();
+            let list = if case.command == "zsh" {
+                "fc -l 1"
+            } else {
+                "history"
+            };
+            send(&mut shim, &s, list, true);
+            // Only the listing prints the marker's command with its quotes
+            // after this point.
+            await_output_after(&mut shim, &s, listed_from, "HISTMARK_''");
+            await_prompt(&mut shim, &s);
+            let listed = output(&mut shim, &s);
+            let listed = listed.get(listed_from..).unwrap_or(&listed);
+            assert!(
+                listed.contains("echo RECALL''_TWO"),
+                "{} / per_session {per_session}: the listing lacks the agent's own \
+                 commands: {listed:?}",
+                case.name
+            );
+            let out = output(&mut shim, &s);
+            assert!(
+                !out.contains("OPERATORS_OWN_HISTORY"),
+                "{} / per_session {per_session}: the operator's history reached the \
+                 output: {out:?}",
+                case.name
+            );
+            end(&mut shim, &s, Ending::ForceTerminate);
+            ended.push((s, Ending::ForceTerminate));
+        }
+        shim.kill();
+
+        for (s, _) in &ended {
+            let (rel, body) = s.case.files[1];
+            assert_eq!(
+                std::fs::read_to_string(s.home.join(rel)).unwrap(),
+                body,
+                "{}: the operator's history file changed",
+                s.case.name
+            );
+            if !per_session {
+                continue;
+            }
+            let file = inst
+                .dir
+                .join("logs")
+                .join("history")
+                .join(format!("{}.history", s.id));
+            let text = std::fs::read_to_string(&file)
+                .unwrap_or_else(|e| panic!("{}: no {}: {e}", s.case.name, file.display()));
+            for needle in [MARK, "echo RECALL''_ONE", "echo RECALL''_TWO"] {
+                assert!(
+                    text.contains(needle),
+                    "{}: {} lacks {needle}: {text:?}",
+                    s.case.name,
+                    file.display()
+                );
+            }
+            for needle in std::iter::once("OPERATORS_OWN_HISTORY").chain(SNIPPET_MARKS) {
+                assert!(
+                    !text.contains(needle),
+                    "{}: {} holds {needle}: {text:?}",
+                    s.case.name,
+                    file.display()
+                );
+            }
+        }
+        assert_no_leaks(&ended);
+        drop(inst);
+    }
+}
+
+/// `await_output` for text printed after byte `from` of the output.
+fn await_output_after(shim: &mut Shim, s: &Started, from: usize, needle: &str) {
+    let deadline = Instant::now() + SHELL_TIMEOUT;
+    loop {
+        let out = output(shim, s);
+        if out.get(from..).is_some_and(|tail| tail.contains(needle)) {
+            return;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "{}: `{needle}` never appeared after byte {from}; output: {out:?}",
+            s.case.name
+        );
+        std::thread::sleep(Duration::from_millis(100));
+    }
+}
+
 /// Everything the session has printed, once it has stopped printing: the
 /// last of a shell's output can arrive after the shell has gone.
 fn settled_output(shim: &mut Shim, s: &Started) -> String {
