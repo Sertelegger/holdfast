@@ -4,8 +4,9 @@
 //! shell emits semantic markers. §8.5 mandates *typing* it rather than
 //! setting environment variables, and that is the only mechanism that
 //! works: rc files run after the environment is read and would clobber an
-//! inherited `PS1`, whereas a line typed at the first prompt wraps
-//! whatever prompt the user actually ended up with. What has to be typed is
+//! inherited `PS1`, whereas a line the shell reads as its first input,
+//! normally at its first prompt, wraps whatever prompt the user actually
+//! ended up with. What has to be typed is
 //! what *runs* the snippet, not its text: bash's typed line evaluates a
 //! snippet the environment carries, because the whole snippet is longer
 //! than macOS lets a typed line be (see [`BASH_INJECTION_LINE`]).
