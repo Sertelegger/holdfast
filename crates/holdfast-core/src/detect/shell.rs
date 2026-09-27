@@ -531,6 +531,13 @@ const ZSH_INTEGRATION: &str = concat!(
     // the anonymous function puts the rc's value back. Not `fc -p`, which
     // starts a new list but parks the old one on zsh's history stack,
     // where `fc -P` brings it back and zsh saves it at exit (measured).
+    // The value is read as `${HISTSIZE-30}` for an rc that unsets
+    // `HISTSIZE` under `nounset`: a bare `$HISTSIZE` is then *parameter not
+    // set*, which discards the rest of the typed line, the history policy
+    // and the integration with it, so the session's commands went to the
+    // rc's file and nothing marked its prompt (measured, zsh 5.9). 30 is
+    // zsh's own default; an unset `HISTSIZE` keeps whatever limit it last
+    // had, which the shell cannot be asked for.
     //
     // Only when the rc appends to its history file. Without
     // `append_history`, `inc_append_history` or `share_history`, zsh saves
@@ -552,7 +559,7 @@ const ZSH_INTEGRATION: &str = concat!(
     // line, integration and all, `err_exit` or not (measured, zsh 5.9).
     r#" if [[ ${(t)HISTFILE-}${(t)SAVEHIST-}${(t)HISTSIZE-} != *readonly* ]]; then "#,
     r#"[[ -o append_history || -o inc_append_history || -o share_history ]] && "#,
-    r#"() { HISTSIZE=1; HISTSIZE=$1 } $HISTSIZE; "#,
+    r#"() { HISTSIZE=1; HISTSIZE=$1 } ${HISTSIZE-30}; "#,
     r#"if [[ -n ${HOLDFAST_HISTFILE-} ]]; then HISTFILE=$HOLDFAST_HISTFILE; "#,
     r#"SAVEHIST=1000000000; HISTSIZE=1000000000; [[ -r $HISTFILE ]] && fc -R; "#,
     r#"setopt inc_append_history; else HISTFILE=/dev/null; SAVEHIST=0; unsetopt hist_save_by_copy; fi; fi; "#,
@@ -945,7 +952,7 @@ mod tests {
         assert!(read < bash.find(guard).unwrap(), "{bash}");
         let zsh = Shell::Zsh.integration_snippet();
         let cut = zsh
-            .find("() { HISTSIZE=1; HISTSIZE=$1 } $HISTSIZE;")
+            .find("() { HISTSIZE=1; HISTSIZE=$1 } ${HISTSIZE-30};")
             .expect("zsh cuts the list and restores the limit");
         let read = zsh.find("fc -R;").expect("zsh reads back");
         assert!(cut < read && read < zsh.find(guard).unwrap(), "{zsh}");

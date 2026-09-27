@@ -95,6 +95,14 @@ const ZSH_CONDITIONAL_RC: &str = "[ -z \"$HISTFILE\" ] && HISTFILE=\"$HOME/.zsh_
                                   HISTSIZE=10000\nSAVEHIST=10000\n\
                                   setopt share_history inc_append_history\n";
 
+/// An rc that names a history file and then unsets `HISTSIZE` under
+/// `nounset`. The history cut (GH #274) reads `HISTSIZE` to put the rc's
+/// limit back; read bare, it was *parameter not set*, zsh discarded the
+/// rest of the typed line, and every command, the snippet's own line
+/// included, was saved to `~/.zsh_history` (measured, zsh 5.9).
+const ZSH_NOUNSET_UNSET_HISTSIZE_RC: &str =
+    "HISTFILE=~/.zsh_history\nSAVEHIST=100\nsetopt nounset\nunset HISTSIZE\n";
+
 /// One shell configuration.
 #[derive(Clone, Copy)]
 struct Case {
@@ -114,7 +122,7 @@ struct Case {
     needs: &'static str,
 }
 
-const BASH_AND_ZSH: [Case; 7] = [
+const BASH_AND_ZSH: [Case; 8] = [
     Case {
         name: "bash-no-rc",
         command: "bash",
@@ -182,6 +190,16 @@ const BASH_AND_ZSH: [Case; 7] = [
         files: &[(".zshrc", ZSH_CONDITIONAL_RC)],
         integration: true,
         before: &[("exec zsh", "")],
+        hung_up: true,
+        needs: "zsh",
+    },
+    Case {
+        name: "zsh-nounset-unset-histsize",
+        command: "zsh",
+        args: &[],
+        files: &[(".zshrc", ZSH_NOUNSET_UNSET_HISTSIZE_RC)],
+        integration: true,
+        before: &[],
         hung_up: true,
         needs: "zsh",
     },

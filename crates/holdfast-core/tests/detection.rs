@@ -3222,7 +3222,10 @@ async fn a_strict_bash_rc_keeps_the_integration_the_re_wrap_and_the_shell() {
 /// The second arm unsets `HISTFILE`, the usual way to turn zsh's history
 /// off, and is the one the `-` in `${(t)HISTFILE-}` is for: without it
 /// `nounset` makes the test *HISTFILE: parameter not set* and the rest of
-/// the typed line is discarded.
+/// the typed line is discarded. The third unsets `HISTSIZE`, which the
+/// history cut (GH #274) reads to put the rc's limit back: read bare, it
+/// discarded the line the same way, and the session saved its commands to
+/// the rc's history file with no markers at all.
 #[tokio::test]
 async fn a_strict_zsh_rc_keeps_the_integration_the_re_wrap_and_the_shell() {
     if !have(Need::Program("zsh")) {
@@ -3232,6 +3235,7 @@ async fn a_strict_zsh_rc_keeps_the_integration_the_re_wrap_and_the_shell() {
     for (i, (arm, extra)) in [
         ("nounset err_exit", ""),
         ("nounset err_exit, HISTFILE unset", "unset HISTFILE\n"),
+        ("nounset err_exit, HISTSIZE unset", "unset HISTSIZE\n"),
     ]
     .into_iter()
     .enumerate()
