@@ -1775,10 +1775,11 @@ mod tests {
         }
     }
 
-    /// Put a value on the write queue exactly as `attach::conn`'s
-    /// `SecretInput` arm does, which is what a human at an attached client
-    /// is — §5.2's normalisation applied by the daemon, and the value in
-    /// the one type whose `Drop` zeroes it.
+    /// Put a value on the write queue as a human at an attached client's
+    /// answer arrives — §5.2's normalisation applied by the daemon, and the
+    /// value in the one type whose `Drop` zeroes it — but as a write no gate
+    /// refuses, which `attach::conn`'s `SecretInput` arm no longer performs
+    /// (it sends a gated write since GH #262).
     async fn write_as_a_human(s: &Session, bytes: &[u8]) {
         let (req, ack) =
             crate::session::WriteRequest::secret(SecretBytes::normalise(bytes.to_vec(), true));
@@ -3853,9 +3854,10 @@ mod tests {
             .decide(session_id, approval_id, decision, who)
     }
 
-    /// Answer the outstanding secret request exactly as `attach::conn`'s
+    /// Answer the outstanding secret request as `attach::conn`'s
     /// `SecretInput` arm does: take the slot by id, write through the
-    /// queue, then answer the waiting call with the **count**.
+    /// queue, then answer the waiting call with the **count**. The write is
+    /// one no gate refuses, which that arm no longer sends (GH #262).
     ///
     /// This is what makes "falls through to the human-prompt path" an
     /// assertion about a human completing the call, rather than about a

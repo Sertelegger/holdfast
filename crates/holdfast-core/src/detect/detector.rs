@@ -468,7 +468,12 @@ impl PromptDetector {
     /// classifier answers `Executing` there because the state is momentary,
     /// but no command has started, so a write there reaches the shell. And
     /// where a regenerated prompt loses the `A`/`B` markers (GH #220), `D`
-    /// is the last marker at every idle prompt.
+    /// is the last marker at every idle prompt, wherever the snippet's
+    /// `PROMPT_COMMAND` or `precmd` hook survives. Where it does not, as
+    /// after an rc that assigns `PROMPT_COMMAND` is sourced again, or under
+    /// a readonly `PROMPT_COMMAND` whose rc regenerates `PS1`, `C` is the
+    /// last marker at the idle prompt and this answers `false` (measured,
+    /// bash 5.2; SECURITY.md, G3).
     ///
     /// **Not while the terminal has `ECHO` off and `ICANON` on**, which is
     /// a program reading a secret *line*: it leaves the kernel to assemble

@@ -1479,9 +1479,10 @@ mod tests {
         )
     }
 
-    /// Put a resolved value on §4.3's write queue exactly as
-    /// `attach::conn`'s `SecretInput` arm does, and answer with the count
-    /// the PTY took — the number `Resolution::Provided { bytes_written }`
+    /// Put a resolved value on §4.3's write queue as a write no gate
+    /// refuses, which `attach::conn`'s `SecretInput` arm no longer performs
+    /// (it sends a gated write since GH #262), and answer with the count the
+    /// PTY took — the number `Resolution::Provided { bytes_written }`
     /// carries.
     async fn write_secret(s: &crate::session::Session, secret: SecretBytes) -> usize {
         let (req, ack) = crate::session::WriteRequest::secret(secret);
