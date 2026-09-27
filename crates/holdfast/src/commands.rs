@@ -1388,7 +1388,7 @@ pub async fn daemon_status(as_json: bool) -> ExitCode {
         diag!(
             "holdfast daemon status: this daemon is {} (protocol {}.{}), older than this \
              holdfast, {} (protocol {}.{}); `holdfast daemon stop` ends it and every session it \
-             holds, and the next daemon started is {}",
+             holds, and the next daemon started from this binary is {}",
             daemon.daemon_version,
             daemon.protocol_major,
             daemon.protocol_minor,
