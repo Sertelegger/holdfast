@@ -544,10 +544,14 @@ fn daemon_too_old(
              start`."
             .to_string(),
     };
+    let instead = requirement
+        .instead()
+        .map(|s| format!("{s} "))
+        .unwrap_or_default();
     format!(
         "the running Holdfast daemon is {daemon_version} (protocol {major}.{daemon_minor}), older \
          than this holdfast, {ours} (protocol {major}.{}); below protocol {major}.{} it would {}. \
-         {remedy}",
+         {instead}{remedy}",
         handshake::PROTOCOL_MINOR,
         requirement.minor(),
         requirement.otherwise(),

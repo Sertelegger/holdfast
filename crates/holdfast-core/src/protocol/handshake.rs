@@ -222,6 +222,24 @@ impl Requirement {
         daemon_minor >= self.minor()
     }
 
+    /// A call that means what this one does on the older daemon and needs
+    /// no restart, as a whole sentence — or `None` when there is none.
+    ///
+    /// Offered ahead of the restart, which ends every session the daemon
+    /// holds, the one being read included. For a tail read inside the
+    /// holdback there is one: a `since_cursor` read withholds a secret
+    /// still arriving at the end of the output on every daemon, which is
+    /// also how `holdfast logs --tail` reads a daemon this old.
+    pub const fn instead(self) -> Option<&'static str> {
+        match self {
+            Self::TailHoldback => Some(
+                "A `read_output` with `since_cursor` in place of a tail withholds such a secret \
+                 on that daemon and needs no restart; the alternative is a daemon of this build.",
+            ),
+            Self::LaunchContext | Self::EchoGate | Self::Profile => None,
+        }
+    }
+
     /// What an older daemon does instead, as a clause completing *"that
     /// daemon would …"*.
     pub const fn otherwise(self) -> &'static str {

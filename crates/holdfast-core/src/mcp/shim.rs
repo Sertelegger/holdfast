@@ -746,8 +746,9 @@ fn admit(
     if let Some(refusal) = undeclared_argument(tool, arguments) {
         return Err(refusal);
     }
-    for (name, argument, requirement) in ARGUMENTS_BEFORE_CLOSED {
-        if *name == tool && arguments.contains_key(*argument) {
+    for (name, argument, only_with, requirement) in ARGUMENTS_BEFORE_CLOSED {
+        let meant = only_with.is_empty() || only_with.iter().any(|k| arguments.contains_key(*k));
+        if *name == tool && arguments.contains_key(*argument) && meant {
             client.require(*requirement).map_err(too_old)?;
         }
     }
@@ -758,6 +759,13 @@ fn admit(
 /// [`CLOSED_ARGUMENTS_MINOR`] may not know — and would therefore drop
 /// without a word — each with the requirement naming the minor that
 /// does know it.
+///
+/// The third field is the arguments beside which the first means
+/// anything, empty for always. `apply_holdback` changes only a tail read
+/// (`tail_lines`, `tail_bytes`): on a `since_cursor` read every daemon
+/// applies the holdback anyway, so the call means the same dropped or
+/// not, and refusing it would send the agent to a restart that ends the
+/// very session it is reading, for nothing.
 ///
 /// **Closed, and complete by construction rather than by upkeep.** An
 /// argument added from 1.5 on needs no row, because a daemon that
@@ -772,10 +780,15 @@ fn admit(
 /// honest: a profile session is let past the launch-context refusal
 /// because every daemon that knows profiles starts one the same way, and
 /// a 1.0 daemon does not know them.
-const ARGUMENTS_BEFORE_CLOSED: &[(&str, &str, Requirement)] = &[
-    ("start_session", "profile", Requirement::Profile),
-    ("start_session", "vars", Requirement::Profile),
-    ("read_output", "apply_holdback", Requirement::TailHoldback),
+const ARGUMENTS_BEFORE_CLOSED: &[(&str, &str, &[&str], Requirement)] = &[
+    ("start_session", "profile", &[], Requirement::Profile),
+    ("start_session", "vars", &[], Requirement::Profile),
+    (
+        "read_output",
+        "apply_holdback",
+        &["tail_lines", "tail_bytes"],
+        Requirement::TailHoldback,
+    ),
 ];
 
 /// Whether a `start_session` called with `arguments` takes the calling
@@ -2513,16 +2526,27 @@ mod tests {
             err.message
         );
 
-        let err = shim
-            .forward(
-                "read_output",
-                args(json!({ "session": "s", "tail_lines": 5, "apply_holdback": true })),
-                std::future::pending(),
-            )
-            .await
-            .expect_err("an older daemon would drop the holdback");
-        assert_eq!(err.data.clone().unwrap()["reason"], "daemon_too_old");
-        assert!(err.message.contains("apply_holdback"), "{}", err.message);
+        for tail in [json!({ "tail_lines": 5 }), json!({ "tail_bytes": 4096 })] {
+            let mut a = json!({ "session": "s", "apply_holdback": true });
+            a.as_object_mut()
+                .unwrap()
+                .extend(tail.as_object().unwrap().clone());
+            let err = shim
+                .forward("read_output", args(a), std::future::pending())
+                .await
+                .expect_err("an older daemon would drop the holdback on a tail");
+            assert_eq!(err.data.clone().unwrap()["reason"], "daemon_too_old");
+            assert!(err.message.contains("apply_holdback"), "{}", err.message);
+            // The way round it that ends no session comes before the one
+            // that ends them all.
+            let instead = err.message.find("since_cursor");
+            let restart = err.message.find("holdfast daemon stop");
+            assert!(
+                instead.is_some() && instead < restart,
+                "the refusal offers the cursor read first: {}",
+                err.message
+            );
+        }
 
         let err = shim
             .forward(
@@ -2543,13 +2567,20 @@ mod tests {
             "a refused call reached the daemon anyway"
         );
 
-        // The pairing: well-formed calls on the old daemon's own sessions.
+        // The pairing: well-formed calls on the old daemon's own sessions
+        // — among them `apply_holdback` on a cursor read, where every
+        // daemon applies the holdback anyway and dropping the key
+        // changes nothing.
         for (tool, a) in [
             (
                 "send_input",
                 json!({ "session": "s", "data": "x", "append_newline": false }),
             ),
             ("read_output", json!({ "session": "s", "tail_lines": 5 })),
+            (
+                "read_output",
+                json!({ "session": "s", "since_cursor": 0, "apply_holdback": true }),
+            ),
             ("list_sessions", json!({})),
         ] {
             shim.forward(tool, args(a), std::future::pending())
@@ -2817,15 +2848,17 @@ mod tests {
     #[test]
     fn every_argument_an_older_daemon_may_drop_is_one_this_build_declares() {
         let manifest = passthrough::tool_manifest();
-        for (tool, argument, _) in ARGUMENTS_BEFORE_CLOSED {
+        for (tool, argument, only_with, _) in ARGUMENTS_BEFORE_CLOSED {
             let t = manifest
                 .iter()
                 .find(|t| t.name.as_ref() == *tool)
                 .unwrap_or_else(|| panic!("no tool `{tool}`"));
-            assert!(
-                t.input_schema["properties"].get(*argument).is_some(),
-                "`{tool}` no longer declares `{argument}`"
-            );
+            for name in std::iter::once(argument).chain(only_with.iter()) {
+                assert!(
+                    t.input_schema["properties"].get(*name).is_some(),
+                    "`{tool}` no longer declares `{name}`"
+                );
+            }
         }
     }
 }
