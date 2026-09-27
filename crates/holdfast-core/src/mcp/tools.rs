@@ -243,7 +243,9 @@ pub struct StartSessionArgs {
     /// Inject OSC 133 shell integration when the command is bash, zsh,
     /// or fish. Defaults to true. `false` also skips the snippet's history
     /// line, so an rc file that sets `HISTFILE` decides where bash and zsh
-    /// save history.
+    /// save history. An rc file that reads the terminal at start-up (a
+    /// `read`, oh-my-zsh's update question) takes the injected line as its
+    /// answer, and the session starts without integration.
     #[serde(default)]
     pub shell_integration: Option<bool>,
     /// Answer the closed terminal-query set (Primary Device Attributes
@@ -631,8 +633,8 @@ impl HoldfastServer {
                 if let (true, Some(file)) = (created_history_file, &history_file) {
                     let _ = std::fs::remove_file(file);
                 }
-                // `brief` matters here: portable-pty's spawn error embeds
-                // the whole $PATH, which would land in the transcript.
+                // `spawn_failure` has already replaced portable-pty's `$PATH`
+                // line; `brief` bounds what is left.
                 //
                 // `reservation` drops on this return, so the name goes
                 // back immediately. It has to: §4.1 makes a name unique
@@ -2132,11 +2134,14 @@ impl HoldfastServer {
     /// `profile`, optionally narrowed by the observed prompt, and
     /// `prompt_text` reaches no lookup (§9.6, REQ-SEC-012).
     ///
-    /// **Call it while a command is waiting for the secret.** At an idle
-    /// shell prompt it asks nobody and returns `secret_cancelled` with
-    /// reason `at_shell_prompt`, because the shell would show the value,
-    /// run it and save it to history. Run the command that reads the
-    /// secret first, and call this once its password prompt is on screen.
+    /// **Call it while a command is waiting for the secret.** At the idle
+    /// prompt of a shell Holdfast reads markers from (bash, zsh and fish by
+    /// default) it asks nobody and returns `secret_cancelled` with reason
+    /// `at_shell_prompt`, because the shell would show the value, run it
+    /// and save it to history. A REPL's prompt, or a shell started inside
+    /// the session, is not refused and does the same. Run the command that
+    /// reads the secret first, and call this once `interaction_mode` is
+    /// `AwaitingSecret`.
     #[tool(
         annotations(
             title = "Request a secret from the user",
@@ -2647,6 +2652,11 @@ impl HoldfastServer {
 /// line. Measured: 2 of 3 such calls refused with no gap, none at a gap of
 /// 5 ms. Without that sentence, the remedy the details name would send such
 /// an agent to run the command a second time, into its own password prompt.
+/// The wait it names is the pattern-less one, which returns at
+/// `AwaitingSecret` and at the prompt of a command that failed. A pattern
+/// for the password prompt scans only output that arrives after the call
+/// by default, so a prompt already drawn is missed and the wait runs to
+/// its deadline (measured with `read -s -p`).
 fn at_shell_prompt_refusal() -> CallToolResult {
     envelope::envelope(
         Status::SecretCancelled,
@@ -2654,8 +2664,9 @@ fn at_shell_prompt_refusal() -> CallToolResult {
         "nothing was written: the session is at its shell prompt, where a secret \
          would be shown, run as a command and saved to history. Run the command \
          that asks for the secret first, and call this while it waits; if you have \
-         just started it, wait until its password prompt is on screen, then call \
-         this again",
+         just started it, call wait_for_pattern with no pattern and call this again \
+         once interaction_mode is AwaitingSecret. If the command has already failed \
+         or ended, fix it and run it again",
     )
 }
 
