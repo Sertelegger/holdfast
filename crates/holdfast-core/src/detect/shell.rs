@@ -356,15 +356,28 @@ const BASH_INTEGRATION: &str = concat!(
     // and `alias history='history 20'` made the per-command append fail at
     // every prompt, the session's file staying empty (measured, bash 5.2).
     //
-    // The emptied list is what a later `history -w` writes. An rc that
-    // hard-sets `HISTFILE` and runs `history -w` from `PROMPT_COMMAND`,
-    // sourced again in the session, rewrites the operator's file with the
-    // session's commands alone, where before it rewrote it with the
-    // operator's entries and the session's (SECURITY.md, H1; measured,
-    // bash 5.2 and 5.3). Nothing here reaches a hook the rc installs after
-    // it. bash's own save at exit appends, unless the session has run more
-    // commands than `HISTSIZE` holds, and then the list is the session's
-    // alone with or without the emptying.
+    // Not when the rc runs `history -w`: from `PROMPT_COMMAND`, read here
+    // as the rc left it with an array's elements joined, from a function,
+    // which is how the `historymerge` recipe reaches it, or from a trap,
+    // that recipe's `trap historymerge EXIT` included. A command
+    // substitution lists the shell's own traps (measured). `-w` writes the
+    // whole list over the file `HISTFILE` names, and once the agent runs
+    // `source ~/.bashrc`, an rc that hard-sets `HISTFILE` names the
+    // operator's file again: from an emptied list, `history -w` rewrote it
+    // with the session's commands alone, in either history mode, and the
+    // `history -n; history -w; history -c; history -r` sync recipe lost the
+    // operator's first entries in per_session mode (SECURITY.md, H1;
+    // measured, bash 5.2 and 5.3). Such a session keeps the list, and the
+    // line running this with it: the agent can read the operator's entries
+    // (H10), and in per_session mode the rc's `history -w` copies them into
+    // the session's file. `history -a` appends, and `history -a; history
+    // -c; history -r` reads back what `HISTFILE` names, so both still get
+    // the emptying. A pattern, for `builtin history -w`, a file argument
+    // and a tab; a function merely defined with one costs the session the
+    // emptying and nothing else, and one the rc defines only when sourced
+    // again is not seen. bash's own save at exit appends, unless the
+    // session has run more commands than `HISTSIZE` holds, and then the
+    // list is the session's alone with or without the emptying.
     //
     // With a session file: `__holdfast_h` appends after every command,
     // prepended to `PROMPT_COMMAND` for the reason `__holdfast_d` is and
@@ -376,7 +389,8 @@ const BASH_INTEGRATION: &str = concat!(
     // `PROMPT_COMMAND` replaced mid-session — and loses everything recorded
     // before; `bash-append-stopped` in `tests/shell_history.rs` is the row.
     r#"if ! __holdfast_ro HISTFILE; then HISTFILE=${HOLDFAST_HISTFILE:-/dev/null}; "#,
-    r#"builtin history -c; if [[ -f $HISTFILE && -r $HISTFILE ]]; then builtin history -r || :; fi; "#,
+    r#"[[ ${PROMPT_COMMAND[*]-}$(builtin declare -f; builtin trap -p) =~ history[[:blank:]]+-[[:alpha:]]*w ]] || builtin history -c; "#,
+    r#"if [[ -f $HISTFILE && -r $HISTFILE ]]; then builtin history -r || :; fi; "#,
     r#"if [ -n "${HOLDFAST_HISTFILE-}" ]; then "#,
     r#"__holdfast_ro HISTFILESIZE || unset HISTFILESIZE; shopt -s histappend; "#,
     r#"__holdfast_h() { builtin history -a; return "${1:-0}"; }; "#,
@@ -935,10 +949,11 @@ mod tests {
         }
     }
 
-    /// GH #274 at the string level: bash empties the list it read from the
-    /// rc's file once `HISTFILE` is re-pointed, and zsh, when the rc appends
-    /// to that file, cuts it to the line running the snippet, both ahead of
-    /// the guard; each then reads back a file the call named.
+    /// GH #274 at the string level: bash, when the rc runs no `history -w`,
+    /// empties the list it read from the rc's file once `HISTFILE` is
+    /// re-pointed, and zsh, when the rc appends to that file, cuts it to the
+    /// line running the snippet, both ahead of the guard; each then reads
+    /// back a file the call named.
     /// `tests/shell_history.rs` in the `holdfast` crate is what lists and
     /// recalls through them.
     #[test]
@@ -950,6 +965,15 @@ mod tests {
         let read = bash.find("builtin history -r").expect("bash reads back");
         assert!(set < clear && clear < read, "{bash}");
         assert!(read < bash.find(guard).unwrap(), "{bash}");
+        // Only for an rc that does not rewrite the file from its
+        // `PROMPT_COMMAND`, a function or a trap: `history -w` would write
+        // the emptied list over the operator's once the rc is sourced
+        // again. Read before the per-session branch prepends `__holdfast_h`.
+        let rewrites = bash
+            .find("[[ ${PROMPT_COMMAND[*]-}$(builtin declare -f; builtin trap -p) =~ history[[:blank:]]+-[[:alpha:]]*w ]] || builtin history -c;")
+            .expect("bash empties only a list no `history -w` rewrites from");
+        assert!(set < rewrites && rewrites < clear, "{bash}");
+        assert!(clear < bash.find("__holdfast_h()").unwrap(), "{bash}");
         let zsh = Shell::Zsh.integration_snippet();
         let cut = zsh
             .find("() { HISTSIZE=1; HISTSIZE=$1 } ${HISTSIZE-30};")

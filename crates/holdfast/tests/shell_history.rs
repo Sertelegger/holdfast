@@ -36,7 +36,9 @@
 //! which is `zsh_ends_without_a_history_error_under_an_rc_that_saves_history`,
 //! and one whose rc rewrites its history file must leave the operator's
 //! entries in it when the agent sources that rc again, which is
-//! `a_zsh_rc_that_rewrites_its_history_file_keeps_the_operators_entries_when_sourced_again`.
+//! `a_zsh_rc_that_rewrites_its_history_file_keeps_the_operators_entries_when_sourced_again`
+//! and, for a bash rc that runs `history -w` at a prompt or at exit,
+//! `a_bash_rc_that_rewrites_its_history_file_keeps_the_operators_entries_when_sourced_again`.
 //!
 //! Every session gets its own `HOME`, and the assertion is over **every
 //! file** under it rather than over the names a shell is expected to use:
@@ -1012,13 +1014,32 @@ const ZSH_OPERATOR_HISTORY: &str = ": 1700000000:0;echo OPERATORS_OWN_HISTORY_1\
 
 /// Shells whose rc names a history file the operator has already filled.
 /// bash and zsh read it as they start, before the snippet runs (GH #274).
-const OPERATOR_HISTORY: [Case; 2] = [
+/// One bash rc appends to its file from `PROMPT_COMMAND`, which does not
+/// rewrite it: the snippet empties the list there too, and under an rc
+/// that runs `history -w` it does not (see [`BASH_REWRITING_RCS`]).
+const OPERATOR_HISTORY: [Case; 3] = [
     Case {
         name: "bash-operator-history",
         command: "bash",
         args: &[],
         files: &[
             (".bashrc", "HISTFILE=~/.bash_history\n"),
+            (".bash_history", BASH_OPERATOR_HISTORY),
+        ],
+        integration: true,
+        before: &[],
+        hung_up: true,
+        needs: "bash",
+    },
+    Case {
+        name: "bash-operator-history-appends",
+        command: "bash",
+        args: &[],
+        files: &[
+            (
+                ".bashrc",
+                "HISTFILE=~/.bash_history\nPROMPT_COMMAND='history -a'\n",
+            ),
             (".bash_history", BASH_OPERATOR_HISTORY),
         ],
         integration: true,
@@ -1234,6 +1255,141 @@ fn a_zsh_rc_that_rewrites_its_history_file_keeps_the_operators_entries_when_sour
         }
     }
     drop(inst);
+}
+
+/// bash rc files that hard-set `HISTFILE` and rewrite it from the
+/// in-memory list: at every prompt, by `history -w` alone and by the sync
+/// recipe that first reads what other shells appended; by that recipe as
+/// the `historymerge` function and `EXIT` trap it is usually shared as,
+/// which the snippet finds in the function table; and at exit alone, by a
+/// trap. Limits above anything a row writes, so neither trims what it
+/// measures.
+const BASH_REWRITING_RCS: [Case; 4] = [
+    bash_rewriting(
+        "bash-history-w-resourced",
+        &[
+            (".bashrc", BASH_HISTORY_W_RC),
+            (".bash_history", BASH_OPERATOR_HISTORY),
+        ],
+    ),
+    bash_rewriting(
+        "bash-history-sync-resourced",
+        &[
+            (".bashrc", BASH_HISTORY_SYNC_RC),
+            (".bash_history", BASH_OPERATOR_HISTORY),
+        ],
+    ),
+    bash_rewriting(
+        "bash-historymerge-resourced",
+        &[
+            (".bashrc", BASH_HISTORYMERGE_RC),
+            (".bash_history", BASH_OPERATOR_HISTORY),
+        ],
+    ),
+    bash_rewriting(
+        "bash-exit-trap-resourced",
+        &[
+            (".bashrc", BASH_EXIT_TRAP_RC),
+            (".bash_history", BASH_OPERATOR_HISTORY),
+        ],
+    ),
+];
+
+const BASH_HISTORY_W_RC: &str = "HISTFILE=~/.bash_history\nHISTSIZE=1000\nHISTFILESIZE=2000\n\
+                                 PROMPT_COMMAND='history -w'\n";
+
+const BASH_HISTORY_SYNC_RC: &str = "HISTFILE=~/.bash_history\nHISTSIZE=1000\nHISTFILESIZE=2000\n\
+                                    PROMPT_COMMAND='history -n; history -w; history -c; history -r'\n";
+
+const BASH_HISTORYMERGE_RC: &str = "HISTFILE=~/.bash_history\nHISTSIZE=1000\nHISTFILESIZE=2000\n\
+                                    historymerge() { history -n; history -w; history -c; history -r; }\n\
+                                    trap historymerge EXIT\nPROMPT_COMMAND=historymerge\n";
+
+const BASH_EXIT_TRAP_RC: &str = "HISTFILE=~/.bash_history\nHISTSIZE=1000\nHISTFILESIZE=2000\n\
+                                 trap 'history -w' EXIT\n";
+
+/// A bash session under one of [`BASH_REWRITING_RCS`]'s rc files, which
+/// runs a command and then sources the rc again before its marker. The
+/// command comes first, or the sync recipe's line count is the operator's
+/// own and it loses nothing.
+const fn bash_rewriting(
+    name: &'static str,
+    files: &'static [(&'static str, &'static str)],
+) -> Case {
+    Case {
+        name,
+        command: "bash",
+        args: &[],
+        files,
+        integration: true,
+        before: &[("echo before''_source", ""), ("source ~/.bashrc", "")],
+        hung_up: true,
+        needs: "bash",
+    }
+}
+
+/// A bash whose rc rewrites its history file with `history -w`, sourced
+/// again in the session, keeps every one of the operator's entries in that
+/// file, in both history modes (SD-2, review of GH #274). `source
+/// ~/.bashrc` puts the rc's `HISTFILE` back, and the next `history -w` —
+/// at the next prompt, or the `EXIT` trap's — writes the list over the
+/// operator's file.
+/// The GH #274 emptying had left that list holding the session's commands
+/// alone, so `history -w` kept none of the operator's entries; the sync
+/// recipe's `history -n` reads the file back from the line count bash last
+/// recorded, and in per_session mode that count, the session file's, skipped
+/// as many of the operator's first entries as the session had run commands.
+/// The snippet now empties no list such an rc rewrites from (measured,
+/// bash 5.2 and 5.3, exit and hangup).
+///
+/// The session's commands reach the operator's file, as under any rc
+/// sourced again (SECURITY.md, H1), and that is the proof the rewrite
+/// happened at all.
+#[test]
+fn a_bash_rc_that_rewrites_its_history_file_keeps_the_operators_entries_when_sourced_again() {
+    // Every row's loss, not the first: which recipes lose what in which
+    // mode is the measurement.
+    let mut lost = Vec::new();
+    for per_session in [false, true] {
+        let inst = Instance::new(if per_session { "bash-rw-ps" } else { "bash-rw" });
+        if per_session {
+            inst.write_config("[terminal]\nshell_history_file = \"per_session\"\n");
+        }
+        let mut shim = Shim::launch(&inst);
+        let mut ended = Vec::new();
+        for case in available(&BASH_REWRITING_RCS) {
+            for how in [Ending::Exit, Ending::Terminate] {
+                let s = start(&inst, &mut shim, case, &format!("{how:?}"));
+                end(&mut shim, &s, how);
+                ended.push((s, how));
+            }
+        }
+        shim.kill();
+        for (s, how) in &ended {
+            let file = s.home.join(".bash_history");
+            let text = std::fs::read_to_string(&file)
+                .unwrap_or_else(|e| panic!("{} / {how:?}: {}: {e}", s.case.name, file.display()));
+            let row = format!("{} / per_session {per_session} / {how:?}", s.case.name);
+            if !text.contains(MARK) {
+                lost.push(format!(
+                    "{row}: nothing rewrote {}, so this measured nothing: {text:?}",
+                    file.display()
+                ));
+            }
+            let missing: Vec<&str> = BASH_OPERATOR_HISTORY
+                .lines()
+                .filter(|line| !text.lines().any(|l| l == *line))
+                .collect();
+            if !missing.is_empty() {
+                lost.push(format!(
+                    "{row}: the operator's {} lost {missing:?}: {text:?}",
+                    file.display()
+                ));
+            }
+        }
+        drop(inst);
+    }
+    assert!(lost.is_empty(), "{}", lost.join("\n"));
 }
 
 /// `await_output` for text printed after byte `from` of the output.
