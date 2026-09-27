@@ -23,13 +23,16 @@ pub struct CommandEntry {
     /// directions: it can lose part of the line, and it can hold text that
     /// is not the command.
     ///
-    /// A command longer than the terminal width loses its front: 125
-    /// characters typed at 80 columns leaves 47, with the leading 78 gone.
-    /// The line editor's wrap redraw emits `\r` followed by `\x1b[K`, and the
-    /// capture discards what a `\r` returns over. The scanner counts only the
-    /// cursor motion that decides how much of a redrawn line survives (see
-    /// `detect::scanner`); it keeps no grid, so it cannot put a lost front
-    /// back.
+    /// A command longer than the terminal width is where the shells differ,
+    /// measured at 80 and 120 columns. bash (5.2, 5.3) emits no `\r` at the
+    /// margin and the capture is whole. zsh's wrap redraw emits ` \r\x1b[K`
+    /// at the margin, and the capture discards what a `\r` returns over, so
+    /// the rows before the last are lost: under `zsh -f` at 80 columns a
+    /// 125-character `echo` leaves its last 66 (GH #276). fish's capture
+    /// holds the whole command with part of its own text repeated in front
+    /// of it. The scanner counts only the cursor motion that decides how much
+    /// of a redrawn line survives (see `detect::scanner`); it keeps no grid,
+    /// so it cannot put a lost front back.
     ///
     /// **So a detected loss is refused instead of reported.** Truncation is the
     /// dangerous half twice over: a tail *looks like a whole command*, and
@@ -881,11 +884,11 @@ mod tests {
     /// The suffix half of §8.5.1 rule 5, which nothing else separates from
     /// an equality test.
     ///
-    /// The rule is written over a *suffix* because §5.2 documents the echo
-    /// capture truncating to its tail at the terminal width: 125 characters
-    /// typed at 80 columns are captured as the last 47. Holdfast's snippets
-    /// are 300-500 characters, so at any real width the capture is **always**
-    /// a tail and never the whole line — which means an implementation
+    /// The rule is written over a *suffix* because the echo capture can keep
+    /// only the tail of a line wider than the terminal — zsh's wrap redraw
+    /// does exactly that (GH #276) — and the snippets typed for zsh and fish
+    /// run to several hundred characters, so there the capture is a tail at
+    /// any real width and never the whole line — which means an implementation
     /// spelled `line.trim_end() == command` suppresses the injection line
     /// at no terminal width anybody uses, while passing every fixture whose
     /// snippet happens to be short enough to fit.

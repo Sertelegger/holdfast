@@ -196,3 +196,161 @@ fn every_tool_description_fits_the_same_budget() {
         );
     }
 }
+
+/// Every `description` an agent is shown for `tool`: the tool's own, and
+/// every one inside its `inputSchema` and `outputSchema`, each with a path
+/// that says where it was found.
+///
+/// The schemas are most of `tools/list` by size, and their descriptions
+/// are this crate's doc comments, published by `schemars` — so a comment
+/// written for a maintainer lands in front of the agent unless it is kept
+/// out of `///`.
+fn published_descriptions(tool: &rmcp::model::Tool) -> Vec<(String, String)> {
+    fn walk(value: &serde_json::Value, path: String, out: &mut Vec<(String, String)>) {
+        match value {
+            serde_json::Value::Object(map) => {
+                for (key, child) in map {
+                    if key == "description" {
+                        if let Some(text) = child.as_str() {
+                            out.push((path.clone(), text.to_string()));
+                        }
+                    }
+                    walk(child, format!("{path}.{key}"), out);
+                }
+            }
+            serde_json::Value::Array(items) => {
+                for (i, child) in items.iter().enumerate() {
+                    walk(child, format!("{path}[{i}]"), out);
+                }
+            }
+            _ => {}
+        }
+    }
+    let name = tool.name.to_string();
+    let mut out = Vec::new();
+    if let Some(d) = tool.description.as_deref() {
+        out.push((name.clone(), d.to_string()));
+    }
+    let input = serde_json::Value::Object(tool.input_schema.as_ref().clone());
+    walk(&input, format!("{name}.inputSchema"), &mut out);
+    if let Some(output) = tool.output_schema.as_ref() {
+        let output = serde_json::Value::Object(output.as_ref().clone());
+        walk(&output, format!("{name}.outputSchema"), &mut out);
+    }
+    out
+}
+
+/// **A running command's `heuristic` tier is stated where the tier is
+/// described.** The detector withholds the OSC 133 and bracketed-paste
+/// rungs once the shell hands the terminal to a program it started, so
+/// every external command reads `Executing` / `heuristic` with the reason
+/// `no deterministic signal`, in a session whose integration is working.
+/// An agent told only that `semantic` means *markers* and `heuristic`
+/// means *a guess* reads that as a broken integration.
+///
+/// Checked on every tool that publishes the `DetectionTier` definition,
+/// because each carries its own copy, and at least one must.
+#[test]
+fn detection_tier_says_a_running_command_reads_heuristic() {
+    let mut seen = 0;
+    for tool in passthrough::tool_manifest() {
+        let name = tool.name.to_string();
+        let Some(output) = tool.output_schema.as_ref() else {
+            continue;
+        };
+        let Some(tier) = output
+            .get("$defs")
+            .and_then(|d| d.get("DetectionTier"))
+            .and_then(|t| t.get("description"))
+            .and_then(|d| d.as_str())
+        else {
+            continue;
+        };
+        seen += 1;
+        let tier = tier.split_whitespace().collect::<Vec<_>>().join(" ");
+        for needle in [
+            "A running command normally reads `heuristic`, even in an integrated shell",
+            "once the shell hands the terminal to a program",
+            "`no deterministic signal`",
+            "`semantic` again at the shell's next prompt",
+        ] {
+            assert!(
+                tier.contains(needle),
+                "`{name}`'s DetectionTier description dropped {needle:?}:\n{tier}"
+            );
+        }
+    }
+    assert!(
+        seen >= 7,
+        "only {seen} tools publish DetectionTier; the prompt-bearing tools lost it"
+    );
+}
+
+/// **What the agent is shown is prose, not source.** `wait_for_pattern`'s
+/// `pattern` argument reached `tools/list` with runs of spaces, literal
+/// `\"` and the name of a private function (`run_wait_for_idle`): a
+/// string-continuation edit made inside a `///` comment, which rustdoc and
+/// `schemars` publish byte for byte. Nothing looked at the rendered text.
+///
+/// Indentation at the start of a line is allowed — a Markdown list item's
+/// continuation is indented on purpose — so the space check is on what
+/// follows it.
+#[test]
+fn no_published_description_carries_source_artefacts() {
+    let mut checked = 0;
+    for tool in passthrough::tool_manifest() {
+        for (path, text) in published_descriptions(&tool) {
+            checked += 1;
+            for line in text.lines() {
+                assert!(
+                    !line.trim_start().contains("  "),
+                    "{path} has a run of spaces inside a line: {line:?}"
+                );
+            }
+            assert!(
+                !text.contains("\\\""),
+                "{path} carries a literal backslash-quote: {text:?}"
+            );
+        }
+    }
+    assert!(checked > 100, "only {checked} descriptions were walked");
+
+    let wait = HoldfastServer::wait_for_pattern_tool_attr();
+    let pattern = wait
+        .input_schema
+        .get("properties")
+        .and_then(|p| p.get("pattern"))
+        .and_then(|p| p.get("description"))
+        .and_then(|d| d.as_str())
+        .expect("pattern has a description");
+    assert!(
+        !pattern.contains("run_wait_for_idle"),
+        "the pattern argument names a private function again: {pattern}"
+    );
+}
+
+/// `no_tool_description_calls_the_unresolved_marker_unmatched`, extended to
+/// the schemas: `read_output`'s own `redactions` field told the agent that
+/// `unresolved` means *nothing matched these bytes*, in the one place an
+/// agent totalling the map would look, while the tool's description said
+/// the opposite.
+#[test]
+fn no_published_schema_calls_the_unresolved_marker_unmatched() {
+    const FALSE_UNRESOLVED_CLAIMS: [&str; 2] = ["no rule matched", "nothing matched"];
+    for tool in passthrough::tool_manifest() {
+        for (path, text) in published_descriptions(&tool) {
+            let text = text
+                .split_whitespace()
+                .collect::<Vec<_>>()
+                .join(" ")
+                .to_lowercase();
+            for claim in FALSE_UNRESOLVED_CLAIMS {
+                assert!(
+                    !text.contains(claim),
+                    "{path} says {claim:?}, which is false of \
+                     `[REDACTED:unresolved]` when a real match was folded into it:\n{text}"
+                );
+            }
+        }
+    }
+}

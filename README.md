@@ -143,12 +143,14 @@ into the child and accept the stall.
 ### Shell integration
 
 When the session command is `bash`, `zsh` or `fish`, Holdfast types a
-one-line OSC 133 snippet at the first prompt, so the shell marks its own
-prompt, command and exit-code boundaries and detection runs at the
-`semantic` tier. The snippet wraps whatever `PS1` the shell ended up with
-instead of replacing it, does nothing when your configuration already
-emits OSC 133, and is not exported — a nested shell is integrated in its
-own right. Pass `shell_integration: false` to `start_session` to skip it.
+one-line OSC 133 snippet into the session as it spawns, so the shell marks
+its own prompt, command and exit-code boundaries and detection runs at the
+`semantic` tier. The terminal holds the line until the shell first reads
+input, which is normally at its first prompt, after your rc files have run.
+The snippet wraps whatever `PS1` the shell ended up with instead of
+replacing it, does nothing when your configuration already emits OSC 133,
+and is not exported — a nested shell is integrated in its own right. Pass
+`shell_integration: false` to `start_session` to skip it.
 
 It is **typed into the session, never installed**: there is nothing to add
 to an rc file, and `crates/holdfast-core/src/detect/shell.rs` holds the only
@@ -158,6 +160,15 @@ snippet from `HOLDFAST_BASH_INTEGRATION`, which the session starts with and
 that line unsets. Anything else — `dash`, `sh`, a REPL, a plain
 program — degrades silently to `terminal_mode` or `heuristic`, with no
 configuration and no error.
+
+**Anything an rc file reads from the terminal at start-up reads that line
+instead.** A `read` in `.bashrc` or `.zshrc`, zsh's new-user menu in a home
+with no `.zshrc`, or oh-my-zsh's update question `[Y/n]` takes the line, or
+its first characters, as its answer, and the session can start without
+integration and degrade the same way. Measured with a `read` in the rc
+file, bash and zsh both started at `terminal_mode` with no command history.
+Switch such a question off for the shells Holdfast starts; oh-my-zsh's is
+`zstyle ':omz:update' mode auto` (or `disabled`).
 
 Output is ANSI-stripped and secret-redacted by default: secrets are
 replaced with `[REDACTED:<kind>]` markers, and `read_output` with

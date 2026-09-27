@@ -149,6 +149,57 @@ fn argv_from_procargs2(buf: &[u8]) -> Option<Vec<String>> {
         .collect()
 }
 
+/// The start of the line portable-pty ends a failed `$PATH` search with,
+/// followed by the whole `$PATH` Debug-quoted.
+const NO_PATH_CANDIDATE: &str = "No viable candidates found in PATH";
+
+/// `spawn_command`'s refusal as one line that keeps its cause.
+///
+/// **One line because `start_session` reports one** (`envelope::brief`
+/// keeps the first line of an error and bounds it), and portable-pty's
+/// `$PATH` search fails with several: a headline ending in `because:`,
+/// one line per candidate that exists but cannot be run, and last
+/// `No viable candidates found in PATH "<the whole $PATH>"`. Cut at the
+/// first line, the agent was told `Unable to spawn X because:` and nothing
+/// after the colon. Here every line is kept, joined into the headline.
+///
+/// **The `$PATH` line is replaced, not kept.** It would put the whole
+/// search path into the MCP transcript, which `start_session` keeps out
+/// on purpose; what the agent can act on is that the program was not
+/// found on it. With no candidate at all that is the whole cause; beside
+/// candidates that exist but cannot be run, it says no other one could.
+///
+/// `{:#}` rather than `{}`, so a failure that is a chain of errors — an
+/// `exec` refused by the kernel, wrapped by portable-pty — keeps every
+/// link and not only the outermost.
+fn spawn_failure(e: &anyhow::Error) -> String {
+    let full = format!("{e:#}");
+    let mut lines = full
+        .lines()
+        .map(|l| l.trim().trim_end_matches('.'))
+        .filter(|l| !l.is_empty());
+    let Some(headline) = lines.next() else {
+        return full;
+    };
+    let mut causes: Vec<&str> = Vec::new();
+    for line in lines {
+        if line.starts_with(NO_PATH_CANDIDATE) {
+            causes.push(if causes.is_empty() {
+                "not found on PATH"
+            } else {
+                "no other candidate on PATH"
+            });
+        } else {
+            causes.push(line);
+        }
+    }
+    if causes.is_empty() {
+        headline.to_string()
+    } else {
+        format!("{headline} {}", causes.join("; "))
+    }
+}
+
 impl InProcessPty {
     pub fn spawn(cfg: &PtySpawnConfig) -> Result<Self> {
         Self::spawn_with_base_env(cfg, None)
@@ -202,7 +253,7 @@ impl InProcessPty {
         let child = pair
             .slave
             .spawn_command(cmd)
-            .map_err(|e| HoldfastError::Pty(format!("spawn: {e}")))?;
+            .map_err(|e| HoldfastError::Pty(format!("spawn: {}", spawn_failure(&e))))?;
         // Drop the slave so the master sees EOF when the child exits.
         //
         // **This line is load-bearing in a second place, and it is not
@@ -1172,5 +1223,115 @@ mod leader_argv_parsing {
         ] {
             assert_eq!(argv_from_procargs2(&broken), None, "{broken:?}");
         }
+    }
+}
+
+/// `spawn_failure`, on portable-pty's own messages and on a real spawn.
+///
+/// The transcribed rows pin the formatting; the two `#[cfg(unix)]` rows
+/// drive portable-pty itself, so a release of it that rewords its `$PATH`
+/// search goes red here instead of reaching the agent as a bare
+/// `because:` again.
+#[cfg(test)]
+mod spawn_failure_message {
+    use super::*;
+    // Only the two rows that drive portable-pty name it, and they are Unix.
+    #[cfg(unix)]
+    use crate::pty::PtySpawnConfig;
+
+    #[test]
+    fn a_path_search_that_found_nothing_says_not_found_and_hides_the_path() {
+        let e = anyhow::anyhow!(
+            "Unable to spawn frob because:\n\
+             No viable candidates found in PATH \"/secret/tools:/usr/bin\""
+        );
+        assert_eq!(
+            spawn_failure(&e),
+            "Unable to spawn frob because: not found on PATH"
+        );
+    }
+
+    #[test]
+    fn a_candidate_that_cannot_run_is_kept_beside_the_verdict() {
+        let e = anyhow::anyhow!(
+            "Unable to spawn frob because:\n\
+             /opt/bin/frob exists but is not executable.\n\
+             /usr/bin/frob exists but is a directory.\n\
+             No viable candidates found in PATH \"/opt/bin:/usr/bin\""
+        );
+        assert_eq!(
+            spawn_failure(&e),
+            "Unable to spawn frob because: /opt/bin/frob exists but is not \
+             executable; /usr/bin/frob exists but is a directory; no other \
+             candidate on PATH"
+        );
+    }
+
+    #[test]
+    fn a_one_line_failure_is_unchanged() {
+        let e = anyhow::anyhow!("Unable to spawn ./frob because it does not exist");
+        assert_eq!(
+            spawn_failure(&e),
+            "Unable to spawn ./frob because it does not exist"
+        );
+    }
+
+    #[test]
+    fn a_chained_failure_keeps_every_link() {
+        let e = anyhow::Error::new(std::io::Error::from(std::io::ErrorKind::PermissionDenied))
+            .context("exec");
+        let s = spawn_failure(&e);
+        assert!(s.starts_with("exec: "), "{s}");
+        assert!(s.len() > "exec: ".len(), "the cause was dropped: {s}");
+    }
+
+    /// The reported case: `start_session` for a program that is not
+    /// installed answered `Unable to spawn … because:` and nothing more.
+    #[cfg(unix)]
+    #[test]
+    fn a_missing_program_is_reported_as_not_found_on_path() {
+        let cfg = PtySpawnConfig::new("holdfast_definitely_not_a_real_program");
+        let Err(e) = InProcessPty::spawn(&cfg) else {
+            panic!("a program that does not exist was spawned");
+        };
+        let msg = e.to_string();
+        assert_eq!(msg.lines().count(), 1, "{msg:?}");
+        assert!(
+            msg.ends_with(
+                "Unable to spawn holdfast_definitely_not_a_real_program because: \
+                 not found on PATH"
+            ),
+            "{msg:?}"
+        );
+    }
+
+    /// The other shape of the same search: the name is on `$PATH` and
+    /// cannot be run. The candidate is named, and `$PATH` itself is not.
+    #[cfg(unix)]
+    #[test]
+    fn a_program_on_path_that_cannot_run_is_named() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().expect("tempdir");
+        let file = dir.path().join("holdfast_not_executable_probe");
+        std::fs::write(&file, "#!/bin/sh\n").expect("write");
+        std::fs::set_permissions(&file, std::fs::Permissions::from_mode(0o644)).expect("chmod");
+        let mut cfg = PtySpawnConfig::new("holdfast_not_executable_probe");
+        let path = dir.path().to_str().expect("utf-8 tempdir").to_string();
+        cfg.env.push(("PATH".into(), path.clone()));
+        let Err(e) = InProcessPty::spawn(&cfg) else {
+            panic!("a file without an execute bit was spawned");
+        };
+        let msg = e.to_string();
+        assert_eq!(msg.lines().count(), 1, "{msg:?}");
+        assert!(
+            msg.contains(&format!("{} exists but is not executable", file.display())),
+            "{msg:?}"
+        );
+        assert!(msg.ends_with("; no other candidate on PATH"), "{msg:?}");
+        assert!(!msg.contains(NO_PATH_CANDIDATE), "{msg:?}");
+        assert!(
+            !msg.contains(&format!("\"{path}\"")),
+            "$PATH leaked: {msg:?}"
+        );
     }
 }
