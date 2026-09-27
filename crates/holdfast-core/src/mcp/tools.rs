@@ -4535,14 +4535,19 @@ pub struct WaitForPatternArgs {
     /// removed, as read_output returns it — and as raw bytes; the earlier
     /// match wins. match.offset is always a raw byte offset.
     ///
-    /// **Omit it to wait for the session to stop executing instead. An empty      string is rejected rather than treated as either, because it is a likely client      encoding of \"omit\" and it used to match at offset zero and complete instantly** —
-    /// which is not the same claim as "the command finished"; see
-    /// `run_wait_for_idle` for what each tier can actually establish. A
-    /// shell-prompt regex is a guess about the operator's `$PS1` and
-    /// silently never matches a customised one, so "wait until the
-    /// command finishes" is answered from the detector rather than from
-    /// text. Supply this only for a *program's* prompt — `Password:`,
-    /// `(gdb)`, `>>>` — which is text no detector knows about.
+    /// **Omit it to wait for the session to stop executing instead.** An
+    /// empty string is refused as an invalid argument rather than read as
+    /// either form; omit the key to mean "no pattern". Supply a pattern
+    /// only for a *program's* prompt — `Password:`, `(gdb)`, `>>>` — which
+    /// no detector knows about. Never pass one for the shell's own prompt:
+    /// it is a guess about the operator's `$PS1`, silently never matches a
+    /// customised one, and so times out on a command that has finished.
+    //
+    // Everything in `///` above is this argument's published description,
+    // so it says what a caller does and nothing about the code. Why `""`
+    // is refused is at the top of `wait_for_pattern`; what the pattern-less
+    // wait can establish at each detection tier is `run_wait_for_idle`'s
+    // doc.
     #[serde(default)]
     pub pattern: Option<String>,
     /// Deadline in seconds. Defaults to 30. 0 means "no caller deadline"
