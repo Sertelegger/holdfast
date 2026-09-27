@@ -2521,7 +2521,11 @@ mod tests {
         let call = json!({ "session": "s", "prompt_text": "sudo password" });
         let (shim, mut received, _dir) = shim_over("oldsecret", 1).await;
         let err = shim
-            .forward("request_secret_input", args(call.clone()), std::future::pending())
+            .forward(
+                "request_secret_input",
+                args(call.clone()),
+                std::future::pending(),
+            )
             .await
             .expect_err("a 1.1 daemon would ask at an idle shell prompt");
         let data = err.data.clone().expect("the reason is structured");
