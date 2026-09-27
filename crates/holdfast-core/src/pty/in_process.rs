@@ -1235,6 +1235,8 @@ mod leader_argv_parsing {
 #[cfg(test)]
 mod spawn_failure_message {
     use super::*;
+    // Only the two rows that drive portable-pty name it, and they are Unix.
+    #[cfg(unix)]
     use crate::pty::PtySpawnConfig;
 
     #[test]
