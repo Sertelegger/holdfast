@@ -146,7 +146,7 @@ and G5 is not claimed. Each row states its status.
 |---|---|---|
 | **G1. Routing** | Every byte that reaches an agent or an observer comes from the redactor, except through the raw paths named below. | **Holds**, with the raw paths listed under G1. |
 | **G2. Known values** | A secret whose exact value Holdfast knows is masked wherever it appears, within a published scope. | **Not built.** Known gap: `printenv`. |
-| **G3. Write gate** | Holdfast writes a secret into a session only at a real secret prompt, or on a human's explicit override. | **Partial.** The gate admits any terminal with echo off, which includes an idle shell prompt (GH #262). |
+| **G3. Write gate** | Holdfast writes a secret into a session only at a real secret prompt, or on a human's explicit override. | **Partial.** The gate refuses a shell sitting at its own prompt when the shell's OSC 133 markers show it. It still admits a REPL's prompt and a line-editing shell with no markers, because both have echo off (GH #262). |
 | **G4. One verdict per byte** | Once Holdfast has decided whether a byte is shown or masked, every surface and every later read give the same answer. | **Not built.** Each read decides on its own. |
 | **G5. Bounded withholding** | Nothing is withheld indefinitely. | **Not claimed.** One indefinite hold is known. |
 
@@ -278,7 +278,11 @@ or reveals something about output the redactor masked:
      read's start, and every other mask, still applies. A token longer than
      the lookbehind, which began further back, comes back in part (R18).
    - A tail read that passes `apply_holdback: true` keeps the withhold.
-     `holdfast logs --tail` always passes it.
+     `holdfast logs --tail` always passes it. Against a daemon too old to
+     honour it (protocol below 1.4, which a `v0.0.7` daemon still running
+     after an upgrade is), it reads through cursor reads instead, which
+     keep the in-flight withhold, and says where they stopped if they end
+     short of the head.
 4. **`wait_for_pattern` and `send_input(wait_for:)` match the agent's
    regular expression against unredacted bytes**: the raw stream, and a copy
    with escape sequences removed.
@@ -374,36 +378,109 @@ Today they are discarded as soon as they are written.
 
 #### G3. The write gate: partial
 
-**What exists.** Holdfast refuses to write a credential into a session unless
-the child's terminal has echo turned off. This applies to both production
-paths that write one:
+**What exists.** Holdfast writes a credential into a session only when two
+tests pass. This applies to both production paths that write one:
 - a human's answer to `request_secret_input` from an attached client;
 - a value that an operator-configured secret provider resolves.
 
-The terminal is sampled on the writer thread one statement before the write,
-not read from a cache. A refused value is zeroed without reaching the PTY
-(`write_secret_if_unread`, `crates/holdfast-core/src/session/mod.rs`). A
-backend that cannot report the terminal's state is refused in the same way.
+Both tests run on the writer thread one statement before the write
+(`write_secret_if_unread`, `crates/holdfast-core/src/session/mod.rs`). The
+terminal's state is sampled once at that moment, not read from a cache.
+The shell's markers are read as the output reader has scanned them by
+then. A refused value is zeroed without reaching the PTY.
+1. **The child's terminal has echo turned off.** A backend that cannot
+   report the terminal's state is refused in the same way.
+2. **The session's shell is not sitting at its own prompt** (GH #262). The
+   shell reports this with its OSC 133 markers: Holdfast's own integration
+   for bash, zsh and fish, or an integration the shell already carries.
+   The write is refused when all of these hold:
+   - no command has started since the shell's last prompt marker;
+   - the shell still holds the terminal;
+   - the terminal is not in the shape of a secret line read, which is echo
+     off with canonical (line-at-a-time) input on. No line editor reads
+     that way, and a shell's own `read -s` does. This exception lets
+     `read -s` through where the markers never say a command started:
+     bash older than 4.4, such as macOS's `/bin/bash` 3.2, and an
+     integration that marks only the prompt.
 
-**What it admits.** Echo off is not the same thing as a password prompt. Line
-editors such as bash's readline and zsh's zle, and the Python and Node REPLs,
-turn echo off and draw the characters typed at them themselves. So a secret
-submitted while a shell sits idle at its prompt passes the gate. Then:
-1. the line editor draws it, so it reaches the session's output;
-2. it runs as a command when the newline that Holdfast appends by default
-   arrives;
-3. it can be saved to the shell's history.
+`request_secret_input` asks the second question before it asks anyone. At
+an idle shell prompt it answers `secret_cancelled` with reason
+`at_shell_prompt`. No human is asked to type, no provider runs, and nothing
+is audited, because nothing was requested. It asks again just before it
+raises the request, after any provider has run. If the shell returns to
+its prompt later, for example because the command that asked has ended,
+the writer refuses the answer with the same reason.
 
-This is measured end to end for bash, zsh and the Python REPL, on both write
-paths, in GH #262. On the provider path, with a binding that asks for no
-confirmation, no human takes part at all.
+**Why the second test is needed.** Echo off is not the same thing as a
+password prompt. Line editors such as bash's readline and zsh's zle turn
+echo off and draw the characters typed at them themselves. Before the
+second test, a secret submitted while a shell sat idle at its prompt
+passed the gate. Then:
+1. the line editor drew it, so it reached the session's output and the
+   attached human's own terminal;
+2. it ran as a command when the newline that Holdfast appends by default
+   arrived;
+3. it could be saved to the shell's history.
 
-The classifier that reports `interaction_mode: AwaitingSecret` already asks a
-stricter question: echo off, the terminal still in canonical (line-at-a-time)
-mode, and no bracketed paste (`crates/holdfast-core/src/detect/detector.rs`).
-The write gate does not use it. The planned fix is for the gate to use the
-classifier's predicate, with a per-submission override for the human
-(GH #262).
+GH #262 measured this end to end for bash, zsh and the Python REPL, on both
+write paths. On the provider path, with a binding that asks for no
+confirmation, no human took part at all. One ordinary agent mistake is
+enough to get there: bash's `read -s -p` fails in zsh and leaves the
+session at its prompt.
+
+**What it still admits.** The second test is an interim guard, and it sees
+only a shell whose markers arrive. These still pass on echo alone:
+- **a REPL**: Python, Node, a database client, or any other line editor
+  that is not a shell;
+- **a line-editing shell whose integration is off**: a session started
+  with `shell_integration: false`, a shell Holdfast does not integrate
+  (`ksh`, `mksh`, `tcsh`), a nested shell started inside the session, or
+  one reached with `exec`. `sh` and `dash` echo at their prompt, so the
+  echo test refuses them unless a human sends `--allow-echo`;
+- **a remote shell under `ssh`**, unless the remote shell emits the
+  markers itself;
+- **a prompt the reader has not scanned yet**, for as long as the reader
+  takes to see the markers the shell has just printed.
+
+A secret submitted at any of those idle prompts is still drawn, run and
+saved as above. Two more cases are admitted with a different outcome:
+- **a shell with no line editor whose terminal a program left with echo
+  off**, such as `bash --noediting` after an interrupted `stty -echo`. Its
+  prompt reads exactly like a secret line read. The value is not drawn,
+  but it is run as a command and saved to history;
+- **a full-screen program with echo off**, such as an editor. The value
+  goes into that program's own input, for example a vim buffer in insert
+  mode, which `get_screen_state` shows.
+
+**What it refuses that it should not.**
+- **A secret prompt from a remote shell under `ssh -t` whose integration
+  marks only the prompt.** `ssh` holds the local terminal in raw mode, so
+  the secret-line-read exception cannot see the remote read, and the
+  remote shell's prompt marker is still the last one. No override reaches
+  it.
+- **A request made in the same instant as the command that asks for the
+  secret.** Until the shell has read the command line, it is still at its
+  prompt. Measured: 2 of 3 calls made with no gap were refused, and none
+  with a gap of 5 ms or more. The refusal tells the agent to wait for the
+  password prompt and call again, and that call succeeds.
+
+**What it does not refuse.** A command that is reading the secret:
+- `read -s`;
+- `sudo` and `getpass`;
+- a program running in the foreground in its own process group, such as
+  `ssh -t` at a remote password prompt when the remote shell emits no
+  markers or all of them.
+
+They read after the shell's "command started" marker, or while another
+program holds the terminal, or, for the shell's own `read -s`, as a secret
+line read.
+
+**The planned fix** makes the gate use the classifier's own predicate.
+That predicate is what reports `interaction_mode: AwaitingSecret`: echo
+off, the terminal still in canonical mode, and no bracketed paste
+(`crates/holdfast-core/src/detect/detector.rs`). It needs a per-submission
+override for the human, because on its own it refuses real password
+prompts that run in raw mode, such as `ssh -t` (GH #262).
 
 **The human override.** `holdfast attach --allow-echo` skips the echo test
 for that connection:
@@ -411,8 +488,12 @@ for that connection:
   argument.
 - It is `false` when absent, so a client that predates it fails closed.
 - It exists for programs that ask for a code without ever clearing echo.
-- Under it, the value is still masked on the human's own terminal. It still
-  lands in the session's output, where only the pattern rules can catch it.
+- Under it, the value is still masked on the human's own terminal. It
+  still lands in the session's output, where only the pattern rules can
+  catch it.
+- **It does not skip the shell-prompt test.** It accepts that a secret
+  prompt echoes, and an idle shell is not a secret prompt: the value would
+  be run and saved to history, not only shown.
 
 **Open issues.** Three leave gaps between the gate's check and the child's
 read:
@@ -543,6 +624,7 @@ not a secret.
 | R18 | **Leaks** the tail of a token longer than 512 bytes, such as a JWT | Every rule but the private-key rule is judged over a window that reaches only the lookbehind (512 bytes by default) behind a read's start. So a read that begins more than that into a long token misses it: a `tail_bytes` read, `wait_for_pattern`'s `match.text`, a read from an arbitrary `since_cursor`, or the cursor read after one that saw the token partly arrived | `cat` a generated 1,027-byte JWT, then `read_output(tail_bytes: 400)`: the last 310 characters of the signature come back raw, with `redactions: {}`, with or without `apply_holdback: true`. `tail_bytes: 600` masks them. `wait_for_pattern(pattern: "[A-Za-z0-9_-]{300}\r\n")` returns 300 signature characters raw in `match.text` in one call, while the same response's `output_since_start` masks them. Print 600 bytes of the token, pause, then print the rest: the first cursor read masks what has arrived as `[REDACTED:unresolved]`, and the next returns the rest of the token raw. With 300 bytes before the pause, the token is held and then masked | **Open**, GH #261 | Yes: give token rules the backward search that private keys have |
 | R19 | **Over-masks** hex digests and base64 lines after a mention of a private-key header | A line that names a whole `…PRIVATE KEY-----` header without being a key, such as a `grep` hit, a code literal or a test fixture's name. Up to 16 KiB past the header, every line with a run of 48 or more base64-alphabet characters (letters, digits, `+`, `/`, `=`) is masked as `[REDACTED:unresolved]`: SHA-256 hex digests, the base64 part of a `sha512-` integrity string, base64 blobs. A 40-digit git object id is too short to qualify | `grep` a file for `-----BEGIN RSA PRIVATE KEY-----`, then run `sha256sum` over twelve files: all 12 digest lines are masked on the default cursor read, on a 1 KiB page and on the grid. Only `redact: false` shows them, and it also shows every real secret in the window | **Open**, GH #260 | Partly. Refusing hex-only runs and `sha256-`, `sha384-` and `sha512-` prefixes closes digests and integrity strings. A base64 blob has the alphabet of key body, and stays masked |
 | R20 | **Leaks** the tail of a recalled command in `get_command_history`, reported as complete | A line editor that answers a carriage return by moving the cursor forward past the prompt, which resumes inside the command, as bash does for history recall and fish does while typing. The capture discards the row, and the entry keeps only what was written after the resume, with `truncated: false`. A secret whose label or prefix sat before that column comes back as a bare tail that no rule matches | In bash, run `echo short`, then press Up, Up, Down, Enter: the entry reads `short` with `truncated: false`. fish typing `echo hello world` key by key records `d` | **Open**, GH #271 | Yes: treat the motion as resuming inside the command, or report `truncated: true` whenever a carriage return discards text no later write replaced |
+| R21 | **Leaks** a token that zsh's wrap redraw splits, on `read_output`; and records a long command as `[REDACTED:unresolved]` or as a tail reported as complete in `get_command_history` | A command line wider than the terminal under zsh, which redraws it at the right margin with ` \r\e[K<char>\r`. That puts a space and two carriage returns inside a token straddling the margin, and the history capture reads the `\r` after the autowrap as a return to the start of the line. At the default 120 columns this is an ordinary long command | In zsh, type a fake `AKIAIOSFODNN7EXAMPLE` so that `AKIAIOSF` ends the first row: `read_output` returns both halves raw with `redactions: {}`, where bash returns `{aws: 1}` and fish `{aws: 2}`; `get_screen_state` masks it. A 112-character pipeline or a 115-character `echo` at 120 columns, under `zsh -f` or an empty `.zshrc`, is recorded as `[REDACTED:unresolved]` with the right exit code. When the second row is at least as long as the dropped front, the tail passes the truncation check and is reported as the whole command | **Open**, GH #276. Not a regression: v0.0.7 does the same | Yes: pass the session's columns to the scanner, so a `\r` past the width returns only to the current row, which fixes the history entry; and normalise the same redraw in the redactor's input, which fixes the split token |
 
 **Known, filed, and not yet a row.** Each of these is a leak:
 - **A partial token in a window title.** Metadata is matched for complete
@@ -582,16 +664,25 @@ mechanisms prevent it:
     `PSQL_HISTORY` are `nul`, because a native program opens `/dev/null`
     as `\dev\null` on the current drive;
   - `SHELL_SESSIONS_DISABLE=1`, for macOS Terminal's per-window zsh
-    history.
+    history;
+  - for a bash session with shell integration,
+    `HOLDFAST_BASH_INTEGRATION`, which carries the integration snippet to
+    the line Holdfast types and is unset by that line; a call's `env`
+    cannot replace it. It fails to reach bash when an rc re-execs bash
+    through `env -i` or `env -u` or defines its own `eval` function or
+    alias, and is expected to for WSL's `bash.exe` started from native
+    Windows (not measured), and such a session gets neither integration
+    nor the snippet's half of this policy.
 
-  A call's own `env` overrides any of them. `SQLITE_HISTORY` is empty
-  rather than `/dev/null` because libedit `fchmod`s the history file it
-  saves to `0600`, which as root would change `/dev/null` itself. node's
-  value is empty rather than `/dev/null` because node 24 and later print
-  *Could not open history file* at every REPL start when it is a device.
-  ts-node treats an empty value as its default file, so it gets a space,
-  which node trims to empty. MariaDB 11 reads `MARIADB_HISTFILE` before
-  `MYSQL_HISTFILE`, and 10.x reads only the second, so both are set.
+  A call's own `env` overrides any of them but the last. `SQLITE_HISTORY`
+  is empty rather than `/dev/null` because libedit `fchmod`s the history
+  file it saves to `0600`, which as root would change `/dev/null` itself.
+  node's value is empty rather than `/dev/null` because node 24 and later
+  print *Could not open history file* at every REPL start when it is a
+  device. ts-node treats an empty value as its default file, so it gets a
+  space, which node trims to empty. MariaDB 11 reads `MARIADB_HISTFILE`
+  before `MYSQL_HISTFILE`, and 10.x reads only the second, so both are
+  set.
 - **The integration snippet**, for bash and zsh. It begins with a space
   and runs after the rc files, and sets `HISTFILE` again. The value is
   `/dev/null`, or a `HISTFILE` the call set itself, which the snippet
@@ -599,6 +690,15 @@ mechanisms prevent it:
   `/dev/null` and does not unset the variable, for two reasons:
   oh-my-zsh and prezto re-arm an empty `HISTFILE` when the rc is sourced
   again, and a nested shell or `exec` does not inherit an unset one.
+  It then empties the history the shell has already read from the file
+  the rc names (GH #274; see H10), and reads back only a file the
+  session's own `HISTFILE` names. It leaves that list whole in a zsh
+  whose rc turns off `append_history`, `inc_append_history` and
+  `share_history`: such a zsh saves by rewriting its file from the list,
+  and after the agent sources the rc again an emptied list would replace
+  the operator's file with the session's commands. When `HISTFILE` is
+  readonly, or in zsh `SAVEHIST` or `HISTSIZE`, it leaves the history
+  variables and the list alone (see H1).
   In zsh it also sets `SAVEHIST=0` and unsets `hist_save_by_copy`. With
   `SAVEHIST` set by an rc, zsh saves at exit and locks first by creating
   `/dev/null.LOCK`. As any user but root that fails, and *zsh: locking
@@ -636,13 +736,14 @@ The record is kept for convenience; it is not an audit trail:
 - The call's `env` can point `HISTFILE` somewhere else.
 - The rc's own options decide what is recorded. For example, Debian's
   `HISTCONTROL=ignoreboth` and zsh's `hist_ignore_space` drop commands
-  that begin with a space. Without such an option, each bash file begins
-  with the snippet's own line.
+  that begin with a space.
 - zsh records a command when it is entered, not when it finishes.
 - Anything in the list below that re-points `HISTFILE` takes the rest of
   the session's commands with it.
-- An rc sourced again that sets `HISTFILESIZE` truncates the file to that
-  size when bash exits (measured: `HISTFILESIZE=3` left three lines).
+- An rc sourced again that sets `HISTFILESIZE`, or an rc that makes it
+  `readonly`, which the snippet then cannot unset, truncates the file to
+  that size when bash exits (measured for both: `HISTFILESIZE=3` left
+  three lines).
 - A `PROMPT_COMMAND` replaced mid-session removes the per-command append.
   Commands after that reach the file only if bash saves at exit or on a
   hangup, and then only the last `HISTSIZE` of them. `histappend`, which
@@ -662,9 +763,25 @@ and Python 3.12.
   - an rc that hard-sets `HISTFILE` is sourced again;
   - `exec bash` or a nested bash starts under such an rc;
   - `PROMPT_COMMAND` assigns `HISTFILE`;
-  - `HISTFILE` is `readonly`, in bash or zsh. The snippet's assignment
-    then fails, and `HISTFILE: readonly variable` appears in the
-    session's output.
+  - `HISTFILE` is `readonly`, in bash or zsh, as audit-hardened rc files
+    and every `rbash` make it, or in zsh `SAVEHIST` or `HISTSIZE` is. The
+    snippet then leaves the history variables alone, so the rc's settings
+    decide what is saved and where, and it leaves the history the shell
+    read in memory (H10). The integration is unaffected: markers, exit
+    codes and `get_command_history` work, and nothing is printed.
+    Measured on bash 5.2 and 5.3 and zsh 5.9. A bash older than 4.4
+    cannot test for it, and there the snippet's assignment still fails
+    and takes the integration with it (not measured).
+
+  Since GH #274 the first case can cost the operator's bash history
+  rather than add to it. An rc that hard-sets `HISTFILE` and runs
+  `history -w` from `PROMPT_COMMAND`, sourced again, rewrites the
+  operator's file from the session's list, and that list now holds only
+  the session's commands: none of the operator's entries survive
+  (measured, bash 5.2 and 5.3, by `exit` and by hangup). bash's own save
+  at exit appends and is unaffected. zsh's equivalent, an rc that saves by
+  rewriting its history file, is why the snippet leaves such a zsh's list
+  whole (H10).
 - **H2. A zsh started inside a session, or by `exec zsh`, under an rc that
   sets `HISTFILE` unconditionally.** macOS's `/etc/zshrc` sets one for
   every zsh, so on a Mac any nested or exec'd zsh writes `~/.zsh_history`,
@@ -739,19 +856,53 @@ and Python 3.12.
   standing in for `/dev/null`: the exec'd and nested shells replaced it
   (new inode, the commands inside), and the re-sourced shell wrote into
   it in place.
-- **H10. Reading the operator's history.** bash and zsh load the history
-  file that an rc names as they start, before the snippet runs, so the
-  operator's own history is in the session's memory. The agent can list
-  it with `history` or `fc -l`, and recall it with up-arrow, into output
-  it reads. Measured on bash 5.2 under an rc that sets `HISTFILE`, and on
-  zsh 5.9 under macOS's `/etc/zshrc` lines and an oh-my-zsh-style rc. On a
-  Mac that is every zsh session.
+- **H10. Reading the operator's history, where the snippet does not
+  reach.** bash and zsh load the history file that an rc names as they
+  start, before the snippet runs. The snippet then empties that list, so
+  in a session Holdfast types into, `history`, `fc -l`, up-arrow and `!!`
+  offer only what was typed after it (GH #274). zsh's list keeps one
+  entry, the snippet's own line. Measured on bash 5.2 and 5.3 and zsh
+  5.9, in both history modes, under rc files that name a filled history
+  file. What still reads it:
+  - a bash or zsh started inside a session, or by `exec`, which loads the
+    file its own rc names, where the agent can list and recall it;
+  - a zsh whose rc turns off `append_history`, `inc_append_history` and
+    `share_history`. Such a zsh saves by rewriting its file from the
+    list, so after `source ~/.zshrc` an emptied list replaced the
+    operator's file with the session's commands (measured, zsh 5.9), and
+    the snippet leaves its list whole instead;
+  - a session whose `HISTFILE` is readonly, or in zsh whose `SAVEHIST` or
+    `HISTSIZE` is (H1), a session with `shell_integration: false`, a bash
+    the snippet's carrier does not reach, and a session whose rc reads the
+    terminal at start-up (H12), none of which get the emptying;
+  - anything that reads the file itself: the session runs as the
+    operator, so `cat ~/.bash_history` works as it always did.
 
   A fish nested inside a Holdfast fish session reads the history file its
   own config.fish names in the same way. It offers the lines as
   autosuggestions and lists them in `history`, and it can create an empty
   file where there was none. Measured on fish 3.7.0, 4.0.2 and 4.9.3. A
   fish that Holdfast starts reads nothing.
+- **H11. A history recorder that an rc installs as a hook.** atuin,
+  zsh-histdb, mcfly and loggers built on bash-preexec run from a shell
+  hook, such as a `preexec` function or zsh's `zshaddhistory`, and write
+  each command to a store of their own as it runs. Nothing the
+  environment or the snippet sets reaches that store, so every command
+  the agent runs is recorded there, in either history mode and with
+  `shell_integration: false`. Measured with bash-preexec 0.5.0, 0.6.0 and
+  its master branch: a logger hooked through it wrote every agent command
+  to a file under `$HOME`, whatever `HISTFILE` said. atuin itself was not
+  measured.
+- **H12. An rc file that reads the terminal at start-up.** Holdfast writes
+  its integration line as the session spawns, and the shell reads it as
+  its first input. A `read` in `.zshrc`, oh-my-zsh's update question or
+  zsh's new-user menu takes the line as its answer, and the snippet, with
+  its half of the history policy, never runs. Measured on zsh 5.9 with
+  `HISTFILE` and `SAVEHIST` set in `.zshrc` followed by a `read`: the
+  agent's commands were written to `~/.zsh_history` on `exit`. bash 5.2
+  under the same `read` saved nothing. fish's policy runs from `-C` and
+  was not measured under an rc-time prompt. Such a session also keeps the
+  history the shell read (H10).
 
 #### The out-of-band secret channel
 
@@ -765,9 +916,10 @@ it.** It shipped in 0.0.7.
 
 The value travels client → daemon → PTY, and it appears in no tool argument
 and no tool result. That is a statement about the tool, not about the
-session's output: written at an idle shell prompt, the value is drawn into
-the output, where only the pattern rules stand between it and the agent (G3,
-GH #262).
+session's output. Written at an idle REPL prompt, or at a shell prompt
+Holdfast cannot see, the value is drawn into the output, where only the
+pattern rules stand between it and the agent. A shell prompt it can see is
+refused (G3, GH #262).
 
 The channel needs a daemon and an attached client:
 - On Windows it is refused as `not_supported_on_platform`.
@@ -781,7 +933,11 @@ password prompt could get a human to type a real credential into an echoing
 terminal.
 The line discipline would then put it in the output, and the default,
 redacted `read_output` would hand it back to that same agent in the clear. An
-arbitrary password matches no rule.
+arbitrary password matches no rule. A newer `holdfast attach` does not rely
+on that daemon. Joined to a daemon older than the echo test (protocol below
+1.3, which a `v0.0.7` daemon still running after an upgrade is), it collects
+a secret masked, discards it unless `--allow-echo` was given, and says so at
+the prompt before anything is typed.
 
 **Other input channels:**
 - **`send_input` is not that channel and never was.** It writes whatever the
