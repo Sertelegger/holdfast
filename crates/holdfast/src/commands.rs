@@ -2957,16 +2957,19 @@ async fn attach_connected(
                         }
                         if mine {
                             submitted = None;
-                            // **The one outcome that gets a sentence
-                            // rather than a token** (GH #137). Every other
-                            // word here names something the human already
-                            // knows they did or watched happen; this one
-                            // names a thing Holdfast did *instead of* what
-                            // they asked for, and `secret request
-                            // not_echo_off` does not say that a password
-                            // they typed was thrown away. The token stays
-                            // in the line so it is still greppable and
-                            // still matches the agent's
+                            // **The two outcomes that get a sentence
+                            // rather than a token** (GH #137, GH #262).
+                            // Every other word here names something the
+                            // human already knows they did or watched
+                            // happen; these two name a thing Holdfast did
+                            // *instead of* what they asked for, and
+                            // `secret request not_echo_off` does not say
+                            // that a password they typed was thrown away.
+                            // `at_shell_prompt` also says that
+                            // `--allow-echo` does not reach it, since the
+                            // other sentence offers that flag. The token
+                            // stays in the line so it is still greppable
+                            // and still matches the agent's
                             // `secret_cancelled.reason`.
                             if outcome == "not_echo_off" {
                                 diag!(
@@ -2975,6 +2978,15 @@ async fn attach_connected(
                                      discarded and nothing was sent to the child. Re-attach \
                                      with `--allow-echo` to send it anyway, accepting that \
                                      the child will echo it into the session's output."
+                                );
+                            } else if outcome == "at_shell_prompt" {
+                                diag!(
+                                    "holdfast attach: secret request at_shell_prompt — the \
+                                     session's shell was back at its prompt, where the value \
+                                     would have been shown, run as a command and saved to \
+                                     history, so it was discarded and nothing was sent. \
+                                     `--allow-echo` does not change this; the command that \
+                                     asks for it has to be run again."
                                 );
                             } else {
                                 diag!("holdfast attach: secret request {outcome}");

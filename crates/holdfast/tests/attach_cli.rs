@@ -1490,6 +1490,71 @@ async fn a_declined_secret_is_reported_to_the_client_that_submitted_it() {
     );
 }
 
+/// **GH #262, client side: the shell-prompt decline gets its sentence
+/// too**, under `--allow-echo`, because that is the flag the human would
+/// otherwise reach for. The daemon's writer refuses a value whose shell is
+/// back at its own prompt whatever `allow_echo` says; a client that
+/// printed only `secret request at_shell_prompt` would leave the human
+/// believing the password went somewhere.
+///
+/// Answered by the stub after the `SecretInput`, for the reason the
+/// `not_echo_off` row above is.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_shell_prompt_decline_says_the_value_was_discarded_whatever_allow_echo_says() {
+    let stub = StubDaemon::start_reacting(
+        "secretatprompt",
+        vec![
+            enc(&ServerFrame::Attached {
+                session_id: "sess_stub01".into(),
+                name: None,
+                cols: 80,
+                rows: 24,
+                state: "Running".into(),
+                exit_code: None,
+                protocol_major: PROTOCOL_MAJOR,
+                protocol_minor: PROTOCOL_MINOR,
+            }),
+            enc(&ServerFrame::AwaitingSecret {
+                request_id: "req_sp01".into(),
+                prompt_text: "Password: ".into(),
+                raised_by: None,
+            }),
+        ],
+        |f| matches!(f, ClientFrame::SecretInput { .. }),
+        enc(&ServerFrame::SecretRequestClosed {
+            request_id: "req_sp01".into(),
+            outcome: "at_shell_prompt".into(),
+        }),
+        Duration::from_secs(15),
+    )
+    .await;
+
+    let mut term = Term::spawn(
+        stub.paths.dir(),
+        &["attach", "sess_stub01", "--allow-echo"],
+        80,
+        24,
+    );
+    term.wait_for(SECRET_PROMPT_DRAWN, 10);
+    term.type_keys(b"hunter2\r");
+
+    // The sentence's last words, so the whole line is in by then.
+    let seen = term.wait_for(b"has to be run again", 10);
+    let needles: [&[u8]; 3] = [
+        b"at_shell_prompt",
+        b"discarded",
+        b"`--allow-echo` does not change this",
+    ];
+    for needle in needles {
+        assert!(
+            contains(&seen, needle),
+            "the shell-prompt decline did not say {:?}:\n{}",
+            String::from_utf8_lossy(needle),
+            String::from_utf8_lossy(&seen)
+        );
+    }
+}
+
 /// **A close for a request this client already answered must not tear
 /// down a prompt it is currently showing** (GH #137, review finding).
 ///
