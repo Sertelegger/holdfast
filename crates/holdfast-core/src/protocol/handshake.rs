@@ -305,6 +305,26 @@ impl Requirement {
 /// out.
 pub const HANDSHAKE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
 
+/// This build, as a message names it beside an older daemon that reports
+/// `daemon_version`: *"this holdfast, 0.0.8 (protocol 1.5)"*.
+///
+/// **Qualified when the version is the daemon's own.** Between releases
+/// the package version has not moved — the release bumps it — so a build
+/// from `main` meeting the last release's daemon would otherwise read
+/// *"0.0.7 (protocol 1.1), older than this holdfast, 0.0.7 (protocol
+/// 1.5)"*, which looks like a mistake in the message rather than the
+/// true statement it is. The protocol is what differs, and the wording
+/// says so.
+pub fn this_build_beside(daemon_version: &str) -> String {
+    let ours = env!("CARGO_PKG_VERSION");
+    let later = if daemon_version == ours {
+        "a later build of "
+    } else {
+        ""
+    };
+    format!("this holdfast, {later}{ours} (protocol {PROTOCOL_MAJOR}.{PROTOCOL_MINOR})")
+}
+
 /// Build identifier reported in the handshake and printed by `holdfast
 /// version`, so the CLI and the daemon it talks to name a build the same
 /// way. This crate's `build.rs` sets it: `HOLDFAST_BUILD_SHA` when the
@@ -524,6 +544,23 @@ mod tests {
                 PROFILE_MINOR,
             ),
             (5, 4, 3, 5, 1)
+        );
+    }
+
+    /// This build beside an older daemon names its own version — and,
+    /// when the daemon reports the same one, says it is a later build of
+    /// it rather than reading *"0.0.7, older than 0.0.7"*.
+    #[test]
+    fn this_build_is_named_beside_a_daemon_of_its_own_version_without_contradicting_it() {
+        let ours = env!("CARGO_PKG_VERSION");
+        let protocol = format!("(protocol {PROTOCOL_MAJOR}.{PROTOCOL_MINOR})");
+        assert_eq!(
+            this_build_beside("0.0.1-older"),
+            format!("this holdfast, {ours} {protocol}")
+        );
+        assert_eq!(
+            this_build_beside(ours),
+            format!("this holdfast, a later build of {ours} {protocol}")
         );
     }
 

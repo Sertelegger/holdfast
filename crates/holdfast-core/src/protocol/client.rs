@@ -531,18 +531,18 @@ fn daemon_too_old(
     daemon_minor: u32,
     kind: ClientKind,
 ) -> String {
-    let ours = env!("CARGO_PKG_VERSION");
     let major = handshake::PROTOCOL_MAJOR;
     let remedy = match kind {
-        ClientKind::Shim => format!(
-            "Ask the user to run `holdfast daemon stop` — it ends every session that daemon \
-             holds, for every client — and then retry: this server starts a {ours} daemon on the \
-             next call."
-        ),
-        ClientKind::Cli | ClientKind::UiBridge => "Restart the daemon to update it: \
+        ClientKind::Shim => {
+            "Ask the user to run `holdfast daemon stop` — it ends every session \
+             that daemon holds, for every client — and then retry: this server starts a daemon of \
+             its own build on the next call."
+        }
+        ClientKind::Cli | ClientKind::UiBridge => {
+            "Restart the daemon to update it: \
              `holdfast daemon stop` (this ends every session it holds), then `holdfast daemon \
              start`."
-            .to_string(),
+        }
     };
     let instead = requirement
         .instead()
@@ -550,9 +550,8 @@ fn daemon_too_old(
         .unwrap_or_default();
     format!(
         "the running Holdfast daemon is {daemon_version} (protocol {major}.{daemon_minor}), older \
-         than this holdfast, {ours} (protocol {major}.{}); below protocol {major}.{} it would {}. \
-         {instead}{remedy}",
-        handshake::PROTOCOL_MINOR,
+         than {}; below protocol {major}.{} it would {}. {instead}{remedy}",
+        handshake::this_build_beside(daemon_version),
         requirement.minor(),
         requirement.otherwise(),
     )

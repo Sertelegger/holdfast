@@ -2460,7 +2460,10 @@ impl Drop for CallRegistration {
 /// daemon before this refusal existed. The shim is the stale half, since
 /// a daemon is started from the installed binary and a shim lives as
 /// long as the MCP client that launched it, so the advice is to restart
-/// that client.
+/// that client — and, for the one case a restart does not cure, to look
+/// at what the client is configured to run: an install that added the
+/// plugin beside an older hand-written `holdfast mcp` entry relaunches
+/// the older binary on every restart.
 ///
 /// **What still works, and why each was kept.** A `profile` session
 /// never takes a client's context (GH #55), so it means the same from
@@ -2488,8 +2491,11 @@ fn older_peer_start_refusal(id: u64, peer: Peer) -> Response {
              reached, {ours}, and cannot tell the daemon which directory and environment it \
              runs in: a session started now would run in the daemon's own instead of this \
              project's. Ask the user to restart the MCP client (Claude Code: restart it) so \
-             that it runs the installed holdfast, then retry. Sessions already running are \
-             unaffected, and a `profile` session can still be started.",
+             that it runs the installed holdfast, then retry. If this comes back after the \
+             restart, the MCP client's configuration runs an older holdfast than the one \
+             installed — an entry added by hand, for instance — and that entry needs updating \
+             or removing. Sessions already running are unaffected, and a `profile` session can \
+             still be started.",
             peer.minor
         ),
         ClientKind::Cli | ClientKind::UiBridge => format!(

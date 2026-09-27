@@ -1386,16 +1386,13 @@ pub async fn daemon_status(as_json: bool) -> ExitCode {
     let daemon = client.daemon_info();
     if daemon.protocol_minor < holdfast_core::protocol::PROTOCOL_MINOR {
         diag!(
-            "holdfast daemon status: this daemon is {} (protocol {}.{}), older than this \
-             holdfast, {} (protocol {}.{}); `holdfast daemon stop` ends it and every session it \
-             holds, and the next daemon started from this binary is {}",
+            "holdfast daemon status: this daemon is {} (protocol {}.{}), older than {}; \
+             `holdfast daemon stop` ends it and every session it holds, and the next daemon \
+             started from this binary is this build's",
             daemon.daemon_version,
             daemon.protocol_major,
             daemon.protocol_minor,
-            env!("CARGO_PKG_VERSION"),
-            holdfast_core::protocol::PROTOCOL_MAJOR,
-            holdfast_core::protocol::PROTOCOL_MINOR,
-            env!("CARGO_PKG_VERSION"),
+            holdfast_core::protocol::handshake::this_build_beside(&daemon.daemon_version),
         );
     }
     ExitCode::SUCCESS
