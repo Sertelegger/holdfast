@@ -5967,16 +5967,22 @@ async fn a_program_reading_with_echo_off_is_still_answered() {
          printf 'got=%s\\n' \"$(printf %s \"$x\" | tr a-z A-Z)\"",
     )
     .await;
+    // **The positive fact, not a correlated one.** The terminal's raw
+    // shape arrives while `stty` still holds it, and until the reader has
+    // scanned the `C` the shell's `B` is last again the moment `stty`
+    // exits: a request made then is refused, correctly, as the prompt. So
+    // this waits for the `C` itself, which `Executing` at the `semantic`
+    // tier is, with the shell's group holding the terminal for
+    // `head -c 8` inside the command substitution.
     await_command(&s, "the raw read", |s| {
         let l = s.line_discipline();
-        l.echo == Some(false) && l.canonical == Some(false)
+        let det = s.detection();
+        l.echo == Some(false)
+            && l.canonical == Some(false)
+            && det.interaction_mode == InteractionMode::Executing
+            && det.detection_tier == DetectionTier::Semantic
     })
     .await;
-    assert_eq!(
-        s.detection().interaction_mode,
-        InteractionMode::Executing,
-        "the arrangement is not the `Executing` a raw-mode password prompt reads as"
-    );
 
     let call = spawn_call(&d, secret_args(&s.id, 20));
     let (id, _) = next_awaiting_secret(&mut c, 20).await;
