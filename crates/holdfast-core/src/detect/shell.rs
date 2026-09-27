@@ -182,6 +182,43 @@ pub fn detect_shell(command: &str, args: &[String]) -> Option<Shell> {
 /// - The `PS1` test makes the snippet a no-op when the user's own
 ///   configuration already emits OSC 133.
 ///
+/// **Nothing in it may abort, print, or end the shell because of how an rc
+/// file configured it.** Three ways it could, each measured on bash 5.2 and
+/// 5.3:
+///
+/// - **A readonly variable.** An assignment to one at an interactive prompt
+///   discards the rest of the line, and for the carrier the rest of the
+///   evaluated snippet. The history clause comes first, so an rc that makes
+///   `HISTFILE` readonly — the audit-hardening pattern, and every `rbash` —
+///   would print *HISTFILE: readonly variable* and cost the session all of
+///   its integration, markers and `get_command_history` both. Under
+///   `set -e` a readonly `PROMPT_COMMAND` or `PS1` ends the shell at
+///   start-up. So `__holdfast_ro` tests the attribute first, for every
+///   variable the snippet assigns that an rc might lock: `HISTFILE`,
+///   `HISTFILESIZE`, `PROMPT_COMMAND`, `PS1` and `PS0`. With `PS1` or `PS0`
+///   locked there is nothing to mark, and nothing past the history clause
+///   is installed; with `PROMPT_COMMAND` locked, `A`, `B` and `C` arrive
+///   without `D`, so commands keep their text and have no exit code.
+///   `${NAME[@]@a}` and not `${NAME@a}`, which fails under `set -u` for an
+///   unset variable, and a variable can be readonly and unset. Not a trial
+///   assignment: `printf -v` into a readonly variable ends a `set -e` shell
+///   even inside an `if`, and the `2>/dev/null` that would silence it is
+///   itself refused by `rbash`. `@a` needs bash 4.4; an older bash assigns
+///   without asking.
+/// - **`set -u`.** `${#PROMPT_COMMAND[@]}` counts a scalar's elements as
+///   unbound: every session would print *PROMPT_COMMAND: unbound variable*
+///   and lose the re-wrap below, and under `set -eu` the shell would exit
+///   before its first prompt. `${!PROMPT_COMMAND[@]}` lists the indices
+///   without complaint, and a space in the list means more than one
+///   element, a sparse array's included: inside `[[ ]]` the list is joined
+///   with a space whatever `IFS` is.
+/// - **`set -e`.** `__holdfast_d` returns the status it reports (see
+///   below), and a `PROMPT_COMMAND` member that returns non-zero ends a
+///   `set -e` shell, so the first `false && true` — a failure `set -e`
+///   exempts at the prompt — would end the session. ` && :` makes the call
+///   a non-final member of an AND list, which `set -e` ignores, and leaves
+///   the list's status, the `$?` the next member reads, as the call's.
+///
 /// **The prompt is re-wrapped at every prompt, not once (GH #220).** Until
 /// then the snippet wrapped `PS1` a single time, and anything that
 /// *regenerates* `PS1` erased the wrapping at the next prompt. starship is
@@ -244,11 +281,11 @@ pub fn detect_shell(command: &str, args: &[String]) -> Option<Shell> {
 ///
 /// Array `PROMPT_COMMAND` (bash ≥ 5.1) survives intact. Assigning a
 /// scalar to an existing array writes index 0, and `${PROMPT_COMMAND:+…}`
-/// reads index 0, so index 0 becomes `__holdfast_d "$?"; <user index 0>` and
-/// every later element is untouched and still runs. Measured on bash 5.3:
-/// `PROMPT_COMMAND=('echo PC_ONE' 'echo PC_TWO')` becomes
-/// `declare -a PROMPT_COMMAND=([0]="__holdfast_d \"\$?\"; echo PC_ONE" [1]="echo PC_TWO")`,
-/// both elements still execute, and the markers are correct. Array
+/// reads index 0, so index 0 becomes `__holdfast_d "$?" && :; <user index 0>`
+/// and every later element is untouched and still runs. Measured on bash
+/// 5.3: `PROMPT_COMMAND=('echo PC_ONE' 'echo PC_TWO')` becomes
+/// `declare -a PROMPT_COMMAND=([0]="__holdfast_d \"\$?\" && :; echo PC_ONE" [1]="echo PC_TWO" [2]="__holdfast_p")`,
+/// every element still executes, and the markers are correct. Array
 /// `PROMPT_COMMAND` semantics have shifted across bash versions and 5.3 is
 /// the only version measured, so treat older releases as untested.
 ///
@@ -285,11 +322,17 @@ pub fn detect_shell(command: &str, args: &[String]) -> Option<Shell> {
 /// variables between the elements of an *array* `PROMPT_COMMAND`, so a
 /// user whose hooks live at indices ≥ 1 is unaffected in both.
 const BASH_INTEGRATION: &str = concat!(
+    // Whether the variable named by `$1` is readonly; false on a bash
+    // older than 4.4, which has no `@a`. See the doc comment above.
+    r#" __holdfast_ro() { (( BASH_VERSINFO[0] * 100 + BASH_VERSINFO[1] >= 404 )) && "#,
+    r#"eval "[[ \${$1[@]@a} == *r* ]]"; }; "#,
     // GH #252, ahead of the guard so it runs even when the snippet yields
     // to the user's own markers. `HOLDFAST_HISTFILE` carries the session's
     // history file past the rc files; empty, history goes to `/dev/null`.
     // An assignment rather than `unset`: with `HISTFILE` unset, `history
     // -a` in an rc's `PROMPT_COMMAND` appends to `~/.history` (measured).
+    // Skipped whole when `HISTFILE` is readonly: the policy cannot apply
+    // there (SECURITY.md, shell history, H1), and integration still can.
     //
     // With a session file: `__holdfast_h` appends after every command,
     // prepended to `PROMPT_COMMAND` for the reason `__holdfast_d` is and
@@ -300,24 +343,28 @@ const BASH_INTEGRATION: &str = concat!(
     // holds, which happens once the per-command append stops —
     // `PROMPT_COMMAND` replaced mid-session — and loses everything recorded
     // before; `bash-append-stopped` in `tests/shell_history.rs` is the row.
-    r#" HISTFILE=${HOLDFAST_HISTFILE:-/dev/null}; if [ -n "${HOLDFAST_HISTFILE-}" ]; then "#,
-    r#"unset HISTFILESIZE; shopt -s histappend; __holdfast_h() { history -a; return "${1:-0}"; }; "#,
-    r#"[[ "${PROMPT_COMMAND-}" == *__holdfast_h* ]] || "#,
-    r#"PROMPT_COMMAND='__holdfast_h "$?"'"${PROMPT_COMMAND:+; $PROMPT_COMMAND}"; fi; "#,
-    r#"if [ -z "${HOLDFAST_SHELL_INTEGRATION-}" ] && [[ "${PS1-}" != *"133;A"* ]]; then "#,
+    r#"if ! __holdfast_ro HISTFILE; then HISTFILE=${HOLDFAST_HISTFILE:-/dev/null}; "#,
+    r#"if [ -n "${HOLDFAST_HISTFILE-}" ]; then "#,
+    r#"__holdfast_ro HISTFILESIZE || unset HISTFILESIZE; shopt -s histappend; "#,
+    r#"__holdfast_h() { history -a; return "${1:-0}"; }; "#,
+    r#"__holdfast_ro PROMPT_COMMAND || [[ "${PROMPT_COMMAND-}" == *__holdfast_h* ]] || "#,
+    r#"PROMPT_COMMAND='__holdfast_h "$?" && :'"${PROMPT_COMMAND:+; $PROMPT_COMMAND}"; fi; fi; "#,
+    r#"if [ -z "${HOLDFAST_SHELL_INTEGRATION-}" ] && [[ "${PS1-}" != *"133;A"* ]] "#,
+    r#"&& ! __holdfast_ro PS1 && ! __holdfast_ro PS0; then "#,
     r#"HOLDFAST_SHELL_INTEGRATION=1; "#,
     r#"__holdfast_p() { [[ "${PS0-}" == *"133;C;holdfast=1"* ]] || PS0='\e]133;C;holdfast=1\a'"${PS0-}"; "#,
     r#"[[ "${PS1-}" == *"133;B;holdfast=1"* ]] || PS1='\[\e]133;A;holdfast=1\a\]'"${PS1-}"'\[\e]133;B;holdfast=1\a\]'; }; "#,
     r#"__holdfast_p; "#,
     r#"__holdfast_d() { printf '\033]133;D;%s;holdfast=1\007' "${1:-0}"; return "${1:-0}"; }; "#,
-    r#"PROMPT_COMMAND='__holdfast_d "$?"'"${PROMPT_COMMAND:+; $PROMPT_COMMAND}"; "#,
-    r#"if (( BASH_VERSINFO[0] * 100 + BASH_VERSINFO[1] >= 501 && ${#PROMPT_COMMAND[@]} > 1 )); then "#,
+    r#"if ! __holdfast_ro PROMPT_COMMAND; then "#,
+    r#"PROMPT_COMMAND='__holdfast_d "$?" && :'"${PROMPT_COMMAND:+; $PROMPT_COMMAND}"; "#,
+    r#"if (( BASH_VERSINFO[0] * 100 + BASH_VERSINFO[1] >= 501 )) && [[ ${!PROMPT_COMMAND[@]} == *' '* ]]; then "#,
     r#"if [[ ${PROMPT_COMMAND[-1]} == __bp_interactive_mode ]]; then "#,
     r#"unset 'PROMPT_COMMAND[-1]'; PROMPT_COMMAND+=(__holdfast_p __bp_interactive_mode); "#,
     r#"else PROMPT_COMMAND+=(__holdfast_p); fi; "#,
     r#"elif [[ $PROMPT_COMMAND == *$'\n'__bp_interactive_mode ]]; then "#,
     r#"PROMPT_COMMAND=${PROMPT_COMMAND%__bp_interactive_mode}$'__holdfast_p\n__bp_interactive_mode'; "#,
-    r#"else PROMPT_COMMAND+=$'\n__holdfast_p'; fi; "#,
+    r#"else PROMPT_COMMAND+=$'\n__holdfast_p'; fi; fi; "#,
     r#"fi"#,
 );
 
@@ -354,8 +401,17 @@ pub const BASH_INTEGRATION_CARRIER: &str = "HOLDFAST_BASH_INTEGRATION";
 ///   the daemon would have to watch for and a bash without readline never
 ///   makes.
 ///
-/// `${…-}` keeps the line quiet under an rc's `set -u`. It starts with a
-/// space for the reason every snippet does.
+/// `${…-}` keeps the line quiet under an rc's `set -u`, and the snippet it
+/// evaluates is quiet there too (see [`BASH_INTEGRATION`]). It starts with
+/// a space for the reason every snippet does.
+///
+/// **The environment has to reach the bash that reads the line**, and an
+/// rc can stop it: one that re-execs bash through `env -i` or `env -u`,
+/// or defines its own `eval` function or alias, leaves the line nothing to
+/// evaluate, and the session gets neither integration nor the snippet's
+/// history policy (measured, bash 5.2 and 5.3). WSL's `bash.exe` started
+/// from native Windows is expected to behave the same, since Windows does
+/// not pass the environment into WSL without `WSLENV`; not measured.
 const BASH_INJECTION_LINE: &str =
     r#" eval "${HOLDFAST_BASH_INTEGRATION-}"; unset HOLDFAST_BASH_INTEGRATION"#;
 
@@ -390,13 +446,26 @@ const BASH_INJECTION_LINE: &str =
 /// "repair" zsh by reordering `precmd_functions` — it would change
 /// behaviour to fix nothing** (§8.5).
 ///
-/// **`return $s` is therefore defensive and is measured to be
-/// unobservable here, which is stated rather than implied.** Re-measured
-/// with the `return` removed, all three arrangements still report 42, so
-/// **no test in this workspace can distinguish its presence from its
-/// absence on zsh 5.9** and none pretends to. It is kept as the mirror of
-/// bash's, where the same line is load-bearing, and because a shell that
-/// did *not* restore independently would need it.
+/// **So `precmd` does not return the status it reports**, as bash's
+/// `__holdfast_d` does. For `$?` a `return` is unobservable here — with one,
+/// all three arrangements report 42, as they do without — and it is
+/// observable another way: under an rc's `setopt err_exit` a hook that
+/// returns non-zero ends the shell, so the first `false && true`, a failure
+/// `err_exit` exempts at the prompt, would end the session (measured, zsh
+/// 5.9).
+///
+/// **Nothing in it may abort, print, or end the shell because of how an rc
+/// configured it**, for bash's reasons (see `BASH_INTEGRATION`). An
+/// assignment to a readonly variable discards the rest of the typed line,
+/// so a readonly `HISTFILE`, `SAVEHIST` or `HISTSIZE` would cost the
+/// session all of its integration and print *read-only variable*, and a
+/// readonly `PS1` ends an `err_exit` shell at start-up. Each is tested with
+/// `${(t)NAME-}`, whose type names `readonly` for a readonly parameter, set
+/// or not, and which is quiet under `nounset` where `${(t)NAME}` is not
+/// (measured, zsh 5.9). The history clause is skipped whole when any of its
+/// three is readonly: pointing `HISTFILE` at a session file under the rc's
+/// `SAVEHIST` would save the rc's list there, and raising `SAVEHIST` under
+/// the rc's `HISTFILE` would save the agent's commands into the operator's.
 ///
 /// **Corrected by re-measurement (GH #220): zsh 5.9 runs the bare `precmd`
 /// function *first*, then `precmd_functions` in order** — whichever was
@@ -416,15 +485,16 @@ const ZSH_INTEGRATION: &str = concat!(
     // `/dev/null` gets `SAVEHIST=0`, so zsh never saves or locks it, and no
     // `hist_save_by_copy`, for an rc sourced again that sets `SAVEHIST`: see
     // `session::launch::history_defaults`.
-    r#" if [[ -n ${HOLDFAST_HISTFILE-} ]]; then HISTFILE=$HOLDFAST_HISTFILE; "#,
+    r#" if [[ ${(t)HISTFILE-}${(t)SAVEHIST-}${(t)HISTSIZE-} != *readonly* ]]; then "#,
+    r#"if [[ -n ${HOLDFAST_HISTFILE-} ]]; then HISTFILE=$HOLDFAST_HISTFILE; "#,
     r#"SAVEHIST=1000000000; HISTSIZE=1000000000; "#,
-    r#"setopt inc_append_history; else HISTFILE=/dev/null; SAVEHIST=0; unsetopt hist_save_by_copy; fi; "#,
-    r#"if [ -z "${HOLDFAST_SHELL_INTEGRATION-}" ] && [[ "${PS1-}" != *"133;A"* ]]; then "#,
+    r#"setopt inc_append_history; else HISTFILE=/dev/null; SAVEHIST=0; unsetopt hist_save_by_copy; fi; fi; "#,
+    r#"if [ -z "${HOLDFAST_SHELL_INTEGRATION-}" ] && [[ "${PS1-}" != *"133;A"* && ${(t)PS1-} != *readonly* ]]; then "#,
     r#"HOLDFAST_SHELL_INTEGRATION=1; "#,
     r#"__holdfast_preexec() { printf '\033]133;C;holdfast=1\007' }; "#,
     r#"__holdfast_p() { [[ "${PS1-}" == *"133;B;holdfast=1"* ]] || "#,
     "PS1=$'%{\\e]133;A;holdfast=1\\a%}'\"${PS1-}\"$'%{\\e]133;B;holdfast=1\\a%}'; }; ",
-    r#"__holdfast_precmd() { local s=$?; printf '\033]133;D;%s;holdfast=1\007' "$s"; __holdfast_p; return $s }; "#,
+    r#"__holdfast_precmd() { local s=$?; printf '\033]133;D;%s;holdfast=1\007' "$s"; __holdfast_p }; "#,
     r#"__holdfast_p; "#,
     r#"autoload -Uz add-zsh-hook; "#,
     r#"add-zsh-hook precmd __holdfast_precmd; "#,
@@ -701,10 +771,8 @@ mod tests {
     ///
     /// **bash only, and that is a measurement rather than an omission.**
     /// zsh restores `$?` before each `precmd_functions` entry
-    /// independently (measured, see `ZSH_INTEGRATION`), so its `return $s`
-    /// is defensive and unobservable; asserting it here would be asserting
-    /// a string, which is what this test file is otherwise careful not to
-    /// mistake for behaviour.
+    /// independently (measured, see `ZSH_INTEGRATION`), so its `precmd` has
+    /// no status to hand on, and returning one ended an `err_exit` shell.
     #[test]
     fn the_bash_completion_emitter_restores_the_status_it_reported() {
         let snippet = Shell::Bash.integration_snippet();
@@ -791,6 +859,43 @@ mod tests {
                  inherited by `exec`: {snippet}"
             );
         }
+    }
+
+    /// Every assignment to a variable an rc can make readonly is behind a
+    /// test for it, because the assignment would discard the rest of the
+    /// snippet (review of GH #252). The rows that start real shells under
+    /// such rc files are in `tests/detection.rs`; this pins the two forms
+    /// of the test whose simpler spellings fail there: `${NAME@a}` under
+    /// `set -u` for an unset variable, and `${(t)NAME}` under `nounset`.
+    #[test]
+    fn every_variable_an_rc_can_lock_is_tested_before_it_is_assigned() {
+        let bash = Shell::Bash.integration_snippet();
+        assert!(
+            bash.contains(r#"eval "[[ \${$1[@]@a} == *r* ]]""#),
+            "{bash}"
+        );
+        let tested = bash
+            .find("if ! __holdfast_ro HISTFILE; then")
+            .expect("HISTFILE");
+        assert!(tested < bash.find("HISTFILE=${").unwrap(), "{bash}");
+        assert!(
+            bash.contains(r#"]] && ! __holdfast_ro PS1 && ! __holdfast_ro PS0; then"#),
+            "the guard tests PS1 and PS0: {bash}"
+        );
+        // Each `PROMPT_COMMAND` assignment follows its own test.
+        let mut from = 0;
+        for (at, _) in bash.match_indices("PROMPT_COMMAND='__holdfast_") {
+            let test = bash[from..at]
+                .rfind("__holdfast_ro PROMPT_COMMAND")
+                .unwrap_or_else(|| panic!("untested assignment at {at}: {bash}"));
+            from += test + 1;
+        }
+        let zsh = Shell::Zsh.integration_snippet();
+        let tested = zsh
+            .find("${(t)HISTFILE-}${(t)SAVEHIST-}${(t)HISTSIZE-} != *readonly*")
+            .expect("the history clause's three");
+        assert!(tested < zsh.find("HISTFILE=").unwrap(), "{zsh}");
+        assert!(zsh.contains("${(t)PS1-} != *readonly*"), "{zsh}");
     }
 
     #[test]
