@@ -105,7 +105,7 @@ session), then restart Claude Code. Until both, each side refuses a
   atuin, zsh-histdb, mcfly and bash-preexec loggers still do (SECURITY.md, H11).
 - A bash or zsh session no longer lists or recalls your own shell history: the
   snippet empties the list the shell read from your rc's history file, except
-  where SECURITY.md's H10 says it cannot safely ([#274]).
+  where SECURITY.md's H10 says it cannot safely, as for `history -w` ([#274]).
 - `SECURITY.md` states a two-tier redaction contract and each guarantee's status
   today, and keeps a residual register of known leaks ([#253], [#254], [#255],
   [#256], [#257], [#258], [#259]).
@@ -175,9 +175,6 @@ session), then restart Claude Code. Until both, each side refuses a
 - An rc file that reads the terminal at start-up (a `read`, oh-my-zsh's update
   question, zsh's new-user menu) takes the integration line as its answer: the
   session starts without it, and zsh saves to the history file the rc names.
-- A bash rc that sets `HISTFILE` and runs `history -w` from `PROMPT_COMMAND`,
-  sourced again in a session, overwrites that file with the session's commands
-  alone, since the session no longer holds your history ([#274]).
 
 ## [0.0.7] — 2026-09-01 (Carabiner)
 

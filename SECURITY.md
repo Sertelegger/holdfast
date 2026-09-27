@@ -701,10 +701,11 @@ mechanisms prevent it:
   again, and a nested shell or `exec` does not inherit an unset one.
   It then empties the history the shell has already read from the file
   the rc names (GH #274; see H10), and reads back only a file the
-  session's own `HISTFILE` names. It leaves that list whole in a zsh
-  whose rc turns off `append_history`, `inc_append_history` and
-  `share_history`: such a zsh saves by rewriting its file from the list,
-  and after the agent sources the rc again an emptied list would replace
+  session's own `HISTFILE` names. It leaves that list whole where the
+  shell rewrites its file from the list: a bash whose rc runs `history
+  -w` from `PROMPT_COMMAND`, a function or a trap, and a zsh whose rc
+  turns off `append_history`, `inc_append_history` and `share_history`.
+  After the agent sources such an rc again, an emptied list would replace
   the operator's file with the session's commands. When `HISTFILE` is
   readonly, or in zsh `SAVEHIST` or `HISTSIZE`, it leaves the history
   variables and the list alone (see H1).
@@ -782,15 +783,21 @@ and Python 3.12.
     cannot test for it, and there the snippet's assignment still fails
     and takes the integration with it (not measured).
 
-  Since GH #274 the first case can cost the operator's bash history
-  rather than add to it. An rc that hard-sets `HISTFILE` and runs
-  `history -w` from `PROMPT_COMMAND`, sourced again, rewrites the
-  operator's file from the session's list, and that list now holds only
-  the session's commands: none of the operator's entries survive
-  (measured, bash 5.2 and 5.3, by `exit` and by hangup). bash's own save
-  at exit appends and is unaffected. zsh's equivalent, an rc that saves by
-  rewriting its history file, is why the snippet leaves such a zsh's list
-  whole (H10).
+  Since GH #274 the first case could cost the operator's bash history
+  rather than add to it. An rc that hard-sets `HISTFILE` and rewrites it
+  with `history -w`, sourced again, writes the session's list over the
+  operator's file, and the list the snippet empties holds only the
+  session's commands: none of the operator's entries survived, and the
+  `history -n; history -w; history -c; history -r` sync recipe lost the
+  first ones in `per_session` mode. The snippet therefore leaves such a
+  bash's list whole when the rc runs `history -w` from `PROMPT_COMMAND`,
+  a function or a trap, and the operator's file keeps every entry
+  (measured, bash 5.2 and 5.3, both modes, by `exit` and by hangup). A
+  `history -w` that exists only once the rc is sourced again is not seen
+  and still rewrites the file from the emptied list, losing every entry
+  (measured the same way). bash's own save at exit appends. zsh's
+  equivalent, an rc that saves by rewriting its history file, is left
+  whole for the same reason (H10).
 - **H2. A zsh started inside a session, or by `exec zsh`, under an rc that
   sets `HISTFILE` unconditionally.** macOS's `/etc/zshrc` sets one for
   every zsh, so on a Mac any nested or exec'd zsh writes `~/.zsh_history`,
@@ -880,6 +887,14 @@ and Python 3.12.
     list, so after `source ~/.zshrc` an emptied list replaced the
     operator's file with the session's commands (measured, zsh 5.9), and
     the snippet leaves its list whole instead;
+  - a bash whose rc runs `history -w` from `PROMPT_COMMAND`, a function
+    or a trap, for the same reason (H1). Its list also keeps the line
+    Holdfast typed to install the snippet, unless `HISTCONTROL` ignores a
+    leading space. In `per_session` mode the rc's `history -w` rewrites
+    the session's file from that list, so the file holds the operator's
+    entries and that line as well as the agent's commands (measured, bash
+    5.2 and 5.3). A function that merely contains `history -w`, called
+    from nowhere, keeps the list the same way;
   - a session whose `HISTFILE` is readonly, or in zsh whose `SAVEHIST` or
     `HISTSIZE` is (H1), a session with `shell_integration: false`, a bash
     the snippet's carrier does not reach, and a session whose rc reads the
