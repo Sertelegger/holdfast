@@ -141,7 +141,9 @@ use holdfast_core::mcp::tools::{
 use holdfast_core::platform::Capabilities;
 use holdfast_core::protocol::frame;
 use holdfast_core::protocol::handshake::{ClientKind, PROTOCOL_MAJOR, PROTOCOL_MINOR};
-use holdfast_core::pty::{InProcessPty, MockPty, PtyBackend, PtySpawnConfig, Signal};
+use holdfast_core::pty::{
+    InProcessPty, LineDiscipline, MockPty, PtyBackend, PtySpawnConfig, Signal,
+};
 use holdfast_core::request::{CancelSignal, RequestContext};
 use holdfast_core::secret::{
     keychain_step_runs, resolve, select, ArgvProvider, ProviderError, SecretProvider,
@@ -3685,16 +3687,20 @@ async fn every_secret_cancelled_reason_is_reachable() {
 
     // at_shell_prompt — a submission the writer refused because the
     // session's shell was back at its own prompt, by its OSC 133 markers,
-    // with `ECHO` off as a line editor leaves it (GH #262). The request
-    // is raised before the markers arrive, so this is the writer's
-    // producer; `request_secret_input` refuses with the same word before
-    // it raises anything, and the GH #262 rows below drive both against
-    // real shells.
+    // with `ECHO` and `ICANON` off as a line editor leaves them (GH #262).
+    // The request is raised before the markers arrive, so this is the
+    // writer's producer; `request_secret_input` refuses with the same word
+    // before it raises anything, and the GH #262 rows below drive both
+    // against real shells.
     {
         let (s, pty) = d.mock_session();
         let mut c = attach_ok(&d, &s.id, AttachMode::ReadWrite).await;
         let call = spawn_call(&d, secret_args(&s.id, 20));
         let (id, _) = next_awaiting_secret(&mut c, 20).await;
+        // The helper's terminal is a secret line read, echo off and still
+        // canonical, which the prompt test admits on purpose. A line
+        // editor leaves canonical mode.
+        pty.set_canonical(Some(false));
         pty.queue_output(IDLE_PROMPT_MARKERS);
         await_shell_prompt(&s).await;
         send(
@@ -5675,8 +5681,13 @@ async fn await_shell_prompt(s: &Session) {
     }
 }
 
-/// Poll until the shell has started a command (its `C` has arrived) and
-/// the terminal is in the state `ready` accepts.
+/// Poll until the session is no longer at its shell prompt by the write
+/// gate's own test and the terminal is in the state `ready` accepts.
+///
+/// **Not "until the `C` has arrived."** The gate's test also answers
+/// `false` for a secret line read, and while another program's group holds
+/// the terminal. So a row that needs the `C` itself puts it in `ready`, as
+/// `Executing` at the `semantic` tier.
 async fn await_command(s: &Session, what: &str, ready: impl Fn(&Session) -> bool) {
     let deadline = tokio::time::Instant::now() + Duration::from_secs(20);
     while s.at_shell_prompt() || !ready(s) {
@@ -6007,4 +6018,101 @@ async fn a_program_reading_with_echo_off_is_still_answered() {
         String::from_utf8_lossy(&buffered(&s))
     );
     let _ = s.signal(Signal::Kill);
+}
+
+/// **What the interim guard must not refuse, where no `C` ever arrives: the
+/// shell's own `read -s`.** A bash older than 4.4 has no `PS0`, so
+/// Holdfast's snippet there emits `D`/`A`/`B` and no `C`; macOS's
+/// `/bin/bash` 3.2 is one. And a user integration that marks only the
+/// prompt makes the snippet stand down, which leaves `A`/`B` alone. Under
+/// both, `read -s` runs with `B` still last and the session still reads
+/// `AtPrompt`. What tells it from the prompt is the terminal: `ECHO` off
+/// with `ICANON` on, which no line editor uses.
+///
+/// Driven with the bash on this host, because the stream is the subject
+/// and not the bash version: a `PS1` carrying the markers makes Holdfast's
+/// snippet stand down. Both shapes run, prompt-only and `D`/`A`/`B`. The
+/// idle refusal in each is the control, since without it the admission
+/// would pass against a session whose markers were never read at all.
+#[tokio::test]
+async fn a_read_s_is_answered_where_the_markers_never_say_a_command_started() {
+    let dir = tempfile::tempdir().expect("a directory for the rc files");
+    for (shape, ps1) in [
+        ("prompt-only", r"PS1='\[\e]133;A\a\]fab\$ \[\e]133;B\a\]'"),
+        (
+            "D/A/B",
+            r"PS1='\[\e]133;D;$?\a\]\[\e]133;A\a\]fabd\$ \[\e]133;B\a\]'",
+        ),
+    ] {
+        let rc = dir
+            .path()
+            .join(format!("{}.bashrc", shape.replace('/', "")));
+        std::fs::write(&rc, format!("{ps1}\n")).expect("write the rc file");
+        let d = TestDaemon::start("promptnoc").await;
+        let s = start_shell(&d, "bash", &["--rcfile", rc.to_str().expect("utf-8")]).await;
+        await_idle_prompt(&s).await;
+        let mut c = attach_ok(&d, &s.id, AttachMode::ReadWrite).await;
+
+        let refused = body(&d.call(secret_args(&s.id, 20)).await);
+        assert_eq!(
+            cancelled_reason(&refused),
+            "at_shell_prompt",
+            "{shape}: the idle prompt was not refused, so this row cannot show that \
+             these markers are read: {refused}"
+        );
+
+        type_line(
+            &d,
+            &s,
+            "read -s -p 'Password: ' PW; printf 'got=%s\\n' \"$(printf %s \"$PW\" | tr a-z A-Z)\"",
+        )
+        .await;
+        // Waited on the terminal alone and not on `at_shell_prompt`, so it
+        // is the request below that meets the prompt test, at both of its
+        // request-time checks and at the write.
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(20);
+        while s.line_discipline()
+            != (LineDiscipline {
+                echo: Some(false),
+                canonical: Some(true),
+            })
+        {
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "{shape}: `read -s` never started; line discipline {:?}",
+                s.line_discipline()
+            );
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        let det = s.detection();
+        assert_eq!(
+            (det.interaction_mode, det.detection_tier),
+            (InteractionMode::AtPrompt, DetectionTier::Semantic),
+            "{shape}: a `C` arrived, so this is not the stream the row is about"
+        );
+
+        let call = spawn_call(&d, secret_args(&s.id, 20));
+        let (id, _) = next_awaiting_secret(&mut c, 20).await;
+        send(
+            &mut c,
+            &ClientFrame::SecretInput {
+                request_id: id,
+                bytes: PROBE.as_bytes().to_vec(),
+                allow_echo: false,
+            },
+        )
+        .await;
+        let payload = joined(call, "the read -s call").await;
+        assert_eq!(
+            payload["status"], "secret_provided",
+            "{shape}: the shell's own `read -s` was refused as its prompt: {payload}"
+        );
+        await_output(&s, b"got=HUNTER2").await;
+        assert!(
+            !contains(&buffered(&s), PROBE.as_bytes()),
+            "{shape}: `read -s` echoed the value:\n{}",
+            String::from_utf8_lossy(&buffered(&s))
+        );
+        let _ = s.signal(Signal::Kill);
+    }
 }

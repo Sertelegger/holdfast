@@ -894,8 +894,9 @@ impl WriteRequest {
 /// guard, on the writer thread.
 ///
 /// **Order matters, and it is the cheap-and-certain one first.**
-/// `expect_writes` is a load of an atomic; the other two take the
-/// detector's lock or make a syscall. All three refuse, so the order is
+/// `expect_writes` is a load of an atomic; the other two share one sample,
+/// which takes the detector's lock and makes two syscalls. All three
+/// refuse, so the order is
 /// not a correctness question — but the counter is also the condition
 /// that can be true while the child is *still* at its prompt (bytes ahead
 /// of the credential have not been consumed yet), which is the case a
@@ -908,7 +909,8 @@ impl WriteRequest {
 /// test is [`Session::at_shell_prompt`], read here rather than passed in by
 /// the caller, because a human answers a request seconds or minutes after
 /// `request_secret_input` checked the same thing, and a command that asked
-/// for the secret can have ended in between.
+/// for the secret can have ended in between. The echo test reads the line
+/// discipline that test was judged on, so both describe one instant.
 ///
 /// **`echo != Some(false)` and not `echo == Some(true)`.** A backend that
 /// cannot sample the line discipline reports `None`, and "we cannot
@@ -931,7 +933,11 @@ impl WriteRequest {
 /// the reader has not yet fed**: a shell that has just printed its prompt
 /// markers, and whose chunk the reader thread has not scanned yet, still
 /// reads as running its command. That window is the reader's latency,
-/// not a human's typing time.
+/// not a human's typing time. **And a marked prompt whose terminal reads
+/// as a secret line read** (`ECHO` off, `ICANON` on), which the test
+/// admits on purpose so that a shell's own `read -s` is answered where no
+/// `C` ever arrives; [`PromptDetector::shell_at_prompt`] says what else
+/// that admits.
 ///
 /// ## What neither of the first two conditions can see, and why (GH #43)
 ///
@@ -971,11 +977,12 @@ fn write_secret_if_unread(
         drop(secret);
         return Ok(SecretWrite::Declined(DeclineReason::OtherWriteIntervened));
     }
-    if session.at_shell_prompt() {
+    let (at_shell_prompt, line) = session.shell_prompt_sample();
+    if at_shell_prompt {
         drop(secret);
         return Ok(SecretWrite::Declined(DeclineReason::AtShellPrompt));
     }
-    if require_echo_off && session.line_discipline().echo != Some(false) {
+    if require_echo_off && line.echo != Some(false) {
         drop(secret);
         return Ok(SecretWrite::Declined(DeclineReason::NotEchoOff));
     }
@@ -1819,35 +1826,45 @@ impl Session {
     }
 
     /// Whether this session's shell says, by its own OSC 133 markers, that
-    /// it is sitting at its prompt with no command started since (GH #262).
-    /// See [`PromptDetector::shell_at_prompt`] for what counts and what it
+    /// it is sitting at its prompt with no command started since (GH #262),
+    /// and the terminal is not at a secret line read. See
+    /// [`PromptDetector::shell_at_prompt`] for what counts and what it
     /// cannot see.
     ///
-    /// **The secret gate's question, asked at two moments.**
-    /// `request_secret_input` asks it before it raises anything or runs a
-    /// provider, and `write_secret_if_unread` asks it again on the writer
-    /// thread one statement before the write, because a command that asked
-    /// for the secret can end while a human is still typing it.
+    /// **The secret gate's question, asked at the request and at the
+    /// write.** `request_secret_input` asks it before it raises anything
+    /// or runs a provider, and again just before the raise.
+    /// `write_secret_if_unread` asks it on the writer thread one statement
+    /// before the write, because a command that asked for the secret can
+    /// end while a human is still typing it.
+    pub fn at_shell_prompt(&self) -> bool {
+        self.shell_prompt_sample().0
+    }
+
+    /// [`at_shell_prompt`](Self::at_shell_prompt), and the line discipline
+    /// it was judged on. The writer takes both, so its echo test reads the
+    /// same `tcgetattr` the shell-prompt test did, not a second one that
+    /// could describe a different instant.
     ///
-    /// **The foreground sample is taken with the detector held**, as in
-    /// [`detection`](Self::detection): it decides whether the marker the
-    /// detector holds still belongs to the program at the terminal, and a
-    /// chunk fed between the two samples would let them describe different
-    /// instants. Nothing here blocks — a `WNOHANG` wait, one lock and one
-    /// ioctl.
+    /// **The foreground and line-discipline samples are taken with the
+    /// detector held**, as in [`detection`](Self::detection): they decide
+    /// whether the marker the detector holds still belongs to the program
+    /// at the terminal and whether that program is at a secret line read,
+    /// and a chunk fed between the samples would let them describe
+    /// different instants. Nothing here blocks: a `WNOHANG` wait, one lock
+    /// and two ioctls.
     ///
     /// **`false` for a child that has exited**, whose last marker describes
     /// nothing. The classifier answers liveness before any marker for the
     /// same reason. Without it a session that died while a provider was
     /// answering would be refused `at_shell_prompt` instead of reaching the
     /// `session_died` its caller is owed.
-    pub fn at_shell_prompt(&self) -> bool {
-        if !self.backend.is_alive() {
-            return false;
-        }
+    fn shell_prompt_sample(&self) -> (bool, crate::pty::LineDiscipline) {
+        let alive = self.backend.is_alive();
         let detector = self.detector.lock();
+        let line = self.backend.line_discipline();
         let foreground = self.backend.foreground_group();
-        detector.shell_at_prompt(foreground)
+        (alive && detector.shell_at_prompt(foreground, line), line)
     }
 
     /// True once any OSC 133 marker has arrived, i.e. shell integration is
@@ -3347,10 +3364,12 @@ mod tests {
             "a command's own echo-off read was refused as if it were the prompt"
         );
 
-        // It ended, and the prompt is not drawn yet: still the shell's.
+        // It ended, and the prompt is not drawn yet: still the shell's. The
+        // terminal has left `read -s`'s shape, and keeps `ECHO` off so that
+        // only the prompt test stands between the value and the shell.
+        pty.set_canonical(Some(false));
         pty.queue_output(COMMAND_ENDED);
         wait_until("the detector to scan the `D`", || s.at_shell_prompt());
-        pty.set_canonical(Some(false));
         assert_eq!(
             submit(&s, None, true),
             SecretWrite::Declined(DeclineReason::AtShellPrompt),
@@ -3394,6 +3413,59 @@ mod tests {
         assert!(
             !s.at_shell_prompt(),
             "a dead shell's last marker still read as a prompt"
+        );
+    }
+
+    /// **GH #262, the markers that never say a command started.** A bash
+    /// older than 4.4 has no `PS0`, so its stream is `D`/`A`/`B` with no
+    /// `C`, and a user integration that marks only the prompt is `A`/`B`.
+    /// Under either, the shell's own `read -s` runs with `B` still last.
+    /// The terminal is what tells the two states apart: `read -s` is `ECHO`
+    /// off with `ICANON` on, and no line editor reads that way.
+    ///
+    /// **The refusals are the other half.** The same markers with the
+    /// terminal in a line editor's shape, in the echoing shape of a prompt
+    /// with no line editor, or with `ICANON` unreadable, all still refuse.
+    #[test]
+    fn a_shells_own_secret_read_is_answered_where_no_c_arrives() {
+        let (s, pty) = mock_session();
+        pty.set_echo(Some(false));
+        pty.set_canonical(Some(false));
+        pty.queue_output(b"\x1b]133;A\x07fab$ \x1b]133;B\x07");
+        wait_until("the detector to scan the prompt-only markers", || {
+            s.at_shell_prompt()
+        });
+
+        // The line was submitted and `read -s` runs: no `C` arrives.
+        pty.set_canonical(Some(true));
+        assert!(
+            !s.at_shell_prompt(),
+            "a secret line read under prompt-only markers read as the shell's prompt"
+        );
+        assert_eq!(
+            submit(&s, None, true),
+            SecretWrite::Written(8),
+            "a shell's own `read -s` was refused because no `C` said it had started"
+        );
+        let written = pty.written().len();
+
+        for (echo, canonical, which) in [
+            (Some(false), Some(false), "a line editor's prompt"),
+            (Some(true), Some(true), "a prompt with no line editor"),
+            (Some(false), None, "an unreadable ICANON"),
+        ] {
+            pty.set_echo(echo);
+            pty.set_canonical(canonical);
+            assert_eq!(
+                submit(&s, None, false),
+                SecretWrite::Declined(DeclineReason::AtShellPrompt),
+                "{which} under the shell's own markers took a write"
+            );
+        }
+        assert_eq!(
+            pty.written().len(),
+            written,
+            "a declined value still reached the PTY"
         );
     }
 
