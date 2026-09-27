@@ -605,13 +605,16 @@ pub struct ListSessions {
     pub sessions: Vec<SessionRecord>,
 }
 
-/// One OSC 133-derived command (§5.2 `get_command_history`).
+/// One command the session ran, from its OSC 133 markers.
 #[derive(Debug, Serialize, schemars::JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct CommandEntry {
     /// Monotonic per session; survives ring eviction.
     pub index: u64,
-    /// The echoed command line, best-effort and redacted (§5.2, §9.2).
+    /// The echoed command line, best-effort and redacted. A command wider
+    /// than the terminal can come back as `[REDACTED:unresolved]`, as its
+    /// tail, or with part of it repeated in front, depending on the shell;
+    /// the tool's description says which.
     /// **Null when no text was captured** — no `B` marker armed the
     /// capture before this command's `C` — which is never spelled `""`:
     /// an empty string is a capture that saw no echo.

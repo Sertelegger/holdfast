@@ -2025,11 +2025,17 @@ impl HoldfastServer {
     /// corroborated with `status` before acting on it.
     ///
     /// `command` is best-effort: it is reconstructed from the terminal's
-    /// echo of what was typed, so a command longer than the terminal width
-    /// is captured truncated to its tail (125 characters at 80 columns
-    /// yields 47), and non-ASCII bytes are recorded as Latin-1. A truncated
-    /// tail looks exactly like a complete shorter command, with no ellipsis
-    /// and no error, so do not read `command` as a transcript of what ran.
+    /// echo of what was typed, not reported by the shell, so do not read it
+    /// as a transcript of what ran. A command wider than the terminal is
+    /// where it goes wrong, and how depends on the shell. bash records it
+    /// whole. zsh's redraw at the right margin loses the front of the line:
+    /// when that loss is detected, `command` is `[REDACTED:unresolved]`,
+    /// which means the text was withheld, not that it held a secret; when it
+    /// is not, the tail is reported as if it were the whole command, with no
+    /// ellipsis and no error. fish can put a copy of part of the command in
+    /// front of it, sometimes on a line of its own. A line edited in place,
+    /// such as one recalled from history, can also lose its front or keep
+    /// text that did not run. Non-ASCII text is recorded as typed.
     /// `command` is null when no text was captured at all: the command's
     /// `C` marker had no `B` marker in front of it. A prompt framework that
     /// regenerates the prompt over the markers does this, as does a shell
@@ -6167,19 +6173,29 @@ mod tests {
     #[test]
     fn get_command_history_description_carries_its_caveats() {
         let tool = HoldfastServer::get_command_history_tool_attr();
-        let description = tool.description.as_deref().unwrap_or("");
-        // `80 columns` and `Latin-1` are here because the needle set was
-        // narrower than the caveat it guards: deleting the quantification
-        // ("125 characters at 80 columns yields 47") *and* the Latin-1
-        // clause while keeping the phrase `truncated to its tail` survived
-        // the whole suite. Those two are what tell the agent *how* wrong
-        // `command` gets and on which inputs, and they are the first
-        // casualties of a reword — the bare phrase would still be there.
+        // Collapsed, because the description keeps its source line breaks
+        // and a needle should not depend on where a reflow puts them.
+        let description = tool
+            .description
+            .as_deref()
+            .unwrap_or("")
+            .split_whitespace()
+            .collect::<Vec<_>>()
+            .join(" ");
+        // The per-shell needles are here because a bare "best-effort" is
+        // the reword that survives a phrase check: what tells the agent
+        // *how* wrong `command` gets, and on which inputs, is the wide
+        // command, zsh's refusal that it must not read as a secret, the
+        // silent tail and fish's duplicated text — and those are the first
+        // casualties of a shortening.
         for needle in [
             "nested integrated shell",
-            "truncated to its tail",
-            "80 columns",
-            "Latin-1",
+            "wider than the terminal",
+            "bash records it whole",
+            "`[REDACTED:unresolved]`, which means the text was withheld",
+            "the tail is reported as if it were the whole command",
+            "fish can put a copy of part of the command in front of it",
+            "Non-ASCII text is recorded as typed",
             "null when no text was captured",
             "in its own output",
             "cannot predict the next",
@@ -6188,6 +6204,17 @@ mod tests {
                 description.contains(needle),
                 "get_command_history's advertised description dropped \
                  {needle:?}:\n{description}"
+            );
+        }
+        // What it said until GH #270 and the per-shell measurement: a
+        // decoding bug that is fixed, and a quantification no shell
+        // matches (bash records 125 characters at 80 columns whole). Both
+        // were pinned *in*, which is how they outlived the behaviour.
+        for stale in ["Latin-1", "yields 47", "truncated to its tail"] {
+            assert!(
+                !description.contains(stale),
+                "get_command_history's advertised description still says \
+                 {stale:?}, which the code no longer does:\n{description}"
             );
         }
     }

@@ -679,20 +679,31 @@ jcheck "read_output declares held_back_cause and says what to do with it" \
   '[["#/$defs/HeldBackCause","null"],true]'
 
 # The caveats have to be in the text the AGENT reads, and scoped to the
-# tool that carries them rather than to the transcript. `80 columns` and
-# `Latin-1` are here for the same reason `tests/schema.rs` has them:
-# deleting the quantification while keeping the phrase `truncated to its
-# tail` is the reword that survives a bare-substring check, and those two
-# are what tell the agent *how* wrong `command` gets.
+# tool that carries them rather than to the transcript. The per-shell
+# needles are here for the same reason
+# `get_command_history_description_carries_its_caveats` in `mcp/tools.rs`
+# has them: a bare "best-effort" is the reword that survives a phrase check,
+# and what tells the agent *how* wrong `command` gets is which shell, the
+# refusal it must not read as a secret, and the silent tail. The absence
+# check is for the two claims that were pinned in and outlived the code:
+# Latin-1 decoding (fixed, GH #270) and a 47-character tail no shell gives.
 jcheck "get_command_history warns about nested shells" \
   'tool("get_command_history").description as $d
    | ["nested integrated shell"]
    | map(. as $n | select(($d | contains($n)) | not))' \
   '[]'
-jcheck "get_command_history warns that command is truncated" \
-  'tool("get_command_history").description as $d
-   | ["truncated to its tail","80 columns","Latin-1"]
+jcheck "get_command_history says how a wide command is recorded, per shell" \
+  '(tool("get_command_history").description | gsub("\\s+";" ")) as $d
+   | ["wider than the terminal","bash records it whole",
+      "`[REDACTED:unresolved]`, which means the text was withheld",
+      "the tail is reported as if it were the whole command",
+      "fish can put a copy of part of the command in front of it"]
    | map(. as $n | select(($d | contains($n)) | not))' \
+  '[]'
+jcheck "get_command_history no longer claims Latin-1 or a 47-character tail" \
+  'tool("get_command_history").description as $d
+   | ["Latin-1","yields 47"]
+   | map(. as $n | select($d | contains($n)))' \
   '[]'
 
 # ------------------------------------------- unknown arguments (GH #219)
