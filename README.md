@@ -85,9 +85,12 @@ tells you why rather than delivering it. `holdfast attach --allow-echo` sends it
 anyway, for the programs that ask for a code or an API key without ever clearing
 echo — the value is still masked on your own terminal, and it will still appear
 in the session's output. Echo off is not proof of a password prompt, though: a
-shell's line editor turns echo off too and draws what it is given, so a value
-sent while a shell sits at its prompt passes that test and lands in the output
-(G3 in SECURITY.md). `request_secret_input`, the tool an agent calls to *ask* for that
+shell's line editor turns echo off too and draws what it is given. So Holdfast
+also refuses a secret while the session's shell sits at its own prompt, which
+it knows from the shell's OSC 133 markers, and `--allow-echo` does not change
+that. A REPL, or a shell without those markers, still passes the echo test at
+its prompt and would draw, run and record the value (G3 in SECURITY.md).
+`request_secret_input`, the tool an agent calls to *ask* for that
 password, ships in 0.0.7 and is one of the twelve above. It was not: this
 sentence said twelve while the list above it enumerated eleven, and
 `request_secret_input` — the tool the sentence is about — was the one it
