@@ -2588,6 +2588,20 @@ impl HoldfastServer {
                 ),
                 format!("{bytes_written} byte(s) written to the session"),
             ),
+            // The writer's GH #262 refusal gets the same guidance as the
+            // request-time one: the bare word does not say that a human's
+            // answer was thrown away, or what the agent does next.
+            Resolution::Cancelled(CancelReason::AtShellPrompt) => envelope::envelope(
+                Status::SecretCancelled,
+                json!({
+                    "request_id": request_id,
+                    "reason": CancelReason::AtShellPrompt.as_str(),
+                }),
+                "the answer was not written: the command that asked for it had ended and \
+                 the session was back at its shell prompt, where it would have been shown, \
+                 run as a command and saved to history. Run the command that asks for the \
+                 secret again, and call this while it waits",
+            ),
             Resolution::Cancelled(reason) => envelope::envelope(
                 Status::SecretCancelled,
                 json!({ "request_id": request_id, "reason": reason.as_str() }),

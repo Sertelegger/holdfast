@@ -5796,6 +5796,12 @@ async fn an_idle_prompt_is_refused_and_a_read_s_is_not(
         "a refusal before the raise named a request: {payload}"
     );
     assert!(
+        payload["details"]
+            .as_str()
+            .is_some_and(|d| d.contains("Run the command")),
+        "the refusal does not tell the agent what to do next: {payload}"
+    );
+    assert!(
         d.daemon
             .server
             .attach_hub()
@@ -5918,6 +5924,12 @@ async fn a_request_answered_after_the_shell_prompt_returned_is_not_written() {
              refused at the write: {payload}"
         );
         assert_eq!(payload["data"]["request_id"], id.as_str());
+        assert!(
+            payload["details"]
+                .as_str()
+                .is_some_and(|d| d.contains("Run the command")),
+            "the refusal does not tell the agent what to do next: {payload}"
+        );
         let (closed, outcome) = next_secret_closed(&mut c, 20).await;
         assert_eq!(closed, id);
         assert_eq!(outcome, "at_shell_prompt", "allow_echo: {allow_echo}");
