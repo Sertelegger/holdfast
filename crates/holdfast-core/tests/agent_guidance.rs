@@ -196,3 +196,49 @@ fn every_tool_description_fits_the_same_budget() {
         );
     }
 }
+
+/// **A running command's `heuristic` tier is stated where the tier is
+/// described.** The detector withholds the OSC 133 and bracketed-paste
+/// rungs once the shell hands the terminal to a program it started, so
+/// every external command reads `Executing` / `heuristic` with the reason
+/// `no deterministic signal`, in a session whose integration is working.
+/// An agent told only that `semantic` means *markers* and `heuristic`
+/// means *a guess* reads that as a broken integration.
+///
+/// Checked on every tool that publishes the `DetectionTier` definition,
+/// because each carries its own copy, and at least one must.
+#[test]
+fn detection_tier_says_a_running_command_reads_heuristic() {
+    let mut seen = 0;
+    for tool in passthrough::tool_manifest() {
+        let name = tool.name.to_string();
+        let Some(output) = tool.output_schema.as_ref() else {
+            continue;
+        };
+        let Some(tier) = output
+            .get("$defs")
+            .and_then(|d| d.get("DetectionTier"))
+            .and_then(|t| t.get("description"))
+            .and_then(|d| d.as_str())
+        else {
+            continue;
+        };
+        seen += 1;
+        let tier = tier.split_whitespace().collect::<Vec<_>>().join(" ");
+        for needle in [
+            "A running command normally reads `heuristic`, even in an integrated shell",
+            "once the shell hands the terminal to a program",
+            "`no deterministic signal`",
+            "`semantic` again at the shell's next prompt",
+        ] {
+            assert!(
+                tier.contains(needle),
+                "`{name}`'s DetectionTier description dropped {needle:?}:\n{tier}"
+            );
+        }
+    }
+    assert!(
+        seen >= 7,
+        "only {seen} tools publish DetectionTier; the prompt-bearing tools lost it"
+    );
+}

@@ -74,7 +74,7 @@ pub enum Status {
     Unavailable,
 }
 
-/// What the session is doing (§18.2a).
+/// What the session is doing. `detection_tier` says how that was judged.
 #[derive(Debug, Serialize, schemars::JsonSchema)]
 pub enum InteractionMode {
     AtPrompt,
@@ -84,7 +84,30 @@ pub enum InteractionMode {
     Exited,
 }
 
-/// Which mechanism produced `interaction_mode` (§18.2a).
+/// Which mechanism produced `interaction_mode`, and so how far to trust it.
+///
+/// `semantic` is read from OSC 133 shell-integration markers, and
+/// `terminal_mode` from the terminal's own state: bracketed paste, echo,
+/// or the alternate screen. Both are measurements. `heuristic` is a guess
+/// from how long the output has been quiet and how much its last line
+/// looks like a prompt. `prompt.reason` names the evidence behind any tier.
+///
+/// **A running command normally reads `heuristic`, even in an integrated
+/// shell, and that is by design.** The markers and bracketed paste
+/// describe the shell that produced them, not a program it started, so
+/// once the shell hands the terminal to a program they vouch for nothing:
+/// the answer is `Executing` at `heuristic`, with `prompt.reason` starting
+/// `no deterministic signal`. That is not a lost integration, and the tier
+/// is `semantic` again at the shell's next prompt.
+//
+// The variants carry no doc comments on purpose: one would turn this
+// `enum` into a `oneOf` in the published schema. The by-design paragraph
+// is `detect::detector`'s owner scoping (GH #240): a licence is withheld
+// when the program that emitted a signal and the one holding the terminal
+// are both known and differ, which moves every external command from the
+// T1 and T2 executing rungs to T3. It is stated here because an agent that
+// sees `heuristic` beside a working integration otherwise reads it as a
+// broken one.
 #[derive(Debug, Serialize, schemars::JsonSchema)]
 #[serde(rename_all = "snake_case")]
 pub enum DetectionTier {
@@ -268,26 +291,35 @@ pub enum CommandCapture {
     Missing,
 }
 
-/// The `prompt` object carried by every prompt-bearing response (§18.2a).
+/// The evidence behind `interaction_mode` and `detection_tier`.
+//
+// Carried by every prompt-bearing response (§18.2a); the field docs below
+// are published to agents, so they name config keys and not spec sections
+// (§8.4 for `confidence`, §8.6 T3a-T3c for the three scores, §8.3's ladder
+// for `reason`, §9.2 and REQ-T-011 for `last_line`).
 #[derive(Debug, Serialize, schemars::JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct Prompt {
-    /// Combined confidence in [0,1] (§8.4).
+    /// Combined confidence in [0,1]. At `heuristic` it is
+    /// `quiescent_score` times the larger of `pattern_score` and
+    /// `cursor_score`, and 0.5 or more reads as `AtPrompt`.
     pub confidence: f64,
-    /// How settled the output stream is, in [0,1] (§8.6 T3a).
+    /// How settled the output stream is, in [0,1]: 1.0 once nothing has
+    /// arrived for the operator's `prompts.settle_threshold_ms`.
     pub quiescent_score: f64,
-    /// Best tier-3 pattern match against the last line, in [0,1] (§8.6 T3b).
+    /// How well the last line matches a prompt pattern, built-in or the
+    /// operator's `prompts.extra_patterns`, in [0,1].
     pub pattern_score: f64,
-    /// Cursor sub-signal (§8.6 T3c). `0.0` whenever Tier B is off for
-    /// the session, which is the ordinary line-oriented case, and
-    /// whenever the cursor has not held position for
-    /// `cursor_stable_samples`.
+    /// How much the cursor's position looks like a prompt's, in [0,1].
+    /// `0.0` whenever `screen_tracking` is off, which is the ordinary
+    /// line-oriented case, and until the cursor has held its position for
+    /// the operator's `prompts.cursor_stable_samples`.
     pub cursor_score: f64,
-    /// Which branch of the §8.3 ladder answered, in words.
+    /// Which rule produced the answer, in words. A running command
+    /// normally reads `no deterministic signal`, followed by the scores.
     pub reason: String,
-    /// Last logical line of output, escape-free, and **redacted**
-    /// (§9.2, REQ-T-011) — it is the line a child that just echoed a
-    /// secret puts it on.
+    /// Last logical line of output, escape-free, and **redacted** — it is
+    /// the line a child that just echoed a secret puts it on.
     pub last_line: String,
 }
 
