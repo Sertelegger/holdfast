@@ -72,6 +72,9 @@ if [ -z "$new_bin" ]; then
     python3 -c 'import json, sys; print(json.load(sys.stdin)["target_directory"])')" || exit 2
   new_bin="$target/debug/holdfast"
 fi
+# Absolute, because every client below runs from a directory of its own.
+new_bin="$(cd "$(dirname "$new_bin")" && pwd)/$(basename "$new_bin")"
+[ -x "$new_bin" ] || { printf 'not an executable: %s\n' "$new_bin" >&2; exit 2; }
 echo "== building $old_tag in a detached worktree under $workdir"
 git -C "$repo" worktree add --detach "$old_tree" "$old_tag" >/dev/null || exit 2
 CARGO_TARGET_DIR="$old_target" cargo build --locked --bin holdfast \
