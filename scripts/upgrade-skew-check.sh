@@ -172,7 +172,7 @@ start_call() {
 # jq-free field reads, so the script needs only python3 besides the builds.
 # The expression evaluated is always one written in this file, never data:
 # the JSON it reads arrives as `d`, a parsed value.
-field() { python3 -c 'import json,sys; d=json.load(sys.stdin); print(eval(sys.argv[1], {"d": d}))' "$1"; }
+field() { python3 -c 'import json,sys; d=json.load(sys.stdin); print(eval(sys.argv[1], {"d": d, "json": json}))' "$1"; }
 
 failures=0
 check() { # check <label> <python-truthy-expression over d> <json>
@@ -196,6 +196,13 @@ start="$(start_call 'echo "CWD=$(pwd -P) PROBE=${HF_PROBE:-unset}"; sleep 20')"
 # ghp_ and 30 of the 36 characters a classic PAT has: a candidate still
 # arriving at the tail. Entirely made up.
 partial="$(start_call "printf 'line one\\ntoken ghp_FAKEfakeFAKEfakeFAKEfakeFAKEfa'; sleep 60")"
+# A line of prose naming a key block's opening marker, with no end and
+# 300 KB after it: a daemon from before GH #195 freezes its cursor there,
+# so a drain stops 300 KB short of the end however often it retries.
+keyblock="$(start_call 'i=0; while [ $i -lt 1000 ]; do echo "before line $i ................................"; i=$((i+1)); done
+echo "prose that names -----BEGIN RSA PRIVATE KEY----- and never ends it"
+i=0; while [ $i -lt 6000 ]; do echo "after line $i ................................................."; i=$((i+1)); done
+echo LAST-LINE-MARKER; sleep 60')"
 
 # ======================================== A: the old daemon, new clients
 echo "== A: $old_tag daemon, this tree's clients"
@@ -210,13 +217,17 @@ check "new shim: start_session refused, not run in the daemon's directory" \
 r="$(mcp "$new_bin" "$client_cwd" '[
   ["tools/call", {"name": "send_input", "arguments": {"session": "sess_none", "data": "x", "apend_newline": false}}],
   ["tools/call", {"name": "read_output", "arguments": {"session": "sess_none", "tail_lines": 3, "apply_holdback": true}}],
-  ["tools/call", {"name": "list_sessions", "arguments": {}}]]')"
+  ["tools/call", {"name": "list_sessions", "arguments": {}}],
+  ["tools/call", {"name": "start_session", "arguments": {"command": "/bin/sh", "profile": null}}]]')"
 check "new shim: a misspelt argument is refused by name, not dropped" \
   '"unknown field `apend_newline`" in d[0].get("error", {}).get("message", "")' "$r"
-check "new shim: apply_holdback is refused, not dropped" \
-  'd[1].get("error", {}).get("data", {}).get("reason") == "daemon_too_old"' "$r"
+check "new shim: apply_holdback on a tail is refused, cursor read offered first" \
+  'd[1].get("error", {}).get("data", {}).get("reason") == "daemon_too_old"
+   and 0 <= d[1]["error"]["message"].find("since_cursor") < d[1]["error"]["message"].find("holdfast daemon stop")' "$r"
 check "new shim: the old daemon's sessions stay reachable" \
   'd[2].get("result", {}).get("structuredContent", {}).get("status") == "ok"' "$r"
+check "new shim: profile: null is no profile, and is refused" \
+  'd[3].get("error", {}).get("data", {}).get("reason") == "daemon_too_old"' "$r"
 
 # A session ending in a still-arriving fake token, started the only way the
 # old daemon now can be: through its own shim.
@@ -233,6 +244,20 @@ check_cmd "new CLI: logs --tail withholds it and still prints the lines before i
 new_all="$("$new_bin" logs "$sid" 2>&1)"
 ! printf '%s' "$new_all" | grep -q 'ghp_FAKE'
 check_cmd "new CLI: logs (the drain) withholds it" $? "$new_all"
+r="$(mcp "$new_bin" "$client_cwd" "[[\"tools/call\", {\"name\": \"read_output\", \"arguments\": {\"session\": \"$sid\", \"since_cursor\": 0, \"apply_holdback\": true}}]]")"
+check "new shim: apply_holdback on a cursor read is forwarded, and the read withholds the token" \
+  '"line one" in d[0]["result"]["structuredContent"]["data"]["output"]
+   and "ghp_FAKE" not in json.dumps(d[0])' "$r"
+
+r="$(mcp "$old_bin" "$daemon_cwd" "[$keyblock]")"
+kid="$(printf '%s' "$r" | field 'd[0]["result"]["structuredContent"]["data"]["session_id"]' 2>/dev/null)"
+sleep 3
+old_tail="$("$old_bin" logs "$kid" --tail 3 2>&1)"
+printf '%s' "$old_tail" | grep -q 'LAST-LINE-MARKER'
+check_cmd "control: the session's last line is there to be read (the old CLI's tail read prints it)" $? "$old_tail"
+new_tail="$("$new_bin" logs "$kid" --tail 3 2>&1)"
+printf '%s' "$new_tail" | grep -q 'not the last of the' && printf '%s' "$new_tail" | grep -q 'GH #195'
+check_cmd "new CLI: --tail stopped short by the old daemon says so, and not as the tail" $? "$new_tail"
 
 st="$("$new_bin" daemon status 2>&1)"; rc=$?
 [ "$rc" = 0 ] && printf '%s' "$st" | grep -q 'older than this holdfast'
