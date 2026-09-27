@@ -409,9 +409,12 @@ pub(crate) fn secret_prompt_label(prompt_text: &str, raised_by: Option<&str>) ->
 /// into a terminal that echoes* — is served as an ungated write, and a
 /// secret typed at an echoing prompt lands in the session's output, where
 /// `read_output` hands it to the agent. So against such a daemon a secret
-/// goes only with `--allow-echo`, which means on that daemon exactly what
-/// it has always done there, and was chosen by the person who can see the
-/// terminal.
+/// goes only with `--allow-echo`, the decision of the person at the
+/// terminal. On that daemon the flag is an ungated write, into a shell's
+/// own idle prompt as much as into an echoing program, since it also
+/// predates the shell-prompt check (GH #262); so the advice to use it
+/// says to send only while the command that asks is waiting, and
+/// [`secret_unguarded_note`] says it again once the flag is given.
 #[cfg(unix)]
 pub(crate) fn secret_not_sendable(allow_echo: bool, daemon_minor: u32) -> Option<String> {
     let gate = Requirement::EchoGate;
@@ -419,14 +422,50 @@ pub(crate) fn secret_not_sendable(allow_echo: bool, daemon_minor: u32) -> Option
         return None;
     }
     let major = holdfast_core::protocol::PROTOCOL_MAJOR;
+    let only_while = if Requirement::ShellPromptGuard.met_by(daemon_minor) {
+        ""
+    } else {
+        " while the command that asks for it is waiting on screen (that daemon also cannot tell \
+         the shell's own prompt from a password prompt, and at an idle prompt the value is run \
+         as a command and saved to history)"
+    };
     Some(format!(
         "this daemon speaks protocol {major}.{daemon_minor}, which predates the echo check \
          ({major}.{}): it would {}. What you type here will not be sent. Reattach with \
-         `holdfast attach --allow-echo` to send it anyway, or restart the daemon to update it \
-         (`holdfast daemon stop` ends every session). Ctrl-C returns the keyboard to the \
-         session.",
+         `holdfast attach --allow-echo` to send it anyway{only_while}, or restart the daemon to \
+         update it (`holdfast daemon stop` ends every session). Ctrl-C returns the keyboard to \
+         the session.",
         gate.minor(),
         gate.otherwise(),
+    ))
+}
+
+/// What `holdfast attach` says under a secret prompt it will send to a
+/// daemon without the shell-prompt check, or `None` when the daemon has
+/// it ([`Requirement::ShellPromptGuard`]).
+///
+/// **Said where the human is about to type, not only on joining.** Such a
+/// daemon writes the value into whatever holds the terminal, and at a
+/// shell's idle prompt the line editor draws it, the shell runs it and
+/// history keeps it (GH #262; measured with this client's `--allow-echo`
+/// against a v0.0.7 daemon, bash 5.2). The joining note says so once, and
+/// may have scrolled away by the time a request is raised; and a v0.0.7
+/// daemon sends no picture of the screen, so the human may not see that
+/// the shell is at its prompt. Only the daemon can refuse it, so this is a
+/// warning and not a refusal: the same human may be answering `sudo`.
+#[cfg(unix)]
+pub(crate) fn secret_unguarded_note(daemon_minor: u32) -> Option<String> {
+    let guard = Requirement::ShellPromptGuard;
+    if guard.met_by(daemon_minor) {
+        return None;
+    }
+    let major = holdfast_core::protocol::PROTOCOL_MAJOR;
+    Some(format!(
+        "this daemon speaks protocol {major}.{daemon_minor}, which predates the shell-prompt \
+         check ({major}.{}): it cannot tell the shell's own prompt from a password prompt. Send \
+         only while the command that asks for it is waiting on screen; at an idle prompt the \
+         value is shown, run as a command and saved to history. Ctrl-C abandons.",
+        guard.minor(),
     ))
 }
 
@@ -448,7 +487,8 @@ pub(crate) fn older_daemon_note(what: &str, daemon_minor: u32) -> Option<String>
         return None;
     }
     // The minors are the handshake log's (`protocol::handshake`): 1.3
-    // `SecretInput.allow_echo`, 1.4 `OutputGap`, 1.5 `ScreenSnapshot`.
+    // `SecretInput.allow_echo`, 1.4 `OutputGap`, 1.5 `ScreenSnapshot`, and
+    // the first release with the shell-prompt check, which is 1.5 too.
     use holdfast_core::protocol::handshake::{OUTPUT_GAP_MINOR, SCREEN_SNAPSHOT_MINOR};
     let mut lacks = Vec::new();
     if what == "attach" && !Requirement::EchoGate.met_by(daemon_minor) {
@@ -456,6 +496,13 @@ pub(crate) fn older_daemon_note(what: &str, daemon_minor: u32) -> Option<String>
             "it cannot check that a program will not echo a secret back into the session, so a \
              secret typed here is sent only with `--allow-echo` ({major}.{})",
             Requirement::EchoGate.minor()
+        ));
+    }
+    if what == "attach" && !Requirement::ShellPromptGuard.met_by(daemon_minor) {
+        lacks.push(format!(
+            "it does not refuse a secret while the session's shell sits at its own prompt, where \
+             the value is shown, run as a command and saved to history ({major}.{})",
+            Requirement::ShellPromptGuard.minor()
         ));
     }
     if daemon_minor < OUTPUT_GAP_MINOR {
@@ -2927,6 +2974,8 @@ async fn attach_connected(
                             // to type into the very echo this refuses.
                             if let Some(why) = secret_not_sendable(allow_echo, daemon_minor) {
                                 render(format!("[holdfast] {why}\r\n").as_bytes());
+                            } else if let Some(why) = secret_unguarded_note(daemon_minor) {
+                                render(format!("[holdfast] {why}\r\n").as_bytes());
                             }
                             secret = Some((request_id, crate::attach_tty::SecretLine::default()));
                         }
@@ -5227,8 +5276,11 @@ mod tests {
     /// `--allow-echo`** (1.3's `SecretInput.allow_echo`). Without the
     /// flag, the frame means *gate it* to a 1.3 daemon and nothing at all
     /// to v0.0.7's 1.1, which writes the secret into an echoing program
-    /// and so into the session's output. With it, the frame means the same
-    /// to both, so it goes.
+    /// and so into the session's output. With it, the frame goes, as the
+    /// human's decision; it is not the same write a daemon of this build
+    /// makes, because v0.0.7 also has no shell-prompt check (GH #262), so
+    /// the advice to use the flag says to send only while the command that
+    /// asks is waiting.
     #[test]
     fn a_secret_goes_to_a_daemon_without_the_echo_gate_only_with_allow_echo() {
         use holdfast_core::protocol::handshake::ECHO_GATE_MINOR;
@@ -5239,6 +5291,8 @@ mod tests {
             "will not be sent",
             "--allow-echo",
             "holdfast daemon stop",
+            "while the command that asks for it is waiting on screen",
+            "run as a command and saved to history",
         ] {
             assert!(why.contains(needle), "`{needle}` missing: {why}");
         }
@@ -5247,6 +5301,28 @@ mod tests {
         assert!(secret_not_sendable(true, 1).is_none());
         assert!(secret_not_sendable(false, ECHO_GATE_MINOR).is_none());
         assert!(secret_not_sendable(false, holdfast_core::protocol::PROTOCOL_MINOR).is_none());
+    }
+
+    /// **A secret sent to a daemon without the shell-prompt check is sent
+    /// with a warning under its prompt** (GH #262): such a daemon writes
+    /// it into a shell's idle prompt, where it is run and saved to history,
+    /// and only the daemon can refuse that. Keyed to the guard's own
+    /// minor, and silent from it on.
+    #[test]
+    fn a_secret_prompt_warns_when_the_daemon_cannot_refuse_a_shell_prompt() {
+        use holdfast_core::protocol::handshake::SHELL_PROMPT_GUARD_MINOR;
+        let why = secret_unguarded_note(1).expect("v0.0.7 has no shell-prompt check");
+        for needle in [
+            "protocol 1.1",
+            "shell-prompt check (1.5)",
+            "waiting on screen",
+            "run as a command and saved to history",
+        ] {
+            assert!(why.contains(needle), "`{needle}` missing: {why}");
+        }
+        assert!(secret_unguarded_note(SHELL_PROMPT_GUARD_MINOR - 1).is_some());
+        assert!(secret_unguarded_note(SHELL_PROMPT_GUARD_MINOR).is_none());
+        assert!(secret_unguarded_note(holdfast_core::protocol::PROTOCOL_MINOR).is_none());
     }
 
     /// **An older daemon's missing frames are said once, on joining**,
@@ -5259,6 +5335,7 @@ mod tests {
         for needle in [
             "holdfast attach: this daemon speaks protocol 1.1",
             "--allow-echo",
+            "sits at its own prompt",
             "drops output",
             "picture of the screen",
             "`holdfast daemon stop`",
@@ -5267,8 +5344,16 @@ mod tests {
         }
         let watch = older_daemon_note("watch", 1).expect("v0.0.7 is older");
         assert!(
-            !watch.contains("--allow-echo"),
+            !watch.contains("--allow-echo") && !watch.contains("own prompt"),
             "`watch` never sends a secret: {watch}"
+        );
+        // One below the shell-prompt check's minor lacks it; the echo gate
+        // it has.
+        let attach_four = older_daemon_note("attach", 4).expect("1.4 is older");
+        assert!(
+            attach_four.contains("sits at its own prompt")
+                && attach_four.contains("saved to history (1.5)"),
+            "1.4 has no shell-prompt check: {attach_four}"
         );
         let four = older_daemon_note("watch", 4).expect("1.4 is older");
         assert!(

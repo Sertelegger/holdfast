@@ -15,8 +15,9 @@
 # daemon's protocol MAJOR, so across the 0.0.7 (protocol 1.1) -> 0.0.8
 # (protocol 1.5) boundary a new shim's `start_session` ran in the old
 # daemon's directory and environment, a new `holdfast logs --tail` printed a
-# still-arriving token in the clear, and a misspelt argument was served --
-# all without a word. Every row below is one of those, now refused or read
+# still-arriving token in the clear, a misspelt argument was served, and a
+# `request_secret_input` was raised at an idle shell prompt that this
+# tree's tool description says is refused -- all without a word. Every row below is one of those, now refused or read
 # safely, plus the controls that prove the probe would have caught it.
 #
 # Everything runs isolated: HOME, the XDG directories and
@@ -38,7 +39,7 @@ while [ $# -gt 0 ]; do
   esac
 done
 
-repo="$(git rev-parse --show-toplevel)" || exit 2
+repo="$(cd "$(dirname "$0")" && git rev-parse --show-toplevel)" || exit 2
 own_workdir=0
 if [ -z "$workdir" ]; then
   workdir="$(mktemp -d "${TMPDIR:-/tmp}/holdfast-skew.XXXXXX")" || exit 2
@@ -73,6 +74,10 @@ cleanup() {
   rm -rf -- "$old_target"
   if [ "$own_workdir" = 1 ]; then
     rm -rf -- "$workdir"
+  elif [ "$isolated" = 1 ]; then
+    # A --workdir of the caller's: keep it, but not the run's own HOME,
+    # audit log and daemon logs, which hold the fake tokens above.
+    rm -rf -- "$iso"
   fi
 }
 trap cleanup EXIT
@@ -248,6 +253,21 @@ r="$(mcp "$new_bin" "$client_cwd" "[[\"tools/call\", {\"name\": \"read_output\",
 check "new shim: apply_holdback on a cursor read is forwarded, and the read withholds the token" \
   '"line one" in d[0]["result"]["structuredContent"]["data"]["output"]
    and "ghp_FAKE" not in json.dumps(d[0])' "$r"
+
+# A secret request on that session. The old daemon has no shell-prompt
+# check (GH #262): at an idle shell prompt it raises the request and writes
+# an answer into the prompt, where it is run and saved to history. This
+# tree's shim publishes that such a prompt is refused, so it refuses the
+# call itself; the control shows the old daemon raising it for its own shim.
+secret="[\"tools/call\", {\"name\": \"request_secret_input\", \"arguments\": {\"session\": \"$sid\", \"prompt_text\": \"fake passphrase\", \"timeout_secs\": 1}}]"
+r="$(mcp "$new_bin" "$client_cwd" "[$secret]")"
+check "new shim: request_secret_input refused, not raised where no check stops it" \
+  'd[0].get("error", {}).get("data", {}).get("reason") == "daemon_too_old"
+   and "idle at its own prompt" in d[0]["error"]["message"]' "$r"
+r="$(mcp "$old_bin" "$daemon_cwd" "[$secret]")"
+check "control: the old shim's request is raised by the old daemon, and times out unanswered" \
+  'd[0]["result"]["structuredContent"]["status"] == "secret_cancelled"
+   and d[0]["result"]["structuredContent"]["data"]["reason"] == "timeout"' "$r"
 
 r="$(mcp "$old_bin" "$daemon_cwd" "[$keyblock]")"
 kid="$(printf '%s' "$r" | field 'd[0]["result"]["structuredContent"]["data"]["session_id"]' 2>/dev/null)"

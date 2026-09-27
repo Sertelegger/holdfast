@@ -59,6 +59,9 @@ use std::sync::Arc;
 /// same constant the daemon takes it by, so the two cannot drift apart.
 const START_SESSION: &str = crate::session::launch::CLIENT_PARAM_TOOL;
 
+/// The tool [`admit`] refuses whole below [`Requirement::ShellPromptGuard`].
+const REQUEST_SECRET_INPUT: &str = "request_secret_input";
+
 /// What a response carries when the call that produced it had to start a
 /// new daemon first (GH #231). Put in front of `details`, or of the
 /// message of an error, so it is the first thing read.
@@ -718,6 +721,11 @@ fn a_closing_listener(e: &ClientError) -> bool {
 ///   drops [`CLIENT_PARAM`] and starts the session in its own directory
 ///   and environment (GH #229). A `profile` session is exempt: it never
 ///   takes a client's context, from any daemon ([`takes_launch_context`]).
+/// * `request_secret_input`, below [`Requirement::ShellPromptGuard`]: the
+///   description this shim publishes says an idle shell prompt is refused
+///   `at_shell_prompt`, and such a daemon asks anyway and writes the answer
+///   into the prompt, where it is run and saved to history (GH #262). No
+///   argument makes the call safe there, so the whole call is refused.
 /// * Below [`CLOSED_ARGUMENTS_MINOR`], an argument this build does not
 ///   declare — an agent's typo — which the daemon would drop and run the
 ///   call without. Refused here by name, as a daemon of that minor
@@ -738,6 +746,11 @@ fn admit(
     if tool == START_SESSION && takes_launch_context(arguments) {
         client
             .require(Requirement::LaunchContext)
+            .map_err(too_old)?;
+    }
+    if tool == REQUEST_SECRET_INPUT {
+        client
+            .require(Requirement::ShellPromptGuard)
             .map_err(too_old)?;
     }
     if client.daemon_info().protocol_minor >= CLOSED_ARGUMENTS_MINOR {
@@ -2492,6 +2505,54 @@ mod tests {
         // The launch context travels to a daemon that takes it; `field`
         // panics, naming the keys that did, when it is absent.
         field(&sent.params, CLIENT_PARAM);
+    }
+
+    /// **`request_secret_input` is not sent to a daemon without the
+    /// shell-prompt refusal** (GH #262). This shim publishes that an idle
+    /// shell prompt answers `at_shell_prompt` before anyone is asked; a
+    /// v0.0.7 daemon raises the request there, and an answer from a human
+    /// or a provider is written into the prompt, drawn, run and saved to
+    /// history (measured through the shim, v0.0.7 daemon, bash 5.2). No
+    /// argument changes that, so the whole call is refused, unsent.
+    ///
+    /// Paired with a daemon of the guard's own minor, which is sent it.
+    #[tokio::test]
+    async fn request_secret_input_is_refused_unsent_by_a_daemon_without_the_shell_prompt_guard() {
+        let call = json!({ "session": "s", "prompt_text": "sudo password" });
+        let (shim, mut received, _dir) = shim_over("oldsecret", 1).await;
+        let err = shim
+            .forward("request_secret_input", args(call.clone()), std::future::pending())
+            .await
+            .expect_err("a 1.1 daemon would ask at an idle shell prompt");
+        let data = err.data.clone().expect("the reason is structured");
+        assert_eq!(data["reason"], "daemon_too_old", "{data}");
+        assert_eq!(
+            data["required_protocol"],
+            format!("1.{}", handshake::SHELL_PROMPT_GUARD_MINOR),
+            "{data}"
+        );
+        for needle in [
+            "0.0.7 (protocol 1.1)",
+            "idle at its own prompt",
+            "run as a command and saved to history",
+            "Ask the user to run `holdfast daemon stop`",
+        ] {
+            assert!(err.message.contains(needle), "`{needle}`: {}", err.message);
+        }
+        assert!(
+            received.try_recv().is_err(),
+            "the refused request reached the daemon anyway"
+        );
+
+        let (shim, mut received, _dir) =
+            shim_over("guardedsecret", handshake::SHELL_PROMPT_GUARD_MINOR).await;
+        let _ = shim
+            .forward("request_secret_input", args(call), std::future::pending())
+            .await;
+        assert_eq!(
+            received.recv().await.expect("forwarded").method,
+            "tool/request_secret_input"
+        );
     }
 
     /// **A misspelt argument, and one added since, against a daemon that

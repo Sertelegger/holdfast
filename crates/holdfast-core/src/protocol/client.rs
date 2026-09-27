@@ -921,6 +921,7 @@ mod tests {
             Requirement::LaunchContext,
             Requirement::TailHoldback,
             Requirement::EchoGate,
+            Requirement::ShellPromptGuard,
         ] {
             let err = old
                 .require(r)
@@ -977,6 +978,7 @@ mod tests {
             Requirement::LaunchContext,
             Requirement::TailHoldback,
             Requirement::EchoGate,
+            Requirement::ShellPromptGuard,
         ] {
             current
                 .require(r)

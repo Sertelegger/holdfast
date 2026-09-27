@@ -155,6 +155,25 @@ pub const PROFILE_MINOR: u32 = 1;
 /// `read_output` hands it to the agent.
 pub const ECHO_GATE_MINOR: u32 = 3;
 
+/// The first minor at which a **released** daemon refuses a secret while
+/// the session's shell sits at its own prompt (GH #262): `request_secret_input`
+/// answers `secret_cancelled` with reason `at_shell_prompt` before it asks
+/// anyone, and the writer refuses such a write whatever `allow_echo` says.
+///
+/// **A daemon behaviour, not a wire field, so no minor was bumped for it.**
+/// It landed while `main` was at 1.5, before any 1.5 was released, so the
+/// first release to speak 1.5 has it, and every release before it (v0.0.7's
+/// 1.1 among them) does not. A daemon built from `main` between the 1.5 bump
+/// and the guard also reports 1.5 and lacks it; that is a development build
+/// only, and is the direction this constant cannot see. A minor of its own
+/// would have to be recorded as a wire shape that did not change.
+///
+/// An older daemon raises the request at an idle prompt, and writes an
+/// answer there, where the line editor draws it, the shell runs it and
+/// history keeps it; `holdfast attach --allow-echo` is how a human sends
+/// one to such a daemon at all (see [`ECHO_GATE_MINOR`]).
+pub const SHELL_PROMPT_GUARD_MINOR: u32 = 5;
+
 /// The first minor whose daemon sends `ServerFrame::OutputGap` when it
 /// drops output an attached client could not keep up with (GH #200; the
 /// 1.4 entry above). Sent by the daemon, so nothing is refused for it:
@@ -174,7 +193,8 @@ pub const SCREEN_SNAPSHOT_MINOR: u32 = 5;
 /// **Every entry is decided by the client before it sends**, because the
 /// older daemon cannot decide it: it does not know the key that carries
 /// the difference, and before [`CLOSED_ARGUMENTS_MINOR`] it drops unknown
-/// keys in silence. The call is refused (`ClientError::DaemonTooOld`),
+/// keys in silence, or it lacks the check the call's description promises
+/// ([`Requirement::ShellPromptGuard`]). The call is refused (`ClientError::DaemonTooOld`),
 /// naming both versions and what to do — or, where a call that means the
 /// same on the older daemon exists, sent as that call instead, which is
 /// what `holdfast logs --tail` does. Either way the skew costs a restart
@@ -214,6 +234,11 @@ pub enum Requirement {
     /// `start_session`'s `profile` and `vars` (GH #55), which a shim passes
     /// on from an agent. Only a pre-0.0.7 daemon lacks them.
     Profile,
+    /// `request_secret_input`, whose description promises that a shell idle
+    /// at its own prompt is refused (`at_shell_prompt`, GH #262). An older
+    /// daemon raises the request there and writes the answer into the
+    /// prompt. See [`SHELL_PROMPT_GUARD_MINOR`].
+    ShellPromptGuard,
 }
 
 impl Requirement {
@@ -225,6 +250,7 @@ impl Requirement {
             Self::TailHoldback => TAIL_HOLDBACK_MINOR,
             Self::EchoGate => ECHO_GATE_MINOR,
             Self::Profile => PROFILE_MINOR,
+            Self::ShellPromptGuard => SHELL_PROMPT_GUARD_MINOR,
         }
     }
 
@@ -248,7 +274,7 @@ impl Requirement {
                 "A `read_output` with `since_cursor` in place of a tail withholds such a secret \
                  on that daemon and needs no restart; the alternative is a daemon of this build.",
             ),
-            Self::LaunchContext | Self::EchoGate | Self::Profile => None,
+            Self::LaunchContext | Self::EchoGate | Self::Profile | Self::ShellPromptGuard => None,
         }
     }
 
@@ -271,6 +297,11 @@ impl Requirement {
             Self::Profile => {
                 "ignore `profile` and start whatever `command` names instead, in its own \
                  directory and environment"
+            }
+            Self::ShellPromptGuard => {
+                "ask for the secret even while the session's shell sits idle at its own prompt, \
+                 and write the answer there, where it is shown, run as a command and saved to \
+                 history"
             }
         }
     }
@@ -530,6 +561,7 @@ mod tests {
             Requirement::TailHoldback,
             Requirement::EchoGate,
             Requirement::Profile,
+            Requirement::ShellPromptGuard,
         ] {
             assert!(r.met_by(r.minor()), "{r:?}");
             assert!(!r.met_by(r.minor() - 1), "{r:?}");
@@ -543,6 +575,7 @@ mod tests {
             Requirement::LaunchContext,
             Requirement::TailHoldback,
             Requirement::EchoGate,
+            Requirement::ShellPromptGuard,
         ] {
             assert!(!r.met_by(1), "{r:?}: v0.0.7 speaks 1.1");
         }
@@ -556,8 +589,9 @@ mod tests {
                 PROFILE_MINOR,
                 OUTPUT_GAP_MINOR,
                 SCREEN_SNAPSHOT_MINOR,
+                SHELL_PROMPT_GUARD_MINOR,
             ),
-            (5, 4, 3, 5, 1, 4, 5)
+            (5, 4, 3, 5, 1, 4, 5, 5)
         );
     }
 
