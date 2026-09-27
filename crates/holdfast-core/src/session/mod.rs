@@ -1833,8 +1833,18 @@ impl Session {
     /// [`detection`](Self::detection): it decides whether the marker the
     /// detector holds still belongs to the program at the terminal, and a
     /// chunk fed between the two samples would let them describe different
-    /// instants. Nothing here blocks — one lock and one ioctl.
+    /// instants. Nothing here blocks — a `WNOHANG` wait, one lock and one
+    /// ioctl.
+    ///
+    /// **`false` for a child that has exited**, whose last marker describes
+    /// nothing. The classifier answers liveness before any marker for the
+    /// same reason. Without it a session that died while a provider was
+    /// answering would be refused `at_shell_prompt` instead of reaching the
+    /// `session_died` its caller is owed.
     pub fn at_shell_prompt(&self) -> bool {
+        if !self.backend.is_alive() {
+            return false;
+        }
         let detector = self.detector.lock();
         let foreground = self.backend.foreground_group();
         detector.shell_at_prompt(foreground)
@@ -3376,6 +3386,14 @@ mod tests {
             submit(&s, None, true),
             SecretWrite::Declined(DeclineReason::AtShellPrompt),
             "an unknown foreground withdrew the licence, which REQ-PD-025 says it must not"
+        );
+
+        // A shell that has exited is at no prompt: its last marker is a
+        // record, not a state, and its caller is owed `session_died`.
+        pty.exit(0);
+        assert!(
+            !s.at_shell_prompt(),
+            "a dead shell's last marker still read as a prompt"
         );
     }
 
