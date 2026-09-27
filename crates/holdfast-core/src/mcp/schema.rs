@@ -491,13 +491,15 @@ pub struct RequestSecretInput {
     pub bytes_written: Option<u64>,
     /// On both `secret_provided` and `secret_cancelled`.
     ///
-    /// **Absent on exactly one path** (GH #127): a call cancelled before
-    /// it raised or adopted anything has no request to name. Every other
-    /// `secret_cancelled` carries one.
+    /// **Absent on the two paths that raise nothing**: a call cancelled
+    /// before it raised or adopted anything (GH #127), and one refused
+    /// `at_shell_prompt` before the raise (GH #262). Neither has a request
+    /// to name. Every other `secret_cancelled` carries one, including an
+    /// `at_shell_prompt` the writer returned after a human answered.
     pub request_id: Option<String>,
     /// `secret_cancelled` only: `user_cancelled` | `timeout` |
     /// `too_large` | `concurrent_request_pending` | `caller_cancelled` |
-    /// `not_echo_off`.
+    /// `not_echo_off` | `at_shell_prompt`.
     pub reason: Option<String>,
     /// `session_died` only (§5.1).
     pub exit_code: Option<i32>,

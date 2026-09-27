@@ -1037,10 +1037,14 @@ fn the_secret_input_arm_owns_its_submission_as_a_secret() {
     // The normalised value, on the same inverted rule as the binding
     // above: every use whitelisted, so a *new* way of touching it fails
     // until it is named here deliberately.
+    // The two writes are whole lines rather than `let` bindings since GH
+    // #262 gave both arms one ack type: `allow_echo` reaches
+    // `secret_echo_allowed`, which still refuses a shell at its prompt, and
+    // no longer the unconditional `WriteRequest::secret`.
     const ALLOWED_VALUE: [&str; 3] = [
         "let value = bytes.normalised(raised.append_newline);",
-        "let (w, rx) = WriteRequest::secret(value);",
-        "let (w, rx) = WriteRequest::secret_if_echo_off(value);",
+        "WriteRequest::secret_echo_allowed(value)",
+        "WriteRequest::secret_if_echo_off(value)",
     ];
     for line in code.iter().filter(|l| touches(l, "value")) {
         assert!(

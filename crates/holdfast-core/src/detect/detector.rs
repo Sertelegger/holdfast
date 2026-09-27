@@ -285,20 +285,6 @@ impl PromptDetector {
         // See the `availability` test module for the rows that pin this on
         // both axes: signal membership (REQ-PD-015) and scope
         // (REQ-PD-026).
-
-        /// §8.3's scope rule, in one place because it applies to both
-        /// executing rungs, to the T1 prompt-marker rung, and to the
-        /// exited tier.
-        ///
-        /// A licence is withheld **only when owner and holder are both
-        /// known and differ**. Absence is not a change: an unknown owner
-        /// or an unknown holder reproduces the pre-rev.-37 session-scoped
-        /// answer exactly, never a third one, which is what covers ConPTY
-        /// and every failed ioctl (REQ-PD-025).
-        fn licensed(observed: bool, owner: Option<i32>, holder: Option<i32>) -> bool {
-            observed && !matches!((owner, holder), (Some(o), Some(h)) if o != h)
-        }
-
         let t1 = licensed(modes.saw_osc133, modes.osc133_owner, foreground);
         let t2_prompt_mode = licensed(
             modes.saw_bracketed_paste,
@@ -462,6 +448,75 @@ impl PromptDetector {
         let elapsed = now.saturating_duration_since(self.last_output).as_millis() as f64;
         ((elapsed / threshold as f64) as f32).clamp(0.0, 1.0)
     }
+
+    /// Whether the shell's own OSC 133 markers say it is at its prompt: the
+    /// latest one is `A`, `B` or `D`, so no `C` has started a command since,
+    /// the program that emitted it still holds the terminal, and the
+    /// terminal is not at a secret line read. `foreground` and `line` are
+    /// the terminal's foreground group and line discipline, sampled by the
+    /// caller under the same lock as this read, as `snapshot` takes them.
+    ///
+    /// **This is the secret write gate's shell-prompt test (GH #262), not a
+    /// classification.** A secret written at an idle prompt goes to the
+    /// shell's line editor. The editor draws it, the appended newline runs
+    /// it as a command, and the shell saves it to history. The tty's `ECHO`
+    /// flag cannot see any of that, because readline and zle turn `ECHO`
+    /// off at every idle prompt and draw the characters themselves.
+    ///
+    /// **`D` counts here, and the T1 prompt-marker rung does not count it.**
+    /// Between `D` and the next `A` the shell is drawing its prompt. The
+    /// classifier answers `Executing` there because the state is momentary,
+    /// but no command has started, so a write there reaches the shell. And
+    /// where a regenerated prompt loses the `A`/`B` markers (GH #220), `D`
+    /// is the last marker at every idle prompt.
+    ///
+    /// **Not while the terminal has `ECHO` off and `ICANON` on**, which is
+    /// a program reading a secret *line*: it leaves the kernel to assemble
+    /// the line, so it stays canonical. No line editor reads that way.
+    /// readline, zle, fish's reader and CPython's all leave canonical mode,
+    /// because they draw what is typed themselves (GH #262's table). The
+    /// exception matters where the markers never say that a command
+    /// started, because then the shell's own `read -s` runs with `B` still
+    /// last. That happens with a bash older than 4.4, which has no `PS0` and
+    /// so no `C` (macOS's `/bin/bash` 3.2 is one), and with a user
+    /// integration that marks only the prompt, which makes Holdfast's
+    /// snippet stand down. Without the exception a genuine secret prompt
+    /// there would be refused, with no override. An unknown `ICANON` is not
+    /// the exception, so an unreadable flag keeps the refusal.
+    ///
+    /// **What the exception admits, and what it still refuses.** A shell
+    /// with no line editor (`bash --noediting`) sitting at its prompt after
+    /// a program left `ECHO` off reads the same way, and is admitted: the
+    /// value is not drawn there, but it is run as a command and saved to
+    /// history. And a raw-mode read under such markers is still refused
+    /// while their emitter holds the terminal. The case that matters is a
+    /// remote shell under `ssh -t` that marks only its prompt: its markers
+    /// are owned by `ssh`'s group, and every secret prompt it shows
+    /// reaches the local terminal in raw mode.
+    ///
+    /// **It sees only a shell whose markers arrive.** A REPL, a nested
+    /// shell with no integration, `exec zsh`, and a session whose
+    /// integration is off all read their input after a `C`, or with no
+    /// marker at all, so this answers `false` for them.
+    pub fn shell_at_prompt(&self, foreground: Option<i32>, line: LineDiscipline) -> bool {
+        let modes = self.scanner.modes();
+        let secret_line_read = line.echo == Some(false) && line.canonical == Some(true);
+        licensed(modes.saw_osc133, modes.osc133_owner, foreground)
+            && matches!(self.scanner.last_marker(), Some(b'A' | b'B' | b'D'))
+            && !secret_line_read
+    }
+}
+
+/// §8.3's scope rule, in one place because it applies to both executing
+/// rungs, to the T1 prompt-marker rung, to the exited tier, and to the
+/// secret write gate's [`PromptDetector::shell_at_prompt`].
+///
+/// A licence is withheld **only when owner and holder are both known and
+/// differ**. Absence is not a change: an unknown owner or an unknown holder
+/// reproduces the pre-rev.-37 session-scoped answer exactly, never a third
+/// one, which is what covers ConPTY and every failed ioctl (REQ-PD-025).
+fn licensed(observed: bool, owner: Option<i32>, holder: Option<i32>) -> bool {
+    observed && !matches!((owner, holder), (Some(o), Some(h)) if o != h)
 }
 
 #[cfg(test)]

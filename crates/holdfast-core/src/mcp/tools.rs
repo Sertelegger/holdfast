@@ -2125,6 +2125,12 @@ impl HoldfastServer {
     /// fires only for a session started from an operator-declared
     /// `profile`, optionally narrowed by the observed prompt, and
     /// `prompt_text` reaches no lookup (§9.6, REQ-SEC-012).
+    ///
+    /// **Call it while a command is waiting for the secret.** At an idle
+    /// shell prompt it asks nobody and returns `secret_cancelled` with
+    /// reason `at_shell_prompt`, because the shell would show the value,
+    /// run it and save it to history. Run the command that reads the
+    /// secret first, and call this once its password prompt is on screen.
     #[tool(
         annotations(
             title = "Request a secret from the user",
@@ -2254,6 +2260,25 @@ impl HoldfastServer {
                 json!({ "exit_code": session.exit_code() }),
                 "session has exited",
             ));
+        }
+
+        // **GH #262: nothing is asked for at an idle shell prompt.** A
+        // shell sitting at its own prompt has `ECHO` off, because its line
+        // editor draws what is typed, so the writer's echo test admits it —
+        // and a secret written there is drawn on every surface, run as a
+        // command, and saved to history. The writer refuses that too
+        // (`write_secret_if_unread`), and this check is not instead of it:
+        // it is what keeps the refusal from costing a human's typing or a
+        // provider run. Before step 1, so no binding resolves, no approval
+        // is asked and no `max_uses` claim is spent; before the raise, so no
+        // attached human is asked to type a credential that will be
+        // dropped.
+        //
+        // Checked a second time just before the raise, because step 1 can
+        // be away for a provider's timeout or a human approval. The writer
+        // checks a third time, one statement before the write.
+        if session.at_shell_prompt() {
+            return Ok(at_shell_prompt_refusal());
         }
 
         // **The request's one context** (GH #126, GH #127), built here
@@ -2405,8 +2430,9 @@ impl HoldfastServer {
         // adopted* request and this call raised none, so a lone
         // `secret_input_resolved` would name nothing and a
         // `secret_input_request` with no id would not be §9.4's shape.
-        // `schema::RequestSecretInput.request_id` is an `Option` and this
-        // is the one path that leaves it unset.
+        // `schema::RequestSecretInput.request_id` is an `Option`, and this
+        // and `at_shell_prompt_refusal` are the two paths that leave it
+        // unset.
         //
         // **The child's affordance is left exactly as found.** Whatever
         // raise §8.3's edge produced is still outstanding and still
@@ -2417,6 +2443,11 @@ impl HoldfastServer {
                 json!({ "reason": CancelReason::CallerCancelled.as_str() }),
                 "the request was cancelled by its caller before a secret was requested",
             ));
+        }
+        // GH #262's second check, for a step 1 that was away long enough
+        // for the command that asked to end — see the first, above.
+        if session.at_shell_prompt() {
+            return Ok(at_shell_prompt_refusal());
         }
 
         // REQ-SEC-010a. Raise if the slot is vacant, **adopt** if an echo
@@ -2558,6 +2589,20 @@ impl HoldfastServer {
                 ),
                 format!("{bytes_written} byte(s) written to the session"),
             ),
+            // The writer's GH #262 refusal gets the same guidance as the
+            // request-time one: the bare word does not say that a human's
+            // answer was thrown away, or what the agent does next.
+            Resolution::Cancelled(CancelReason::AtShellPrompt) => envelope::envelope(
+                Status::SecretCancelled,
+                json!({
+                    "request_id": request_id,
+                    "reason": CancelReason::AtShellPrompt.as_str(),
+                }),
+                "the answer was not written: the command that asked for it had ended and \
+                 the session was back at its shell prompt, where it would have been shown, \
+                 run as a command and saved to history. Run the command that asks for the \
+                 secret again, and call this while it waits",
+            ),
             Resolution::Cancelled(reason) => envelope::envelope(
                 Status::SecretCancelled,
                 json!({ "request_id": request_id, "reason": reason.as_str() }),
@@ -2570,6 +2615,42 @@ impl HoldfastServer {
             ),
         })
     }
+}
+
+/// `request_secret_input`'s answer at an idle shell prompt (GH #262).
+///
+/// **`secret_cancelled` with no `request_id`**, the shape GH #127's
+/// already-cancelled call set: nothing was raised, so there is no request
+/// to name, and no §9.4 pair is written for the same reason.
+///
+/// **One text for both call sites, so it claims only what is true at
+/// both.** Before step 1 nothing has run. Before the raise a binding's
+/// provider may have run, and its value been refused by the writer for
+/// this same reason. That leaves a `binding_resolved` audit line with no
+/// request pair after it. So the text says nothing was written, not that
+/// nothing was requested.
+///
+/// **The details say what to do, not only what happened.** An agent that
+/// meets this has usually just watched a command fail, such as a `read -s`
+/// that zsh parses differently, and is about to ask again. What it needs is
+/// to run the command that reads the secret and ask while it waits. Not
+/// told to retry as it is, and not told to find a human: neither changes a
+/// shell's prompt into a secret prompt. **But told what to do if it has
+/// just started the command**, because a call made in the same instant as
+/// the `send_input` that runs it arrives before the shell has read that
+/// line. Measured: 2 of 3 such calls refused with no gap, none at a gap of
+/// 5 ms. Without that sentence, the remedy the details name would send such
+/// an agent to run the command a second time, into its own password prompt.
+fn at_shell_prompt_refusal() -> CallToolResult {
+    envelope::envelope(
+        Status::SecretCancelled,
+        json!({ "reason": CancelReason::AtShellPrompt.as_str() }),
+        "nothing was written: the session is at its shell prompt, where a secret \
+         would be shown, run as a command and saved to history. Run the command \
+         that asks for the secret first, and call this while it waits; if you have \
+         just started it, wait until its password prompt is on screen, then call \
+         this again",
+    )
 }
 
 impl HoldfastServer {
@@ -2773,7 +2854,8 @@ impl HoldfastServer {
         // `AwaitingSecret` — and `request_secret_input` had no echo-state
         // precondition before that check existed. The writer gates on the
         // echo state itself, which is the condition the harm actually
-        // turns on.
+        // turns on — and, since GH #262, on whether the session's shell is
+        // back at its own prompt, where `ECHO` is off and the harm is worse.
         //
         // ## And the question that is not about the slot at all (GH #126)
         //

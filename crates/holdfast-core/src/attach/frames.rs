@@ -479,7 +479,7 @@ pub enum ServerFrame {
     SecretRequestClosed {
         request_id: String,
         /// `"fulfilled" | "cancelled" | "timeout" | "caller_cancelled" |
-        /// `"not_echo_off"` — §18.4d is the catalogue.
+        /// "not_echo_off" | "at_shell_prompt"` — §18.4d is the catalogue.
         ///
         /// **A free `String` and not an enum**, so widening the set costs
         /// nothing on the wire: the golden records `"<str>"` and a client
@@ -487,7 +487,9 @@ pub enum ServerFrame {
         /// to list three when the daemon emitted four — GH #127 added
         /// `caller_cancelled` and updated `mcp/schema.rs` but not the one
         /// place a consumer of *this* type reads. GH #137 adds
-        /// `not_echo_off` and repairs the omission.
+        /// `not_echo_off` and repairs the omission, and GH #262 adds
+        /// `at_shell_prompt`: a submission the writer refused because the
+        /// session's shell was back at its own prompt.
         outcome: String,
     },
     /// §9.6's `require_confirm` approval, raised when a binding that

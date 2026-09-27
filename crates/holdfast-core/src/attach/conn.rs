@@ -1159,12 +1159,16 @@ async fn read_loop(
                         // through the masked path this way — pushing it
                         // to `send_input` would be strictly worse, since
                         // that has no masking at all.
+                        //
+                        // **And it waives the echo test only** (GH #262).
+                        // Both spellings still refuse a shell sitting at
+                        // its own prompt, where the value would be run
+                        // and saved to history rather than merely shown:
+                        // see `WriteRequest::secret_echo_allowed`.
                         let (write, ack) = if allow_echo {
-                            let (w, rx) = WriteRequest::secret(value);
-                            (w, Submitted::EchoAllowed(rx))
+                            WriteRequest::secret_echo_allowed(value)
                         } else {
-                            let (w, rx) = WriteRequest::secret_if_echo_off(value);
-                            (w, Submitted::Gated(rx))
+                            WriteRequest::secret_if_echo_off(value)
                         };
                         // The frame body still holds the value in
                         // cleartext and is about to be reused for the
@@ -1224,7 +1228,7 @@ async fn read_loop(
                         // connection.
                         let for_ack = Arc::clone(session);
                         tokio::spawn(async move {
-                            match ack.resolve().await {
+                            match resolve(ack).await {
                                 Submission::Written(n) => answer.settle(
                                     crate::secret::Resolution::Provided {
                                         bytes_written: n as u64,
@@ -1260,21 +1264,26 @@ async fn read_loop(
                                     // `expect_writes` is `None`, so
                                     // `write_secret_if_unread` cannot
                                     // return `OtherWriteIntervened` and
-                                    // the second arm is unreachable —
-                                    // which is exactly why it is written
-                                    // out. A `_ =>` here would turn a
-                                    // third condition added later into a
-                                    // *wrong word on the wire*, silently:
-                                    // the agent's `secret_cancelled.reason`
-                                    // and every attached client's
+                                    // that arm is unreachable — which is
+                                    // exactly why it is written out. A
+                                    // `_ =>` here would turn a condition
+                                    // added later into a *wrong word on
+                                    // the wire*, silently: the agent's
+                                    // `secret_cancelled.reason` and every
+                                    // attached client's
                                     // `SecretRequestClosed.outcome` would
                                     // name a refusal that did not happen.
                                     // Exhaustive, so that change is a
-                                    // compile error instead.
+                                    // compile error instead — which is
+                                    // how GH #262's `AtShellPrompt`
+                                    // arrived here with its own word.
                                     let reason = match why {
                                         crate::session::DeclineReason::NotEchoOff
                                         | crate::session::DeclineReason::OtherWriteIntervened => {
                                             crate::secret::CancelReason::NotEchoOff
+                                        }
+                                        crate::session::DeclineReason::AtShellPrompt => {
+                                            crate::secret::CancelReason::AtShellPrompt
                                         }
                                     };
                                     // **A dead session is not an echoing
@@ -2215,25 +2224,7 @@ async fn forward_events(
     }
 }
 
-/// The two acks `attach::conn`'s `SecretInput` arm can be waiting on, and
-/// the one answer it acts on (GH #137).
-///
-/// **A type rather than two `tokio::spawn`s.** The gated write and the
-/// opted-out one differ in exactly one thing — whether the writer is
-/// allowed to refuse — and everything downstream of the ack is identical:
-/// the same `SecretAnswer`, the same three outcomes, the same broadcast.
-/// Two spawned tasks would be two copies of that, and the copy that
-/// mattered would be the one nobody updated.
-enum Submitted {
-    /// `SecretInput.allow_echo: true`. [`WriteRequest::secret`], which
-    /// cannot refuse and whose ack is therefore a plain count.
-    EchoAllowed(tokio::sync::oneshot::Receiver<crate::error::Result<usize>>),
-    /// The default. [`WriteRequest::secret_if_echo_off`], whose ack can
-    /// say the write did not happen.
-    Gated(tokio::sync::oneshot::Receiver<crate::error::Result<SecretWrite>>),
-}
-
-/// What became of a submission, with the two ack shapes collapsed.
+/// What became of a submission (GH #137).
 enum Submission {
     Written(usize),
     Declined(crate::session::DeclineReason),
@@ -2243,19 +2234,22 @@ enum Submission {
     SessionDied,
 }
 
-impl Submitted {
-    async fn resolve(self) -> Submission {
-        match self {
-            Self::EchoAllowed(rx) => match rx.await {
-                Ok(Ok(n)) => Submission::Written(n),
-                _ => Submission::SessionDied,
-            },
-            Self::Gated(rx) => match rx.await {
-                Ok(Ok(SecretWrite::Written(n))) => Submission::Written(n),
-                Ok(Ok(SecretWrite::Declined(why))) => Submission::Declined(why),
-                _ => Submission::SessionDied,
-            },
-        }
+/// The writer's answer to a `SecretInput` arm's write, as the arm acts on
+/// it.
+///
+/// **One ack shape for both spellings of the write** (GH #262). Until then
+/// `allow_echo` reached [`WriteRequest::secret`], which cannot refuse, and
+/// this was an enum over two receivers. `allow_echo` now reaches
+/// [`WriteRequest::secret_echo_allowed`], which can refuse at a shell
+/// prompt, so both acks can say the write did not happen and one function
+/// reads them.
+async fn resolve(
+    rx: tokio::sync::oneshot::Receiver<crate::error::Result<SecretWrite>>,
+) -> Submission {
+    match rx.await {
+        Ok(Ok(SecretWrite::Written(n))) => Submission::Written(n),
+        Ok(Ok(SecretWrite::Declined(why))) => Submission::Declined(why),
+        _ => Submission::SessionDied,
     }
 }
 
