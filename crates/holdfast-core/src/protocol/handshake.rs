@@ -65,21 +65,37 @@ pub const PROTOCOL_MAJOR: u32 = 1;
 ///
 /// 1.5 also adds [`CLIENT_PARAM`] on `tool/start_session`: the shim's own
 /// working directory and environment, which the daemon starts the session
-/// from (GH #229). The only entry in this log that is **gated on the
-/// peer's minor**, and the gate is [`LAUNCH_CONTEXT_MINOR`]. Every other
-/// addition here is safe in an older peer's hands because an older peer
-/// never sends it; this one an older shim *can* send, because it forwards
-/// the agent's `arguments` verbatim, and from such a shim the key is the
-/// agent's text rather than a launch context. So a 1.5 daemon takes it
-/// only from a peer that declared 1.5 or later and leaves it in an older
-/// peer's arguments, where the tool refuses it. A 1.5 shim against a 1.4
-/// daemon sends a key that daemon ignores as an unknown argument, and its
-/// sessions start where that daemon would have started them anyway.
+/// from (GH #229). The first entry in this log that is **gated on the
+/// peer's minor**, and the gate is [`LAUNCH_CONTEXT_MINOR`], in both
+/// directions. An older shim *can* send the key, because it forwards the
+/// agent's `arguments` verbatim, so from one it is the agent's text and
+/// not a launch context — and an older shim sends no context of its own,
+/// so a session it starts would run in the daemon's directory and
+/// environment. A 1.5 daemon therefore refuses a pre-1.5 peer's
+/// `start_session` outright, telling it to restart its MCP client, unless
+/// the call names a `profile`, which never takes a client's context and
+/// means the same thing from either peer. A 1.5 shim refuses to send
+/// `start_session` to a pre-1.5 daemon, which would drop the key as an
+/// unknown argument and start the session in its own directory, and says
+/// to restart the daemon.
 ///
 /// Not a control-protocol change, and recorded here because it changes
 /// what an older peer is answered: from 1.5 every tool's arguments are
 /// closed (GH #219), so an argument the daemon does not know — an agent's
 /// typo passed on by any shim — is refused where it used to be ignored.
+///
+/// **From 1.5 the minor is also read after the handshake, by both peers,
+/// and neither reading is a wire change.** Nothing new is sent: every
+/// daemon since 1.0 answers the handshake with its `protocol_minor`, and
+/// every client has always declared one. What changes is that a peer now
+/// refuses a call whose meaning depends on the other side being newer,
+/// before it sends it or before it serves it, where it used to let the
+/// older side serve it as something else without a word. The client's
+/// half is [`Requirement`] and [`CLOSED_ARGUMENTS_MINOR`]; the daemon's
+/// is the `start_session` refusal above. The answers are existing ones —
+/// a §18.3 `bad_params` carrying an MCP code on the wire, an MCP error or
+/// a CLI diagnostic off it — so the wire-shape record has nothing to
+/// move for.
 ///
 /// [`CLIENT_PARAM`]: crate::protocol::method::CLIENT_PARAM
 pub const PROTOCOL_MINOR: u32 = 5;
@@ -90,6 +106,125 @@ pub const PROTOCOL_MINOR: u32 = 5;
 ///
 /// [`CLIENT_PARAM`]: crate::protocol::method::CLIENT_PARAM
 pub const LAUNCH_CONTEXT_MINOR: u32 = 5;
+
+/// The first minor every daemon of which honours `read_output`'s
+/// `apply_holdback` (GH #169).
+///
+/// **A tool argument, not a wire field, so no minor was bumped for it.**
+/// It landed while `main` was at 1.3, so some 1.3 daemons have it and
+/// some do not; every 1.4 daemon does. Before GH #219 closed the argument
+/// types a daemon dropped an argument it did not know without a word, and
+/// a `tail_lines` read without this one is §4.1's documented per-call
+/// bypass — so an older daemon hands a caller that asked for the holdback
+/// a secret still arriving at the end of the output, in the clear.
+/// v0.0.7 (1.1) does exactly that, measured.
+pub const TAIL_HOLDBACK_MINOR: u32 = 4;
+
+/// The first minor whose daemon refuses a tool argument it does not
+/// declare, by name, rather than dropping it (GH #219).
+///
+/// **Why a shim reads it.** A shim advertises its own build's tool
+/// schemas — `list_tools` is answered locally — and those say
+/// `additionalProperties: false`. A daemon older than this ignores an
+/// argument it does not know, an agent's typo or one added since, and
+/// serves the call as though it had not been sent. So against such a
+/// daemon the shim checks the arguments against its own schemas first,
+/// which is the answer a daemon of this minor gives. Every 1.5 daemon on
+/// `main` has it; it arrived there beside [`LAUNCH_CONTEXT_MINOR`].
+///
+/// Past this minor a new argument needs no entry anywhere: a daemon that
+/// predates the argument refuses it by name, which is loud.
+pub const CLOSED_ARGUMENTS_MINOR: u32 = 5;
+
+/// The first minor whose daemon declines to write a secret into a child
+/// that has not dropped `ECHO` unless the submission says `allow_echo`
+/// (GH #137; the 1.3 entry above).
+///
+/// `allow_echo: false` means *gate it* to a daemon of this minor and
+/// nothing at all to an older one, which writes the secret regardless;
+/// the line discipline then echoes it into the ring buffer, and
+/// `read_output` hands it to the agent.
+pub const ECHO_GATE_MINOR: u32 = 3;
+
+/// A call a client of this build makes whose **meaning** depends on the
+/// daemon being at least [`Requirement::minor`]. Sent to an older one it
+/// is not refused but served as something else, and nothing says so.
+///
+/// **Every entry is a refusal the client makes before it sends**, because
+/// the older daemon cannot make it: it does not know the key that carries
+/// the difference, and before [`CLOSED_ARGUMENTS_MINOR`] it drops unknown
+/// keys in silence. The refusal names both versions and says what to do,
+/// so the skew costs a restart and not a session started in the wrong
+/// project or a token printed in the clear.
+///
+/// **What is deliberately not here**, from the minor log above:
+///
+/// * `Attach.terminal` (1.1) is a protection a 1.0 daemon lacks, not a
+///   call it serves as something else: a second writer on one keyboard
+///   is not refused, and the person typing sees the keystrokes split.
+///   Nothing is disclosed, and v0.0.7 already has it.
+/// * `Request.cancel_token` (1.2) changes nothing about what a call
+///   *does*. An older daemon runs the call to the end of its window,
+///   which is what it always did, and rmcp discards the answer to a
+///   request its client cancelled.
+/// * `OutputGap` (1.4), `ScreenSnapshot` and `raised_by` (1.5) are sent
+///   by the daemon. An older one sends none of them, and a client cannot
+///   refuse what it was never going to be told; `holdfast attach` and
+///   `watch` say when they connect that the daemon is older than they are.
+/// * Closed arguments (1.5) are not a refusal but a check a shim runs
+///   itself; see [`CLOSED_ARGUMENTS_MINOR`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Requirement {
+    /// `tool/start_session`, whose [`CLIENT_PARAM`] an older daemon drops:
+    /// the session would start in the daemon's own directory and
+    /// environment, which are whichever client's spawned it (GH #229).
+    ///
+    /// [`CLIENT_PARAM`]: crate::protocol::method::CLIENT_PARAM
+    LaunchContext,
+    /// `read_output`'s `apply_holdback` (GH #169), which `holdfast logs
+    /// --tail` sends and a shim passes on from an agent.
+    TailHoldback,
+    /// A secret submitted without `allow_echo` (GH #137), which `holdfast
+    /// attach` sends unless it was given `--allow-echo`.
+    EchoGate,
+}
+
+impl Requirement {
+    /// The first minor whose daemon gives this call the meaning this
+    /// build means by it.
+    pub const fn minor(self) -> u32 {
+        match self {
+            Self::LaunchContext => LAUNCH_CONTEXT_MINOR,
+            Self::TailHoldback => TAIL_HOLDBACK_MINOR,
+            Self::EchoGate => ECHO_GATE_MINOR,
+        }
+    }
+
+    /// Whether a daemon advertising `daemon_minor`, on this major, serves
+    /// the call as this build means it.
+    pub const fn met_by(self, daemon_minor: u32) -> bool {
+        daemon_minor >= self.minor()
+    }
+
+    /// What an older daemon does instead, as a clause completing *"that
+    /// daemon would …"*.
+    pub const fn otherwise(self) -> &'static str {
+        match self {
+            Self::LaunchContext => {
+                "start the session in its own working directory and environment instead of \
+                 this client's, without saying so"
+            }
+            Self::TailHoldback => {
+                "ignore `apply_holdback` and print a secret that is still arriving at the end \
+                 of the output in the clear"
+            }
+            Self::EchoGate => {
+                "write the secret even into a program that echoes it, where it lands in the \
+                 session's output"
+            }
+        }
+    }
+}
 
 /// How long either peer waits for the **first** frame of the handshake
 /// before giving up on the connection.
@@ -308,6 +443,41 @@ mod tests {
             assert_eq!(serde_json::to_string(&kind).unwrap(), wire);
             assert_eq!(kind.as_str(), wire.trim_matches('"'));
         }
+    }
+
+    /// Every requirement is met from its own minor on and not one minor
+    /// before it, and **none is met by v0.0.7's 1.1** — the daemon the
+    /// whole list exists for.
+    ///
+    /// The thresholds are also pinned as literals. Each one is a fact
+    /// about history (which minor a feature reached every daemon at), and
+    /// a threshold that drifted down would still pass every relational
+    /// assertion here while letting that daemon serve the call.
+    #[test]
+    fn each_requirement_is_met_from_its_own_minor_and_by_no_0_0_7_daemon() {
+        for r in [
+            Requirement::LaunchContext,
+            Requirement::TailHoldback,
+            Requirement::EchoGate,
+        ] {
+            assert!(r.met_by(r.minor()), "{r:?}");
+            assert!(!r.met_by(r.minor() - 1), "{r:?}");
+            assert!(
+                r.met_by(PROTOCOL_MINOR),
+                "{r:?} would refuse a daemon of this very build"
+            );
+            assert!(!r.met_by(1), "{r:?}: v0.0.7 speaks 1.1");
+            assert!(!r.otherwise().is_empty());
+        }
+        assert_eq!(
+            (
+                LAUNCH_CONTEXT_MINOR,
+                TAIL_HOLDBACK_MINOR,
+                ECHO_GATE_MINOR,
+                CLOSED_ARGUMENTS_MINOR
+            ),
+            (5, 4, 3, 5)
+        );
     }
 
     #[test]

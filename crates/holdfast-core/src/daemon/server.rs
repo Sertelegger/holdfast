@@ -2449,6 +2449,65 @@ impl Drop for CallRegistration {
     }
 }
 
+/// The answer to a `start_session` from a peer older than
+/// [`handshake::LAUNCH_CONTEXT_MINOR`] that would take a launch context.
+///
+/// **Refused rather than served, because served it is GH #229 exactly.**
+/// Such a peer — a shim that predates 1.5, v0.0.7's among them — sends no
+/// context of its own, so the session would start in the daemon's own
+/// directory and environment: whichever client happened to spawn the
+/// daemon, silently. Measured with a real v0.0.7 shim against this
+/// daemon before this refusal existed. The shim is the stale half, since
+/// a daemon is started from the installed binary and a shim lives as
+/// long as the MCP client that launched it, so the advice is to restart
+/// that client.
+///
+/// **What still works, and why each was kept.** A `profile` session
+/// never takes a client's context (GH #55), so it means the same from
+/// either peer and is served; the caller of [`dispatch_tool`] checks
+/// that. Every other tool is served too — none reads the context, and
+/// since GH #219 an argument an older shim passes on that this daemon
+/// does not know is refused by name. No other pre-1.5 caller of
+/// `start_session` exists: the CLI never sends it and the UI bridge is
+/// unbuilt.
+///
+/// `bad_params` with `-32603`, the shape every tool fault takes on this
+/// wire: a v0.0.7 shim re-raises the `rpc_code` and the message as they
+/// are (its `rebuild_error`), so the agent reads this text and an
+/// internal-error code rather than being told its arguments were wrong.
+fn older_peer_start_refusal(id: u64, peer: Peer) -> Response {
+    let major = handshake::PROTOCOL_MAJOR;
+    let ours = format!(
+        "holdfast {} (protocol {major}.{})",
+        env!("CARGO_PKG_VERSION"),
+        handshake::PROTOCOL_MINOR
+    );
+    let message = match peer.kind {
+        ClientKind::Shim => format!(
+            "This Holdfast MCP server speaks protocol {major}.{}, older than the daemon it \
+             reached, {ours}, and cannot tell the daemon which directory and environment it \
+             runs in: a session started now would run in the daemon's own instead of this \
+             project's. Ask the user to restart the MCP client (Claude Code: restart it) so \
+             that it runs the installed holdfast, then retry. Sessions already running are \
+             unaffected, and a `profile` session can still be started.",
+            peer.minor
+        ),
+        ClientKind::Cli | ClientKind::UiBridge => format!(
+            "This {} client speaks protocol {major}.{}, older than the daemon it reached, {ours}, \
+             and cannot tell the daemon which directory and environment to start a session in; \
+             upgrade it to the installed holdfast.",
+            peer.kind.as_str(),
+            peer.minor
+        ),
+    };
+    Response::error_with_rpc_code(
+        id,
+        ErrorCode::BadParams,
+        message,
+        Some(rmcp::model::ErrorCode::INTERNAL_ERROR.0),
+    )
+}
+
 async fn dispatch_tool(
     daemon: &Arc<Daemon>,
     req: &Request,
@@ -2484,6 +2543,17 @@ async fn dispatch_tool(
     // A shim older than the key passes the agent's arguments through
     // unchanged, so from one it is the agent's text, not a launch context,
     // and it is left for the tool to refuse in the same way.
+    //
+    // **An older peer's `start_session` is refused before that**, unless
+    // it is a `profile` session — see [`older_peer_start_refusal`].
+    if tool == crate::session::launch::CLIENT_PARAM_TOOL && !peer.sends_launch_context() {
+        let takes_context = args
+            .as_object()
+            .is_none_or(crate::mcp::shim::takes_launch_context);
+        if takes_context {
+            return older_peer_start_refusal(req.id, peer);
+        }
+    }
     let client = if tool == crate::session::launch::CLIENT_PARAM_TOOL && peer.sends_launch_context()
     {
         match crate::session::launch::take_client_param(&mut args) {

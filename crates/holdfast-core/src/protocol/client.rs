@@ -4,7 +4,7 @@
 //! daemon, and (from 0.0.10) by the web-UI bridge.
 
 use super::frame::{self, FrameError};
-use super::handshake::{self, ClientKind, HandshakeData, HandshakeParams};
+use super::handshake::{self, ClientKind, HandshakeData, HandshakeParams, Requirement};
 use super::method::{self, CborValue, ErrorCode, Request, Response};
 use serde::de::DeserializeOwned;
 use serde::Serialize;
@@ -31,6 +31,19 @@ pub enum ClientError {
     VersionMismatch { ours: u32, theirs: u32 },
     #[error("daemon replied to request {got}, expected {expected}")]
     IdMismatch { expected: u64, got: u64 },
+    /// The daemon's minor is too old for a call this build would make,
+    /// which that daemon would serve as something else rather than refuse
+    /// ([`handshake::Requirement`]). Raised here, before anything is sent.
+    #[error("{}", daemon_too_old(*.requirement, .daemon_version, *.daemon_minor, *.kind))]
+    DaemonTooOld {
+        requirement: Requirement,
+        daemon_version: String,
+        daemon_minor: u32,
+        /// Who is refusing, which decides who can act on the advice: a
+        /// shim's reader is an agent, who must ask the user rather than
+        /// stop a daemon every other client depends on.
+        kind: ClientKind,
+    },
     #[error("{method} failed: [{code}] {message}")]
     Method {
         method: String,
@@ -102,6 +115,9 @@ pub struct ControlClient {
     dial: Option<Dial>,
     next_id: AtomicU64,
     daemon: HandshakeData,
+    /// What this client declared itself as, which is who a
+    /// [`ClientError::DaemonTooOld`] addresses its advice to.
+    kind: ClientKind,
 }
 
 /// What [`ControlClient`] needs to open a further connection.
@@ -124,6 +140,7 @@ impl ControlClient {
             }),
             next_id: AtomicU64::new(1),
             daemon,
+            kind,
         })
     }
 
@@ -143,17 +160,40 @@ impl ControlClient {
             dial: None,
             next_id: AtomicU64::new(1),
             daemon,
+            kind,
         })
     }
 
     /// What the daemon told us about itself during the handshake.
     ///
     /// The first connection's answer. Every later one handshakes against
-    /// the same daemon and is refused outright if it disagrees, so there
-    /// is no reading of this that could go stale without the call that
-    /// opened the connection having already failed.
+    /// the same daemon and is refused outright if its *major* disagrees.
+    /// A daemon restarted under a live client at another **minor** is not
+    /// noticed here — the pool reconnects without comparing minors — which
+    /// is why a long-lived caller that refuses on [`Self::require`] checks
+    /// the daemon is still the one it describes before believing it (the
+    /// shim's `ShimServer::forward`).
     pub fn daemon_info(&self) -> &HandshakeData {
         &self.daemon
+    }
+
+    /// Refuse, before sending anything, a call this daemon would serve as
+    /// something other than what this build means by it
+    /// ([`Requirement`]).
+    ///
+    /// `Ok` when the daemon's minor has what the call needs. The minor is
+    /// the handshake's own, which every daemon since 1.0 answers, so this
+    /// works against exactly the daemons it exists for.
+    pub fn require(&self, requirement: Requirement) -> Result<(), ClientError> {
+        if requirement.met_by(self.daemon.protocol_minor) {
+            return Ok(());
+        }
+        Err(ClientError::DaemonTooOld {
+            requirement,
+            daemon_version: self.daemon.daemon_version.clone(),
+            daemon_minor: self.daemon.protocol_minor,
+            kind: self.kind,
+        })
     }
 
     /// Send a request, wait for its response, return it verbatim —
@@ -477,6 +517,43 @@ async fn handshake_exchange_within(
     Ok(daemon)
 }
 
+/// [`ClientError::DaemonTooOld`]'s whole message: both versions, what the
+/// older daemon would do instead, and what to do about it.
+///
+/// **The advice depends on who reads it.** A CLI's reader is the operator,
+/// who can restart the daemon. A shim's is an agent, and `holdfast daemon
+/// stop` ends every session of every client on the machine — so an agent
+/// is told to ask, not to run it, and told that this server starts the
+/// replacement itself on the next call (GH #231).
+fn daemon_too_old(
+    requirement: Requirement,
+    daemon_version: &str,
+    daemon_minor: u32,
+    kind: ClientKind,
+) -> String {
+    let ours = env!("CARGO_PKG_VERSION");
+    let major = handshake::PROTOCOL_MAJOR;
+    let remedy = match kind {
+        ClientKind::Shim => format!(
+            "Ask the user to run `holdfast daemon stop` — it ends every session that daemon \
+             holds, for every client — and then retry: this server starts a {ours} daemon on the \
+             next call."
+        ),
+        ClientKind::Cli | ClientKind::UiBridge => "Restart the daemon to update it: \
+             `holdfast daemon stop` (this ends every session it holds), then `holdfast daemon \
+             start`."
+            .to_string(),
+    };
+    format!(
+        "the running Holdfast daemon is {daemon_version} (protocol {major}.{daemon_minor}), older \
+         than this holdfast, {ours} (protocol {major}.{}); below protocol {major}.{} it would {}. \
+         {remedy}",
+        handshake::PROTOCOL_MINOR,
+        requirement.minor(),
+        requirement.otherwise(),
+    )
+}
+
 impl ClientError {
     /// Whether a retry could plausibly succeed (§18.3's Retriable
     /// column, plus "the daemon is not there yet").
@@ -796,6 +873,116 @@ mod tests {
             "retrying the same wedged daemon repeats the wait"
         );
         stand_in.abort();
+    }
+
+    // ------------------------------------------ minor gating (0.0.8)
+
+    /// A client whose daemon answered the handshake as a daemon of
+    /// `minor` and `version`, over a socket pair — `require` reads only
+    /// what the handshake said, so nothing past it is answered. The far
+    /// end is returned so it stays open for as long as the caller holds
+    /// it.
+    async fn client_of(minor: u32, version: &str, kind: ClientKind) -> (ControlClient, UnixStream) {
+        let (ours, mut theirs) = UnixStream::pair().unwrap();
+        let version = version.to_string();
+        let stand_in = tokio::spawn(async move {
+            let req: Request = frame::read_frame(&mut theirs).await.unwrap();
+            let data = HandshakeData {
+                protocol_major: handshake::PROTOCOL_MAJOR,
+                protocol_minor: minor,
+                daemon_version: version,
+                build: "stand-in".into(),
+                accepted: true,
+                reject_reason: None,
+            };
+            let resp = Response::ok(req.id, &data, "handshake accepted").unwrap();
+            frame::write_frame(&mut theirs, &resp).await.unwrap();
+            theirs
+        });
+        let client = ControlClient::handshake_on(ours, kind).await.unwrap();
+        (client, stand_in.await.unwrap())
+    }
+
+    /// **The refusal the whole 0.0.7 ↔ 0.0.8 boundary rests on**: a
+    /// client meeting a daemon older than a call needs says so, with both
+    /// versions and the way out, instead of letting that daemon serve the
+    /// call as something else.
+    ///
+    /// Paired with the daemon of this build, which must be served — a
+    /// `require` that refused everything would pass the first half and
+    /// lock every client out of its own daemon.
+    #[tokio::test]
+    async fn require_refuses_an_older_daemon_by_both_versions_and_admits_a_current_one() {
+        let (old, _old_end) = client_of(1, "0.0.7", ClientKind::Shim).await;
+        for r in [
+            Requirement::LaunchContext,
+            Requirement::TailHoldback,
+            Requirement::EchoGate,
+        ] {
+            let err = old
+                .require(r)
+                .expect_err("a 1.1 daemon meets no requirement");
+            assert!(
+                matches!(
+                    &err,
+                    ClientError::DaemonTooOld {
+                        requirement,
+                        daemon_minor: 1,
+                        kind: ClientKind::Shim,
+                        ..
+                    } if *requirement == r
+                ),
+                "{err:?}"
+            );
+            let msg = err.to_string();
+            for needle in [
+                "0.0.7 (protocol 1.1)",
+                &format!(
+                    "{} (protocol {}.{})",
+                    env!("CARGO_PKG_VERSION"),
+                    handshake::PROTOCOL_MAJOR,
+                    handshake::PROTOCOL_MINOR
+                ),
+                &format!("below protocol 1.{}", r.minor()),
+                r.otherwise(),
+                "Ask the user to run `holdfast daemon stop`",
+            ] {
+                assert!(
+                    msg.contains(needle),
+                    "{r:?}: `{needle}` missing from: {msg}"
+                );
+            }
+            assert!(!err.retriable(), "retrying meets the same daemon");
+        }
+
+        // The operator's wording: a CLI can act on the advice itself.
+        let (cli, _cli_end) = client_of(1, "0.0.7", ClientKind::Cli).await;
+        let msg = cli
+            .require(Requirement::TailHoldback)
+            .unwrap_err()
+            .to_string();
+        assert!(msg.contains("`holdfast daemon stop`"), "{msg}");
+        assert!(!msg.contains("Ask the user"), "{msg}");
+
+        // The pairing: this build's own daemon, and each requirement's own
+        // minor, are served.
+        let (current, _current_end) =
+            client_of(handshake::PROTOCOL_MINOR, "0.0.8", ClientKind::Shim).await;
+        let (at_threshold, _threshold_end) =
+            client_of(handshake::TAIL_HOLDBACK_MINOR, "dev", ClientKind::Cli).await;
+        for r in [
+            Requirement::LaunchContext,
+            Requirement::TailHoldback,
+            Requirement::EchoGate,
+        ] {
+            current
+                .require(r)
+                .expect("this build's daemon meets every requirement");
+        }
+        at_threshold
+            .require(Requirement::TailHoldback)
+            .expect("a daemon of the requirement's own minor meets it");
+        assert!(at_threshold.require(Requirement::LaunchContext).is_err());
     }
 
     // ------------------------------------- one call per connection (C-3)

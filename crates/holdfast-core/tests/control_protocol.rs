@@ -3179,33 +3179,36 @@ async fn only_start_session_takes_the_launch_context_every_other_tool_refuses_it
     let _ = std::fs::remove_dir_all(&project);
 }
 
-/// **`@client` is taken only from a peer whose protocol has it** — the
-/// integration review of GH #229, through the upgrade window README
-/// describes.
+/// **A peer older than the launch context cannot start a session that
+/// would take one** — GH #229 across the upgrade window README describes,
+/// from the daemon's side.
 ///
-/// A shim older than the key (protocol 1.4 and before) forwards an
-/// agent's `start_session` arguments verbatim, and a daemon outlives such
-/// shims by design: they keep running until each Claude Code session
-/// restarts. So from one, `@client` is text the agent typed — and the
-/// daemon took it as a launch context. Measured before the gate, with an
-/// `a81b02d` shim against this daemon: the session started in the
-/// agent's directory, its shell saw the agent's `HOME` and variables and
-/// no `CLAUDE_PROJECT_DIR`, and the `session_start` audit row read
-/// `"env_keys":[]`, where the same variables passed as `env` are listed.
+/// A shim older than `@client` (protocol 1.4 and before, v0.0.7's among
+/// them) sends no launch context, and a daemon outlives such shims by
+/// design: they keep running until each MCP client restarts. Served, its
+/// `start_session` ran in the daemon's own directory and environment,
+/// silently — measured with a real v0.0.7 shim against this daemon. And
+/// from one, `@client` is text the agent typed: measured before the first
+/// gate with an `a81b02d` shim, the session started in the agent's
+/// directory with the agent's `HOME`, and `session_start` read
+/// `"env_keys":[]`.
 ///
-/// Three calls over a real socket, each with the handshake's minor
-/// chosen:
+/// Over a real socket, with the handshake's minor chosen:
 ///
-/// * a peer one minor older than the key sends it: refused by name, as
-///   `--no-daemon` refuses it;
-/// * the same peer without the key starts a session, and not in the
-///   directory the refused key named — the refusal is about the key, not
-///   the peer;
-/// * a peer of the key's own minor sends it: taken, and the session
-///   starts where it says — the control, without which a daemon that
-///   stopped taking the key from anyone passes the first two.
+/// * a peer one minor older, with the agent's `@client` and without it:
+///   both refused with the advice to restart the MCP client, and no
+///   session started — the refusal is about the peer, not the key;
+/// * the same peer's `profile` session is **not** refused by that rule
+///   (it never takes a context), and its forged key is still refused by
+///   name rather than taken;
+/// * the same peer is served everything else: `list_sessions`, and
+///   `daemon/status` and `daemon/stop`, which are how its user follows the
+///   advice;
+/// * a peer of the key's own minor sends it: taken, and the session starts
+///   where it says — the control, without which a daemon that refused
+///   every `start_session` passes the rows above.
 #[tokio::test]
-async fn a_peer_older_than_the_launch_context_cannot_supply_one() {
+async fn a_peer_older_than_the_launch_context_is_told_to_restart_rather_than_served() {
     use holdfast_core::session::launch::CLIENT_PARAM;
     async fn peer(d: &TestDaemon, minor: u32) -> UnixStream {
         let mut s = d.raw().await;
@@ -3228,56 +3231,104 @@ async fn a_peer_older_than_the_launch_context_cannot_supply_one() {
         );
         s
     }
-    async fn call(s: &mut UnixStream, id: u64, tool: &str, args: &Value) -> Response {
-        let req = Request::new(id, format!("tool/{tool}"), args).unwrap();
+    async fn call(s: &mut UnixStream, id: u64, method: &str, args: &Value) -> Response {
+        let req = Request::new(id, method, args).unwrap();
         frame::write_frame(s, &req).await.unwrap();
         frame::read_frame(s).await.unwrap()
+    }
+    async fn live(s: &mut UnixStream, id: u64) -> usize {
+        let resp = call(s, id, "tool/list_sessions", &json!({})).await;
+        assert_eq!(resp.status, "ok", "{}", resp.details);
+        let data: Value = method::from_cbor(&resp.data).unwrap();
+        data["sessions"].as_array().map_or(0, Vec::len)
     }
 
     let d = TestDaemon::start("oldshim").await;
     let project = scratch_dir("oldshim-project");
     std::fs::create_dir_all(&project).unwrap();
     let project = project.canonicalize().unwrap();
-    let forged = json!({
-        "command": "sh",
-        "args": ["-c", "sleep 30"],
-        CLIENT_PARAM: {
-            "cwd": project.to_str().unwrap(),
-            "env": { "PATH": "/usr/bin:/bin", "HOME": "/tmp", "AGENT_CHOSE": "1" },
-        },
+    let context = json!({
+        "cwd": project.to_str().unwrap(),
+        "env": { "PATH": "/usr/bin:/bin", "HOME": "/tmp", "AGENT_CHOSE": "1" },
     });
-    let mut started = Vec::new();
+    let forged = json!({ "command": "sh", "args": ["-c", "sleep 30"], CLIENT_PARAM: context });
+    let plain = json!({ "command": "sh", "args": ["-c", "sleep 30"] });
 
-    // ---- a peer older than the key: refused, by name.
+    // ---- a peer older than the key: refused, with or without it.
     let older = handshake::LAUNCH_CONTEXT_MINOR - 1;
     let mut old = peer(&d, older).await;
-    let resp = call(&mut old, 1, "start_session", &forged).await;
-    let e = resp.control_error().unwrap_or_else(|| {
-        panic!(
-            "a 1.{older} peer's `{CLIENT_PARAM}` was taken as a launch context — from a shim \
-             that old it is the agent's argument: {}",
-            resp.details
-        )
-    });
-    assert_eq!(e.code, ErrorCode::BadParams.as_str(), "{}", e.message);
+    for (id, args) in [(1, &forged), (2, &plain)] {
+        let resp = call(&mut old, id, "tool/start_session", args).await;
+        let e = resp.control_error().unwrap_or_else(|| {
+            panic!(
+                "a 1.{older} peer's start_session ({args}) was served (status {:?}): its \
+                 session runs in the daemon's directory and environment, silently: {}",
+                resp.details, resp.status
+            )
+        });
+        assert_eq!(e.code, ErrorCode::BadParams.as_str(), "{}", e.message);
+        assert_eq!(
+            e.rpc_code,
+            Some(-32603),
+            "an old shim re-raises `rpc_code` as it is; `invalid_params` would send the \
+             agent looking for other arguments: {}",
+            e.message
+        );
+        for needle in [
+            &format!("protocol 1.{older}") as &str,
+            &format!("holdfast {}", env!("CARGO_PKG_VERSION")),
+            "restart the MCP client",
+            "profile",
+        ] {
+            assert!(
+                e.message.contains(needle),
+                "`{needle}` missing: {}",
+                e.message
+            );
+        }
+    }
+    assert_eq!(
+        live(&mut old, 3).await,
+        0,
+        "a refused call started a session"
+    );
+
+    // ---- a profile session is not this rule's: the gate lets it through
+    // to the tool, which refuses the agent's key by name rather than
+    // taking it, and without the key reaches the tool's own answer.
+    let profiled = json!({ "profile": "no-such-profile", CLIENT_PARAM: context });
+    let resp = call(&mut old, 4, "tool/start_session", &profiled).await;
+    let e = resp
+        .control_error()
+        .expect("an unknown key is still refused");
     assert!(
         e.message
             .contains(&format!("unknown field `{CLIENT_PARAM}`")),
-        "the refusal does not name the key: {}",
+        "a 1.{older} peer's `{CLIENT_PARAM}` must be refused as the agent's argument, not \
+         taken or answered with the restart advice: {}",
         e.message
     );
-
-    // ---- the pairing: the same peer, without the key, is served.
-    let plain = json!({ "command": "sh", "args": ["-c", "sleep 30"] });
-    let resp = call(&mut old, 2, "start_session", &plain).await;
-    assert_eq!(resp.status, "ok", "{}", resp.details);
-    let data: Value = method::from_cbor(&resp.data).unwrap();
-    assert_ne!(data["cwd"].as_str(), project.to_str(), "{data}");
-    started.push(data["session_id"].as_str().unwrap().to_string());
+    let resp = call(
+        &mut old,
+        5,
+        "tool/start_session",
+        &json!({ "profile": "no-such-profile" }),
+    )
+    .await;
+    let answer = format!(
+        "{} {:?}",
+        resp.details,
+        resp.control_error().map(|e| e.message)
+    );
+    assert!(
+        !answer.contains("restart the MCP client"),
+        "a profile session was refused for the launch context it never takes: {answer}"
+    );
+    assert!(answer.contains("no-such-profile"), "{answer}");
 
     // ---- the control: a peer of the key's own minor is taken at its word.
     let mut new = peer(&d, handshake::LAUNCH_CONTEXT_MINOR).await;
-    let resp = call(&mut new, 1, "start_session", &forged).await;
+    let resp = call(&mut new, 1, "tool/start_session", &forged).await;
     assert_eq!(
         resp.status,
         "ok",
@@ -3291,16 +3342,31 @@ async fn a_peer_older_than_the_launch_context_cannot_supply_one() {
         project.to_str(),
         "the context was not taken: {data}"
     );
-    started.push(data["session_id"].as_str().unwrap().to_string());
+    let id = data["session_id"].as_str().unwrap().to_string();
 
-    for (i, id) in started.iter().enumerate() {
-        call(
-            &mut new,
-            10 + i as u64,
-            "terminate",
-            &json!({ "session": id, "force": true }),
-        )
-        .await;
-    }
+    // ---- and the older peer is still served everything else, including
+    // the two calls its user needs to follow the advice.
+    assert_eq!(
+        live(&mut old, 6).await,
+        1,
+        "the older peer sees the session"
+    );
+    let resp = call(&mut old, 7, method::METHOD_DAEMON_STATUS, &json!({})).await;
+    assert_eq!(resp.status, "ok", "{}", resp.details);
+    let resp = call(
+        &mut old,
+        8,
+        "tool/terminate",
+        &json!({ "session": id, "force": true }),
+    )
+    .await;
+    assert!(resp.control_error().is_none(), "{}", resp.details);
+    let stop = serde_json::to_value(StopParams::default()).unwrap();
+    let resp = call(&mut old, 9, method::METHOD_DAEMON_STOP, &stop).await;
+    assert_eq!(
+        resp.status, "ok",
+        "`holdfast daemon stop` from an older client is how its user follows the advice: {}",
+        resp.details
+    );
     let _ = std::fs::remove_dir_all(&project);
 }

@@ -26,12 +26,18 @@
 //! manifest method on the control protocol, which is a protocol addition
 //! for a later milestone; what is fixed here is the description and the
 //! one code the skew makes reachable.
+//!
+//! **The skew that would go unnoticed is the daemon being older**, and
+//! that is the one [`admit`] closes: a call the older daemon would serve
+//! as something else — `start_session` without the launch context, an
+//! argument it would drop — is refused here, before it is sent, naming
+//! both versions and the restart that ends the skew.
 
 use super::passthrough;
 use crate::daemon::RuntimePaths;
 use crate::protocol::client::{ClientError, ControlClient};
 use crate::protocol::frame::FrameError;
-use crate::protocol::handshake::ClientKind;
+use crate::protocol::handshake::{ClientKind, Requirement, CLOSED_ARGUMENTS_MINOR};
 use crate::protocol::method::{self, CborValue, Response, TOOL_METHOD_PREFIX};
 use crate::session::launch::{ClientLaunch, CLIENT_PARAM};
 use rmcp::model::{
@@ -229,6 +235,40 @@ impl ShimServer {
         Some(Ok(Reconnected { client, restarted }))
     }
 
+    /// Whether the daemon a refusal was judged against is still the one
+    /// answering, before the refusal is believed.
+    ///
+    /// **Why the refusal cannot be taken at its word.** [`admit`] reads
+    /// the minor the daemon declared when this connection was made, and
+    /// the advice it gives is `holdfast daemon stop`. The first call after
+    /// the user follows that advice would otherwise be refused again, by
+    /// the minor of a daemon that no longer exists, and so would every
+    /// call after it. So a refusal costs one `daemon/status` round trip,
+    /// which every daemon answers. `Ok(None)` is the same daemon, still
+    /// there, and the refusal stands. A daemon that has gone is replaced
+    /// through [`Self::reconnect`], the GH #231 path, and
+    /// `Ok(Some((connection, restarted)))` is the connection to ask again.
+    ///
+    /// A shim that does not respawn has nothing to replace its daemon
+    /// with, so it believes the refusal outright.
+    async fn recheck(&self, seen: &Connected) -> Result<Option<(Connected, bool)>, ErrorData> {
+        if self.link.respawn.is_none() {
+            return Ok(None);
+        }
+        let probe = seen
+            .client
+            .call_raw(method::METHOD_DAEMON_STATUS, CborValue::Map(Vec::new()))
+            .await;
+        let Err(e) = probe else {
+            return Ok(None);
+        };
+        match self.reconnect(seen, &e).await {
+            None => Err(map_client_error(e)),
+            Some(Err(spawn)) => Err(respawn_failed(&e, spawn)),
+            Some(Ok(fresh)) => Ok(Some((self.connected(), fresh.restarted))),
+        }
+    }
+
     /// One tool round trip on `client`, racing `cancelled` as GH #127
     /// requires. `cancel_seen` records that the cancel arm fired, which
     /// is what stops a cancelled call from being re-sent after a
@@ -315,6 +355,24 @@ impl ShimServer {
         cancelled: impl std::future::Future<Output = ()>,
     ) -> Result<CallToolResult, ErrorData> {
         let mut arguments = arguments.unwrap_or_default();
+        // **Refused here, before anything is sent, when the daemon would
+        // serve the call as something else** — see [`admit`]. The verdict
+        // is about the daemon this shim last reached, and the refusal's
+        // own advice is to stop that daemon; so before it is believed, the
+        // daemon is checked to be still there, and one that has gone is
+        // replaced exactly as a lost daemon is (GH #231) and asked again.
+        let mut first = self.connected();
+        let mut replaced_for_gate = false;
+        if let Err(refusal) = admit(&first.client, tool, &arguments) {
+            match self.recheck(&first).await? {
+                None => return Err(refusal),
+                Some((fresh, restarted)) => {
+                    admit(&fresh.client, tool, &arguments)?;
+                    first = fresh;
+                    replaced_for_gate = restarted;
+                }
+            }
+        }
         // **GH #229: a session starts where its caller is.** This process
         // is the one the MCP client launched, in the client's project and
         // with the client's environment; the daemon is shared by every
@@ -330,14 +388,12 @@ impl ShimServer {
                 .map_err(|e| ErrorData::internal_error(e.to_string(), None))?;
             arguments.insert(CLIENT_PARAM.to_string(), context);
         }
-        let args = Value::Object(arguments);
-        let params =
-            method::to_cbor(&args).map_err(|e| ErrorData::internal_error(e.to_string(), None))?;
+        let params = method::to_cbor(&arguments)
+            .map_err(|e| ErrorData::internal_error(e.to_string(), None))?;
         let token = uuid::Uuid::new_v4().simple().to_string();
         let method_name = format!("{TOOL_METHOD_PREFIX}{tool}");
         tokio::pin!(cancelled);
         let mut cancel_seen = false;
-        let first = self.connected();
         let outcome = Self::round_trip(
             &first.client,
             &method_name,
@@ -358,11 +414,15 @@ impl ShimServer {
         // `start_session` would run it twice. That one is answered with
         // what is known, and no guess.
         let (resp, restarted) = match outcome {
-            Ok(resp) => (resp, false),
+            Ok(resp) => (resp, replaced_for_gate),
             Err(e) => match self.reconnect(&first, &e).await {
                 None => return Err(map_client_error(e)),
                 Some(Err(spawn)) => return Err(respawn_failed(&e, spawn)),
                 Some(Ok(fresh)) if never_reached_a_daemon(&e) && !cancel_seen => {
+                    // Whichever daemon answered is asked the same
+                    // question the first was: `ensure_daemon` connects to
+                    // one already running before it starts its own.
+                    admit(&fresh.client, tool, &arguments)?;
                     let resp = Self::round_trip(
                         &fresh.client,
                         &method_name,
@@ -607,6 +667,151 @@ fn a_closing_listener(e: &ClientError) -> bool {
         ),
         _ => false,
     }
+}
+
+/// Whether the daemon behind `client` serves `tool`, called with
+/// `arguments`, as this shim's own `tools/list` describes it — and a
+/// refusal naming both versions and the way out when it would not.
+///
+/// **This shim advertises its own build's tools**, not the daemon's
+/// (`list_tools` is answered locally), so an agent reads this build's
+/// schemas and this build's promises. A daemon from an older minor serves
+/// some calls as something else and says nothing, and this is where each
+/// such call is stopped before a byte is sent:
+///
+/// * `start_session`, below [`Requirement::LaunchContext`]: the daemon
+///   drops [`CLIENT_PARAM`] and starts the session in its own directory
+///   and environment (GH #229). A `profile` session is exempt: it never
+///   takes a client's context, from any daemon ([`takes_launch_context`]).
+/// * Below [`CLOSED_ARGUMENTS_MINOR`], an argument this build does not
+///   declare — an agent's typo — which the daemon would drop and run the
+///   call without. Refused here by name, as a daemon of that minor
+///   refuses it (GH #219).
+/// * Below it too, an argument this build declares and the daemon may
+///   not know ([`ARGUMENTS_BEFORE_CLOSED`]), by that argument's own
+///   requirement.
+///
+/// Every other call is forwarded, including every call on a session the
+/// older daemon already holds: its answers are that daemon's, as they
+/// were before this shim was installed, and nothing the agent asked for
+/// is lost on the way.
+fn admit(
+    client: &ControlClient,
+    tool: &str,
+    arguments: &serde_json::Map<String, Value>,
+) -> Result<(), ErrorData> {
+    if tool == START_SESSION && takes_launch_context(arguments) {
+        client
+            .require(Requirement::LaunchContext)
+            .map_err(too_old)?;
+    }
+    if client.daemon_info().protocol_minor >= CLOSED_ARGUMENTS_MINOR {
+        return Ok(());
+    }
+    if let Some(refusal) = undeclared_argument(tool, arguments) {
+        return Err(refusal);
+    }
+    for (name, argument, requirement) in ARGUMENTS_BEFORE_CLOSED {
+        if *name == tool && arguments.contains_key(*argument) {
+            client.require(*requirement).map_err(too_old)?;
+        }
+    }
+    Ok(())
+}
+
+/// Tool arguments this build declares that a daemon older than
+/// [`CLOSED_ARGUMENTS_MINOR`] may not know — and would therefore drop
+/// without a word — each with the requirement naming the minor that
+/// does know it.
+///
+/// **Closed, and complete by construction rather than by upkeep.** An
+/// argument added from 1.5 on needs no row, because a daemon that
+/// predates it refuses it by name. The window this covers, 1.0 to 1.4, is
+/// history: diffing every `*Args` struct across v0.0.5, v0.0.6, v0.0.7
+/// and this build finds `apply_holdback` and nothing else. [`CLIENT_PARAM`]
+/// is not an agent's argument and is [`Requirement::LaunchContext`]'s.
+const ARGUMENTS_BEFORE_CLOSED: &[(&str, &str, Requirement)] =
+    &[("read_output", "apply_holdback", Requirement::TailHoldback)];
+
+/// Whether a `start_session` called with `arguments` takes the calling
+/// client's launch context.
+///
+/// Every one does but a `profile` session's, which runs from the
+/// operator's environment and directory whoever asks (GH #55; see
+/// `session::launch`). So for a profile session a daemon that cannot take
+/// the context changes nothing, and neither this shim nor a daemon facing
+/// an older shim has a reason to refuse it.
+pub(crate) fn takes_launch_context(arguments: &serde_json::Map<String, Value>) -> bool {
+    arguments.get("profile").is_none_or(Value::is_null)
+}
+
+/// The refusal a daemon of [`CLOSED_ARGUMENTS_MINOR`] gives an argument
+/// the tool does not declare, given here on its behalf to a daemon that
+/// would not — or `None` when every argument is declared.
+///
+/// Read from this build's own input schemas, which are what the agent was
+/// shown, and worded as serde words the daemon's refusal, so the agent
+/// meets one message whichever side refused. [`CLIENT_PARAM`] on
+/// `start_session` is this shim's own key and is not the agent's to be
+/// refused for.
+fn undeclared_argument(
+    tool: &str,
+    arguments: &serde_json::Map<String, Value>,
+) -> Option<ErrorData> {
+    let manifest = passthrough::tool_manifest();
+    let declared = manifest
+        .iter()
+        .find(|t| t.name.as_ref() == tool)?
+        .input_schema
+        .get("properties")?
+        .as_object()?;
+    let unknown = arguments
+        .keys()
+        .find(|k| !declared.contains_key(*k) && !(tool == START_SESSION && *k == CLIENT_PARAM))?;
+    let expected = if declared.is_empty() {
+        "there are no fields".to_string()
+    } else {
+        let names: Vec<String> = declared.keys().map(|k| format!("`{k}`")).collect();
+        format!("expected one of {}", names.join(", "))
+    };
+    Some(ErrorData::invalid_params(
+        format!("unknown field `{unknown}`, {expected}"),
+        None,
+    ))
+}
+
+/// A [`ClientError::DaemonTooOld`] as the MCP error an agent reads.
+///
+/// `-32603` with a `data.reason`, the shape §3.2 gives
+/// `daemon_unreachable` and `daemon_restarted`: the fault is the
+/// installation, not the agent's arguments, and `invalid_params` would
+/// send an agent looking for a different way to call the tool. The
+/// structured half says what the message says, so a client can branch on
+/// `daemon_too_old` without reading prose.
+fn too_old(e: ClientError) -> ErrorData {
+    let ClientError::DaemonTooOld {
+        requirement,
+        ref daemon_version,
+        daemon_minor,
+        ..
+    } = e
+    else {
+        return map_client_error(e);
+    };
+    let major = crate::protocol::handshake::PROTOCOL_MAJOR;
+    let data = json!({
+        "reason": "daemon_too_old",
+        "daemon_version": daemon_version,
+        "daemon_protocol": format!("{major}.{daemon_minor}"),
+        "required_protocol": format!("{major}.{}", requirement.minor()),
+    });
+    let message = e.to_string();
+    let mut chars = message.chars();
+    let message = match chars.next() {
+        Some(first) => first.to_uppercase().chain(chars).collect(),
+        None => message,
+    };
+    ErrorData::internal_error(message, Some(data))
 }
 
 /// Whether a failed round trip means the daemon is gone: "nobody is
@@ -2050,5 +2255,265 @@ mod tests {
             "a Holdfast bug must reach the agent as one, not as its own bad argument"
         );
         assert!(err.message.contains("write task failed"), "{}", err.message);
+    }
+
+    // ---------------------------------------- an older daemon (0.0.8)
+
+    /// A stand-in daemon that declares `minor` in its handshake and
+    /// answers every later request `ok`, recording each one — so a row can
+    /// tell a call this shim refused from one it forwarded.
+    fn daemon_of_minor(sock: PathBuf, minor: u32) -> tokio::sync::mpsc::UnboundedReceiver<Request> {
+        let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+        let listener = tokio::net::UnixListener::bind(&sock).unwrap();
+        tokio::spawn(async move {
+            loop {
+                let Ok((mut stream, _)) = listener.accept().await else {
+                    return;
+                };
+                let tx = tx.clone();
+                tokio::spawn(async move {
+                    let Ok(hs) = frame::read_frame::<_, Request>(&mut stream).await else {
+                        return;
+                    };
+                    let data = HandshakeData {
+                        protocol_major: handshake::PROTOCOL_MAJOR,
+                        protocol_minor: minor,
+                        daemon_version: "0.0.7".into(),
+                        build: "stand-in".into(),
+                        accepted: true,
+                        reject_reason: None,
+                    };
+                    let resp = Response::ok(hs.id, &data, "handshake accepted").unwrap();
+                    frame::write_frame(&mut stream, &resp).await.unwrap();
+                    while let Ok(req) = frame::read_frame::<_, Request>(&mut stream).await {
+                        let resp = Response::ok(req.id, &json!({}), "served").unwrap();
+                        let _ = tx.send(req);
+                        if frame::write_frame(&mut stream, &resp).await.is_err() {
+                            return;
+                        }
+                    }
+                });
+            }
+        });
+        rx
+    }
+
+    /// A shim over [`daemon_of_minor`], and what that daemon received.
+    async fn shim_over(
+        tag: &str,
+        minor: u32,
+    ) -> (
+        ShimServer,
+        tokio::sync::mpsc::UnboundedReceiver<Request>,
+        Scoped,
+    ) {
+        let dir = scratch_dir(tag);
+        std::fs::create_dir_all(&dir).unwrap();
+        let sock = dir.join("control.sock");
+        let received = daemon_of_minor(sock.clone(), minor);
+        let client = ControlClient::connect(&sock, ClientKind::Shim)
+            .await
+            .expect("the stand-in is bound before it is dialled");
+        (ShimServer::new(Arc::new(client)), received, Scoped(dir))
+    }
+
+    fn args(v: Value) -> Option<serde_json::Map<String, Value>> {
+        Some(v.as_object().expect("an object").clone())
+    }
+
+    /// **The measured 0.0.7 ↔ 0.0.8 defect, from the shim's side.** A
+    /// v0.0.7 daemon drops `@client` as an unknown argument and starts the
+    /// session in its own directory and environment — measured, silently.
+    /// This shim refuses to send it, with both versions and what to do,
+    /// and the daemon receives nothing.
+    ///
+    /// The pairings are what make it a gate rather than a wall: the same
+    /// call to a daemon of the launch context's own minor is forwarded, and
+    /// a `profile` session — which never takes a context — is forwarded to
+    /// the old one.
+    #[tokio::test]
+    async fn start_session_is_refused_unsent_by_a_daemon_older_than_the_launch_context() {
+        let (shim, mut received, _dir) = shim_over("oldstart", 1).await;
+        let err = shim
+            .forward(
+                "start_session",
+                args(json!({ "command": "bash" })),
+                std::future::pending(),
+            )
+            .await
+            .expect_err("a 1.1 daemon cannot start a session where this client is");
+        assert_eq!(err.code, rmcp::model::ErrorCode::INTERNAL_ERROR, "{err:?}");
+        let data = err.data.clone().expect("the reason is structured");
+        assert_eq!(data["reason"], "daemon_too_old", "{data}");
+        assert_eq!(data["daemon_protocol"], "1.1", "{data}");
+        assert_eq!(
+            data["required_protocol"],
+            format!("1.{}", handshake::LAUNCH_CONTEXT_MINOR),
+            "{data}"
+        );
+        for needle in [
+            "0.0.7 (protocol 1.1)",
+            env!("CARGO_PKG_VERSION"),
+            "working directory and environment",
+            "Ask the user to run `holdfast daemon stop`",
+        ] {
+            assert!(err.message.contains(needle), "`{needle}`: {}", err.message);
+        }
+        assert!(
+            received.try_recv().is_err(),
+            "the refused call reached the daemon anyway"
+        );
+
+        // A profile session never takes the context, so it goes.
+        shim.forward(
+            "start_session",
+            args(json!({ "profile": "prod-ssh" })),
+            std::future::pending(),
+        )
+        .await
+        .expect("a profile session means the same to an older daemon");
+        let sent = received.recv().await.expect("forwarded");
+        assert_eq!(sent.method, "tool/start_session");
+
+        // The control: a daemon of the key's own minor is sent the call.
+        let (shim, mut received, _dir) =
+            shim_over("newstart", handshake::LAUNCH_CONTEXT_MINOR).await;
+        shim.forward(
+            "start_session",
+            args(json!({ "command": "bash" })),
+            std::future::pending(),
+        )
+        .await
+        .expect("a current daemon is sent start_session");
+        let sent = received.recv().await.expect("forwarded");
+        // The launch context travels to a daemon that takes it; `field`
+        // panics, naming the keys that did, when it is absent.
+        field(&sent.params, CLIENT_PARAM);
+    }
+
+    /// **A misspelt argument, and one added since, against a daemon that
+    /// drops what it does not know.** A v0.0.7 daemon has no closed
+    /// argument types, so `send_input { apend_newline: false }` would have
+    /// appended the newline and answered `ok`, and `read_output {
+    /// apply_holdback: true }` would have printed a secret still arriving
+    /// in the clear. Against such a daemon this shim refuses both before
+    /// sending, the first as a daemon of 1.5 would, by name.
+    ///
+    /// Paired with the same calls spelled correctly, and without the new
+    /// argument, which are forwarded — an older daemon still serves the
+    /// sessions it holds — and with a daemon of each threshold's own
+    /// minor, which is trusted with what it knows.
+    #[tokio::test]
+    async fn an_older_daemon_is_sent_no_argument_it_would_drop() {
+        let (shim, mut received, _dir) = shim_over("oldargs", 1).await;
+
+        let err = shim
+            .forward(
+                "send_input",
+                args(json!({ "session": "s", "data": "x", "apend_newline": false })),
+                std::future::pending(),
+            )
+            .await
+            .expect_err("a typo is refused, as a 1.5 daemon refuses it");
+        assert_eq!(err.code, rmcp::model::ErrorCode::INVALID_PARAMS, "{err:?}");
+        assert!(
+            err.message.contains("unknown field `apend_newline`")
+                && err.message.contains("`append_newline`"),
+            "the refusal names the key and the ones that exist: {}",
+            err.message
+        );
+
+        let err = shim
+            .forward(
+                "read_output",
+                args(json!({ "session": "s", "tail_lines": 5, "apply_holdback": true })),
+                std::future::pending(),
+            )
+            .await
+            .expect_err("an older daemon would drop the holdback");
+        assert_eq!(err.data.clone().unwrap()["reason"], "daemon_too_old");
+        assert!(err.message.contains("apply_holdback"), "{}", err.message);
+
+        let err = shim
+            .forward(
+                "list_sessions",
+                args(json!({ "session": "s" })),
+                std::future::pending(),
+            )
+            .await
+            .expect_err("a tool with no arguments has none to misspell");
+        assert!(
+            err.message
+                .contains("unknown field `session`, there are no fields"),
+            "{}",
+            err.message
+        );
+        assert!(
+            received.try_recv().is_err(),
+            "a refused call reached the daemon anyway"
+        );
+
+        // The pairing: well-formed calls on the old daemon's own sessions.
+        for (tool, a) in [
+            (
+                "send_input",
+                json!({ "session": "s", "data": "x", "append_newline": false }),
+            ),
+            ("read_output", json!({ "session": "s", "tail_lines": 5 })),
+            ("list_sessions", json!({})),
+        ] {
+            shim.forward(tool, args(a), std::future::pending())
+                .await
+                .unwrap_or_else(|e| panic!("`{tool}` was refused: {e:?}"));
+            assert_eq!(
+                received.recv().await.expect("forwarded").method,
+                format!("tool/{tool}")
+            );
+        }
+
+        // Each threshold's own minor is trusted with what it knows: a 1.4
+        // daemon has `apply_holdback` (and is checked for typos still);
+        // a 1.5 daemon refuses a typo itself, so it is sent.
+        let (shim, mut received, _dir) =
+            shim_over("holdback", handshake::TAIL_HOLDBACK_MINOR).await;
+        shim.forward(
+            "read_output",
+            args(json!({ "session": "s", "tail_lines": 5, "apply_holdback": true })),
+            std::future::pending(),
+        )
+        .await
+        .expect("a 1.4 daemon honours apply_holdback");
+        received.recv().await.expect("forwarded");
+        let (shim, mut received, _dir) =
+            shim_over("closed", handshake::CLOSED_ARGUMENTS_MINOR).await;
+        shim.forward(
+            "send_input",
+            args(json!({ "session": "s", "data": "x", "apend_newline": false })),
+            std::future::pending(),
+        )
+        .await
+        .expect("the stand-in answers ok; a real 1.5 daemon refuses the key by name");
+        received
+            .recv()
+            .await
+            .expect("a 1.5 daemon is trusted to refuse it");
+    }
+
+    /// Every row of [`ARGUMENTS_BEFORE_CLOSED`] names an argument this
+    /// build still declares, on a tool it still has — a renamed argument
+    /// would leave its row guarding nothing.
+    #[test]
+    fn every_argument_an_older_daemon_may_drop_is_one_this_build_declares() {
+        let manifest = passthrough::tool_manifest();
+        for (tool, argument, _) in ARGUMENTS_BEFORE_CLOSED {
+            let t = manifest
+                .iter()
+                .find(|t| t.name.as_ref() == *tool)
+                .unwrap_or_else(|| panic!("no tool `{tool}`"));
+            assert!(
+                t.input_schema["properties"].get(*argument).is_some(),
+                "`{tool}` no longer declares `{argument}`"
+            );
+        }
     }
 }
