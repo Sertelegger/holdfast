@@ -249,8 +249,9 @@ history file your rc names as they start, and the snippet then empties
 that list, so the agent cannot list your history with `history` or recall
 it with up-arrow. A bash or zsh started inside the session loads its rc's
 file again. A readonly `HISTFILE` leaves the list as your rc loaded it,
-and so does a bash rc whose prompt or traps run `history -w`, or a zsh
-rc that turns off `append_history`, `inc_append_history` and
+and so does a bash rc whose prompt or traps run `history -w`
+(SECURITY.md's H1 lists the hooks Holdfast can see), ble.sh, or a zsh rc
+that turns off `append_history`, `inc_append_history` and
 `share_history`, because emptying it would let a later save replace your
 file. Nothing empties it with `shell_integration: false`, or under an rc
 that takes the integration line. A fish started inside a fish session

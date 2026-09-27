@@ -791,26 +791,30 @@ and Python 3.12.
   `history -n; history -w; history -c; history -r` sync recipe lost the
   first ones in `per_session` mode. The snippet therefore leaves such a
   bash's list whole. It finds `history -w` by following
-  `PROMPT_COMMAND`, bash-preexec's `precmd_functions` and the traps
-  through the aliases and functions they name, so the `historymerge`
-  function and its `EXIT` trap are found, and a function nothing at the
-  prompt calls, such as fzf's history-deletion key binding, is not. The
+  `PROMPT_COMMAND`, the hook arrays of bash-preexec (`precmd_functions`,
+  `preexec_functions`) and oh-my-bash (`_omb_util_prompt_command`), and
+  the traps, through the aliases and functions they name. So the
+  `historymerge` function and its `EXIT` trap are found, and a function
+  nothing at the prompt calls, such as fzf's history-deletion key
+  binding, is not. A search that fails keeps the list rather than risk
+  the file. Under ble.sh, which rewrites the file at exit through a hook
+  of its own whenever `histappend` is off, the list is always kept. The
   operator's file then keeps every entry (measured, bash 5.2 and 5.3,
   both modes, by `exit` and by hangup, under `history -w` alone, the sync
-  recipe, `historymerge`, an `EXIT` trap and an alias). What still loses
-  entries:
+  recipe, `historymerge`, an `EXIT` trap, an alias, a hook array,
+  bash-it and ble.sh). What still loses entries:
   - a `history -w` that exists only once the rc is sourced again, or is
-    reached only through a variable or a hook array other than
-    `precmd_functions`, rewrites the file from the emptied list and
-    loses every entry;
+    reached only through a variable or a hook array not named above,
+    rewrites the file from the emptied list and loses every entry;
   - on bash 4.3 and older, whose `history -n` counts the lines already
     in the list rather than those read from the file, the sync recipe
     sourced again in `none` mode after another command loses the
     operator's oldest entry, as it did before the snippet emptied
     anything (measured, bash 3.2.57, macOS's `/bin/bash`; 4.2 and 4.3 by
     their source). Sourced as the session's first command it loses
-    nothing, because in `none` mode the snippet empties the list when the
-    prompt's own path runs `history -c`; keeping it lost every entry;
+    nothing, because in `none` mode the snippet empties the list when
+    the prompt runs `history -c` after `history -w`; keeping it lost
+    every entry;
   - bash's own save at exit appends, unless the session has run more
     commands than `HISTSIZE` holds, when it rewrites the file from the
     list with or without the emptying.
@@ -907,13 +911,14 @@ and Python 3.12.
     operator's file with the session's commands (measured, zsh 5.9), and
     the snippet leaves its list whole instead;
   - a bash whose prompt or traps run `history -w`, for the same reason
-    (H1), except in `none` mode where the prompt also runs `history -c`
-    and so empties the list itself. Its list also keeps the line Holdfast
-    typed to install the snippet, unless `HISTCONTROL` ignores a leading
-    space. In `per_session` mode a prompt's `history -w` rewrites the
-    session's file from that list, so the file holds the operator's
-    entries and that line as well as the agent's commands (measured, bash
-    5.2 and 5.3);
+    (H1), except in `none` mode where the prompt runs `history -c` after
+    it and so empties the list itself; and any bash under ble.sh, where
+    in `per_session` mode nothing needs the list. Its list also keeps the
+    line Holdfast typed to install the snippet, unless `HISTCONTROL`
+    ignores a leading space. In `per_session` mode a prompt's `history
+    -w` rewrites the session's file from that list, so the file holds the
+    operator's entries and that line as well as the agent's commands
+    (measured, bash 5.2 and 5.3);
   - a session whose `HISTFILE` is readonly, or in zsh whose `SAVEHIST` or
     `HISTSIZE` is (H1), a session with `shell_integration: false`, a bash
     the snippet's carrier does not reach, and a session whose rc reads the
