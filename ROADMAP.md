@@ -131,9 +131,11 @@ This group is what has to be true before that step:
   - Only once that commit ships on by default does the `tail_*` bypass of the
     holdback go.
 - **The secret write gate uses the classifier's own test for a secret
-  prompt,** with a per-submission human override. Today it admits any
-  terminal with echo off, including an idle shell or REPL prompt, where the
-  secret is echoed, run as a command and saved to history
+  prompt,** with a per-submission human override. An interim guard in
+  0.0.8 refuses a shell sitting at its own prompt by its markers. The gate
+  still admits any other terminal with echo off, including a REPL prompt
+  or a shell whose integration is off, where the secret is echoed, run as
+  a command and saved to history
   ([#262](https://github.com/Sertelegger/holdfast/issues/262)). The override
   is what keeps prompts the stricter test would refuse, such as `ssh -t`,
   working.

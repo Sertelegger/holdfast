@@ -217,7 +217,9 @@ Except:
   re-sourcing an rc that hard-sets it, `exec bash` or a nested bash under
   such an rc, any nested zsh under an unconditional one (macOS's
   `/etc/zshrc` sets one for every zsh), a `PROMPT_COMMAND` that assigns
-  it, or a `readonly HISTFILE` the snippet cannot change;
+  it, or a `readonly HISTFILE` the snippet cannot change — and
+  re-sourcing an rc whose `PROMPT_COMMAND` runs `history -w` replaces your
+  bash history file with the session's commands;
 - mksh under an rc that sets `HISTFILE`;
 - tcsh and csh on `exit`, EOF or a daemon crash, which save `~/.history`
   when an rc sets `savehist`;
@@ -230,15 +232,28 @@ Except:
   `HISTFILE`: it replaces `/dev/null` with a file of its commands;
 - a login bash in macOS Terminal, whose per-window history under
   `~/.bash_sessions/` only a `~/.bash_sessions_disable` file turns off;
+- a history recorder your rc installs as a hook — atuin, zsh-histdb, mcfly
+  or a bash-preexec logger — which records every command in a store of its
+  own;
+- an rc that reads the terminal at start-up, which takes the integration
+  line (see Shell integration above), so a zsh whose rc names a history
+  file saves to it;
 - Python 3.12 and older, which ignore `PYTHON_HISTORY` and write
   `~/.python_history`, a `.psqlrc` that sets `HISTFILE`, and any other
   program with a history file of its own, PowerShell's PSReadLine among
   them.
 
-Reading is not covered. bash and zsh load the history file your rc names
-as they start, before the snippet runs, so the agent can list your own
-history with `history` and recall it with up-arrow; a fish started inside
-a fish session reads the file its config.fish names the same way.
+Reading is covered in the session's own shell: bash and zsh load the
+history file your rc names as they start, and the snippet then empties
+that list, so the agent cannot list your history with `history` or recall
+it with up-arrow. A bash or zsh started inside the session loads its rc's
+file again. A readonly `HISTFILE` leaves the list as your rc loaded it,
+and so does a zsh rc that turns off `append_history`,
+`inc_append_history` and `share_history`, because emptying it would let a
+later save replace your file. Nothing empties it with
+`shell_integration: false`, or under an rc that takes the integration
+line. A fish started inside a fish session reads the file its config.fish
+names.
 
 If your rc's `PROMPT_COMMAND` re-reads the history file at every prompt
 (`history -a; history -c; history -r`), `HISTFILE=/dev/null` also empties
@@ -264,11 +279,11 @@ saves one; fish sessions get none.
 
 It is a convenience record, not an audit trail. A call's own `env` can
 point `HISTFILE` somewhere else, your rc's history options still apply —
-Debian's `HISTCONTROL=ignoreboth` drops commands that begin with a space,
-and without it each bash file begins with the snippet's own line — an rc
-sourced again that sets `HISTFILESIZE` truncates the file when bash exits,
-and anything in the list above that re-points `HISTFILE` takes the rest of
-the session's commands with it.
+Debian's `HISTCONTROL=ignoreboth` drops commands that begin with a space —
+an rc sourced again that sets `HISTFILESIZE`, or one that makes it
+readonly, truncates the file when bash exits, and anything in the list
+above that re-points `HISTFILE` takes the rest of the session's commands
+with it.
 
 With `shell_integration: false` only the environment applies: an rc file
 that sets `HISTFILE` itself decides where bash and zsh save history — and
@@ -320,9 +335,12 @@ working directory, with the daemon's environment — and `cargo install --path`
 runs in this checkout, so a daemon started from the same shell would point
 every such session, in every project, at the Holdfast repository. Those
 `holdfast mcp` processes are still the old binary until each Claude Code
-session restarts; a different protocol *minor* between them and the daemon is
-allowed, and a different major is refused with a message saying which side to
-restart. `holdfast daemon status` shows what is running.
+session restarts. A different protocol *minor* between them and the daemon is
+allowed for every call that means the same to both. A call that does not is
+refused, with a message saying which side to restart; `start_session` above
+all, which would start in the daemon's directory. A different major is refused
+outright. `holdfast daemon status` shows what is running, and says on stderr
+when the daemon is older than the CLI.
 
 **One registration per Claude Code config directory.** `claude mcp add
 --scope user` writes to the config directory in effect — `~/.claude.json`, or

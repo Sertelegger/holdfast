@@ -378,7 +378,17 @@ Cutting one is therefore:
    trusting the list. Most of its hits are in `CHANGELOG.md` and are
    **history** — a released section names its own version forever. Change
    only the claims about what is *newest*, *current* or *not yet tagged*.
-6. Tag `vX.Y.Z` and push the tag. That triggers
+6. **Run the upgrade-window check by hand first:**
+   `scripts/upgrade-skew-check.sh --old-tag <previous tag>`. It builds the
+   previous tag in a detached worktree under a temporary directory, drives
+   that release's daemon under this build's clients and this build's
+   daemon under that release's shim, and removes the worktree and its
+   target on exit. Every daemon it starts is isolated, it stops none
+   before it has isolated itself, and it needs no network beyond cargo's
+   registry. CI does not run it: what it measures is the pair a user holds
+   on the day they upgrade.
+
+   Then tag `vX.Y.Z` and push the tag. That triggers
    `.github/workflows/release.yml`, which checks that the tag, the crate
    version and a changelog section with actual content in it all agree, then
    publishes the release with that section as the body and the name derived
