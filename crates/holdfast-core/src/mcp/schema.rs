@@ -521,17 +521,17 @@ pub struct SendInput {
     pub prompt: Option<Prompt>,
 }
 
-/// `request_secret_input`.
-///
-/// **There is no field here capable of holding the value, and that is
-/// this type's job in this milestone** (REQ-SEC-004, REQ-T-015). §9.2
-/// marks the secret `n/a` for redaction rather than "redacted", because
-/// it reaches no boundary a redactor could run at: the protections are a
-/// type that cannot serialise, a write path that consumes, a `Drop` that
-/// zeroes — and this schema, which has nowhere to put it.
-/// `request_secret_input_has_no_field_that_could_carry_a_value` asserts
-/// the key set **exactly**, so a field added later fails whatever it is
-/// called.
+/// `request_secret_input`. No field here can hold the secret's value: a
+/// caller learns a byte count and an outcome, never the value.
+//
+// **That is this type's job** (REQ-SEC-004, REQ-T-015). §9.2 marks the
+// secret `n/a` for redaction rather than "redacted", because it reaches
+// no boundary a redactor could run at: the protections are a type that
+// cannot serialise, a write path that consumes, a `Drop` that zeroes —
+// and this schema, which has nowhere to put it.
+// `request_secret_input_has_no_field_that_could_carry_a_value` asserts
+// the key set **exactly**, so a field added later fails whatever it is
+// called.
 #[derive(Debug, Serialize, schemars::JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct RequestSecretInput {
@@ -543,16 +543,18 @@ pub struct RequestSecretInput {
     /// On both `secret_provided` and `secret_cancelled`.
     ///
     /// **Absent on the two paths that raise nothing**: a call cancelled
-    /// before it raised or adopted anything (GH #127), and one refused
-    /// `at_shell_prompt` before the raise (GH #262). Neither has a request
-    /// to name. Every other `secret_cancelled` carries one, including an
+    /// before it raised or adopted anything, and one refused
+    /// `at_shell_prompt` before the raise. Neither has a request to name.
+    /// Every other `secret_cancelled` carries one, including an
     /// `at_shell_prompt` the writer returned after a human answered.
+    // GH #127 and GH #262 respectively.
     pub request_id: Option<String>,
     /// `secret_cancelled` only: `user_cancelled` | `timeout` |
     /// `too_large` | `concurrent_request_pending` | `caller_cancelled` |
     /// `not_echo_off` | `at_shell_prompt`.
     pub reason: Option<String>,
-    /// `session_died` only (§5.1).
+    /// `session_died` only.
+    // §5.1.
     pub exit_code: Option<i32>,
     // ---- §5.4's session-state block, on `secret_provided` (REQ-T-019).
     // Built by `mcp::detection`'s one builder. §5.4 is explicit that a

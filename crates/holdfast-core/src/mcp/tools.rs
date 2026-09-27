@@ -188,7 +188,8 @@ pub struct StartSessionArgs {
     /// Arguments passed to the program. Only with `command`.
     #[serde(default)]
     pub args: Vec<String>,
-    /// Name of an operator-declared session profile to start (spec §9.6).
+    // Spec §9.6.
+    /// Name of an operator-declared session profile to start.
     /// The operator wrote the command line; supply values for its slots in
     /// `vars`. Mutually exclusive with `command`/`args`. **Only a
     /// profile-started session can be given a keychain credential.**
@@ -212,7 +213,8 @@ pub struct StartSessionArgs {
     /// environment of the Holdfast MCP server your client launched. PAGER,
     /// GIT_PAGER, MANPAGER and SYSTEMD_PAGER default to `cat`, because a
     /// pager waits for keystrokes; set one here to get a pager back. Do not
-    /// pass secrets: these values cross the MCP boundary (spec §5.2).
+    /// pass secrets: these values cross the MCP boundary.
+    // Spec §5.2.
     #[serde(default)]
     pub env: Option<HashMap<String, String>>,
     /// Terminal width in columns, 1 to 1000. Defaults to 120. A value
@@ -223,7 +225,8 @@ pub struct StartSessionArgs {
     /// outside that range is clamped to it, not rejected.
     #[serde(default)]
     pub rows: Option<u16>,
-    /// Tier-B VT100 emulation: "off", "adaptive" (default), or "on".
+    // Tier B (§4.5).
+    /// VT100 emulation: "off", "adaptive" (default), or "on".
     /// Full emulation costs ~11.6 ms per MiB on the write path, so
     /// "adaptive" turns it on only when something needs the rendered
     /// screen. Leave it alone unless you are profiling.
@@ -2132,7 +2135,7 @@ impl HoldfastServer {
     /// back is a byte count. You cannot name a secret either: a binding
     /// fires only for a session started from an operator-declared
     /// `profile`, optionally narrowed by the observed prompt, and
-    /// `prompt_text` reaches no lookup (§9.6, REQ-SEC-012).
+    /// `prompt_text` reaches no lookup.
     ///
     /// **Call it while a command is waiting for the secret.** At the idle
     /// prompt of a shell Holdfast reads markers from (bash, zsh and fish by
@@ -2142,6 +2145,9 @@ impl HoldfastServer {
     /// the session, is not refused and does the same. Run the command that
     /// reads the secret first, and call this once `interaction_mode` is
     /// `AwaitingSecret`.
+    //
+    // §9.6 and REQ-SEC-012 (no named secrets); GH #262 (the shell-prompt
+    // refusal).
     #[tool(
         annotations(
             title = "Request a secret from the user",
@@ -4573,7 +4579,8 @@ pub struct ReadOutputArgs {
     /// Read the last N bytes instead.
     #[serde(default)]
     pub tail_bytes: Option<usize>,
-    /// Apply §4.1's targeted secret holdback to a `tail_lines`/`tail_bytes`
+    // §4.1's targeted holdback.
+    /// Apply the targeted secret holdback to a `tail_lines`/`tail_bytes`
     /// read, which bypasses it by default. Only `true` is accepted:
     /// the bypass has exactly one licensed spelling — naming one of those
     /// two arguments — and `redact: false` is the audited escape hatch.
@@ -4701,19 +4708,20 @@ pub struct StatusArgs {
 #[derive(Debug, Default, Deserialize, Serialize, schemars::JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct RequestSecretInputArgs {
-    /// Session id or live session name. **The only selector.** §5.2: the
-    /// tool takes `session`, never a `request_id` — the id is returned to
-    /// you and never accepted from you (REQ-SEC-010a).
+    /// Session id or live session name. **The only selector.** The tool
+    /// takes `session`, never a `request_id`: the id is returned to you and
+    /// never accepted from you.
+    // §5.2, REQ-SEC-010a.
     pub session: String,
     /// What is being asked for, e.g. "sudo password for deploy-user". At
-    /// most 512 bytes of UTF-8 (§9.5). This reaches no credential lookup:
-    /// bindings match the operator-declared `profile` the session was
-    /// started from, optionally narrowed by the observed prompt — never
-    /// this string (§9.6, REQ-SEC-012).
+    /// most 512 bytes of UTF-8. This reaches no credential lookup: bindings
+    /// match the operator-declared `profile` the session was started from,
+    /// optionally narrowed by the observed prompt, never this string.
+    // §9.5 (the cap), §9.6 and REQ-SEC-012 (no lookup).
     pub prompt_text: String,
-    /// Default true. §5.2's normalisation is the daemon's job, not the
-    /// client's: exactly one trailing `\r\n` or `\n` is stripped from the
-    /// received bytes, then `\n` is appended when this is true.
+    /// Default true. Exactly one trailing `\r\n` or `\n` is stripped from
+    /// the received bytes, then `\n` is appended when this is true.
+    // §5.2's normalisation, which is the daemon's job, not the client's.
     #[serde(default)]
     pub append_newline: Option<bool>,
     /// Default 120. Rejected when 0 or above
