@@ -218,8 +218,9 @@ Except:
   such an rc, any nested zsh under an unconditional one (macOS's
   `/etc/zshrc` sets one for every zsh), a `PROMPT_COMMAND` that assigns
   it, or a `readonly HISTFILE` the snippet cannot change — and
-  re-sourcing an rc whose `PROMPT_COMMAND` runs `history -w` replaces your
-  bash history file with the session's commands;
+  re-sourcing an rc that hard-sets it and runs `history -w` from
+  `PROMPT_COMMAND` replaces your bash history file with the session's
+  commands;
 - mksh under an rc that sets `HISTFILE`;
 - tcsh and csh on `exit`, EOF or a daemon crash, which save `~/.history`
   when an rc sets `savehist`;
