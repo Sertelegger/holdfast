@@ -1659,6 +1659,103 @@ async fn allow_echo_sets_the_flag_on_the_submitted_frame() {
     );
 }
 
+/// **A daemon older than the echo gate is sent no secret without
+/// `--allow-echo`** — 1.3's `SecretInput.allow_echo`, across the upgrade
+/// window.
+///
+/// The frame this client sends without the flag means *do not write this
+/// into a program that echoes it* to a daemon of 1.3 or later, and
+/// nothing at all to v0.0.7's 1.1, which writes the secret regardless —
+/// into the session's output, where `read_output` hands it to the agent.
+/// So against such a daemon the typed value is collected, masked, and
+/// discarded, and the person is told why before and after typing it.
+///
+/// Paired with the same daemon and `--allow-echo`, which means on that
+/// daemon what it always meant, and is sent: a client that refused every
+/// secret to an older daemon would pass the first half.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_secret_is_not_sent_to_a_daemon_without_the_echo_gate_unless_allowed() {
+    for allow_echo in [false, true] {
+        let stub = StubDaemon::start(
+            "secretoldgate",
+            vec![
+                enc(&ServerFrame::Attached {
+                    session_id: "sess_stub01".into(),
+                    name: None,
+                    cols: 80,
+                    rows: 24,
+                    state: "Running".into(),
+                    exit_code: None,
+                    protocol_major: PROTOCOL_MAJOR,
+                    protocol_minor: 1,
+                }),
+                enc(&ServerFrame::AwaitingSecret {
+                    request_id: "req_old01".into(),
+                    prompt_text: "Password: ".into(),
+                    raised_by: None,
+                }),
+            ],
+            Duration::from_secs(15),
+        )
+        .await;
+        let mut args = vec!["attach", "sess_stub01"];
+        if allow_echo {
+            args.push("--allow-echo");
+        }
+        let mut term = Term::spawn(stub.paths.dir(), &args, 80, 24);
+        term.wait_for(SECRET_PROMPT_DRAWN, 10);
+        term.type_keys(b"hunter2\r");
+
+        if allow_echo {
+            let sent = wait_frames(&stub, 10, |f| {
+                f.iter()
+                    .any(|x| matches!(x, ClientFrame::SecretInput { .. }))
+            });
+            assert!(
+                sent.iter().any(|f| matches!(
+                    f,
+                    ClientFrame::SecretInput {
+                        allow_echo: true,
+                        ..
+                    }
+                )),
+                "`--allow-echo` must still reach an older daemon: {sent:?}"
+            );
+        } else {
+            let seen = term.wait_for(b"not sent", 10);
+            for needle in [
+                &b"this daemon speaks protocol 1.1"[..],
+                b"will not be sent",
+                b"--allow-echo",
+            ] {
+                assert!(
+                    contains(&seen, needle),
+                    "`{}` was never said:\n{}",
+                    String::from_utf8_lossy(needle),
+                    String::from_utf8_lossy(&seen)
+                );
+            }
+            // Past the point it would have gone: the refusal is drawn
+            // after the decision, so a frame sent is already recorded.
+            std::thread::sleep(Duration::from_millis(300));
+            assert!(
+                !stub
+                    .frames()
+                    .iter()
+                    .any(|f| matches!(f, ClientFrame::SecretInput { .. })),
+                "a secret was sent to a daemon that would write it into an echoing \
+                 program: {:?}",
+                stub.frames()
+            );
+        }
+        assert!(
+            !contains(&term.snapshot(), b"hunter2"),
+            "the value was drawn on the local terminal:\n{}",
+            String::from_utf8_lossy(&term.snapshot())
+        );
+    }
+}
+
 /// The frames the stub has recorded, once `pred` holds — or a failure on
 /// a deadline. A bare `frames()` read races the client's own write.
 fn wait_frames(

@@ -855,3 +855,202 @@ fn a_listener_that_is_still_closing_is_waited_out_rather_than_reported() {
     );
     shim.kill();
 }
+
+/// A daemon of protocol 1.1 — v0.0.7's — as far as any client can tell:
+/// it answers the handshake with minor 1, answers `daemon/status` and
+/// `daemon/stop` as a daemon does, and answers every tool call `ok`
+/// while recording its name. Runs on a runtime of its own, so stopping
+/// it closes every connection it holds, as a daemon's exit does.
+///
+/// Hand-written because the real one is a build this suite cannot run;
+/// `scripts/upgrade-skew-check.sh` runs the real v0.0.7 by hand.
+struct OldDaemon {
+    rt: Option<tokio::runtime::Runtime>,
+    sock: PathBuf,
+    tools: std::sync::Arc<std::sync::Mutex<Vec<String>>>,
+}
+
+impl OldDaemon {
+    fn start(inst: &Instance) -> Self {
+        use holdfast_core::protocol::frame;
+        use holdfast_core::protocol::handshake::{HandshakeData, PROTOCOL_MAJOR};
+        use holdfast_core::protocol::method::{self, Request, Response};
+
+        let paths = holdfast_core::daemon::paths::RuntimePaths::with_dir(&inst.dir);
+        paths.ensure_dir().expect("the runtime directory");
+        let sock = paths.control_sock();
+        // Stands in for the daemon's process: `holdfast daemon stop` waits
+        // for the pid `daemon/status` names to exit, and `daemon/stop`
+        // ends it, as a daemon's own exit would.
+        let process = std::sync::Arc::new(std::sync::Mutex::new(Some(
+            Command::new("sleep")
+                .arg("60")
+                .spawn()
+                .expect("spawn sleep"),
+        )));
+        let pid = process.lock().unwrap().as_ref().unwrap().id();
+        let tools = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let rt = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(1)
+            .enable_all()
+            .build()
+            .unwrap();
+        let listener = rt.block_on(async { tokio::net::UnixListener::bind(&sock).unwrap() });
+        let seen = std::sync::Arc::clone(&tools);
+        rt.spawn(async move {
+            loop {
+                let Ok((mut stream, _)) = listener.accept().await else {
+                    return;
+                };
+                let seen = std::sync::Arc::clone(&seen);
+                let process = std::sync::Arc::clone(&process);
+                tokio::spawn(async move {
+                    while let Ok(req) = frame::read_frame::<_, Request>(&mut stream).await {
+                        let data = match req.method.as_str() {
+                            method::METHOD_HANDSHAKE => serde_json::to_value(HandshakeData {
+                                protocol_major: PROTOCOL_MAJOR,
+                                protocol_minor: 1,
+                                daemon_version: "0.0.7".into(),
+                                build: "stand-in".into(),
+                                accepted: true,
+                                reject_reason: None,
+                            })
+                            .unwrap(),
+                            method::METHOD_DAEMON_STATUS => json!({
+                                "pid": pid, "uptime_secs": 1, "version": "0.0.7",
+                                "sessions_live": 0, "sessions_exited_retained": 0,
+                                "attach_clients": 0, "bridge_sessions": 0,
+                            }),
+                            method::METHOD_DAEMON_STOP => {
+                                if let Some(mut p) = process.lock().unwrap().take() {
+                                    let _ = p.kill();
+                                    let _ = p.wait();
+                                }
+                                json!({ "stopped_at_unix_secs": 0, "sessions_terminated": 0 })
+                            }
+                            other => {
+                                seen.lock().unwrap().push(other.to_string());
+                                json!({ "sessions": [] })
+                            }
+                        };
+                        let resp = Response::ok(req.id, &data, "0 session(s)").unwrap();
+                        if frame::write_frame(&mut stream, &resp).await.is_err() {
+                            return;
+                        }
+                    }
+                });
+            }
+        });
+        Self {
+            rt: Some(rt),
+            sock,
+            tools,
+        }
+    }
+
+    fn tools(&self) -> Vec<String> {
+        self.tools.lock().unwrap().clone()
+    }
+
+    /// Gone, as a daemon that exited is: every connection closed and the
+    /// socket file removed.
+    fn stop(&mut self) {
+        if let Some(rt) = self.rt.take() {
+            rt.shutdown_background();
+        }
+        let _ = std::fs::remove_file(&self.sock);
+    }
+}
+
+impl Drop for OldDaemon {
+    fn drop(&mut self) {
+        self.stop();
+    }
+}
+
+/// **The 0.0.7 ↔ 0.0.8 boundary, from a real shim, end to end.** An
+/// upgraded `holdfast mcp` meeting a daemon still running v0.0.7's
+/// protocol used to start its sessions in that daemon's directory and
+/// environment without a word — measured with a real v0.0.7 build.
+///
+/// The whole path an operator takes, in order:
+///
+/// 1. `start_session` is refused, never sent, with both versions and the
+///    advice to stop the daemon;
+/// 2. the old daemon's own sessions stay reachable — `list_sessions` is
+///    forwarded;
+/// 3. `holdfast daemon status` and `holdfast daemon stop` both work
+///    against it, and status says what the refusal was about;
+/// 4. once it is gone, the **same** shim's next `start_session` starts a
+///    daemon of its own build and a session in its client's project,
+///    saying the old sessions are gone — rather than being refused again
+///    by the minor of a daemon that no longer exists.
+#[test]
+fn a_shim_on_an_older_daemon_refuses_start_session_until_the_daemon_is_restarted() {
+    let inst = Instance::new("skew");
+    let here = Project::new(&inst, "proj");
+    let mut old = OldDaemon::start(&inst);
+    let mut shim = Shim::launch(&inst, &here.0, &[], &["mcp"]);
+
+    let refused = shim.call(
+        "start_session",
+        json!({ "command": "/bin/sh", "args": ["-c", "sleep 30"] }),
+    );
+    let error = &refused["error"];
+    assert_eq!(error["code"], -32603, "{refused}");
+    assert_eq!(error["data"]["reason"], "daemon_too_old", "{refused}");
+    let message = error["message"].as_str().unwrap_or_default();
+    for needle in [
+        "0.0.7 (protocol 1.1)",
+        env!("CARGO_PKG_VERSION"),
+        "Ask the user to run `holdfast daemon stop`",
+    ] {
+        assert!(message.contains(needle), "`{needle}` missing: {message}");
+    }
+    assert!(
+        !old.tools().iter().any(|t| t == "tool/start_session"),
+        "the refused call reached the old daemon: {:?}",
+        old.tools()
+    );
+
+    let listed = shim.call("list_sessions", json!({}));
+    assert_eq!(envelope(&listed)["status"], "ok", "{listed}");
+    assert!(old.tools().iter().any(|t| t == "tool/list_sessions"));
+
+    let (code, out, err) = inst.run(&["daemon", "status"]);
+    assert_eq!(code, 0, "{err}");
+    assert!(out.contains("holdfast daemon up"), "{out}");
+    assert!(
+        err.contains("older than this holdfast") && err.contains("`holdfast daemon stop`"),
+        "{err}"
+    );
+    let (code, _, err) = inst.run(&["daemon", "stop"]);
+    assert_eq!(
+        code, 0,
+        "`holdfast daemon stop` must work on the daemon it is advised for: {err}"
+    );
+    old.stop();
+
+    let started = shim.call(
+        "start_session",
+        json!({ "command": "/bin/sh", "args": ["-c", "sleep 30"] }),
+    );
+    let env = envelope(&started);
+    assert_eq!(
+        env["status"], "ok",
+        "the refusal outlived the daemon it was about: {started}"
+    );
+    assert_eq!(env["data"]["cwd"], here.path(), "{started}");
+    assert!(
+        env["details"]
+            .as_str()
+            .unwrap_or_default()
+            .starts_with("The Holdfast daemon had stopped"),
+        "{started}"
+    );
+    assert!(
+        inst.daemon_pid().is_some(),
+        "the shim started its own daemon"
+    );
+    shim.kill();
+}
