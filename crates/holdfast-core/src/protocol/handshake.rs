@@ -155,6 +155,18 @@ pub const PROFILE_MINOR: u32 = 1;
 /// `read_output` hands it to the agent.
 pub const ECHO_GATE_MINOR: u32 = 3;
 
+/// The first minor whose daemon sends `ServerFrame::OutputGap` when it
+/// drops output an attached client could not keep up with (GH #200; the
+/// 1.4 entry above). Sent by the daemon, so nothing is refused for it:
+/// `holdfast attach` and `watch` say on joining an older daemon that
+/// they will not be told.
+pub const OUTPUT_GAP_MINOR: u32 = 4;
+
+/// The first minor whose daemon sends `ServerFrame::ScreenSnapshot` to a
+/// client joining a session (GH #235; the 1.5 entry above) — said on
+/// joining an older one, like [`OUTPUT_GAP_MINOR`].
+pub const SCREEN_SNAPSHOT_MINOR: u32 = 5;
+
 /// A call a client of this build makes whose **meaning** depends on the
 /// daemon being at least [`Requirement::minor`]. Sent to an older one it
 /// is not refused but served as something else, and nothing says so.
@@ -542,8 +554,10 @@ mod tests {
                 ECHO_GATE_MINOR,
                 CLOSED_ARGUMENTS_MINOR,
                 PROFILE_MINOR,
+                OUTPUT_GAP_MINOR,
+                SCREEN_SNAPSHOT_MINOR,
             ),
-            (5, 4, 3, 5, 1)
+            (5, 4, 3, 5, 1, 4, 5)
         );
     }
 

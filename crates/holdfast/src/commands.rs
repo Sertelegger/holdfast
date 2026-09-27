@@ -449,6 +449,7 @@ pub(crate) fn older_daemon_note(what: &str, daemon_minor: u32) -> Option<String>
     }
     // The minors are the handshake log's (`protocol::handshake`): 1.3
     // `SecretInput.allow_echo`, 1.4 `OutputGap`, 1.5 `ScreenSnapshot`.
+    use holdfast_core::protocol::handshake::{OUTPUT_GAP_MINOR, SCREEN_SNAPSHOT_MINOR};
     let mut lacks = Vec::new();
     if what == "attach" && !Requirement::EchoGate.met_by(daemon_minor) {
         lacks.push(format!(
@@ -457,14 +458,14 @@ pub(crate) fn older_daemon_note(what: &str, daemon_minor: u32) -> Option<String>
             Requirement::EchoGate.minor()
         ));
     }
-    if daemon_minor < 4 {
+    if daemon_minor < OUTPUT_GAP_MINOR {
         lacks.push(format!(
-            "it does not say when it drops output under load ({major}.4)"
+            "it does not say when it drops output under load ({major}.{OUTPUT_GAP_MINOR})"
         ));
     }
-    if daemon_minor < 5 {
+    if daemon_minor < SCREEN_SNAPSHOT_MINOR {
         lacks.push(format!(
-            "it sends no picture of the screen on joining ({major}.5)"
+            "it sends no picture of the screen on joining ({major}.{SCREEN_SNAPSHOT_MINOR})"
         ));
     }
     if lacks.is_empty() {
@@ -5263,6 +5264,22 @@ mod tests {
             "1.4 has `OutputGap`: {four}"
         );
         assert!(four.contains("picture of the screen"), "{four}");
+        // One below each frame's own minor lacks it: a threshold that
+        // drifted down would pass the rows above and not these.
+        let three = older_daemon_note("watch", 3).expect("1.3 is older");
+        assert!(
+            three.contains("drops output under load (1.4)"),
+            "1.3 has no `OutputGap`: {three}"
+        );
+        assert!(
+            three.contains("picture of the screen on joining (1.5)"),
+            "{three}"
+        );
+        let attach_three = older_daemon_note("attach", 3).expect("1.3 is older");
+        assert!(
+            !attach_three.contains("--allow-echo"),
+            "1.3 has the echo gate: {attach_three}"
+        );
         assert!(older_daemon_note("attach", holdfast_core::protocol::PROTOCOL_MINOR).is_none());
     }
 

@@ -1759,6 +1759,68 @@ async fn a_secret_is_not_sent_to_a_daemon_without_the_echo_gate_unless_allowed()
     }
 }
 
+/// **`watch` says, on joining an older daemon, what that daemon will not
+/// send it** — a burst it drops (1.4's `OutputGap`) and the screen as it
+/// stands (1.5's `ScreenSnapshot`) — because a view missing either looks
+/// exactly like a quiet session. Once, on stderr, so the stream on
+/// stdout is the session's own. Paired with a daemon of this build, which
+/// is owed no note, and never with `attach`'s secret clause: `watch`
+/// sends no secret.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn watch_says_on_joining_an_older_daemon_what_it_will_not_be_sent() {
+    for (minor, noted) in [(1, true), (PROTOCOL_MINOR, false)] {
+        let stub = StubDaemon::start(
+            "watcholder",
+            vec![
+                enc(&ServerFrame::Attached {
+                    session_id: "sess_wold".into(),
+                    name: None,
+                    cols: 80,
+                    rows: 24,
+                    state: "Running".into(),
+                    exit_code: None,
+                    protocol_major: PROTOCOL_MAJOR,
+                    protocol_minor: minor,
+                }),
+                enc(&ServerFrame::Output {
+                    session: "sess_wold".into(),
+                    bytes: b"JOINED\n".to_vec(),
+                }),
+            ],
+            Duration::from_millis(600),
+        )
+        .await;
+        let out = tokio::task::spawn_blocking({
+            let dir = stub.paths.dir().to_path_buf();
+            move || run_plain(&dir, &["watch", "sess_wold"])
+        })
+        .await
+        .expect("join");
+        let err = String::from_utf8_lossy(&out.stderr).to_string();
+        let stdout = String::from_utf8_lossy(&out.stdout).to_string();
+        assert!(stdout.contains("JOINED"), "1.{minor}: {stdout}");
+        assert_eq!(
+            err.contains("holdfast watch: this daemon speaks protocol 1.1, older than"),
+            noted,
+            "1.{minor}: all stderr:\n{err}"
+        );
+        if noted {
+            assert!(
+                err.contains("drops output") && err.contains("picture of the screen"),
+                "{err}"
+            );
+            assert!(
+                !err.contains("--allow-echo"),
+                "`watch` sends no secret: {err}"
+            );
+            assert!(
+                !stdout.contains("older than"),
+                "the note is in the session's stream: {stdout}"
+            );
+        }
+    }
+}
+
 /// The frames the stub has recorded, once `pred` holds — or a failure on
 /// a deadline. A bare `frames()` read races the client's own write.
 fn wait_frames(
