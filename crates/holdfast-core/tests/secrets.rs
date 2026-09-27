@@ -5764,6 +5764,114 @@ async fn fence(d: &TestDaemon, s: &Session) {
     await_output(s, b"HOLDFAST_FENCE").await;
 }
 
+/// **GH #262's first half, by request.** At an idle prompt nothing is
+/// raised: the call answers `at_shell_prompt` with no `request_id`, no
+/// attached human is asked for anything, and no audit pair is written.
+///
+/// Then **the control in the same session**, which is the dogfood run's
+/// own: the shell's `read -s` is a genuine secret prompt, the request is
+/// accepted, and the value reaches the child without appearing anywhere.
+/// Without it the refusal above passes against a gate that refuses every
+/// shell session.
+async fn an_idle_prompt_is_refused_and_a_read_s_is_not(
+    tag: &str,
+    command: &str,
+    args: &[&str],
+    read_s: &str,
+) {
+    let d = TestDaemon::start(tag).await;
+    let s = start_shell(&d, command, args).await;
+    await_idle_prompt(&s).await;
+    let mut c = attach_ok(&d, &s.id, AttachMode::ReadWrite).await;
+
+    let refused = d.call(secret_args(&s.id, 20)).await;
+    let payload = body(&refused);
+    assert_eq!(
+        cancelled_reason(&payload),
+        "at_shell_prompt",
+        "{command} at its idle prompt was asked for a secret: {payload}"
+    );
+    assert!(
+        payload["data"]["request_id"].is_null(),
+        "a refusal before the raise named a request: {payload}"
+    );
+    assert!(
+        d.daemon
+            .server
+            .attach_hub()
+            .outstanding_secret(&s.id)
+            .is_none(),
+        "the refusal left a request raised for a human to answer"
+    );
+    assert!(
+        secret_audit_kinds(&d, &s.id).is_empty(),
+        "nothing was raised, so §9.4 has no pair to write"
+    );
+
+    // The control: a real secret prompt from the same shell.
+    type_line(&d, &s, read_s).await;
+    let (id, _) = next_awaiting_secret(&mut c, 20).await;
+    let call = spawn_call(&d, secret_args(&s.id, 20));
+    await_waiter(&d, &s.id, "the read -s call").await;
+    send(
+        &mut c,
+        &ClientFrame::SecretInput {
+            request_id: id,
+            bytes: PROBE.as_bytes().to_vec(),
+            allow_echo: false,
+        },
+    )
+    .await;
+    let answered = joined(call, "the read -s call").await;
+    assert_eq!(
+        answered["status"], "secret_provided",
+        "{command}'s `read -s` was refused, so the refusal above is not about the \
+         prompt: {answered}"
+    );
+    await_output(&s, b"got=HUNTER2").await;
+    assert!(
+        !contains(&buffered(&s), PROBE.as_bytes()),
+        "{command}'s `read -s` echoed the value:\n{}",
+        String::from_utf8_lossy(&buffered(&s))
+    );
+    assert!(
+        !whole_result_of(&answered).contains(PROBE),
+        "the tool result carries the value: {answered}"
+    );
+    let _ = s.signal(Signal::Kill);
+}
+
+#[tokio::test]
+async fn bash_at_its_idle_prompt_is_not_asked_for_a_secret() {
+    an_idle_prompt_is_refused_and_a_read_s_is_not(
+        "promptbash",
+        "bash",
+        &["--norc", "--noprofile"],
+        "read -s -p 'Password: ' PW; printf 'got=%s\\n' \"$(printf %s \"$PW\" | tr a-z A-Z)\"",
+    )
+    .await;
+}
+
+/// zsh's `read -p` means something else, so an agent's bash-shaped
+/// `read -s -p` fails there and leaves the shell at its prompt — which is
+/// how the dogfood run reached GH #262. The control uses zsh's own form.
+#[tokio::test]
+async fn zsh_at_its_idle_prompt_is_not_asked_for_a_secret() {
+    if !std::env::var_os("PATH")
+        .is_some_and(|p| std::env::split_paths(&p).any(|dir| dir.join("zsh").is_file()))
+    {
+        eprintln!("skipping: zsh not installed");
+        return;
+    }
+    an_idle_prompt_is_refused_and_a_read_s_is_not(
+        "promptzsh",
+        "zsh",
+        &["-f"],
+        "read -s 'PW?Password: '; printf 'got=%s\\n' \"$(printf %s \"$PW\" | tr a-z A-Z)\"",
+    )
+    .await;
+}
+
 /// **GH #262's second half, by write.** A request raised while a command
 /// runs is answered after that command has ended and the shell is back at
 /// its prompt: the writer refuses, the value never reaches the shell, and
