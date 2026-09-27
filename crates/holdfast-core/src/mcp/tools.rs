@@ -2130,7 +2130,7 @@ impl HoldfastServer {
     /// shell prompt it asks nobody and returns `secret_cancelled` with
     /// reason `at_shell_prompt`, because the shell would show the value,
     /// run it and save it to history. Run the command that reads the
-    /// secret first.
+    /// secret first, and call this once its password prompt is on screen.
     #[tool(
         annotations(
             title = "Request a secret from the user",
@@ -2430,8 +2430,9 @@ impl HoldfastServer {
         // adopted* request and this call raised none, so a lone
         // `secret_input_resolved` would name nothing and a
         // `secret_input_request` with no id would not be §9.4's shape.
-        // `schema::RequestSecretInput.request_id` is an `Option` and this
-        // is the one path that leaves it unset.
+        // `schema::RequestSecretInput.request_id` is an `Option`, and this
+        // and `at_shell_prompt_refusal` are the two paths that leave it
+        // unset.
         //
         // **The child's affordance is left exactly as found.** Whatever
         // raise §8.3's edge produced is still outstanding and still
@@ -2622,19 +2623,33 @@ impl HoldfastServer {
 /// already-cancelled call set: nothing was raised, so there is no request
 /// to name, and no §9.4 pair is written for the same reason.
 ///
+/// **One text for both call sites, so it claims only what is true at
+/// both.** Before step 1 nothing has run. Before the raise a binding's
+/// provider may have run, and its value been refused by the writer for
+/// this same reason. That leaves a `binding_resolved` audit line with no
+/// request pair after it. So the text says nothing was written, not that
+/// nothing was requested.
+///
 /// **The details say what to do, not only what happened.** An agent that
 /// meets this has usually just watched a command fail, such as a `read -s`
 /// that zsh parses differently, and is about to ask again. What it needs is
-/// to run the command that reads the secret and ask while it waits. It is
-/// not told to retry, and not told to find a human: neither changes a
-/// shell's prompt into a secret prompt.
+/// to run the command that reads the secret and ask while it waits. Not
+/// told to retry as it is, and not told to find a human: neither changes a
+/// shell's prompt into a secret prompt. **But told what to do if it has
+/// just started the command**, because a call made in the same instant as
+/// the `send_input` that runs it arrives before the shell has read that
+/// line. Measured: 2 of 3 such calls refused with no gap, none at a gap of
+/// 5 ms. Without that sentence, the remedy the details name would send such
+/// an agent to run the command a second time, into its own password prompt.
 fn at_shell_prompt_refusal() -> CallToolResult {
     envelope::envelope(
         Status::SecretCancelled,
         json!({ "reason": CancelReason::AtShellPrompt.as_str() }),
-        "no secret was requested: the session is at its shell prompt, where a \
-         secret would be shown, run as a command and saved to history. Run the \
-         command that asks for the secret first, and call this while it waits",
+        "nothing was written: the session is at its shell prompt, where a secret \
+         would be shown, run as a command and saved to history. Run the command \
+         that asks for the secret first, and call this while it waits; if you have \
+         just started it, wait until its password prompt is on screen, then call \
+         this again",
     )
 }
 
