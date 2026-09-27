@@ -136,6 +136,15 @@ pub const TAIL_HOLDBACK_MINOR: u32 = 4;
 /// predates the argument refuses it by name, which is loud.
 pub const CLOSED_ARGUMENTS_MINOR: u32 = 5;
 
+/// The first minor whose daemon knows `start_session`'s `profile` and
+/// `vars` (GH #55's operator-declared sessions, v0.0.7).
+///
+/// Tool arguments, not wire fields, and they landed before the 1.1 bump,
+/// so every 1.1 daemon has them and no released 1.0 daemon (v0.0.5,
+/// v0.0.6) does. Such a daemon drops `profile` and starts whatever
+/// `command` names instead.
+pub const PROFILE_MINOR: u32 = 1;
+
 /// The first minor whose daemon declines to write a secret into a child
 /// that has not dropped `ECHO` unless the submission says `allow_echo`
 /// (GH #137; the 1.3 entry above).
@@ -150,12 +159,15 @@ pub const ECHO_GATE_MINOR: u32 = 3;
 /// daemon being at least [`Requirement::minor`]. Sent to an older one it
 /// is not refused but served as something else, and nothing says so.
 ///
-/// **Every entry is a refusal the client makes before it sends**, because
-/// the older daemon cannot make it: it does not know the key that carries
+/// **Every entry is decided by the client before it sends**, because the
+/// older daemon cannot decide it: it does not know the key that carries
 /// the difference, and before [`CLOSED_ARGUMENTS_MINOR`] it drops unknown
-/// keys in silence. The refusal names both versions and says what to do,
-/// so the skew costs a restart and not a session started in the wrong
-/// project or a token printed in the clear.
+/// keys in silence. The call is refused (`ClientError::DaemonTooOld`),
+/// naming both versions and what to do — or, where a call that means the
+/// same on the older daemon exists, sent as that call instead, which is
+/// what `holdfast logs --tail` does. Either way the skew costs a restart
+/// or nothing, and not a session started in the wrong project or a token
+/// printed in the clear.
 ///
 /// **What is deliberately not here**, from the minor log above:
 ///
@@ -187,6 +199,9 @@ pub enum Requirement {
     /// A secret submitted without `allow_echo` (GH #137), which `holdfast
     /// attach` sends unless it was given `--allow-echo`.
     EchoGate,
+    /// `start_session`'s `profile` and `vars` (GH #55), which a shim passes
+    /// on from an agent. Only a pre-0.0.7 daemon lacks them.
+    Profile,
 }
 
 impl Requirement {
@@ -197,6 +212,7 @@ impl Requirement {
             Self::LaunchContext => LAUNCH_CONTEXT_MINOR,
             Self::TailHoldback => TAIL_HOLDBACK_MINOR,
             Self::EchoGate => ECHO_GATE_MINOR,
+            Self::Profile => PROFILE_MINOR,
         }
     }
 
@@ -221,6 +237,10 @@ impl Requirement {
             Self::EchoGate => {
                 "write the secret even into a program that echoes it, where it lands in the \
                  session's output"
+            }
+            Self::Profile => {
+                "ignore `profile` and start whatever `command` names instead, in its own \
+                 directory and environment"
             }
         }
     }
@@ -454,11 +474,12 @@ mod tests {
     /// a threshold that drifted down would still pass every relational
     /// assertion here while letting that daemon serve the call.
     #[test]
-    fn each_requirement_is_met_from_its_own_minor_and_by_no_0_0_7_daemon() {
+    fn each_requirement_is_met_from_its_own_minor_and_all_but_profile_by_no_0_0_7_daemon() {
         for r in [
             Requirement::LaunchContext,
             Requirement::TailHoldback,
             Requirement::EchoGate,
+            Requirement::Profile,
         ] {
             assert!(r.met_by(r.minor()), "{r:?}");
             assert!(!r.met_by(r.minor() - 1), "{r:?}");
@@ -466,17 +487,25 @@ mod tests {
                 r.met_by(PROTOCOL_MINOR),
                 "{r:?} would refuse a daemon of this very build"
             );
-            assert!(!r.met_by(1), "{r:?}: v0.0.7 speaks 1.1");
             assert!(!r.otherwise().is_empty());
         }
+        for r in [
+            Requirement::LaunchContext,
+            Requirement::TailHoldback,
+            Requirement::EchoGate,
+        ] {
+            assert!(!r.met_by(1), "{r:?}: v0.0.7 speaks 1.1");
+        }
+        assert!(Requirement::Profile.met_by(1), "v0.0.7 has profiles");
         assert_eq!(
             (
                 LAUNCH_CONTEXT_MINOR,
                 TAIL_HOLDBACK_MINOR,
                 ECHO_GATE_MINOR,
-                CLOSED_ARGUMENTS_MINOR
+                CLOSED_ARGUMENTS_MINOR,
+                PROFILE_MINOR,
             ),
-            (5, 4, 3, 5)
+            (5, 4, 3, 5, 1)
         );
     }
 

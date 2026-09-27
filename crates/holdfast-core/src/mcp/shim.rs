@@ -728,10 +728,20 @@ fn admit(
 /// argument added from 1.5 on needs no row, because a daemon that
 /// predates it refuses it by name. The window this covers, 1.0 to 1.4, is
 /// history: diffing every `*Args` struct across v0.0.5, v0.0.6, v0.0.7
-/// and this build finds `apply_holdback` and nothing else. [`CLIENT_PARAM`]
-/// is not an agent's argument and is [`Requirement::LaunchContext`]'s.
-const ARGUMENTS_BEFORE_CLOSED: &[(&str, &str, Requirement)] =
-    &[("read_output", "apply_holdback", Requirement::TailHoldback)];
+/// and this build finds `start_session`'s `profile` and `vars` (1.1) and
+/// `read_output`'s `apply_holdback` (1.4), and nothing else.
+/// [`CLIENT_PARAM`] is not an agent's argument and is
+/// [`Requirement::LaunchContext`]'s.
+///
+/// The `profile` row is what keeps [`takes_launch_context`]'s exemption
+/// honest: a profile session is let past the launch-context refusal
+/// because every daemon that knows profiles starts one the same way, and
+/// a 1.0 daemon does not know them.
+const ARGUMENTS_BEFORE_CLOSED: &[(&str, &str, Requirement)] = &[
+    ("start_session", "profile", Requirement::Profile),
+    ("start_session", "vars", Requirement::Profile),
+    ("read_output", "apply_holdback", Requirement::TailHoldback),
+];
 
 /// Whether a `start_session` called with `arguments` takes the calling
 /// client's launch context.
@@ -2374,6 +2384,22 @@ mod tests {
         .expect("a profile session means the same to an older daemon");
         let sent = received.recv().await.expect("forwarded");
         assert_eq!(sent.method, "tool/start_session");
+
+        // ...but not to a daemon that predates profiles (1.0: v0.0.5 and
+        // v0.0.6), which would drop the key and start whatever `command`
+        // names, or its default shell.
+        let (shim, mut received, _dir) = shim_over("noprofiles", 0).await;
+        let err = shim
+            .forward(
+                "start_session",
+                args(json!({ "profile": "prod-ssh" })),
+                std::future::pending(),
+            )
+            .await
+            .expect_err("a 1.0 daemon does not know profiles");
+        assert_eq!(err.data.clone().unwrap()["reason"], "daemon_too_old");
+        assert!(err.message.contains("ignore `profile`"), "{}", err.message);
+        assert!(received.try_recv().is_err(), "it reached the daemon anyway");
 
         // The control: a daemon of the key's own minor is sent the call.
         let (shim, mut received, _dir) =

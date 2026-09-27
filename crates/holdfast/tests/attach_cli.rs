@@ -1724,7 +1724,10 @@ async fn a_secret_is_not_sent_to_a_daemon_without_the_echo_gate_unless_allowed()
         } else {
             let seen = term.wait_for(b"not sent", 10);
             for needle in [
-                &b"this daemon speaks protocol 1.1"[..],
+                // Said on joining, before the terminal went raw...
+                &b"holdfast attach: this daemon speaks protocol 1.1, older than this client's"[..],
+                // ...and again at the prompt, before anything is typed.
+                b"which predates the echo check",
                 b"will not be sent",
                 b"--allow-echo",
             ] {
