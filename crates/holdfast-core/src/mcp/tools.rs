@@ -2773,7 +2773,8 @@ impl HoldfastServer {
         // `AwaitingSecret` — and `request_secret_input` had no echo-state
         // precondition before that check existed. The writer gates on the
         // echo state itself, which is the condition the harm actually
-        // turns on.
+        // turns on — and, since GH #262, on whether the session's shell is
+        // back at its own prompt, where `ECHO` is off and the harm is worse.
         //
         // ## And the question that is not about the slot at all (GH #126)
         //

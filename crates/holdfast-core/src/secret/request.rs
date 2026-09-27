@@ -93,7 +93,8 @@ impl RaisedBy {
 /// later fails to compile until something emits it. GH #127's
 /// [`CancelReason::CallerCancelled`] is the fifth, and it arrived through
 /// exactly that failure; GH #137's [`CancelReason::NotEchoOff`] is the
-/// sixth and arrived the same way.
+/// sixth and arrived the same way, and GH #262's
+/// [`CancelReason::AtShellPrompt`] is the seventh.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub enum CancelReason {
     /// The echo-off condition cleared with no value written: a human
@@ -150,6 +151,26 @@ pub enum CancelReason {
     /// The exit is `SecretInput.allow_echo` — a human's decision at an
     /// attached client, reachable from no argument of any tool.
     NotEchoOff,
+    /// GH #262. The session's shell is sitting at its own prompt, by its
+    /// OSC 133 markers, so a secret written now would go to the line
+    /// editor: drawn on every surface, run as a command, and saved to
+    /// history. `ECHO` is off there, so [`CancelReason::NotEchoOff`]
+    /// cannot see it.
+    ///
+    /// **One condition, checked at two moments, and both report this
+    /// word.** `request_secret_input` checks before it raises anything or
+    /// runs a provider, and answers with no `request_id` because it raised
+    /// none. The writer checks again one statement before the write,
+    /// because the command that asked for the secret can end while a human
+    /// is typing it; there a value was submitted and dropped, as with
+    /// `not_echo_off`.
+    ///
+    /// **Not [`CancelReason::NotEchoOff`]**, whose remedy is wrong here:
+    /// `allow_echo` does not waive this condition, and nothing an attached
+    /// human can do makes an idle shell a secret prompt. The remedy is the
+    /// agent's — run the command that asks for the secret, and request it
+    /// while that command waits.
+    AtShellPrompt,
 }
 
 impl CancelReason {
@@ -162,17 +183,19 @@ impl CancelReason {
             Self::ConcurrentRequestPending => "concurrent_request_pending",
             Self::CallerCancelled => "caller_cancelled",
             Self::NotEchoOff => "not_echo_off",
+            Self::AtShellPrompt => "at_shell_prompt",
         }
     }
 
     /// Every reason, for the exhaustive-reachability guard.
-    pub const ALL: [CancelReason; 6] = [
+    pub const ALL: [CancelReason; 7] = [
         Self::UserCancelled,
         Self::Timeout,
         Self::TooLarge,
         Self::ConcurrentRequestPending,
         Self::CallerCancelled,
         Self::NotEchoOff,
+        Self::AtShellPrompt,
     ];
 }
 
@@ -1565,6 +1588,7 @@ mod tests {
                 CancelReason::ConcurrentRequestPending => "concurrent_request_pending",
                 CancelReason::CallerCancelled => "caller_cancelled",
                 CancelReason::NotEchoOff => "not_echo_off",
+                CancelReason::AtShellPrompt => "at_shell_prompt",
             };
             assert_eq!(r.as_str(), expect);
         }

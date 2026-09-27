@@ -285,20 +285,6 @@ impl PromptDetector {
         // See the `availability` test module for the rows that pin this on
         // both axes: signal membership (REQ-PD-015) and scope
         // (REQ-PD-026).
-
-        /// §8.3's scope rule, in one place because it applies to both
-        /// executing rungs, to the T1 prompt-marker rung, and to the
-        /// exited tier.
-        ///
-        /// A licence is withheld **only when owner and holder are both
-        /// known and differ**. Absence is not a change: an unknown owner
-        /// or an unknown holder reproduces the pre-rev.-37 session-scoped
-        /// answer exactly, never a third one, which is what covers ConPTY
-        /// and every failed ioctl (REQ-PD-025).
-        fn licensed(observed: bool, owner: Option<i32>, holder: Option<i32>) -> bool {
-            observed && !matches!((owner, holder), (Some(o), Some(h)) if o != h)
-        }
-
         let t1 = licensed(modes.saw_osc133, modes.osc133_owner, foreground);
         let t2_prompt_mode = licensed(
             modes.saw_bracketed_paste,
@@ -462,6 +448,48 @@ impl PromptDetector {
         let elapsed = now.saturating_duration_since(self.last_output).as_millis() as f64;
         ((elapsed / threshold as f64) as f32).clamp(0.0, 1.0)
     }
+
+    /// Whether the shell's own OSC 133 markers say it is at its prompt: the
+    /// latest one is `A`, `B` or `D`, so no `C` has started a command since,
+    /// and the program that emitted it still holds the terminal.
+    /// `foreground` is the terminal's foreground group, sampled by the
+    /// caller under the same lock as this read, as `snapshot` takes it.
+    ///
+    /// **This is the secret write gate's shell-prompt test (GH #262), not a
+    /// classification.** A secret written at an idle prompt goes to the
+    /// shell's line editor. The editor draws it, the appended newline runs
+    /// it as a command, and the shell saves it to history. The tty's `ECHO`
+    /// flag cannot see any of that, because readline and zle turn `ECHO`
+    /// off at every idle prompt and draw the characters themselves.
+    ///
+    /// **`D` counts here, and the T1 prompt-marker rung does not count it.**
+    /// Between `D` and the next `A` the shell is drawing its prompt. The
+    /// classifier answers `Executing` there because the state is momentary,
+    /// but no command has started, so a write there reaches the shell. And
+    /// where a regenerated prompt loses the `A`/`B` markers (GH #220), `D`
+    /// is the last marker at every idle prompt.
+    ///
+    /// **It sees only a shell whose markers arrive.** A REPL, a nested
+    /// shell with no integration, `exec zsh`, and a session whose
+    /// integration is off all read their input after a `C`, or with no
+    /// marker at all, so this answers `false` for them.
+    pub fn shell_at_prompt(&self, foreground: Option<i32>) -> bool {
+        let modes = self.scanner.modes();
+        licensed(modes.saw_osc133, modes.osc133_owner, foreground)
+            && matches!(self.scanner.last_marker(), Some(b'A' | b'B' | b'D'))
+    }
+}
+
+/// §8.3's scope rule, in one place because it applies to both executing
+/// rungs, to the T1 prompt-marker rung, to the exited tier, and to the
+/// secret write gate's [`PromptDetector::shell_at_prompt`].
+///
+/// A licence is withheld **only when owner and holder are both known and
+/// differ**. Absence is not a change: an unknown owner or an unknown holder
+/// reproduces the pre-rev.-37 session-scoped answer exactly, never a third
+/// one, which is what covers ConPTY and every failed ioctl (REQ-PD-025).
+fn licensed(observed: bool, owner: Option<i32>, holder: Option<i32>) -> bool {
+    observed && !matches!((owner, holder), (Some(o), Some(h)) if o != h)
 }
 
 #[cfg(test)]
