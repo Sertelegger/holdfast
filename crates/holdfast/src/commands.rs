@@ -1624,6 +1624,10 @@ struct Drained {
     /// The page that ended the drain at a holdback, if one did. Never a
     /// holdback a later page read past: that one withheld nothing.
     held: Option<Value>,
+    /// Where a holdback that made no progress stopped the drain, and the
+    /// head it was reading to — so the notes can say how far short of the
+    /// end the output stops. `None` when the drain reached the head.
+    stopped: Option<(u64, u64)>,
 }
 
 /// Every page from the ring's oldest byte to the head as it stood at the
@@ -1679,6 +1683,7 @@ async fn drain(r: &LogReader<'_>, mut sink: impl FnMut(&str)) -> Result<Drained,
             // nothing. Stop, and keep the page for the note.
             Some(_) if page.held_back => {
                 seen.held = Some(page.data);
+                seen.stopped = Some((cursor, head));
                 break;
             }
             // Since GH #195 every other read makes progress, so this is a
@@ -1702,6 +1707,9 @@ async fn logs_all(r: &LogReader<'_>) -> Result<(), ExitCode> {
     report_gone(seen.gone_before, seen.gone_during);
     if let Some(held) = &seen.held {
         diag!("holdfast logs: {}", held_back_note(r.raw, held));
+    }
+    if let Some(note) = stopped_short_note(r.raw, &seen, None) {
+        diag!("holdfast logs: {note}");
     }
     Ok(())
 }
@@ -1730,10 +1738,20 @@ async fn logs_all(r: &LogReader<'_>) -> Result<(), ExitCode> {
 /// alone** ([`Requirement::TailHoldback`]). Sent the tail read, such a
 /// daemon drops the argument without a word and serves §4.1's bypass the
 /// CLI declined — measured against v0.0.7, which printed a fake token
-/// that was still arriving in the clear. Its cursor reads have always
-/// kept the holdback, so the drain gives `--tail` its whole meaning there,
-/// and the command keeps working across the upgrade window rather than
-/// being refused or quietly weakened.
+/// that was still arriving in the clear. Its cursor reads withhold that
+/// token, measured on the same build, so the drain keeps `--tail` working
+/// across the upgrade window without handing back what the flag declined.
+///
+/// **What the drain cannot give on such a daemon, and what it says
+/// instead.** Its cursor reads are not a current daemon's. Before GH
+/// #195 a candidate key block that begins and never ends could stop a
+/// cursor read at its start for good, however often it was retried —
+/// measured on v0.0.7 with 300 KB after it — and a body short enough to
+/// reach the head came back raw, as it did from that daemon's tail read.
+/// Neither is a regression on the tail read the CLI used to send, but the
+/// first means the last N lines of what the drain returned are not the
+/// session's last, so [`stopped_short_note`] says where they end rather
+/// than letting them pass for the tail.
 #[cfg(unix)]
 async fn logs_tail(r: &LogReader<'_>, n: usize) -> Result<(), ExitCode> {
     if r.client.require(Requirement::TailHoldback).is_ok() {
@@ -1766,7 +1784,55 @@ async fn logs_tail(r: &LogReader<'_>, n: usize) -> Result<(), ExitCode> {
     if let Some(held) = &seen.held {
         diag!("holdfast logs: {}", held_back_note(r.raw, held));
     }
+    if let Some(note) = stopped_short_note(r.raw, &seen, Some(n)) {
+        diag!("holdfast logs: {note}");
+    }
     Ok(())
+}
+
+/// Where a drain that stopped at a holdback short of the head left off,
+/// for the line after [`held_back_note`] — or `None` when it reached the
+/// head, or when there is nothing to add.
+///
+/// **For `--tail` (`tail` is `Some(n)`), always.** Its lines are the last
+/// N of what the drain returned, so when the drain stopped short they end
+/// where it stopped, and printed alone they pass for the session's last.
+///
+/// **For a daemon older than GH #195, always, and with why.** Such a
+/// daemon's cursor could stop for good at a candidate key block that
+/// begins and does not end — measured on v0.0.7 — where
+/// [`held_back_note`]'s *"read again"* never helps. It is recognised by
+/// sending no `held_back_cause`, which arrived with the #195 fix in one
+/// change, and only on a redacting read: `--raw` turns the mechanism off.
+/// A current daemon's holdback is always one a retry can clear or one
+/// the note already calls permanent, so there it adds nothing.
+#[cfg(unix)]
+fn stopped_short_note(raw: bool, seen: &Drained, tail: Option<usize>) -> Option<String> {
+    let (at, head) = seen.stopped?;
+    let before_195 = !raw
+        && seen
+            .held
+            .as_ref()
+            .is_some_and(|d| d.get("held_back_cause").is_none_or(Value::is_null));
+    let mut note = match tail {
+        Some(n) => format!(
+            "so the lines above are the last {n} before byte {at}, where the read stopped, and \
+             not the last of the {head} bytes this session had printed when it began."
+        ),
+        None if before_195 => format!(
+            "the read stopped at byte {at} of the {head} this session had printed when it began."
+        ),
+        None => return None,
+    };
+    if before_195 {
+        note.push_str(
+            " This daemon predates GH #195 and can also stop there for good, at a key block \
+             that begins and never ends: if reading again stops at the same byte, that is why. \
+             A daemon of this build reads past it and marks what it cannot vouch for \
+             (`holdfast daemon stop` updates it, and ends every session).",
+        );
+    }
+    Some(note)
 }
 
 /// The last `n` lines of `text`, counted the way the daemon's
@@ -4442,6 +4508,11 @@ mod tests {
             3,
             "it asked again after a holdback that made no progress"
         );
+        assert_eq!(
+            seen.stopped,
+            Some((6000, 10_000)),
+            "where it stopped, and the head it was reading to, are kept for the note"
+        );
         let held = seen.held.expect("the holdback page is kept");
         assert_eq!(held["held_back_cause"], "in_flight_secret");
         assert_eq!(
@@ -4449,6 +4520,64 @@ mod tests {
             "the page kept is the one that stopped it"
         );
         daemon.abort();
+    }
+
+    /// **`--tail`'s lines are not passed off as the session's last when
+    /// the drain stopped short** — measured against v0.0.7, whose cursor
+    /// froze at a key block that began and never ended with 300 KB after
+    /// it (GH #195), and whose `--tail 3` then printed three lines from
+    /// the middle and advised reading again, which returned the same.
+    ///
+    /// Paired every way the note is decided: a daemon that sends no
+    /// `held_back_cause` is one from before #195 and is told so, with
+    /// the restart that cures it; a current daemon's holdback is not; a
+    /// `--raw` read is not, since redaction is what freezes; a plain
+    /// `logs` says nothing extra to a current daemon, where the note
+    /// before it already says it all; and a drain that reached the head
+    /// says nothing.
+    #[test]
+    fn a_drain_that_stopped_short_says_where_and_an_old_daemon_says_why() {
+        let seen = |cause: Option<HeldBackCause>| Drained {
+            held: Some(held_page(612, 612, Some(612), cause)),
+            stopped: Some((612, 918_000)),
+            ..Drained::default()
+        };
+        let old = seen(None);
+        let current = seen(Some(HeldBackCause::InFlightSecret));
+
+        let tail = stopped_short_note(false, &old, Some(3)).expect("a tail that stopped short");
+        for needle in [
+            "the last 3 before byte 612",
+            "not the last of the 918000 bytes",
+            "GH #195",
+            "for good",
+            "`holdfast daemon stop`",
+        ] {
+            assert!(tail.contains(needle), "`{needle}` missing: {tail}");
+        }
+        let all = stopped_short_note(false, &old, None).expect("an old daemon is told why");
+        assert!(
+            all.contains("byte 612 of the 918000") && all.contains("GH #195"),
+            "{all}"
+        );
+
+        let tail = stopped_short_note(false, &current, Some(3)).expect("a tail that stopped short");
+        assert!(tail.contains("the last 3 before byte 612"), "{tail}");
+        assert!(
+            !tail.contains("GH #195"),
+            "a current daemon reads past it: {tail}"
+        );
+        assert!(stopped_short_note(false, &current, None).is_none());
+
+        let raw = stopped_short_note(true, &old, Some(3)).expect("a tail that stopped short");
+        assert!(
+            !raw.contains("GH #195"),
+            "`--raw` has no holdback to freeze: {raw}"
+        );
+
+        let reached = Drained::default();
+        assert!(stopped_short_note(false, &reached, Some(3)).is_none());
+        assert!(stopped_short_note(false, &reached, None).is_none());
     }
 
     /// **A holdback that made progress is read past** — the review of GH
@@ -4484,6 +4613,7 @@ mod tests {
             seen.held.is_none(),
             "a holdback the drain read past withheld nothing, and the note would say it did"
         );
+        assert!(seen.stopped.is_none(), "it reached the head");
         daemon.abort();
     }
 
