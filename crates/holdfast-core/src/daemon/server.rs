@@ -2462,13 +2462,16 @@ impl Drop for CallRegistration {
 /// long as the MCP client that launched it, so the advice is to restart
 /// that client — and, for the one case a restart does not cure, to look
 /// at what the client is configured to run: an install that added the
-/// plugin beside an older hand-written `holdfast mcp` entry relaunches
-/// the older binary on every restart.
+/// plugin beside an older hand-written `holdfast mcp` entry, or a plugin
+/// not yet updated past the installed binary, relaunches the older binary
+/// on every restart.
 ///
 /// **What still works, and why each was kept.** A `profile` session
 /// never takes a client's context (GH #55), so it means the same from
 /// either peer and is served; the caller of [`dispatch_tool`] checks
-/// that. Every other tool is served too — none reads the context, and
+/// that. The message does not offer it: an agent stuck on this refusal
+/// would read it as a way round it and start an operator's profile, with
+/// whatever bindings it carries, for unrelated work. Every other tool is served too — none reads the context, and
 /// since GH #219 an argument an older shim passes on that this daemon
 /// does not know is refused by name. No other pre-1.5 caller of
 /// `start_session` exists: the CLI never sends it and the UI bridge is
@@ -2493,9 +2496,8 @@ fn older_peer_start_refusal(id: u64, peer: Peer) -> Response {
              project's. Ask the user to restart the MCP client (Claude Code: restart it) so \
              that it runs the installed holdfast, then retry. If this comes back after the \
              restart, the MCP client's configuration runs an older holdfast than the one \
-             installed — an entry added by hand, for instance — and that entry needs updating \
-             or removing. Sessions already running are unaffected, and a `profile` session can \
-             still be started.",
+             installed: a Holdfast plugin not yet updated, or an `mcp` entry added by hand, \
+             needs updating or removing. Sessions already running are unaffected.",
             peer.minor
         ),
         ClientKind::Cli | ClientKind::UiBridge => format!(

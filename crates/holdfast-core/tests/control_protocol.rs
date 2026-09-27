@@ -3284,7 +3284,7 @@ async fn a_peer_older_than_the_launch_context_is_told_to_restart_rather_than_ser
             // What a refusal that survives the restart means: the client
             // is configured to run an older binary than the one installed.
             "configuration runs an older holdfast",
-            "profile",
+            "plugin not yet updated",
         ] {
             assert!(
                 e.message.contains(needle),
