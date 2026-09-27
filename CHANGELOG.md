@@ -143,9 +143,9 @@ session), then restart Claude Code. Until both, each side refuses a
   longer prints an error into it or, under `set -e`, ends it at start-up.
 - `start_session` for a program that is not installed says it was not found
   on PATH; the message used to stop at `because:`.
-- Tool descriptions and schemas no longer cite spec sections or say history
-  decodes non-ASCII as Latin-1; `get_command_history` says how bash, zsh and
-  fish record a command wider than the terminal ([#270], [#276]).
+- Most tool descriptions and schemas no longer cite spec sections or name
+  internal functions, and `get_command_history`'s says how bash, zsh and fish
+  record a command wider than the terminal ([#276]).
 
 ### Known limitations
 
