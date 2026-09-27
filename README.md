@@ -249,13 +249,12 @@ history file your rc names as they start, and the snippet then empties
 that list, so the agent cannot list your history with `history` or recall
 it with up-arrow. A bash or zsh started inside the session loads its rc's
 file again. A readonly `HISTFILE` leaves the list as your rc loaded it,
-and so does a bash rc that runs `history -w` from `PROMPT_COMMAND`, a
-function or a trap, or a zsh rc that turns off `append_history`,
-`inc_append_history` and `share_history`, because emptying it would let a
-later save replace your file. Nothing empties it with
-`shell_integration: false`, or under an rc that takes the integration
-line. A fish started inside a fish session reads the file its config.fish
-names.
+and so does a bash rc whose prompt or traps run `history -w`, or a zsh
+rc that turns off `append_history`, `inc_append_history` and
+`share_history`, because emptying it would let a later save replace your
+file. Nothing empties it with `shell_integration: false`, or under an rc
+that takes the integration line. A fish started inside a fish session
+reads the file its config.fish names.
 
 If your rc's `PROMPT_COMMAND` re-reads the history file at every prompt
 (`history -a; history -c; history -r`), `HISTFILE=/dev/null` also empties

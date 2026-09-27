@@ -702,13 +702,13 @@ mechanisms prevent it:
   It then empties the history the shell has already read from the file
   the rc names (GH #274; see H10), and reads back only a file the
   session's own `HISTFILE` names. It leaves that list whole where the
-  shell rewrites its file from the list: a bash whose rc runs `history
-  -w` from `PROMPT_COMMAND`, a function or a trap, and a zsh whose rc
-  turns off `append_history`, `inc_append_history` and `share_history`.
-  After the agent sources such an rc again, an emptied list would replace
-  the operator's file with the session's commands. When `HISTFILE` is
-  readonly, or in zsh `SAVEHIST` or `HISTSIZE`, it leaves the history
-  variables and the list alone (see H1).
+  shell rewrites its file from the list: a bash whose prompt or traps run
+  `history -w`, and a zsh whose rc turns off `append_history`,
+  `inc_append_history` and `share_history`. After the agent sources such
+  an rc again, an emptied list would replace the operator's file with the
+  session's commands. When `HISTFILE` is readonly, or in zsh `SAVEHIST`
+  or `HISTSIZE`, it leaves the history variables and the list alone (see
+  H1).
   In zsh it also sets `SAVEHIST=0` and unsets `hist_save_by_copy`. With
   `SAVEHIST` set by an rc, zsh saves at exit and locks first by creating
   `/dev/null.LOCK`. As any user but root that fails, and *zsh: locking
@@ -790,14 +790,33 @@ and Python 3.12.
   session's commands: none of the operator's entries survived, and the
   `history -n; history -w; history -c; history -r` sync recipe lost the
   first ones in `per_session` mode. The snippet therefore leaves such a
-  bash's list whole when the rc runs `history -w` from `PROMPT_COMMAND`,
-  a function or a trap, and the operator's file keeps every entry
-  (measured, bash 5.2 and 5.3, both modes, by `exit` and by hangup). A
-  `history -w` that exists only once the rc is sourced again is not seen
-  and still rewrites the file from the emptied list, losing every entry
-  (measured the same way). bash's own save at exit appends. zsh's
-  equivalent, an rc that saves by rewriting its history file, is left
-  whole for the same reason (H10).
+  bash's list whole. It finds `history -w` by following
+  `PROMPT_COMMAND`, bash-preexec's `precmd_functions` and the traps
+  through the aliases and functions they name, so the `historymerge`
+  function and its `EXIT` trap are found, and a function nothing at the
+  prompt calls, such as fzf's history-deletion key binding, is not. The
+  operator's file then keeps every entry (measured, bash 5.2 and 5.3,
+  both modes, by `exit` and by hangup, under `history -w` alone, the sync
+  recipe, `historymerge`, an `EXIT` trap and an alias). What still loses
+  entries:
+  - a `history -w` that exists only once the rc is sourced again, or is
+    reached only through a variable or a hook array other than
+    `precmd_functions`, rewrites the file from the emptied list and
+    loses every entry;
+  - on bash 4.3 and older, whose `history -n` counts the lines already
+    in the list rather than those read from the file, the sync recipe
+    sourced again in `none` mode after another command loses the
+    operator's oldest entry, as it did before the snippet emptied
+    anything (measured, bash 3.2.57, macOS's `/bin/bash`; 4.2 and 4.3 by
+    their source). Sourced as the session's first command it loses
+    nothing, because in `none` mode the snippet empties the list when the
+    prompt's own path runs `history -c`; keeping it lost every entry;
+  - bash's own save at exit appends, unless the session has run more
+    commands than `HISTSIZE` holds, when it rewrites the file from the
+    list with or without the emptying.
+
+  zsh's equivalent, an rc that saves by rewriting its history file, is
+  left whole for the same reason (H10).
 - **H2. A zsh started inside a session, or by `exec zsh`, under an rc that
   sets `HISTFILE` unconditionally.** macOS's `/etc/zshrc` sets one for
   every zsh, so on a Mac any nested or exec'd zsh writes `~/.zsh_history`,
@@ -887,14 +906,14 @@ and Python 3.12.
     list, so after `source ~/.zshrc` an emptied list replaced the
     operator's file with the session's commands (measured, zsh 5.9), and
     the snippet leaves its list whole instead;
-  - a bash whose rc runs `history -w` from `PROMPT_COMMAND`, a function
-    or a trap, for the same reason (H1). Its list also keeps the line
-    Holdfast typed to install the snippet, unless `HISTCONTROL` ignores a
-    leading space. In `per_session` mode the rc's `history -w` rewrites
-    the session's file from that list, so the file holds the operator's
+  - a bash whose prompt or traps run `history -w`, for the same reason
+    (H1), except in `none` mode where the prompt also runs `history -c`
+    and so empties the list itself. Its list also keeps the line Holdfast
+    typed to install the snippet, unless `HISTCONTROL` ignores a leading
+    space. In `per_session` mode a prompt's `history -w` rewrites the
+    session's file from that list, so the file holds the operator's
     entries and that line as well as the agent's commands (measured, bash
-    5.2 and 5.3). A function that merely contains `history -w`, called
-    from nowhere, keeps the list the same way;
+    5.2 and 5.3);
   - a session whose `HISTFILE` is readonly, or in zsh whose `SAVEHIST` or
     `HISTSIZE` is (H1), a session with `shell_integration: false`, a bash
     the snippet's carrier does not reach, and a session whose rc reads the
