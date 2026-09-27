@@ -185,14 +185,25 @@ impl ShimServer {
         if !lost_the_daemon(err) {
             return None;
         }
+        Some(self.replace(failed, respawn).await)
+    }
+
+    /// [`Self::reconnect`]'s work, for a caller that already knows
+    /// `failed` no longer describes the daemon answering — a lost one, or
+    /// [`Self::recheck`]'s daemon that answered under another pid.
+    async fn replace(
+        &self,
+        failed: &Connected,
+        respawn: &Respawn,
+    ) -> Result<Reconnected, ClientError> {
         let _one_at_a_time = self.link.reconnecting.lock().await;
         let now = self.connected();
         if now.generation != failed.generation {
             // Another call reconnected while this one waited for the lock.
-            return Some(Ok(Reconnected {
+            return Ok(Reconnected {
                 client: now.client,
                 restarted: self.link.restarted_at.load(Ordering::SeqCst) > failed.generation,
-            }));
+            });
         }
         // **A daemon that has just died can still be accepting.** Measured
         // with `SIGKILL`: the shim sees its own connection close before
@@ -218,7 +229,7 @@ impl ShimServer {
                 Err(e) if a_closing_listener(&e) && std::time::Instant::now() < settle => {
                     tokio::time::sleep(RECONNECT_POLL).await;
                 }
-                Err(e) => return Some(Err(e)),
+                Err(e) => return Err(e),
             }
         };
         let daemon_pid = crate::daemon::server::read_pid_file(&respawn.paths);
@@ -232,7 +243,7 @@ impl ShimServer {
         if restarted {
             self.link.restarted_at.store(generation, Ordering::SeqCst);
         }
-        Some(Ok(Reconnected { client, restarted }))
+        Ok(Reconnected { client, restarted })
     }
 
     /// Whether the daemon a refusal was judged against is still the one
@@ -245,28 +256,54 @@ impl ShimServer {
     /// the minor of a daemon that no longer exists, and so would every
     /// call after it. So a refusal costs one `daemon/status` round trip,
     /// which every daemon answers. `Ok(None)` is the same daemon, still
-    /// there, and the refusal stands. A daemon that has gone is replaced
-    /// through [`Self::reconnect`], the GH #231 path, and
-    /// `Ok(Some((connection, restarted)))` is the connection to ask again.
+    /// there, and the refusal stands. Otherwise the connection is
+    /// replaced through the GH #231 path and `Ok(Some(..))` is the one to
+    /// ask again, with whether the daemon it reaches is a different one.
+    ///
+    /// **"Still there" is the pid it answers with, not merely an answer.**
+    /// The probe travels on a parked connection when there is one, and a
+    /// parked connection to a daemon that has gone fails, which is the
+    /// ordinary case. With none parked — every one out on a concurrent
+    /// call, or closed by an error — the pool dials afresh and handshakes
+    /// with whatever daemon is listening now, without comparing its minor
+    /// to the one this verdict read; that daemon answers, and an answer
+    /// alone would keep a refusal about its predecessor for every call
+    /// after. `daemon/status` has carried the daemon's `pid` since 1.0,
+    /// and the connection recorded the pid file's when it was made, so a
+    /// mismatch — or either being unknown — is a daemon this verdict is
+    /// not about, and it is asked again on a connection of its own.
     ///
     /// A shim that does not respawn has nothing to replace its daemon
     /// with, so it believes the refusal outright.
-    async fn recheck(&self, seen: &Connected) -> Result<Option<(Connected, bool)>, ErrorData> {
-        if self.link.respawn.is_none() {
+    async fn recheck(&self, seen: &Connected) -> Result<Option<Reconnected>, ErrorData> {
+        let Some(respawn) = self.link.respawn.as_ref() else {
             return Ok(None);
-        }
+        };
         let probe = seen
             .client
             .call_raw(method::METHOD_DAEMON_STATUS, CborValue::Map(Vec::new()))
             .await;
-        let Err(e) = probe else {
-            return Ok(None);
+        let answered = match probe {
+            Ok(resp) => resp,
+            Err(e) => {
+                return match self.reconnect(seen, &e).await {
+                    None => Err(map_client_error(e)),
+                    Some(Err(spawn)) => Err(respawn_failed(&e, spawn)),
+                    Some(Ok(fresh)) => Ok(Some(fresh)),
+                };
+            }
         };
-        match self.reconnect(seen, &e).await {
-            None => Err(map_client_error(e)),
-            Some(Err(spawn)) => Err(respawn_failed(&e, spawn)),
-            Some(Ok(fresh)) => Ok(Some((self.connected(), fresh.restarted))),
+        let pid = method::from_cbor::<Value>(&answered.data)
+            .ok()
+            .and_then(|d| d["pid"].as_u64())
+            .and_then(|p| u32::try_from(p).ok());
+        if pid.is_some() && pid == seen.daemon_pid {
+            return Ok(None);
         }
+        self.replace(seen, respawn)
+            .await
+            .map(Some)
+            .map_err(map_client_error)
     }
 
     /// One tool round trip on `client`, racing `cancelled` as GH #127
@@ -366,10 +403,11 @@ impl ShimServer {
         if let Err(refusal) = admit(&first.client, tool, &arguments) {
             match self.recheck(&first).await? {
                 None => return Err(refusal),
-                Some((fresh, restarted)) => {
-                    admit(&fresh.client, tool, &arguments)?;
-                    first = fresh;
-                    replaced_for_gate = restarted;
+                Some(fresh) => {
+                    first = self.connected();
+                    admit(&first.client, tool, &arguments)
+                        .map_err(|e| after_restart(e, fresh.restarted))?;
+                    replaced_for_gate = fresh.restarted;
                 }
             }
         }
@@ -422,7 +460,8 @@ impl ShimServer {
                     // Whichever daemon answered is asked the same
                     // question the first was: `ensure_daemon` connects to
                     // one already running before it starts its own.
-                    admit(&fresh.client, tool, &arguments)?;
+                    admit(&fresh.client, tool, &arguments)
+                        .map_err(|e| after_restart(e, fresh.restarted))?;
                     let resp = Self::round_trip(
                         &fresh.client,
                         &method_name,
@@ -440,11 +479,7 @@ impl ShimServer {
         };
 
         if let Some(e) = resp.control_error() {
-            let mut err = rebuild_tool_error(e);
-            if restarted {
-                err.message = format!("{DAEMON_RESTARTED} {}", err.message).into();
-            }
-            return Err(err);
+            return Err(after_restart(rebuild_tool_error(e), restarted));
         }
 
         let data: Value = method::from_cbor(&resp.data)
@@ -822,6 +857,17 @@ fn too_old(e: ClientError) -> ErrorData {
         None => message,
     };
     ErrorData::internal_error(message, Some(data))
+}
+
+/// `err`, led by [`DAEMON_RESTARTED`] when the call met a different
+/// daemon than the one this shim had — which the agent needs first,
+/// whatever went wrong next: the previous daemon's sessions are gone,
+/// and a refusal of this call does not bring them back.
+fn after_restart(mut err: ErrorData, restarted: bool) -> ErrorData {
+    if restarted {
+        err.message = format!("{DAEMON_RESTARTED} {}", err.message).into();
+    }
+    err
 }
 
 /// Whether a failed round trip means the daemon is gone: "nobody is
@@ -2355,6 +2401,7 @@ mod tests {
         assert_eq!(err.code, rmcp::model::ErrorCode::INTERNAL_ERROR, "{err:?}");
         let data = err.data.clone().expect("the reason is structured");
         assert_eq!(data["reason"], "daemon_too_old", "{data}");
+        assert_eq!(data["daemon_version"], "0.0.7", "{data}");
         assert_eq!(data["daemon_protocol"], "1.1", "{data}");
         assert_eq!(
             data["required_protocol"],
@@ -2372,6 +2419,23 @@ mod tests {
         assert!(
             received.try_recv().is_err(),
             "the refused call reached the daemon anyway"
+        );
+
+        // `profile: null` is no profile — MCP clients that fill every
+        // optional field send it — so this takes the context too, and is
+        // refused. Sent, it is GH #229 again.
+        let err = shim
+            .forward(
+                "start_session",
+                args(json!({ "command": "bash", "profile": null })),
+                std::future::pending(),
+            )
+            .await
+            .expect_err("`profile: null` names no profile");
+        assert_eq!(err.data.clone().unwrap()["reason"], "daemon_too_old");
+        assert!(
+            received.try_recv().is_err(),
+            "a `profile: null` call reached the daemon anyway"
         );
 
         // A profile session never takes the context, so it goes.
@@ -2523,6 +2587,228 @@ mod tests {
             .recv()
             .await
             .expect("a 1.5 daemon is trusted to refuse it");
+    }
+
+    /// A stand-in whose `n`th connection declares the minor of
+    /// `conns[n]` (the last entry for every later one) and, when that
+    /// entry says so, hangs up straight after the handshake. It answers
+    /// `daemon/status` with `pid` and every other request `ok`, recording
+    /// each — so a row can play a daemon being replaced under a live shim.
+    fn daemon_by_connection(
+        sock: PathBuf,
+        conns: &'static [(u32, bool)],
+        pid: u32,
+    ) -> tokio::sync::mpsc::UnboundedReceiver<Request> {
+        let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+        let listener = tokio::net::UnixListener::bind(&sock).unwrap();
+        tokio::spawn(async move {
+            for n in 0.. {
+                let Ok((mut stream, _)) = listener.accept().await else {
+                    return;
+                };
+                let (minor, hang_up) = conns[n.min(conns.len() - 1)];
+                let tx = tx.clone();
+                tokio::spawn(async move {
+                    let Ok(hs) = frame::read_frame::<_, Request>(&mut stream).await else {
+                        return;
+                    };
+                    let data = HandshakeData {
+                        protocol_major: handshake::PROTOCOL_MAJOR,
+                        protocol_minor: minor,
+                        daemon_version: format!("minor-{minor}"),
+                        build: "stand-in".into(),
+                        accepted: true,
+                        reject_reason: None,
+                    };
+                    let resp = Response::ok(hs.id, &data, "handshake accepted").unwrap();
+                    frame::write_frame(&mut stream, &resp).await.unwrap();
+                    if hang_up {
+                        return;
+                    }
+                    while let Ok(req) = frame::read_frame::<_, Request>(&mut stream).await {
+                        let data = if req.method == method::METHOD_DAEMON_STATUS {
+                            json!({ "pid": pid })
+                        } else {
+                            json!({})
+                        };
+                        let resp = Response::ok(req.id, &data, "served").unwrap();
+                        let _ = tx.send(req);
+                        if frame::write_frame(&mut stream, &resp).await.is_err() {
+                            return;
+                        }
+                    }
+                });
+            }
+        });
+        rx
+    }
+
+    /// The methods `received` holds by now, in order.
+    fn methods(received: &mut tokio::sync::mpsc::UnboundedReceiver<Request>) -> Vec<String> {
+        std::iter::from_fn(|| received.try_recv().ok())
+            .map(|r| r.method)
+            .collect()
+    }
+
+    /// A respawning shim over [`daemon_by_connection`], its pid file
+    /// saying `recorded` when the shim is built — the pid its first
+    /// connection is taken to belong to.
+    async fn respawning_shim_over(
+        tag: &str,
+        conns: &'static [(u32, bool)],
+        recorded: u32,
+        answers: u32,
+    ) -> (
+        ShimServer,
+        tokio::sync::mpsc::UnboundedReceiver<Request>,
+        RuntimePaths,
+        Scoped,
+    ) {
+        let dir = scratch_dir(tag);
+        let paths = RuntimePaths::with_dir(&dir);
+        paths.ensure_dir().unwrap();
+        std::fs::write(paths.pid_file(), format!("{recorded}\n")).unwrap();
+        let received = daemon_by_connection(paths.control_sock(), conns, answers);
+        let client = ControlClient::connect(&paths.control_sock(), ClientKind::Shim)
+            .await
+            .expect("the stand-in is bound before it is dialled");
+        // Never run: a stand-in is listening, so `ensure_daemon` connects.
+        let exe = PathBuf::from("/nonexistent/holdfast");
+        let shim = ShimServer::with_respawn(Arc::new(client), paths.clone(), exe);
+        (shim, received, paths, Scoped(dir))
+    }
+
+    /// **A refusal about a daemon that has been replaced is not kept** —
+    /// even when the check that should notice reaches the replacement
+    /// and is answered. A probe that finds no parked connection dials
+    /// afresh, and the pool does not compare the new daemon's minor with
+    /// the one the refusal read; were an answer enough, the shim would
+    /// refuse `start_session` to a daemon of its own build until its MCP
+    /// client restarted. So the answering pid is compared with the one
+    /// this connection recorded.
+    ///
+    /// Here the first connection declares 1.1 and every later one this
+    /// build's minor, and the check is answered under pid 222 where the
+    /// connection recorded 111: the shim reconnects, admits the call on
+    /// the new daemon's minor, sends it — and says the previous daemon's
+    /// sessions are gone. The pairing is the same daemon answering under
+    /// the recorded pid, whose refusal stands.
+    #[tokio::test]
+    async fn a_refusal_is_reconsidered_when_the_daemon_answering_is_not_the_one_judged() {
+        const REPLACED: &[(u32, bool)] = &[(1, false), (handshake::PROTOCOL_MINOR, false)];
+        let (shim, mut received, paths, _dir) =
+            respawning_shim_over("pidmove", REPLACED, 111, 222).await;
+        std::fs::write(paths.pid_file(), "222\n").unwrap();
+        let result = shim
+            .forward(
+                "start_session",
+                args(json!({ "command": "bash" })),
+                std::future::pending(),
+            )
+            .await
+            .expect("the daemon answering now takes the launch context");
+        let body = result.structured_content.expect("an envelope");
+        assert!(
+            body["details"]
+                .as_str()
+                .is_some_and(|d| d.starts_with(DAEMON_RESTARTED)),
+            "the previous daemon's sessions are gone and the agent is not told: {body}"
+        );
+        let sent = methods(&mut received);
+        assert!(
+            sent.iter().any(|m| m == "tool/start_session"),
+            "a refusal about the old daemon was kept for its replacement: {sent:?}"
+        );
+
+        // Replaced by another old daemon — an old binary's `daemon start`
+        // after the stop — and the call is judged again on that one, and
+        // refused, saying the first one's sessions are gone.
+        const OLD_AGAIN: &[(u32, bool)] = &[(1, false)];
+        let (shim, mut received, paths, _dir) =
+            respawning_shim_over("pidold", OLD_AGAIN, 111, 222).await;
+        std::fs::write(paths.pid_file(), "222\n").unwrap();
+        let err = shim
+            .forward(
+                "start_session",
+                args(json!({ "command": "bash" })),
+                std::future::pending(),
+            )
+            .await
+            .expect_err("the replacement is as old as the daemon it replaced");
+        assert_eq!(err.data.clone().unwrap()["reason"], "daemon_too_old");
+        assert!(err.message.starts_with(DAEMON_RESTARTED), "{}", err.message);
+        let sent = methods(&mut received);
+        assert!(
+            !sent.iter().any(|m| m == "tool/start_session"),
+            "the call went to a replacement too old for it: {sent:?}"
+        );
+
+        const SAME: &[(u32, bool)] = &[(1, false)];
+        let (shim, mut received, _paths, _dir) =
+            respawning_shim_over("pidsame", SAME, 111, 111).await;
+        let err = shim
+            .forward(
+                "start_session",
+                args(json!({ "command": "bash" })),
+                std::future::pending(),
+            )
+            .await
+            .expect_err("the daemon that was judged is still the one answering");
+        assert_eq!(err.data.clone().unwrap()["reason"], "daemon_too_old");
+        assert!(
+            !err.message.contains(DAEMON_RESTARTED),
+            "the same daemon was reported restarted: {}",
+            err.message
+        );
+        let sent = methods(&mut received);
+        assert!(
+            sent.iter().any(|m| m == method::METHOD_DAEMON_STATUS)
+                && !sent.iter().any(|m| m == "tool/start_session"),
+            "{sent:?}"
+        );
+    }
+
+    /// **A call re-sent after its daemon was lost is admitted again, by
+    /// the daemon it is re-sent to** (GH #231's path). Whatever answers
+    /// the reconnection may be older than the daemon the call was judged
+    /// against — `ensure_daemon` joins a daemon already running before it
+    /// starts one, and an old binary's `holdfast daemon start` makes one.
+    ///
+    /// The first connection is this build's minor and hangs up after the
+    /// handshake, so the call's write meets a closed connection and is
+    /// provably unsent; every later connection declares 1.1. The re-send
+    /// is refused, unsent, and says the first daemon's sessions are gone.
+    #[tokio::test]
+    async fn a_call_resent_after_a_lost_daemon_is_admitted_by_the_daemon_it_is_resent_to() {
+        const LOST_TO_AN_OLDER: &[(u32, bool)] = &[(handshake::PROTOCOL_MINOR, true), (1, false)];
+        let (shim, mut received, paths, _dir) =
+            respawning_shim_over("resend", LOST_TO_AN_OLDER, 111, 222).await;
+        std::fs::write(paths.pid_file(), "222\n").unwrap();
+        // Long enough for the hang-up to land, so the write is refused.
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        let err = shim
+            .forward(
+                "start_session",
+                args(json!({ "command": "bash" })),
+                std::future::pending(),
+            )
+            .await
+            .expect_err("the daemon it was re-sent to is too old for it");
+        assert_eq!(
+            err.data.clone().unwrap()["reason"],
+            "daemon_too_old",
+            "{err:?}"
+        );
+        assert!(
+            err.message.starts_with(DAEMON_RESTARTED),
+            "the lost daemon's sessions are gone and the agent is not told: {}",
+            err.message
+        );
+        let sent = methods(&mut received);
+        assert!(
+            !sent.iter().any(|m| m == "tool/start_session"),
+            "the re-sent call reached a daemon that drops its launch context: {sent:?}"
+        );
     }
 
     /// Every row of [`ARGUMENTS_BEFORE_CLOSED`] names an argument this

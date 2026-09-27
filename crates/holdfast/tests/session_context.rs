@@ -867,6 +867,10 @@ fn a_listener_that_is_still_closing_is_waited_out_rather_than_reported() {
 struct OldDaemon {
     rt: Option<tokio::runtime::Runtime>,
     sock: PathBuf,
+    pid_file: PathBuf,
+    /// The stand-in daemon process, until `daemon/stop` or [`Self::stop`]
+    /// ends it.
+    process: std::sync::Arc<std::sync::Mutex<Option<Child>>>,
     tools: std::sync::Arc<std::sync::Mutex<Vec<String>>>,
 }
 
@@ -885,10 +889,19 @@ impl OldDaemon {
         let process = std::sync::Arc::new(std::sync::Mutex::new(Some(
             Command::new("sleep")
                 .arg("60")
+                .stdin(Stdio::null())
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
                 .spawn()
                 .expect("spawn sleep"),
         )));
+        let held = std::sync::Arc::clone(&process);
         let pid = process.lock().unwrap().as_ref().unwrap().id();
+        // As a daemon does, and what a shim records its daemon by: a
+        // check that finds another pid answering is a daemon it has not
+        // judged.
+        std::fs::write(paths.pid_file(), format!("{pid}\n")).expect("the pid file");
+        let pid_file = paths.pid_file();
         let tools = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
         let rt = tokio::runtime::Builder::new_multi_thread()
             .worker_threads(1)
@@ -944,6 +957,8 @@ impl OldDaemon {
         Self {
             rt: Some(rt),
             sock,
+            pid_file,
+            process: held,
             tools,
         }
     }
@@ -952,11 +967,16 @@ impl OldDaemon {
         self.tools.lock().unwrap().clone()
     }
 
-    /// Gone, as a daemon that exited is: every connection closed and the
-    /// socket file removed.
+    /// Gone, as a daemon that exited is: every connection closed, and the
+    /// socket and pid files removed.
     fn stop(&mut self) {
         if let Some(rt) = self.rt.take() {
             rt.shutdown_background();
+            let _ = std::fs::remove_file(&self.pid_file);
+        }
+        if let Some(mut p) = self.process.lock().unwrap().take() {
+            let _ = p.kill();
+            let _ = p.wait();
         }
         let _ = std::fs::remove_file(&self.sock);
     }
@@ -981,10 +1001,14 @@ impl Drop for OldDaemon {
 ///    forwarded;
 /// 3. `holdfast daemon status` and `holdfast daemon stop` both work
 ///    against it, and status says what the refusal was about;
-/// 4. once it is gone, the **same** shim's next `start_session` starts a
-///    daemon of its own build and a session in its client's project,
-///    saying the old sessions are gone — rather than being refused again
-///    by the minor of a daemon that no longer exists.
+/// 4. an old binary's `holdfast daemon start` — a `cargo install` still
+///    on `PATH` beside the plugin — puts another 1.1 daemon in its place,
+///    and the same shim judges the call again on that one: refused, never
+///    sent, and saying the first daemon's sessions are gone;
+/// 5. once that is gone too, the **same** shim's next `start_session`
+///    starts a daemon of its own build and a session in its client's
+///    project, saying the old sessions are gone — rather than being
+///    refused again by the minor of a daemon that no longer exists.
 #[test]
 fn a_shim_on_an_older_daemon_refuses_start_session_until_the_daemon_is_restarted() {
     let inst = Instance::new("skew");
@@ -1008,6 +1032,10 @@ fn a_shim_on_an_older_daemon_refuses_start_session_until_the_daemon_is_restarted
         assert!(message.contains(needle), "`{needle}` missing: {message}");
     }
     assert!(
+        !message.contains("The Holdfast daemon had stopped"),
+        "the daemon that was judged is still running, and was reported gone: {message}"
+    );
+    assert!(
         !old.tools().iter().any(|t| t == "tool/start_session"),
         "the refused call reached the old daemon: {:?}",
         old.tools()
@@ -1030,6 +1058,27 @@ fn a_shim_on_an_older_daemon_refuses_start_session_until_the_daemon_is_restarted
         "`holdfast daemon stop` must work on the daemon it is advised for: {err}"
     );
     old.stop();
+
+    let mut again = OldDaemon::start(&inst);
+    let refused = shim.call(
+        "start_session",
+        json!({ "command": "/bin/sh", "args": ["-c", "sleep 30"] }),
+    );
+    assert_eq!(
+        refused["error"]["data"]["reason"], "daemon_too_old",
+        "a call judged against the first old daemon was sent to its old replacement: {refused}"
+    );
+    let message = refused["error"]["message"].as_str().unwrap_or_default();
+    assert!(
+        message.starts_with("The Holdfast daemon had stopped"),
+        "the first daemon's sessions are gone and the refusal does not say so: {message}"
+    );
+    assert!(
+        !again.tools().iter().any(|t| t == "tool/start_session"),
+        "the call reached a daemon that drops its launch context: {:?}",
+        again.tools()
+    );
+    again.stop();
 
     let started = shim.call(
         "start_session",

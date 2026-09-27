@@ -3253,11 +3253,14 @@ async fn a_peer_older_than_the_launch_context_is_told_to_restart_rather_than_ser
     });
     let forged = json!({ "command": "sh", "args": ["-c", "sleep 30"], CLIENT_PARAM: context });
     let plain = json!({ "command": "sh", "args": ["-c", "sleep 30"] });
+    // No profile, spelt the way MCP clients that fill every optional field
+    // spell it: the context is taken, so the refusal applies.
+    let nulled = json!({ "command": "sh", "args": ["-c", "sleep 30"], "profile": null });
 
     // ---- a peer older than the key: refused, with or without it.
     let older = handshake::LAUNCH_CONTEXT_MINOR - 1;
     let mut old = peer(&d, older).await;
-    for (id, args) in [(1, &forged), (2, &plain)] {
+    for (id, args) in [(1, &forged), (2, &plain), (30, &nulled)] {
         let resp = call(&mut old, id, "tool/start_session", args).await;
         let e = resp.control_error().unwrap_or_else(|| {
             panic!(
