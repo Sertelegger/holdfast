@@ -49,13 +49,26 @@ workdir="$(cd "$workdir" && pwd)"
 old_tree="$workdir/old-tree"
 old_target="$workdir/old-target"
 iso="$workdir/iso"
+# Every daemon this run starts lives here, and only here. Spelt out on
+# each command that stops one rather than inherited, because the builds
+# below run with the caller's own HOME (cargo's registry is under it) and
+# an exit during them -- a mistyped tag, a failed build, Ctrl-C -- runs
+# `cleanup` with that environment still in force.
+iso_env=(HOME="$iso/home" XDG_CONFIG_HOME="$iso/cfg" XDG_DATA_HOME="$iso/data"
+  XDG_STATE_HOME="$iso/state" XDG_RUNTIME_DIR="$iso/run" HOLDFAST_RUNTIME_DIR="$iso/hf")
+isolated=0
 
 cleanup() {
-  # Stop whatever this run started, under the same isolated environment,
-  # with both binaries: either may be the one a daemon was started from.
-  for b in "${new_bin:-}" "${old_bin:-}"; do
-    [ -n "$b" ] && [ -x "$b" ] && "$b" daemon stop --force >/dev/null 2>&1
-  done
+  # Stop whatever this run started, with both binaries: either may be the
+  # one a daemon was started from. Only once isolated, since no daemon is
+  # started before, and never under the caller's environment: a `daemon
+  # stop --force` there ends the caller's real daemon and every session
+  # in it.
+  if [ "$isolated" = 1 ]; then
+    for b in "${new_bin:-}" "${old_bin:-}"; do
+      [ -n "$b" ] && [ -x "$b" ] && env "${iso_env[@]}" "$b" daemon stop --force >/dev/null 2>&1
+    done
+  fi
   git -C "$repo" worktree remove --force "$old_tree" >/dev/null 2>&1
   rm -rf -- "$old_target"
   if [ "$own_workdir" = 1 ]; then
@@ -84,9 +97,8 @@ old_bin="$old_target/debug/holdfast"
 # ------------------------------------------------------------- isolation
 mkdir -p "$iso"/{home,cfg,data,state,run,hf,daemon-cwd,client-cwd}
 chmod 700 "$iso/run" "$iso/hf"
-export HOME="$iso/home" XDG_CONFIG_HOME="$iso/cfg" XDG_DATA_HOME="$iso/data"
-export XDG_STATE_HOME="$iso/state" XDG_RUNTIME_DIR="$iso/run"
-export HOLDFAST_RUNTIME_DIR="$iso/hf"
+export "${iso_env[@]}"
+isolated=1
 unset HF_PROBE
 daemon_cwd="$iso/daemon-cwd"
 client_cwd="$iso/client-cwd"
