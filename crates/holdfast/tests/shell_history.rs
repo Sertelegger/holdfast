@@ -1015,15 +1015,34 @@ const ZSH_OPERATOR_HISTORY: &str = ": 1700000000:0;echo OPERATORS_OWN_HISTORY_1\
 /// Shells whose rc names a history file the operator has already filled.
 /// bash and zsh read it as they start, before the snippet runs (GH #274).
 /// One bash rc appends to its file from `PROMPT_COMMAND`, which does not
-/// rewrite it: the snippet empties the list there too, and under an rc
-/// that runs `history -w` it does not (see [`BASH_REWRITING_RCS`]).
-const OPERATOR_HISTORY: [Case; 3] = [
+/// rewrite it, and one defines a function that runs `history -w` and that
+/// nothing at a prompt calls, as fzf's key bindings do: the snippet
+/// empties the list under both, and under an rc whose prompt or traps run
+/// `history -w` it does not (see [`BASH_REWRITING_RCS`]).
+const OPERATOR_HISTORY: [Case; 4] = [
     Case {
         name: "bash-operator-history",
         command: "bash",
         args: &[],
         files: &[
             (".bashrc", "HISTFILE=~/.bash_history\n"),
+            (".bash_history", BASH_OPERATOR_HISTORY),
+        ],
+        integration: true,
+        before: &[],
+        hung_up: true,
+        needs: "bash",
+    },
+    Case {
+        name: "bash-operator-history-unused-rewriter",
+        command: "bash",
+        args: &[],
+        files: &[
+            (
+                ".bashrc",
+                "HISTFILE=~/.bash_history\n\
+                 __fzf_history_delete() { builtin history -d 1; builtin history -w; }\n",
+            ),
             (".bash_history", BASH_OPERATOR_HISTORY),
         ],
         integration: true,
@@ -1258,13 +1277,14 @@ fn a_zsh_rc_that_rewrites_its_history_file_keeps_the_operators_entries_when_sour
 }
 
 /// bash rc files that hard-set `HISTFILE` and rewrite it from the
-/// in-memory list: at every prompt, by `history -w` alone and by the sync
-/// recipe that first reads what other shells appended; by that recipe as
-/// the `historymerge` function and `EXIT` trap it is usually shared as,
-/// which the snippet finds in the function table; and at exit alone, by a
-/// trap. Limits above anything a row writes, so neither trims what it
-/// measures.
-const BASH_REWRITING_RCS: [Case; 4] = [
+/// in-memory list: at every prompt, by `history -w` alone, by the sync
+/// recipe that first reads what other shells appended, and by an alias
+/// `PROMPT_COMMAND` names; by that recipe as the `historymerge` function
+/// and `EXIT` trap it is usually shared as; and at exit alone, by a trap.
+/// The snippet follows `PROMPT_COMMAND` and the traps to each alias and
+/// function they reach. Limits above anything a row writes, so none trims
+/// what it measures.
+const BASH_REWRITING_RCS: [Case; 5] = [
     bash_rewriting(
         "bash-history-w-resourced",
         &[
@@ -1293,6 +1313,13 @@ const BASH_REWRITING_RCS: [Case; 4] = [
             (".bash_history", BASH_OPERATOR_HISTORY),
         ],
     ),
+    bash_rewriting(
+        "bash-history-w-alias-resourced",
+        &[
+            (".bashrc", BASH_HISTORY_W_ALIAS_RC),
+            (".bash_history", BASH_OPERATOR_HISTORY),
+        ],
+    ),
 ];
 
 const BASH_HISTORY_W_RC: &str = "HISTFILE=~/.bash_history\nHISTSIZE=1000\nHISTFILESIZE=2000\n\
@@ -1307,6 +1334,10 @@ const BASH_HISTORYMERGE_RC: &str = "HISTFILE=~/.bash_history\nHISTSIZE=1000\nHIS
 
 const BASH_EXIT_TRAP_RC: &str = "HISTFILE=~/.bash_history\nHISTSIZE=1000\nHISTFILESIZE=2000\n\
                                  trap 'history -w' EXIT\n";
+
+const BASH_HISTORY_W_ALIAS_RC: &str =
+    "HISTFILE=~/.bash_history\nHISTSIZE=1000\nHISTFILESIZE=2000\n\
+                                       alias hw='history -w'\nPROMPT_COMMAND=hw\n";
 
 /// A bash session under one of [`BASH_REWRITING_RCS`]'s rc files, which
 /// runs a command and then sources the rc again before its marker. The

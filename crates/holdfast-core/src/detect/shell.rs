@@ -356,26 +356,53 @@ const BASH_INTEGRATION: &str = concat!(
     // and `alias history='history 20'` made the per-command append fail at
     // every prompt, the session's file staying empty (measured, bash 5.2).
     //
-    // Not when the rc runs `history -w`: from `PROMPT_COMMAND`, read here
-    // as the rc left it with an array's elements joined, from a function,
-    // which is how the `historymerge` recipe reaches it, or from a trap,
-    // that recipe's `trap historymerge EXIT` included. A command
-    // substitution lists the shell's own traps (measured). `-w` writes the
-    // whole list over the file `HISTFILE` names, and once the agent runs
-    // `source ~/.bashrc`, an rc that hard-sets `HISTFILE` names the
-    // operator's file again: from an emptied list, `history -w` rewrote it
-    // with the session's commands alone, in either history mode, and the
-    // `history -n; history -w; history -c; history -r` sync recipe lost the
-    // operator's first entries in per_session mode (SECURITY.md, H1;
-    // measured, bash 5.2 and 5.3). Such a session keeps the list, and the
-    // line running this with it: the agent can read the operator's entries
-    // (H10), and in per_session mode the rc's `history -w` copies them into
-    // the session's file. `history -a` appends, and `history -a; history
-    // -c; history -r` reads back what `HISTFILE` names, so both still get
-    // the emptying. A pattern, for `builtin history -w`, a file argument
-    // and a tab; a function merely defined with one costs the session the
-    // emptying and nothing else, and one the rc defines only when sourced
-    // again is not seen. bash's own save at exit appends, unless the
+    // Not when the rc rewrites its history file with `history -w`, because
+    // then the list is what keeps the operator's entries in that file. Once
+    // the agent runs `source ~/.bashrc`, an rc that hard-sets `HISTFILE`
+    // names the operator's file again, and `history -w` from an emptied
+    // list rewrote it with the session's commands alone, in either history
+    // mode; the `history -n; history -w; history -c; history -r` sync recipe
+    // lost the operator's first entries in per_session mode (SECURITY.md,
+    // H1; measured, bash 5.2 and 5.3). Such a session keeps the list, and
+    // the line running this with it: the agent can read the operator's
+    // entries (H10), and in per_session mode the rc's `history -w` copies
+    // them into the session's file. `history -a` appends, and `history -a;
+    // history -c; history -r` reads back what `HISTFILE` names, so both
+    // still get the emptying.
+    //
+    // What runs `history -w` is read from the shell rather than guessed:
+    // `PROMPT_COMMAND` with an array's elements joined, bash-preexec's
+    // `precmd_functions` and the traps, then each alias and function they
+    // name, and each function those name, to the end of the chain. That is
+    // how the `historymerge` recipe and its `trap historymerge EXIT` are
+    // found, and `PROMPT_COMMAND=hw` under `alias hw='history -w'`. Not the
+    // whole function table: fzf's key bindings define a function that runs
+    // `history -w` on a key press, and every fzf user kept the list. A
+    // function body shows the aliases it used already expanded. `declare
+    // -F` lists which of the names it is given are functions, and every
+    // function when given none, hence `(( $# ))`. One `declare -f` per link
+    // of the chain: under liquidprompt, the heaviest prompt measured, the
+    // search took 0.1 s on bash 5.2 and 0.3 s on 3.2, where testing each
+    // word of each body took 2.8 s and 12 s. It runs in a command
+    // substitution, so nothing it sets, traces or prints reaches the
+    // session: under an rc's `set -eux`, a readonly `BASH_REMATCH` (which
+    // ended a `set -e` bash 5.3) and `set -x`, which printed the function
+    // table, it measured silent. A restricted shell refuses the redirection
+    // that silences it, and bash 3.2's `rbash` gets this far, so it skips
+    // the search and empties.
+    //
+    // In none mode, not when the prompt's own path also runs `history -c`.
+    // Such an rc empties the list at every prompt, reading back
+    // `/dev/null`, so a list kept until the first prompt protects nothing,
+    // and bash 3.2's `history -n` counted that list as lines already read:
+    // the sync recipe sourced again as the session's first command lost
+    // every entry, where emptying keeps them (measured, bash 3.2.57; 4.2
+    // and 4.3 read the same, by their source).
+    //
+    // Not seen: a `history -w` that exists only once the rc is sourced
+    // again, which still loses every entry; one named through a variable
+    // (`PROMPT_COMMAND='$f'`); and one behind a hook array other than
+    // `precmd_functions`. bash's own save at exit appends, unless the
     // session has run more commands than `HISTSIZE` holds, and then the
     // list is the session's alone with or without the emptying.
     //
@@ -389,7 +416,14 @@ const BASH_INTEGRATION: &str = concat!(
     // `PROMPT_COMMAND` replaced mid-session — and loses everything recorded
     // before; `bash-append-stopped` in `tests/shell_history.rs` is the row.
     r#"if ! __holdfast_ro HISTFILE; then HISTFILE=${HOLDFAST_HISTFILE:-/dev/null}; "#,
-    r#"[[ ${PROMPT_COMMAND[*]-}$(builtin declare -f; builtin trap -p) =~ history[[:blank:]]+-[[:alpha:]]*w ]] || builtin history -c; "#,
+    r#"! builtin shopt -q restricted_shell && [[ $({ builtin set +eux -f; IFS=$' \t\n;&|(){}<>=$`"\''; "#,
+    r#"__holdfast_r() { t=$1; s=$t; v=' '; "#,
+    r#"while builtin set -- $s; (( $# )); do a=$(builtin alias -- "$@"); t+=" $a"; n=; "#,
+    r#"for w in $(builtin declare -F -- "$@" $a); do [[ $v == *" $w "* ]] || { v+="$w "; n+="$w "; }; done; "#,
+    r#"s=; [[ -n $n ]] && s=$(builtin declare -f -- $n); t+=" $s"; done; }; "#,
+    r#"__holdfast_r "${PROMPT_COMMAND[*]-} ${precmd_functions[*]-}"; p=$t; __holdfast_r "$t $(builtin trap -p)"; "#,
+    r#"[[ $t =~ history[[:blank:]]+-[[:alpha:]]*w && ( -n ${HOLDFAST_HISTFILE-} || ! $p =~ history[[:blank:]]+-[[:alpha:]]*c ) ]] "#,
+    r#"&& builtin echo w; } 2>/dev/null) == w ]] || builtin history -c; "#,
     r#"if [[ -f $HISTFILE && -r $HISTFILE ]]; then builtin history -r || :; fi; "#,
     r#"if [ -n "${HOLDFAST_HISTFILE-}" ]; then "#,
     r#"__holdfast_ro HISTFILESIZE || unset HISTFILESIZE; shopt -s histappend; "#,
@@ -965,15 +999,49 @@ mod tests {
         let read = bash.find("builtin history -r").expect("bash reads back");
         assert!(set < clear && clear < read, "{bash}");
         assert!(read < bash.find(guard).unwrap(), "{bash}");
-        // Only for an rc that does not rewrite the file from its
-        // `PROMPT_COMMAND`, a function or a trap: `history -w` would write
-        // the emptied list over the operator's once the rc is sourced
-        // again. Read before the per-session branch prepends `__holdfast_h`.
+        // Only for an rc that does not rewrite the file with `history -w`,
+        // which would write the emptied list over the operator's once the
+        // rc is sourced again. Read before the per-session branch prepends
+        // `__holdfast_h`, and in a command substitution, whose output alone
+        // decides.
         let rewrites = bash
-            .find("[[ ${PROMPT_COMMAND[*]-}$(builtin declare -f; builtin trap -p) =~ history[[:blank:]]+-[[:alpha:]]*w ]] || builtin history -c;")
+            .find("! builtin shopt -q restricted_shell && [[ $({ builtin set +eux -f;")
             .expect("bash empties only a list no `history -w` rewrites from");
         assert!(set < rewrites && rewrites < clear, "{bash}");
         assert!(clear < bash.find("__holdfast_h()").unwrap(), "{bash}");
+        assert!(
+            bash.contains("} 2>/dev/null) == w ]] || builtin history -c;"),
+            "{bash}"
+        );
+        // What the prompt and the traps reach, not the whole function table,
+        // where fzf's key bindings define one that runs `history -w`.
+        assert!(
+            bash.contains(
+                r#"__holdfast_r "${PROMPT_COMMAND[*]-} ${precmd_functions[*]-}"; p=$t; __holdfast_r "$t $(builtin trap -p)";"#
+            ),
+            "{bash}"
+        );
+        assert!(
+            !bash.contains("builtin declare -f;"),
+            "the whole table: {bash}"
+        );
+        // `declare -F` with no names lists every function.
+        assert!(
+            bash.contains(r#"while builtin set -- $s; (( $# )); do a=$(builtin alias -- "$@");"#),
+            "{bash}"
+        );
+        assert!(
+            bash.contains(r#"$(builtin declare -F -- "$@" $a)"#),
+            "{bash}"
+        );
+        // Kept in per_session mode, or where the prompt's path does not
+        // empty the list itself: bash 3.2's `history -n` counts a kept list.
+        assert!(
+            bash.contains(
+                "[[ $t =~ history[[:blank:]]+-[[:alpha:]]*w && ( -n ${HOLDFAST_HISTFILE-} || ! $p =~ history[[:blank:]]+-[[:alpha:]]*c ) ]]"
+            ),
+            "{bash}"
+        );
         let zsh = Shell::Zsh.integration_snippet();
         let cut = zsh
             .find("() { HISTSIZE=1; HISTSIZE=$1 } ${HISTSIZE-30};")
