@@ -1278,13 +1278,14 @@ fn a_zsh_rc_that_rewrites_its_history_file_keeps_the_operators_entries_when_sour
 
 /// bash rc files that hard-set `HISTFILE` and rewrite it from the
 /// in-memory list: at every prompt, by `history -w` alone, by the sync
-/// recipe that first reads what other shells appended, and by an alias
-/// `PROMPT_COMMAND` names; by that recipe as the `historymerge` function
-/// and `EXIT` trap it is usually shared as; and at exit alone, by a trap.
-/// The snippet follows `PROMPT_COMMAND` and the traps to each alias and
+/// recipe that first reads what other shells appended, by an alias
+/// `PROMPT_COMMAND` names, and from a framework's hook array; by that
+/// recipe as the `historymerge` function and `EXIT` trap it is usually
+/// shared as; and at exit alone, by a trap. The snippet follows
+/// `PROMPT_COMMAND`, the hook arrays and the traps to each alias and
 /// function they reach. Limits above anything a row writes, so none trims
 /// what it measures.
-const BASH_REWRITING_RCS: [Case; 5] = [
+const BASH_REWRITING_RCS: [Case; 6] = [
     bash_rewriting(
         "bash-history-w-resourced",
         &[
@@ -1320,6 +1321,13 @@ const BASH_REWRITING_RCS: [Case; 5] = [
             (".bash_history", BASH_OPERATOR_HISTORY),
         ],
     ),
+    bash_rewriting(
+        "bash-hook-arrays-resourced",
+        &[
+            (".bashrc", BASH_HOOK_ARRAYS_RC),
+            (".bash_history", BASH_OPERATOR_HISTORY),
+        ],
+    ),
 ];
 
 const BASH_HISTORY_W_RC: &str = "HISTFILE=~/.bash_history\nHISTSIZE=1000\nHISTFILESIZE=2000\n\
@@ -1338,6 +1346,22 @@ const BASH_EXIT_TRAP_RC: &str = "HISTFILE=~/.bash_history\nHISTSIZE=1000\nHISTFI
 const BASH_HISTORY_W_ALIAS_RC: &str =
     "HISTFILE=~/.bash_history\nHISTSIZE=1000\nHISTFILESIZE=2000\n\
                                        alias hw='history -w'\nPROMPT_COMMAND=hw\n";
+
+/// Two hook arrays, as bash-it and oh-my-bash lay them out, run by a
+/// `PROMPT_COMMAND` function that names neither hook. bash-it's precmd hook
+/// holds a `history -a && history -c && history -r` that runs only when
+/// `HISTCONTROL` holds `auto`: taken for the sync recipe's `history -c`, it
+/// emptied the list in none mode, and a `history -w` then lost every entry
+/// (measured with bash-it itself and an `EXIT` trap). The `history -w` is
+/// behind oh-my-bash's `_omb_util_prompt_command`, which the snippet reads
+/// by name.
+const BASH_HOOK_ARRAYS_RC: &str = "HISTFILE=~/.bash_history\nHISTSIZE=1000\nHISTFILESIZE=2000\n\
+     HISTCONTROL=ignoreboth\n\
+     __auto() { if [[ $HISTCONTROL == *auto* ]]; then history -a && history -c && history -r; fi; }\n\
+     precmd_functions=(__auto)\n\
+     __hw() { history -w; }\n_omb_util_prompt_command=(__hw)\n\
+     __run() { local f; for f in \"${precmd_functions[@]}\" \"${_omb_util_prompt_command[@]}\"; do \"$f\"; done; }\n\
+     PROMPT_COMMAND=__run\n";
 
 /// A bash session under one of [`BASH_REWRITING_RCS`]'s rc files, which
 /// runs a command and then sources the rc again before its marker. The
