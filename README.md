@@ -89,12 +89,12 @@ shell's line editor turns echo off too and draws what it is given. So Holdfast
 also refuses a secret while the session's shell sits at its own prompt, which
 it knows from the shell's OSC 133 markers, and `--allow-echo` does not change
 that. A REPL, or a shell without those markers, still passes the echo test at
-its prompt and would draw, run and record the value (G3 in SECURITY.md).
+its prompt and would draw, run and record the value (G3 in SECURITY.md). A
+daemon started from 0.0.7 and still running after an upgrade has neither
+check: against one, `holdfast attach` says so under the prompt, and the MCP
+server refuses `request_secret_input` until the daemon is restarted.
 `request_secret_input`, the tool an agent calls to *ask* for that
-password, ships in 0.0.7 and is one of the twelve above. It was not: this
-sentence said twelve while the list above it enumerated eleven, and
-`request_secret_input` — the tool the sentence is about — was the one it
-left out.
+password, ships in 0.0.7 and is one of the twelve above.
 
 Sessions outlive the MCP client: `holdfast mcp` auto-spawns a daemon on
 first use and reconnects to it afterwards. `holdfast mcp --no-daemon` runs
@@ -149,8 +149,11 @@ its own prompt, command and exit-code boundaries and detection runs at the
 input, which is normally at its first prompt, after your rc files have run.
 The snippet wraps whatever `PS1` the shell ended up with instead of
 replacing it, does nothing when your configuration already emits OSC 133,
-and is not exported — a nested shell is integrated in its own right. Pass
-`shell_integration: false` to `start_session` to skip it.
+and is not exported. It is typed once, into the shell the session starts:
+a shell started inside the session, or with `exec`, gets no markers unless
+its own configuration emits them, so detection there falls back to the
+lower tiers and a secret is not refused at its prompt (G3 in SECURITY.md).
+Pass `shell_integration: false` to `start_session` to skip it.
 
 It is **typed into the session, never installed**: there is nothing to add
 to an rc file, and `crates/holdfast-core/src/detect/shell.rs` holds the only

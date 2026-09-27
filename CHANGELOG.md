@@ -94,6 +94,12 @@ session), then restart Claude Code. Until both, each side refuses a
 - Against a 0.0.7 daemon, `holdfast logs --tail` withholds a token still
   arriving and says where that daemon stops short, and `holdfast attach` sends
   a secret only with `--allow-echo` ([#169], [#195], [#137]).
+- Against a 0.0.7 daemon, which asks even at an idle shell prompt, the server
+  refuses `request_secret_input`, and `holdfast attach` warns under the prompt
+  before `--allow-echo` sends a secret there ([#262]).
+- `holdfast attach` discards what is typed up to Enter after a secret request
+  closes mid-entry (a timeout, the agent's `interrupt`), where the rest of the
+  password went to the shell as keystrokes and ran as a command.
 - Sessions no longer write the agent's commands into your shell, REPL or
   database-client history files ([#252]), but hook-based recorders such as
   atuin, zsh-histdb, mcfly and bash-preexec loggers still do (SECURITY.md, H11).
@@ -169,6 +175,9 @@ session), then restart Claude Code. Until both, each side refuses a
 - An rc file that reads the terminal at start-up (a `read`, oh-my-zsh's update
   question, zsh's new-user menu) takes the integration line as its answer: the
   session starts without it, and zsh saves to the history file the rc names.
+- A bash rc that sets `HISTFILE` and runs `history -w` from `PROMPT_COMMAND`,
+  sourced again in a session, overwrites that file with the session's commands
+  alone, since the session no longer holds your history ([#274]).
 
 ## [0.0.7] — 2026-09-01 (Carabiner)
 

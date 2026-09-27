@@ -409,7 +409,10 @@ an idle shell prompt it answers `secret_cancelled` with reason
 is audited, because nothing was requested. It asks again just before it
 raises the request, after any provider has run. If the shell returns to
 its prompt later, for example because the command that asked has ended,
-the writer refuses the answer with the same reason.
+the writer refuses the answer with the same reason, while the request is
+still open. Once it has closed, `holdfast attach` discards what its human
+goes on typing, up to Enter, rather than send it to the session as
+keystrokes, which a shell at its prompt would draw, run and save.
 
 **Why the second test is needed.** Echo off is not the same thing as a
 password prompt. Line editors such as bash's readline and zsh's zle turn
@@ -435,8 +438,14 @@ only a shell whose markers arrive. These still pass on echo alone:
 - **a line-editing shell whose integration is off**: a session started
   with `shell_integration: false`, a shell Holdfast does not integrate
   (`ksh`, `mksh`, `tcsh`), a nested shell started inside the session, or
-  one reached with `exec`. `sh` and `dash` echo at their prompt, so the
-  echo test refuses them unless a human sends `--allow-echo`;
+  one reached with `exec`, and a session whose rc makes `PS1` or `PS0`
+  readonly (the snippet then installs nothing) or reads the terminal at
+  start-up (H12). `sh` and `dash` echo at their prompt, so the echo test
+  refuses them unless a human sends `--allow-echo`;
+- **a shell whose markers stop at its prompt**: an rc that assigns
+  `PROMPT_COMMAND` and is sourced again in the session, or makes it
+  readonly and regenerates `PS1` from it. Each leaves the idle prompt with
+  no `A`, `B` or `D` after the last `C` (measured, bash 5.2);
 - **a remote shell under `ssh`**, unless the remote shell emits the
   markers itself;
 - **a prompt the reader has not scanned yet**, for as long as the reader
@@ -938,6 +947,14 @@ on that daemon. Joined to a daemon older than the echo test (protocol below
 1.3, which a `v0.0.7` daemon still running after an upgrade is), it collects
 a secret masked, discards it unless `--allow-echo` was given, and says so at
 the prompt before anything is typed.
+
+Such a daemon has no shell-prompt test (G3) either. Against one, this
+release's MCP server refuses `request_secret_input` (`daemon_too_old`), and
+`holdfast attach` warns under the prompt that a secret it sends with
+`--allow-echo` reaches whatever holds the terminal. A request that an older
+MCP server still running beside it raises at an idle prompt is written
+there once answered, and drawn, run and saved to history, until the daemon
+is restarted.
 
 **Other input channels:**
 - **`send_input` is not that channel and never was.** It writes whatever the
