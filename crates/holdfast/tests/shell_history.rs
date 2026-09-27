@@ -33,7 +33,10 @@
 //! - tcsh with a `savehist` rc, for the endings Holdfast brings about.
 //!
 //! A zsh whose history goes nowhere must also say nothing about it at exit,
-//! which is `zsh_ends_without_a_history_error_under_an_rc_that_saves_history`.
+//! which is `zsh_ends_without_a_history_error_under_an_rc_that_saves_history`,
+//! and one whose rc rewrites its history file must leave the operator's
+//! entries in it when the agent sources that rc again, which is
+//! `a_zsh_rc_that_rewrites_its_history_file_keeps_the_operators_entries_when_sourced_again`.
 //!
 //! Every session gets its own `HOME`, and the assertion is over **every
 //! file** under it rather than over the names a shell is expected to use:
@@ -1149,6 +1152,72 @@ fn bash_and_zsh_list_and_recall_none_of_the_operators_history() {
     }
 }
 
+/// A zsh rc that saves by rewriting its history file, with none of
+/// `append_history`, `inc_append_history` and `share_history`.
+const ZSH_REWRITING_RC: &str = "HISTFILE=~/.zsh_history\nHISTSIZE=1000\nSAVEHIST=1000\n\
+                                unsetopt append_history\n";
+
+/// A zsh whose rc rewrites its history file, sourced again in the session,
+/// keeps the operator's entries in that file (review of GH #274).
+/// `source ~/.zshrc` puts the rc's `HISTFILE` and `SAVEHIST` back, and zsh
+/// then saves at exit by rewriting the file from its list. The GH #274 cut
+/// had left that list holding the session's commands alone, so the
+/// operator's file came out with nothing else in it; the snippet now cuts
+/// only a list whose rc appends (measured, zsh 5.9, exit and hangup).
+///
+/// The session's own commands still reach the operator's file, as they do
+/// under any rc sourced again (SECURITY.md, H1), and that is the proof the
+/// save happened at all: without it the operator's file is intact because
+/// nothing was written, and this row measures nothing.
+#[test]
+fn a_zsh_rc_that_rewrites_its_history_file_keeps_the_operators_entries_when_sourced_again() {
+    let case = Case {
+        name: "zsh-rewriting-rc-resourced",
+        command: "zsh",
+        args: &[],
+        files: &[
+            (".zshrc", ZSH_REWRITING_RC),
+            (".zsh_history", ZSH_OPERATOR_HISTORY),
+        ],
+        integration: true,
+        before: &[("source ~/.zshrc", "")],
+        hung_up: true,
+        needs: "zsh",
+    };
+    if available(&[case]).is_empty() {
+        return;
+    }
+    let inst = Instance::new("rewriting-rc");
+    let mut shim = Shim::launch(&inst);
+    let mut ended = Vec::new();
+    for how in [Ending::Exit, Ending::Terminate] {
+        let s = start(&inst, &mut shim, case, &format!("{how:?}"));
+        end(&mut shim, &s, how);
+        ended.push((s, how));
+    }
+    shim.kill();
+    for (s, how) in &ended {
+        let file = s.home.join(".zsh_history");
+        let text = std::fs::read_to_string(&file)
+            .unwrap_or_else(|e| panic!("{} / {how:?}: {}: {e}", s.case.name, file.display()));
+        assert!(
+            text.contains(MARK),
+            "{} / {how:?}: zsh never saved to {}, so this measured nothing: {text:?}",
+            s.case.name,
+            file.display()
+        );
+        for needle in ["OPERATORS_OWN_HISTORY_1", "OPERATORS_OWN_HISTORY_2"] {
+            assert!(
+                text.contains(needle),
+                "{} / {how:?}: the operator's {} lost {needle}: {text:?}",
+                s.case.name,
+                file.display()
+            );
+        }
+    }
+    drop(inst);
+}
+
 /// `await_output` for text printed after byte `from` of the output.
 fn await_output_after(shim: &mut Shim, s: &Started, from: usize, needle: &str) {
     let deadline = Instant::now() + SHELL_TIMEOUT;
@@ -1228,8 +1297,12 @@ fn zsh_ends_without_a_history_error_under_an_rc_that_saves_history() {
 /// - a bash with shell integration off, where only `HISTFILE` in the
 ///   environment names the file and the shell writes it when it exits;
 /// - [`BASH_APPEND_STOPPED`], whose per-command append stops after the
-///   marker.
-const PER_SESSION_EXTRA: [(Case, Ending); 5] = [
+///   marker;
+/// - a bash whose rc aliases `history`, which is expanded into the
+///   snippet's functions as it is evaluated: the per-command append failed
+///   at every prompt and the file stayed empty until the snippet called
+///   `builtin history`.
+const PER_SESSION_EXTRA: [(Case, Ending); 6] = [
     (
         Case {
             name: "bash-own-markers",
@@ -1271,13 +1344,26 @@ const PER_SESSION_EXTRA: [(Case, Ending); 5] = [
     ),
     (BASH_AND_ZSH[1], Ending::Exit),
     (BASH_APPEND_STOPPED, Ending::Exit),
+    (
+        Case {
+            name: "bash-history-alias",
+            command: "bash",
+            args: &[],
+            files: &[(".bashrc", "alias history='history 20'\n")],
+            integration: true,
+            before: &[],
+            hung_up: true,
+            needs: "bash",
+        },
+        Ending::ForceTerminate,
+    ),
 ];
 
 const BASH_SMALL_LIMITS_RC: &str = "HISTFILE=~/.bash_history\nHISTSIZE=3\nHISTFILESIZE=3\n";
 
 /// A bash whose per-command append stops once the marker is recorded, with
 /// limits of 3 — fewer than the commands typed after it. [`STOP_THE_APPEND`]
-/// shadows the `history` builtin, so the snippet's `history -a` does
+/// redefines the snippet's `__holdfast_h` to hand on the status and append
 /// nothing, as happens when something replaces `PROMPT_COMMAND`
 /// mid-session; bash's own save at exit does not go through it. That save
 /// is then all that writes: with `histappend` it appends the last three
@@ -1294,8 +1380,10 @@ const BASH_APPEND_STOPPED: Case = Case {
     needs: "bash",
 };
 
-/// Typed into [`BASH_APPEND_STOPPED`] once its marker is recorded.
-const STOP_THE_APPEND: &str = "history() { :; }";
+/// Typed into [`BASH_APPEND_STOPPED`] once its marker is recorded. Not a
+/// `history` function shadowing the builtin: the snippet calls `builtin
+/// history -a`, so that an rc's `history` alias cannot stop it.
+const STOP_THE_APPEND: &str = "__holdfast_h() { return \"${1:-0}\"; }";
 
 /// A user's own complete OSC 133 integration, untagged, which Holdfast's
 /// snippet yields to.

@@ -204,6 +204,10 @@ const HOST_DEPENDENT_ROWS: &[(&str, &[Need])] = &[
         &[Need::Program("zsh")],
     ),
     (
+        "a_history_file_the_call_names_and_zsh_cannot_read_costs_nothing",
+        &[Need::Program("zsh")],
+    ),
+    (
         "a_confirmation_prompt_from_an_external_program_answers_at_prompt",
         &[Need::Program("python3")],
     ),
@@ -3214,18 +3218,31 @@ async fn a_strict_bash_rc_keeps_the_integration_the_re_wrap_and_the_shell() {
 /// zsh's arm of the row above. `setopt nounset` was always quiet here; what
 /// `err_exit` found was `precmd`'s `return $s`, which ended the shell at the
 /// first `false && true` exactly as bash's `return` did.
+///
+/// The second arm unsets `HISTFILE`, the usual way to turn zsh's history
+/// off, and is the one the `-` in `${(t)HISTFILE-}` is for: without it
+/// `nounset` makes the test *HISTFILE: parameter not set* and the rest of
+/// the typed line is discarded.
 #[tokio::test]
 async fn a_strict_zsh_rc_keeps_the_integration_the_re_wrap_and_the_shell() {
     if !have(Need::Program("zsh")) {
         eprintln!("skipping: zsh not installed");
         return;
     }
-    for per_session in [false, true] {
-        let arm = format!("nounset err_exit, per_session {per_session}");
-        let dir = Scratch::new(&format!("strict-zsh-{per_session}"));
-        let rc = format!("setopt nounset err_exit\n{ZSH_REGENERATES}");
-        let args = zsh_with_rc(&dir, &rc, per_session);
-        assert_strict_arm(&arm, "zsh", args, &dir).await;
+    for (i, (arm, extra)) in [
+        ("nounset err_exit", ""),
+        ("nounset err_exit, HISTFILE unset", "unset HISTFILE\n"),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        for per_session in [false, true] {
+            let arm = format!("{arm}, per_session {per_session}");
+            let dir = Scratch::new(&format!("strict-zsh-{i}-{per_session}"));
+            let rc = format!("setopt nounset err_exit\n{extra}{ZSH_REGENERATES}");
+            let args = zsh_with_rc(&dir, &rc, per_session);
+            assert_strict_arm(&arm, "zsh", args, &dir).await;
+        }
     }
 }
 
@@ -3280,6 +3297,28 @@ async fn a_readonly_histfile_costs_bash_the_history_policy_and_not_the_integrati
     }
 }
 
+/// A readonly `HISTFILESIZE` with `HISTFILE` writable, which is the one
+/// shape that reaches the per-session clause's own test of it: a hardened
+/// profile locks `HISTFILE` too and skips the clause whole. The clause
+/// unsets `HISTFILESIZE` so bash does not truncate the session's file at
+/// exit, and an `unset` of a readonly variable prints *cannot unset:
+/// readonly variable* and ends a `set -e` shell before its first prompt.
+/// Left alone, the rc's limit applies to the session's file, and the
+/// per-command append records every command.
+#[tokio::test]
+async fn a_readonly_histfilesize_costs_bash_nothing_but_its_own_limit() {
+    let dir = Scratch::new("ro-histfilesize");
+    let rc = format!("set -e\nHISTFILESIZE=100\nreadonly HISTFILESIZE\n{BASH_REGENERATES}");
+    let args = bash_with_rc(&dir, &rc, true);
+    assert_strict_arm(
+        "readonly HISTFILESIZE, set -e, per_session",
+        "bash",
+        args,
+        &dir,
+    )
+    .await;
+}
+
 /// zsh's arm of the row above, where the history clause assigns `SAVEHIST`
 /// and `HISTSIZE` too, and a readonly one of them did the same.
 #[tokio::test]
@@ -3304,8 +3343,10 @@ async fn a_readonly_history_variable_costs_zsh_the_history_policy_and_not_the_in
             "HISTSIZE=1000\nreadonly HISTSIZE\n",
             true,
         ),
+        // zsh has no readonly unset parameter: `typeset -r` on an unset
+        // name makes an empty one. The unset case is the strict row's.
         (
-            "readonly and unset, nounset",
+            "readonly and empty, nounset",
             "setopt nounset\nunset HISTFILE\ntypeset -r HISTFILE\n",
             false,
         ),
@@ -3363,6 +3404,42 @@ async fn a_readonly_prompt_command_keeps_the_prompt_markers_and_ends_nothing() {
         assert!(e["exit_code"].is_null(), "an exit code with no D: {e}");
     }
     kill(&server, &id).await;
+}
+
+/// The rc's own `PROMPT_COMMAND` reads each command's status in both
+/// history modes (REQ-PD-027). Per session it runs after `__holdfast_h`, so
+/// it reads the status `__holdfast_h "$?" && :` leaves rather than
+/// `__holdfast_d`'s, which is all
+/// `a_prompt_that_already_emits_osc_133_meets_the_injected_snippet` sees:
+/// with `|| :` there, every command reached the rc's hook as a success and
+/// that row stayed green.
+#[tokio::test]
+async fn the_rcs_own_prompt_command_reads_each_commands_status_in_both_history_modes() {
+    for per_session in [false, true] {
+        let dir = Scratch::new(&format!("rc-status-{per_session}"));
+        let rc = "PROMPT_COMMAND='printf \"RC_SAW=%s\\n\" \"$?\"'\n";
+        let server = HoldfastServer::new();
+        let id = start(&server, bash_with_rc(&dir, rc, per_session)).await;
+        assert_marker_stream_and_exit_codes(&server, &id, "bash").await;
+        let all = raw(&server, &id).await;
+        let saw: Vec<&str> = all
+            .match_indices("RC_SAW=")
+            .map(|(at, word)| {
+                let rest = &all[at + word.len()..];
+                &rest[..rest
+                    .find(|c: char| !c.is_ascii_digit())
+                    .unwrap_or(rest.len())]
+            })
+            .collect();
+        // The first prompt's, the snippet's own line's, then the three
+        // commands'.
+        assert_eq!(
+            saw,
+            ["0", "0", "0", "1", "42"],
+            "per_session {per_session}: {all:?}"
+        );
+        kill(&server, &id).await;
+    }
 }
 
 /// A readonly `PS1` leaves the snippet nothing to mark, so it installs
@@ -3464,6 +3541,33 @@ async fn a_history_file_the_call_names_is_what_zsh_lists() {
     let args = zsh_with_rc(&dir, rc, true);
     calls_own_history(&dir);
     assert_lists_the_calls_own_file("zsh", args, "fc -l 1").await;
+}
+
+/// A history file the call names and zsh cannot read costs the session
+/// nothing. `fc -R` on it fails, and zsh then discards the rest of the
+/// typed line, integration and all, with or without `err_exit` (measured,
+/// zsh 5.9), so the snippet reads it only when it is readable. The file
+/// holds a line because zsh does not open an empty one, and so never fails
+/// on it. As root every file is readable, and this measures only that the
+/// read does no harm.
+#[cfg(unix)]
+#[tokio::test]
+async fn a_history_file_the_call_names_and_zsh_cannot_read_costs_nothing() {
+    use std::os::unix::fs::PermissionsExt;
+    if !have(Need::Program("zsh")) {
+        eprintln!("skipping: zsh not installed");
+        return;
+    }
+    let dir = Scratch::new("unreadable-zsh");
+    let args = zsh_with_rc(&dir, "setopt err_exit\n", true);
+    std::fs::write(dir.history_file(), "echo CALLERS_OWN_ENTRY\n").expect("call's history");
+    std::fs::set_permissions(dir.history_file(), std::fs::Permissions::from_mode(0o000))
+        .expect("chmod 000");
+    let server = HoldfastServer::new();
+    let id = start(&server, args).await;
+    assert_marker_stream_for(&server, &id, "zsh", ERREXIT_SAFE).await;
+    assert_nothing_tripped("unreadable", &raw(&server, &id).await);
+    kill(&server, &id).await;
 }
 
 // ---------------------------------------------------------------------

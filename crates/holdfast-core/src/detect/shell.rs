@@ -198,9 +198,15 @@ pub fn detect_shell(command: &str, args: &[String]) -> Option<Shell> {
 ///   `HISTFILESIZE`, `PROMPT_COMMAND`, `PS1` and `PS0`. With `PS1` or `PS0`
 ///   locked there is nothing to mark, and nothing past the history clause
 ///   is installed; with `PROMPT_COMMAND` locked, `A`, `B` and `C` arrive
-///   without `D`, so commands keep their text and have no exit code.
+///   without `D`, so commands keep their text and have no exit code. A
+///   locked `HISTFILE` skips the history clause whole; a locked
+///   `HISTFILESIZE` stays, and bash truncates a per-session file to it when
+///   it saves at exit.
 ///   `${NAME[@]@a}` and not `${NAME@a}`, which fails under `set -u` for an
-///   unset variable, and a variable can be readonly and unset. Not a trial
+///   unset variable, and a variable can be readonly and unset. It answers
+///   *not readonly* for a readonly **empty array**, whose `[@]` expands to
+///   nothing, and the assignment then fails as it did before; no rc known
+///   to Holdfast declares one (measured, bash 5.2 and 5.3). Not a trial
 ///   assignment: `printf -v` into a readonly variable ends a `set -e` shell
 ///   even inside an `if`, and the `2>/dev/null` that would silence it is
 ///   itself refused by `rbash`. `@a` needs bash 4.4; an older bash assigns
@@ -343,8 +349,21 @@ const BASH_INTEGRATION: &str = concat!(
     // readable file: `/dev/null` is not, a new per-session file is empty,
     // and a file the call named itself is loaded as bash would have loaded
     // it at start. Tested rather than silenced, because `rbash` refuses the
-    // redirection that would silence it. `builtin`, so an rc's `history`
-    // alias or function cannot take either call.
+    // redirection that would silence it. `builtin` here and in
+    // `__holdfast_h`, so an rc's `history` alias or function cannot take
+    // any of the three calls: an alias is expanded as this is evaluated,
+    // and `alias history='history 20'` made the per-command append fail at
+    // every prompt, the session's file staying empty (measured, bash 5.2).
+    //
+    // The emptied list is what a later `history -w` writes. An rc that
+    // hard-sets `HISTFILE` and runs `history -w` from `PROMPT_COMMAND`,
+    // sourced again in the session, rewrites the operator's file with the
+    // session's commands alone, where before it rewrote it with the
+    // operator's entries and the session's (SECURITY.md, H1; measured,
+    // bash 5.2 and 5.3). Nothing here reaches a hook the rc installs after
+    // it. bash's own save at exit appends, unless the session has run more
+    // commands than `HISTSIZE` holds, and then the list is the session's
+    // alone with or without the emptying.
     //
     // With a session file: `__holdfast_h` appends after every command,
     // prepended to `PROMPT_COMMAND` for the reason `__holdfast_d` is and
@@ -359,7 +378,7 @@ const BASH_INTEGRATION: &str = concat!(
     r#"builtin history -c; if [[ -f $HISTFILE && -r $HISTFILE ]]; then builtin history -r || :; fi; "#,
     r#"if [ -n "${HOLDFAST_HISTFILE-}" ]; then "#,
     r#"__holdfast_ro HISTFILESIZE || unset HISTFILESIZE; shopt -s histappend; "#,
-    r#"__holdfast_h() { history -a; return "${1:-0}"; }; "#,
+    r#"__holdfast_h() { builtin history -a; return "${1:-0}"; }; "#,
     r#"__holdfast_ro PROMPT_COMMAND || [[ "${PROMPT_COMMAND-}" == *__holdfast_h* ]] || "#,
     r#"PROMPT_COMMAND='__holdfast_h "$?" && :'"${PROMPT_COMMAND:+; $PROMPT_COMMAND}"; fi; fi; "#,
     r#"if [ -z "${HOLDFAST_SHELL_INTEGRATION-}" ] && [[ "${PS1-}" != *"133;A"* ]] "#,
@@ -473,12 +492,16 @@ const BASH_INJECTION_LINE: &str =
 /// so a readonly `HISTFILE`, `SAVEHIST` or `HISTSIZE` would cost the
 /// session all of its integration and print *read-only variable*, and a
 /// readonly `PS1` ends an `err_exit` shell at start-up. Each is tested with
-/// `${(t)NAME-}`, whose type names `readonly` for a readonly parameter, set
-/// or not, and which is quiet under `nounset` where `${(t)NAME}` is not
-/// (measured, zsh 5.9). The history clause is skipped whole when any of its
-/// three is readonly: pointing `HISTFILE` at a session file under the rc's
-/// `SAVEHIST` would save the rc's list there, and raising `SAVEHIST` under
-/// the rc's `HISTFILE` would save the agent's commands into the operator's.
+/// `${(t)NAME-}`, whose type names `readonly` for a readonly parameter. The
+/// `-` is for an rc that unsets one under `nounset`, the usual way to turn
+/// history off: `${(t)HISTFILE}` is then *parameter not set*, and the rest
+/// of the typed line is discarded (measured, zsh 5.9). zsh has no readonly
+/// unset parameter: `typeset -r` on an unset name makes an empty one, and
+/// `unset` refuses a readonly one. The history clause is skipped whole when
+/// any of its three is readonly: pointing `HISTFILE` at a session file
+/// under the rc's `SAVEHIST` would save the rc's list there, and raising
+/// `SAVEHIST` under the rc's `HISTFILE` would save the agent's commands
+/// into the operator's.
 ///
 /// **Corrected by re-measurement (GH #220): zsh 5.9 runs the bare `precmd`
 /// function *first*, then `precmd_functions` in order** — whichever was
@@ -507,11 +530,27 @@ const ZSH_INTEGRATION: &str = concat!(
     // the anonymous function puts the rc's value back. Not `fc -p`, which
     // starts a new list but parks the old one on zsh's history stack,
     // where `fc -P` brings it back and zsh saves it at exit (measured).
+    //
+    // Only when the rc appends to its history file. Without
+    // `append_history`, `inc_append_history` or `share_history`, zsh saves
+    // by rewriting the file from the list, so once `source ~/.zshrc` has
+    // put the rc's `HISTFILE` and `SAVEHIST` back, the save at exit
+    // replaced the operator's file with the session's commands alone,
+    // where without the cut it kept every entry and gained the session's
+    // (SECURITY.md, H1; measured, zsh 5.9). Such a session keeps the list,
+    // and the agent can read it (H10). The options are read here, before
+    // the per-session branch sets `inc_append_history`, so they are the
+    // rc's. `inc_append_history_time` appends too and is left out for the
+    // bytes; an rc that turns off `append_history` and relies on it alone
+    // keeps the list the same way, and loses nothing.
+    //
     // A session file is then read with `fc -R`, which finds nothing in a
     // new per-session file and loads a file the call named itself as zsh
     // would have at start, and only when it is readable: `fc -R` on an
-    // unreadable file ends an `err_exit` shell.
+    // unreadable file that holds anything discards the rest of the typed
+    // line, integration and all, `err_exit` or not (measured, zsh 5.9).
     r#" if [[ ${(t)HISTFILE-}${(t)SAVEHIST-}${(t)HISTSIZE-} != *readonly* ]]; then "#,
+    r#"[[ -o append_history || -o inc_append_history || -o share_history ]] && "#,
     r#"() { HISTSIZE=1; HISTSIZE=$1 } $HISTSIZE; "#,
     r#"if [[ -n ${HOLDFAST_HISTFILE-} ]]; then HISTFILE=$HOLDFAST_HISTFILE; "#,
     r#"SAVEHIST=1000000000; HISTSIZE=1000000000; [[ -r $HISTFILE ]] && fc -R; "#,
@@ -889,10 +928,11 @@ mod tests {
     }
 
     /// GH #274 at the string level: bash empties the list it read from the
-    /// rc's file once `HISTFILE` is re-pointed, and zsh cuts it to the line
-    /// running the snippet, both ahead of the guard; each then reads back a
-    /// file the call named. `tests/shell_history.rs` in the `holdfast` crate
-    /// is what lists and recalls through them.
+    /// rc's file once `HISTFILE` is re-pointed, and zsh, when the rc appends
+    /// to that file, cuts it to the line running the snippet, both ahead of
+    /// the guard; each then reads back a file the call named.
+    /// `tests/shell_history.rs` in the `holdfast` crate is what lists and
+    /// recalls through them.
     #[test]
     fn the_history_clauses_empty_the_list_the_rc_file_loaded() {
         let guard = "HOLDFAST_SHELL_INTEGRATION";
@@ -909,6 +949,13 @@ mod tests {
         let read = zsh.find("fc -R;").expect("zsh reads back");
         assert!(cut < read && read < zsh.find(guard).unwrap(), "{zsh}");
         assert!(!zsh.contains("fc -p"), "a parked list comes back: {zsh}");
+        // Only for an rc that appends: a rewriting save would replace the
+        // operator's file with the cut list. Read before the per-session
+        // branch sets an appending option of its own.
+        let appends = zsh
+            .find("[[ -o append_history || -o inc_append_history || -o share_history ]] && ")
+            .expect("zsh cuts only a list whose rc appends");
+        assert!(appends < cut && cut < zsh.find("setopt inc_append_history").unwrap());
     }
 
     /// Every assignment to a variable an rc can make readonly is behind a
