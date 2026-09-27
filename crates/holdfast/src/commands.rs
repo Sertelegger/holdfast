@@ -2863,6 +2863,21 @@ async fn attach_connected(
     // daemon that can now decline the write makes it a silently discarded
     // credential, which is the defect the decline exists to prevent.
     let mut submitted: Option<String> = None;
+    // `Some` after a request closed while its prompt was still up here and
+    // unanswered: what is typed up to the next Enter is collected, masked,
+    // and thrown away, not sent to the session (GH #262's review).
+    //
+    // **A close does not stop the human typing.** The command that asked
+    // ended, timed out or was interrupted, another client answered, or the
+    // agent cancelled; the person at this keyboard learns that from a line
+    // they are not looking at, mid-password. Handed straight back to the
+    // session, the rest of the value went out as `Input`, which a shell
+    // back at its prompt draws, runs as a command and saves to history,
+    // and which the daemon's shell-prompt check never sees because it is
+    // not a secret (measured: `read -s -t 3` timing out, and an agent's
+    // `interrupt`, on bash 5.2 and zsh 5.9). Swallowing until Enter costs a
+    // human who was about to type a command one line, and says so.
+    let mut discarding: Option<crate::attach_tty::SecretLine> = None;
 
     loop {
         tokio::select! {
@@ -2977,6 +2992,10 @@ async fn attach_connected(
                             } else if let Some(why) = secret_unguarded_note(daemon_minor) {
                                 render(format!("[holdfast] {why}\r\n").as_bytes());
                             }
+                            // A new prompt ends a discard: what was typed
+                            // into it is zeroed as it drops, and what is
+                            // typed next is this request's answer.
+                            discarding = None;
                             secret = Some((request_id, crate::attach_tty::SecretLine::default()));
                         }
                     }
@@ -3002,9 +3021,18 @@ async fn attach_connected(
                         let answering = secret.as_ref().is_some_and(|(id, _)| *id == request_id);
                         let mine = answering || submitted.as_deref() == Some(request_id.as_str());
                         if answering {
-                            secret = None;
-                        }
-                        if mine {
+                            // The line keeps collecting, into the discard
+                            // (see `discarding`), rather than handing the
+                            // rest of the password to the session.
+                            discarding = secret.take().map(|(_, line)| line);
+                            submitted = None;
+                            render(b"\r\n");
+                            diag!(
+                                "holdfast attach: secret request {outcome} before Enter — what you \
+                                 type up to the next Enter is discarded, not sent to the session. \
+                                 Ctrl-C discards it at once."
+                            );
+                        } else if mine {
                             submitted = None;
                             // **The two outcomes that get a sentence
                             // rather than a token** (GH #137, GH #262).
@@ -3118,7 +3146,24 @@ async fn attach_connected(
                 // pressed Enter trying to escape. A password prompt is
                 // exactly where a human most needs to be able to leave.
                 let (forward, detached) = detach.feed(&chunk);
-                if !forward.is_empty() {
+                if let Some(line) = discarding.as_mut().filter(|_| !forward.is_empty()) {
+                    // Nothing here reaches the session, `Ctrl-C` included:
+                    // the request it would abandon is already closed, and
+                    // whatever runs now did not ask for it.
+                    let ended = match line.feed(&forward) {
+                        crate::attach_tty::SecretKeys::Pending => false,
+                        crate::attach_tty::SecretKeys::Line(mut bytes) => {
+                            holdfast_core::attach::secret::zero_bytes(&mut bytes);
+                            true
+                        }
+                        crate::attach_tty::SecretKeys::Cancelled(_) => true,
+                    };
+                    if ended {
+                        discarding = None;
+                        render(b"\r\n");
+                        diag!("holdfast attach: discarded; the keyboard is the session's again");
+                    }
+                } else if !forward.is_empty() {
                     match secret.as_mut() {
                         // §9.5: while a prompt is outstanding the bytes
                         // are the *answer* and do not reach the session

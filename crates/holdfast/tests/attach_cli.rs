@@ -3385,6 +3385,92 @@ async fn the_same_secret_request_announced_twice_keeps_what_was_typed() {
     assert_eq!(term.wait_exit(10), 0);
 }
 
+/// **A request that closes while the human is still typing does not hand
+/// the rest of the password to the session** (GH #262's review).
+///
+/// The command that asked can end under the human's hands: `read -t`
+/// times out, `sudo` gives up, the agent interrupts it. The client used to
+/// drop the prompt on the close and send every later keystroke as `Input`,
+/// so the tail of the password, Enter included, reached a shell back at
+/// its prompt, which drew it, ran it and saved it to history (measured on
+/// bash 5.2 and zsh 5.9 through a real daemon). The daemon's shell-prompt
+/// check cannot see that: it is not a secret.
+///
+/// The stub closes the request **in answer to a resize**, so the close
+/// lands after the first half is typed rather than racing it, and an
+/// `Output` behind it says when the client has read it. Asserted on the
+/// wire: no byte of either half leaves as `Input`, and what is typed after
+/// the Enter does, so a client that swallowed the keyboard for good fails
+/// too.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_request_closed_mid_typing_discards_what_is_typed_up_to_enter() {
+    const SEEN_IT: &[u8] = b"CLOSE-WAS-READ";
+    let mut closed = enc(&ServerFrame::SecretRequestClosed {
+        request_id: "req_mid1".into(),
+        outcome: "user_cancelled".into(),
+    });
+    closed.extend(enc(&ServerFrame::Output {
+        session: "sess_mid".into(),
+        bytes: SEEN_IT.to_vec(),
+    }));
+    let stub = StubDaemon::start_reacting(
+        "secretmidclose",
+        vec![
+            attached_stub("sess_mid"),
+            enc(&ServerFrame::AwaitingSecret {
+                request_id: "req_mid1".into(),
+                prompt_text: "Password: ".into(),
+                raised_by: None,
+            }),
+        ],
+        |f| matches!(f, ClientFrame::Resize { cols: 101, .. }),
+        closed,
+        Duration::from_secs(20),
+    )
+    .await;
+    let mut term = Term::spawn(stub.paths.dir(), &["attach", "sess_mid"], 100, 30);
+    term.wait_for(SECRET_PROMPT_DRAWN, 15);
+    term.type_keys(b"fakeHEAD");
+    // Only so the first half is read before the close is asked for.
+    std::thread::sleep(Duration::from_millis(500));
+    term.resize(101, 30);
+    term.wait_for(SEEN_IT, 15);
+    term.wait_for(b"discarded, not sent to the session", 10);
+    term.type_keys(b"fakeTAIL\r");
+    term.wait_for(b"the keyboard is the session's again", 10);
+    term.type_keys(b"after");
+
+    let sent = wait_frames(&stub, 10, |f| {
+        f.iter()
+            .any(|x| matches!(x, ClientFrame::Input { bytes } if contains(bytes, b"after")))
+    });
+    let typed: Vec<u8> = sent
+        .iter()
+        .filter_map(|f| match f {
+            ClientFrame::Input { bytes } => Some(bytes.clone()),
+            _ => None,
+        })
+        .flatten()
+        .collect();
+    assert!(
+        contains(&typed, b"after"),
+        "the keyboard never went back to the session: {sent:?}"
+    );
+    assert!(
+        !contains(&typed, b"fake"),
+        "part of the password reached the session as keystrokes: {:?}",
+        String::from_utf8_lossy(&typed)
+    );
+    assert!(
+        !sent
+            .iter()
+            .any(|f| matches!(f, ClientFrame::SecretInput { .. })),
+        "a closed request was answered: {sent:?}"
+    );
+    term.type_keys(&[0x02, b'd']);
+    assert_eq!(term.wait_exit(10), 0);
+}
+
 /// **`watch` reports a request once however many times it is announced,
 /// and a new request again** (GH #236's review). The second half is what
 /// keeps a watch that only ever reported the first request from passing.
