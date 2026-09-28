@@ -46,7 +46,11 @@ if [ -z "$workdir" ]; then
   own_workdir=1
 fi
 mkdir -p "$workdir"
-workdir="$(cd "$workdir" && pwd)"
+# Physical, not logical: the control row below compares a session's
+# `pwd -P` against `$client_cwd`, which is built from this, so a work
+# directory reached through a symlink (macOS's /tmp and /var are both
+# symlinks) would fail it.
+workdir="$(cd "$workdir" && pwd -P)"
 old_tree="$workdir/old-tree"
 old_target="$workdir/old-target"
 iso="$workdir/iso"

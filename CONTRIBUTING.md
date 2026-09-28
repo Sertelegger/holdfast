@@ -535,8 +535,9 @@ than decorating it.
 | Y Yoke | Z Zip-tie | | |
 
 Assigned so far: **0.0.5 Anchor**, **0.0.6 Bolt**, **0.0.7 Carabiner**,
-**0.0.8 Dowel**. 0.0.8 is the first release `release.yml` names; the three
-before it were renamed by hand (see the note above).
+**0.0.8 Dowel**. 0.0.8 is the first release whose name `release.yml` takes
+from its heading; the three before it were renamed by hand (see the note
+above).
 
 **X is deliberately unfilled.** No fastener or rigging term starts with it,
 and inventing one would break the only rule the list has. It is twenty

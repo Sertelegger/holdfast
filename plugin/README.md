@@ -269,12 +269,15 @@ here rather than discovering twice.
 
 ## Releasing
 
-Three files carry the version and all three must move together:
-`Cargo.toml`, `plugin/version.txt`, and `plugin/.claude-plugin/plugin.json`.
-The spec names only the first two; the install cache is keyed
+The version is in four files and six literals, and all of them move
+together; [CONTRIBUTING.md](../CONTRIBUTING.md#releases) step 4 lists them,
+including the two `Cargo.lock` lines without which every `--locked` build
+fails. Three of the four matter to the plugin: `Cargo.toml`,
+`plugin/version.txt`, and `plugin/.claude-plugin/plugin.json`. The spec names
+only the first two; the install cache is keyed
 `cache/<marketplace>/<plugin>/<version>/` from **plugin.json**, so a release
 that bumps `version.txt` alone ships a plugin that never updates.
-`scripts/plugin-manifest-check.py` fails if they disagree.
+`scripts/plugin-manifest-check.py` fails if those three disagree.
 
 **Which tree an install gets is a separate question, and the answer moves
 after promotion.** While `.claude-plugin/marketplace.json`'s `source` is
