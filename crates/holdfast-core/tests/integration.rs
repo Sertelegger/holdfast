@@ -23,9 +23,11 @@ fn bash() -> PtySpawnConfig {
 /// the deadline by writing a newline, which the line discipline echoes
 /// back — the same way `draining` retires its reader. A session with echo
 /// off does not answer that, so if the read is still parked `WAKE_GRACE`
-/// later the watchdog kills the session, which ends the read with EOF.
-/// Neither step is taken when the needle arrives in time, so a caller
-/// that succeeds never sees the newline.
+/// later the watchdog kills the session's whole process tree, which ends the
+/// read with EOF even when the session leader has already exited. Neither
+/// step is taken when the needle arrives in time, so a caller whose needle
+/// arrives before the deadline never sees the newline. `timeout` is
+/// therefore a hard bound on the call, not a check between reads.
 fn read_until(pty: &dyn PtyBackend, needle: &str, timeout: Duration) -> String {
     use std::sync::mpsc::{channel, RecvTimeoutError};
     const WAKE_GRACE: Duration = Duration::from_secs(5);
@@ -38,7 +40,7 @@ fn read_until(pty: &dyn PtyBackend, needle: &str, timeout: Duration) -> String {
             if let Err(RecvTimeoutError::Timeout) = watch.recv_timeout(timeout) {
                 let _ = pty.write(b"\n");
                 if let Err(RecvTimeoutError::Timeout) = watch.recv_timeout(WAKE_GRACE) {
-                    let _ = pty.signal(Signal::Kill);
+                    let _ = pty.signal_tree(Signal::Kill);
                 }
             }
         });
