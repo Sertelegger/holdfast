@@ -252,13 +252,14 @@ It leaves the list whole under a zsh rc that turns off `append_history`,
 `inc_append_history` and `share_history`, where a later save would rewrite
 your file from the cut list, and under a readonly `HISTFILE`. bash keeps
 the list your rc loaded, and the agent can list and recall it: emptied, it
-is what a bash rc that runs `history -w`, sourced again, wrote over your
-file (SECURITY.md's H1 and H10). A bash or zsh started inside the session
-loads its rc's file again, and the session runs as you, so `cat
+is what a bash rc that runs `history -w`, sourced again, would write over
+your file (SECURITY.md's H1 and H10). A bash or zsh started inside the
+session loads its rc's file again, and the session runs as you, so `cat
 ~/.bash_history` works either way. Nothing is cut with
-`shell_integration: false`, or under an rc that takes the integration
-line. A fish started inside a fish session reads the file its config.fish
-names.
+`shell_integration: false`, under an rc that takes the integration line,
+or in a zsh that `HOLDFAST_ZSH_INTEGRATION` does not reach, such as one an
+rc re-execs through `env -i`. A fish started inside a fish session reads
+the file its config.fish names.
 
 If your rc's `PROMPT_COMMAND` re-reads the history file at every prompt
 (`history -a; history -c; history -r`), `HISTFILE=/dev/null` also empties

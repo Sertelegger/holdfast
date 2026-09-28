@@ -788,25 +788,23 @@ and Python 3.12.
     and takes the integration with it (not measured).
 
   The first case adds the session's commands to the operator's file. Where
-  the rc rewrites that file from the shell's list, it keeps every entry
-  the file held, because the list still holds them: bash keeps the list
-  its rc loaded (H10). Measured through Holdfast on bash 5.2 and 5.3, both
-  modes, by `exit` and by hangup, sourced after another command, under
-  `history -w` at the prompt, the `history -n; history -w; history -c;
-  history -r` sync recipe, the `historymerge` function with its `EXIT`
-  trap, an `EXIT` trap alone, and an rc that sets `history -w` only once
-  it is sourced again: all five of the operator's entries survived every
-  row. When GH #274 emptied bash's list, that last rc lost all five in
-  every row, and no reading of the shell at start-up can find it. What
-  still loses entries:
-  - on bash 4.3 and older, whose `history -n` counts the lines already
-    in the list rather than those read from the file, the sync recipe
-    and `historymerge` sourced again in `none` mode, whose prompt empties
-    the list itself by reading back `/dev/null`. After another command
-    they lose the operator's oldest entry, as they did with GH #274's
-    emptying; as the session's first command, every entry, where the
-    emptying kept them all (measured, bash 3.2.57, macOS's `/bin/bash`;
-    4.2 and 4.3 by their source);
+  the rc rewrites that file from the shell's list, it keeps every entry the
+  file held, because bash keeps the list its rc loaded (H10). Measured
+  through Holdfast on bash 5.2 and 5.3, both modes, by `exit` and by
+  hangup, sourced after another command, under `history -w` at the prompt,
+  the `history -n; history -w; history -c; history -r` sync recipe, the
+  `historymerge` function with its `EXIT` trap, an `EXIT` trap alone, and
+  an rc that sets `history -w` only once it is sourced again: all five of
+  the operator's entries survived every row. Emptying the list instead
+  loses every entry under that last rc, and no reading of the shell at
+  start-up can find it. What still loses entries:
+  - on bash 4.3 and older, whose `history -n` counts the lines already in
+    the list rather than those read from the file, the sync recipe and
+    `historymerge` sourced again in `none` mode, whose prompt empties the
+    list itself by reading back `/dev/null`: the operator's oldest entry
+    after another command, and every entry as the session's first command
+    (measured, bash 3.2.57, macOS's `/bin/bash`; 4.2 and 4.3 by their
+    source);
   - bash's own save at exit appends, unless the session has run more
     commands than `HISTSIZE` holds, when it rewrites the file from a list
     that holds only the newest of them.
@@ -899,12 +897,12 @@ and Python 3.12.
     loaded it, so `history`, `fc -l`, up-arrow and `!!` offer the
     operator's entries, followed by the line Holdfast typed unless
     `HISTCONTROL` ignores a leading space. Emptied, that list is what an
-    rc that runs `history -w`, sourced again, wrote over the operator's
-    file (H1). In `per_session` mode the session's file begins with the
-    typed line, and a prompt or `EXIT` trap that runs `history -w` writes
-    the whole list into it, the operator's entries included; an rc that
-    only appends with `history -a`, or runs no history command at all,
-    puts none of them there (measured, bash 5.2 and 5.3);
+    rc that runs `history -w`, sourced again, would write over the
+    operator's file (H1). In `per_session` mode the session's file begins
+    with the typed line, and a prompt or `EXIT` trap that runs `history
+    -w` writes the whole list into it, the operator's entries included;
+    an rc that only appends with `history -a`, or runs no history command
+    at all, puts none of them there (measured, bash 5.2 and 5.3);
   - a bash or zsh started inside a session, or by `exec`, which loads the
     file its own rc names, where the agent can list and recall it;
   - a zsh whose rc turns off `append_history`, `inc_append_history` and

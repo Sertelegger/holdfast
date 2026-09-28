@@ -175,6 +175,9 @@ session), then restart Claude Code. Until both, each side refuses a
 - An rc file that reads the terminal at start-up (a `read`, oh-my-zsh's update
   question, zsh's new-user menu) takes the integration line as its answer: the
   session starts without it, and zsh saves to the history file the rc names.
+- By default, on bash 4.3 and older (macOS's `/bin/bash`), an rc whose prompt
+  runs `history -n; history -w; history -c; history -r`, sourced again, loses
+  your oldest history entry, or every entry if sourced first (SECURITY.md, H1).
 
 ## [0.0.7] — 2026-09-01 (Carabiner)
 
