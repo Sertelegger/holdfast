@@ -7,9 +7,11 @@
 //! inherited `PS1`, whereas a line the shell reads as its first input,
 //! normally at its first prompt, wraps whatever prompt the user actually
 //! ended up with. What has to be typed is
-//! what *runs* the snippet, not its text: bash's typed line evaluates a
-//! snippet the environment carries, because the whole snippet is longer
-//! than macOS lets a typed line be (see [`BASH_INJECTION_LINE`]).
+//! what *runs* the snippet, not its text: bash's and zsh's typed lines
+//! evaluate a snippet the environment carries, because bash's is longer
+//! than macOS lets a typed line be and zsh's had come to within 13 bytes
+//! of the bound pinned under it (see [`BASH_INJECTION_LINE`] and
+//! [`ZSH_INJECTION_LINE`]).
 //!
 //! Consequence, accepted for 0.0.2: the typed line is echoed by the shell
 //! and therefore appears once in the session's output buffer.
@@ -34,7 +36,7 @@ impl Shell {
     /// The code that integrates this shell, as one line without a trailing
     /// newline. Complete in itself: typed at a prompt, it integrates the
     /// shell that reads it. What Holdfast types at start-up is
-    /// [`Shell::injection_line`], which for bash evaluates this.
+    /// [`Shell::injection_line`], which for bash and zsh evaluates this.
     pub fn integration_snippet(self) -> &'static str {
         match self {
             Self::Bash => BASH_INTEGRATION,
@@ -44,21 +46,25 @@ impl Shell {
     }
 
     /// The line Holdfast types at start-up, without its trailing newline:
-    /// the snippet itself for zsh and fish, and [`BASH_INJECTION_LINE`] for
-    /// bash, whose snippet is too long to type (see there).
+    /// [`BASH_INJECTION_LINE`] for bash and [`ZSH_INJECTION_LINE`] for zsh,
+    /// whose snippets are too long to type (see there), and the snippet
+    /// itself for fish.
     pub fn injection_line(self) -> &'static str {
         match self {
             Self::Bash => BASH_INJECTION_LINE,
-            Self::Zsh | Self::Fish => self.integration_snippet(),
+            Self::Zsh => ZSH_INJECTION_LINE,
+            Self::Fish => self.integration_snippet(),
         }
     }
 
-    /// The environment [`Shell::injection_line`] needs: bash's snippet,
-    /// under [`BASH_INTEGRATION_CARRIER`]. Nothing for zsh and fish.
+    /// The environment [`Shell::injection_line`] needs: bash's snippet
+    /// under [`BASH_INTEGRATION_CARRIER`], and zsh's under
+    /// [`ZSH_INTEGRATION_CARRIER`]. Nothing for fish.
     pub fn injection_env(self) -> &'static [(&'static str, &'static str)] {
         match self {
             Self::Bash => &[(BASH_INTEGRATION_CARRIER, BASH_INTEGRATION)],
-            Self::Zsh | Self::Fish => &[],
+            Self::Zsh => &[(ZSH_INTEGRATION_CARRIER, ZSH_INTEGRATION)],
+            Self::Fish => &[],
         }
     }
 
@@ -406,7 +412,8 @@ pub const BASH_INTEGRATION_CARRIER: &str = "HOLDFAST_BASH_INTEGRATION";
 /// drops every byte past it, the newline included. bash then reads those
 /// 1024 bytes with the agent's first command appended, inside quotes and
 /// braces the cut left open, and prompts `> ` for their continuation.
-/// bash's snippet is longer than that; zsh's and fish's are typed whole.
+/// bash's snippet is longer than that, and zsh's travels the same way (see
+/// [`ZSH_INJECTION_LINE`]); fish's is typed whole.
 /// Linux does not drop: a 70 000-byte line typed at a bash still in its rc
 /// file arrived whole (measured, Linux 6.12), so only a Mac shows the cut.
 /// `every_injection_line_fits_in_one_canonical_line_on_macos` holds all
@@ -436,6 +443,14 @@ pub const BASH_INTEGRATION_CARRIER: &str = "HOLDFAST_BASH_INTEGRATION";
 /// history policy (measured, bash 5.2 and 5.3). WSL's `bash.exe` started
 /// from native Windows is expected to behave the same, since Windows does
 /// not pass the environment into WSL without `WSLENV`; not measured.
+///
+/// **An rc that locks the carrier keeps it.** With the variable readonly
+/// bash prints *cannot unset: readonly variable*, and with `unset`
+/// redefined as a function or alias nothing is printed. Either way the
+/// snippet still runs, everything the session starts inherits the
+/// carrier, and under `set -e` an `unset` that fails ends the shell before
+/// its first prompt (measured, bash 5.2 and 5.3). Only an rc that names
+/// Holdfast's own variable, or redefines `unset`, gets there.
 const BASH_INJECTION_LINE: &str =
     r#" eval "${HOLDFAST_BASH_INTEGRATION-}"; unset HOLDFAST_BASH_INTEGRATION"#;
 
@@ -566,6 +581,41 @@ const ZSH_INTEGRATION: &str = concat!(
     r#"add-zsh-hook preexec __holdfast_preexec; "#,
     r#"fi"#,
 );
+
+/// The environment variable that carries [`ZSH_INTEGRATION`] into a zsh
+/// session for [`ZSH_INJECTION_LINE`] to evaluate.
+pub const ZSH_INTEGRATION_CARRIER: &str = "HOLDFAST_ZSH_INTEGRATION";
+
+/// What Holdfast types into a zsh session: [`ZSH_INTEGRATION`], evaluated
+/// from [`ZSH_INTEGRATION_CARRIER`], for [`BASH_INJECTION_LINE`]'s reasons.
+/// Typed whole, the snippet was 987 bytes with its newline, of the 1000
+/// that `every_injection_line_fits_in_one_canonical_line_on_macos` allows,
+/// so the next clause it needed would have cost a Mac its integration.
+///
+/// It is the shell's first input, as the typed snippet was, and it is
+/// stopped where bash's is (measured, zsh 5.9):
+///
+/// - an rc that re-execs zsh through `env -i` or `env -u`, or defines its
+///   own `eval` function or alias, leaves the snippet unevaluated, and the
+///   session gets neither integration nor the snippet's history policy.
+///   The re-exec is new with the carrier: the typed snippet integrated the
+///   zsh it reached;
+/// - an rc that reads the whole line at start-up (SECURITY.md, H12) takes
+///   it as before, and now also leaves the carrier in the environment of
+///   everything the session starts, as bash's does;
+/// - an rc that makes the carrier readonly or redefines `unset` keeps the
+///   carrier, zsh printing *read-only variable* for the first, and under
+///   `err_exit` an `unset` that fails ends the shell.
+///
+/// Under an rc's `nounset` and `err_exit` alone it is quiet.
+///
+/// **What zsh records is this line**, not the snippet: `eval` adds nothing
+/// to the history list. So the history cut (GH #274) leaves this line as
+/// the list's one entry, and `session::launch::ZSH_HISTORY_IGNORE` names
+/// the carrier to keep it out of a history file, where
+/// `inc_append_history` writes it before it runs.
+const ZSH_INJECTION_LINE: &str =
+    r#" eval "${HOLDFAST_ZSH_INTEGRATION-}"; unset HOLDFAST_ZSH_INTEGRATION"#;
 
 /// fish has no "prompt finished" hook, so `fish_prompt` is copied aside
 /// and wrapped — the non-destructive form §8.5 requires. `fish_postexec`
@@ -722,7 +772,7 @@ mod tests {
     /// so that nothing rests on exactly how macOS counts the newline.
     ///
     /// FreeBSD's `<sys/syslimits.h>` declares a `MAX_CANON` of 255, which
-    /// zsh's and fish's lines exceed. No FreeBSD runs a session in CI, and
+    /// fish's line exceeds. No FreeBSD runs a session in CI, and
     /// this bound says nothing about what FreeBSD's tty layer does with a
     /// longer line.
     const TYPED_LINE_BOUND: usize = 1000;
@@ -740,25 +790,32 @@ mod tests {
         }
     }
 
-    /// bash types a line that evaluates its snippet from the variable the
-    /// spawn sets, and unsets it; zsh and fish type their snippets whole.
-    /// The line names the carrier as a literal, so this is what keeps it
-    /// and `BASH_INTEGRATION_CARRIER` the same name.
+    /// bash and zsh type a line that evaluates their snippet from the
+    /// variable the spawn sets, and unset it; fish types its snippet whole.
+    /// Each line names its carrier as a literal, so this is what keeps it
+    /// and the carrier's constant the same name.
     #[test]
-    fn the_bash_line_evaluates_the_snippet_its_environment_carries_and_unsets_it() {
-        assert_eq!(
-            Shell::Bash.injection_env(),
-            [(BASH_INTEGRATION_CARRIER, BASH_INTEGRATION)]
-        );
-        let c = BASH_INTEGRATION_CARRIER;
-        assert_eq!(
-            Shell::Bash.injection_line(),
-            format!(r#" eval "${{{c}-}}"; unset {c}"#)
-        );
-        for s in [Shell::Zsh, Shell::Fish] {
-            assert_eq!(s.injection_line(), s.integration_snippet());
-            assert!(s.injection_env().is_empty(), "{}", s.as_str());
+    fn the_bash_and_zsh_lines_evaluate_the_snippet_their_environment_carries_and_unset_it() {
+        for (s, carrier, snippet) in [
+            (Shell::Bash, BASH_INTEGRATION_CARRIER, BASH_INTEGRATION),
+            (Shell::Zsh, ZSH_INTEGRATION_CARRIER, ZSH_INTEGRATION),
+        ] {
+            assert_eq!(s.injection_env(), [(carrier, snippet)], "{}", s.as_str());
+            assert_eq!(
+                s.injection_line(),
+                format!(r#" eval "${{{carrier}-}}"; unset {carrier}"#),
+                "{}",
+                s.as_str()
+            );
         }
+        assert_eq!(Shell::Fish.injection_line(), FISH_INTEGRATION);
+        assert!(Shell::Fish.injection_env().is_empty());
+        // zsh's `HISTORY_IGNORE` keeps the line zsh records out of a history
+        // file by the carrier's name, which is all that line holds of note.
+        assert_eq!(
+            crate::session::launch::ZSH_HISTORY_IGNORE,
+            format!("*{ZSH_INTEGRATION_CARRIER}*")
+        );
     }
 
     #[test]

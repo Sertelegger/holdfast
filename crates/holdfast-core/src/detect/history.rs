@@ -884,14 +884,15 @@ mod tests {
     /// The suffix half of §8.5.1 rule 5, which nothing else separates from
     /// an equality test.
     ///
-    /// The rule is written over a *suffix* because the echo capture can keep
-    /// only the tail of a line wider than the terminal — zsh's wrap redraw
-    /// does exactly that (GH #276) — and the snippets typed for zsh and fish
-    /// run to several hundred characters, so there the capture is a tail at
-    /// any real width and never the whole line — which means an implementation
-    /// spelled `line.trim_end() == command` suppresses the injection line
-    /// at no terminal width anybody uses, while passing every fixture whose
-    /// snippet happens to be short enough to fit.
+    /// The rule is written over a *suffix* because the echo capture of a
+    /// line wider than the terminal differs from the line at its front.
+    /// zsh's wrap redraw keeps only the tail (GH #276), and zsh's
+    /// 68-character line wraps behind any prompt wider than 12 columns at
+    /// 80; fish's capture of its several-hundred-character line holds part
+    /// of its own text repeated in front of it. So an implementation spelled
+    /// `line.trim_end() == command` suppresses the injection line only where
+    /// it happens to fit, while passing every fixture whose snippet happens
+    /// to be short enough to fit.
     #[test]
     fn the_injection_line_is_matched_as_a_suffix_and_not_as_an_equality() {
         let snippet = "if [ -z \"${HOLDFAST_SHELL_INTEGRATION-}\" ]; then \

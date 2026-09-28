@@ -71,12 +71,13 @@ const SHELL_TIMEOUT: Duration = Duration::from_secs(30);
 const MARK: &str = "HISTMARK_";
 
 /// Text only Holdfast's integration snippets and the lines it types contain.
-/// Either reaching a history file is part of GH #252 too. bash's typed line
-/// names only the variable that carries its snippet.
-const SNIPPET_MARKS: [&str; 3] = [
+/// Either reaching a history file is part of GH #252 too. bash's and zsh's
+/// typed lines name only the variable that carries their snippet.
+const SNIPPET_MARKS: [&str; 4] = [
     "HOLDFAST_SHELL_INTEGRATION",
     "HOLDFAST_HISTFILE",
     "HOLDFAST_BASH_INTEGRATION",
+    "HOLDFAST_ZSH_INTEGRATION",
 ];
 
 const BASH_HARD_RC: &str =

@@ -1955,16 +1955,15 @@ async fn bash_integration_emits_the_measured_marker_stream_and_exact_exit_codes(
     kill(&server, &id).await;
 }
 
-/// bash's typed line evaluates a snippet its environment carries, and
-/// unsets the carrier (`detect::shell::BASH_INJECTION_LINE`). The row above
-/// is the proof the snippet ran; this is the proof that nothing the agent
-/// runs afterwards inherits it, in the shell or in a child's environment.
-#[tokio::test]
-async fn bash_hands_the_carrier_of_its_snippet_to_nothing_the_agent_runs() {
+/// bash's and zsh's typed lines evaluate a snippet their environment
+/// carries, and unset the carrier (`detect::shell::BASH_INJECTION_LINE`,
+/// `ZSH_INJECTION_LINE`). The marker-stream rows are the proof the snippet
+/// ran; this is the proof that nothing the agent runs afterwards inherits
+/// it, in the shell or in a child's environment.
+async fn assert_carrier_is_gone(args: StartSessionArgs, carrier: &str) {
     let server = HoldfastServer::new();
-    let id = start(&server, bash()).await;
+    let id = start(&server, args).await;
     await_markers(&server, &id, 3).await;
-    let carrier = holdfast_core::detect::shell::BASH_INTEGRATION_CARRIER;
     send(
         &server,
         &id,
@@ -1973,8 +1972,24 @@ async fn bash_hands_the_carrier_of_its_snippet_to_nothing_the_agent_runs() {
     .await;
     await_markers(&server, &id, 7).await;
     let out = raw(&server, &id).await;
-    assert!(out.contains("CARRIER=unset:0"), "{out:?}");
+    assert!(out.contains("CARRIER=unset:0"), "{carrier}: {out:?}");
     kill(&server, &id).await;
+}
+
+#[tokio::test]
+async fn bash_hands_the_carrier_of_its_snippet_to_nothing_the_agent_runs() {
+    let carrier = holdfast_core::detect::shell::BASH_INTEGRATION_CARRIER;
+    assert_carrier_is_gone(bash(), carrier).await;
+}
+
+#[tokio::test]
+async fn zsh_hands_the_carrier_of_its_snippet_to_nothing_the_agent_runs() {
+    if !have(Need::Program("zsh")) {
+        eprintln!("skipping: zsh not installed");
+        return;
+    }
+    let carrier = holdfast_core::detect::shell::ZSH_INTEGRATION_CARRIER;
+    assert_carrier_is_gone(program("zsh", &["-f"]), carrier).await;
 }
 
 #[tokio::test]

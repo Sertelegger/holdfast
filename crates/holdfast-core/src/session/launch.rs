@@ -354,9 +354,10 @@ pub enum History<'a> {
 /// assigns it back; empty means nowhere.
 pub const HISTFILE_CARRIER: &str = "HOLDFAST_HISTFILE";
 
-/// zsh's `HISTORY_IGNORE`: a pattern matching the integration snippet and
-/// nothing a user is likely to type. See [`history_defaults`].
-pub const ZSH_HISTORY_IGNORE: &str = "*HOLDFAST_SHELL_INTEGRATION*";
+/// zsh's `HISTORY_IGNORE`: a pattern matching the line Holdfast types into
+/// zsh, which names the variable carrying the snippet, and nothing a user
+/// is likely to type. See [`history_defaults`].
+pub const ZSH_HISTORY_IGNORE: &str = "*HOLDFAST_ZSH_INTEGRATION*";
 
 /// History a session's other interactive programs would keep under
 /// `$HOME`, switched off (GH #252). Each measured through a PTY with a
@@ -496,10 +497,12 @@ pub const NULL_DEVICE: &str = "nul";
 ///   config.fish names.
 /// - **`HISTORY_IGNORE`**, [`ZSH_HISTORY_IGNORE`]. zsh's
 ///   `inc_append_history` and `share_history` write a line when it is
-///   entered, before it runs, so the snippet's own line reached the rc's
+///   entered, before it runs, so the line Holdfast types reached the rc's
 ///   history file whenever `hist_ignore_space` was off (measured). The
-///   pattern matches only lines that name the snippet's guard variable,
-///   so a history file zsh rewrites keeps every other line (measured).
+///   pattern matches only a line that names the snippet's carrier: the
+///   typed line does, and the snippet it evaluates never enters the
+///   history list. So a history file zsh rewrites keeps every other line
+///   (measured).
 ///
 /// - **[`CLIENT_HISTORY_DEFAULTS`]**, for the REPLs and database clients
 ///   that keep a history file of their own, in either mode: they are not
@@ -793,7 +796,7 @@ mod tests {
                 ("HISTFILE", "/dev/null"),
                 ("HOLDFAST_HISTFILE", ""),
                 ("fish_history", ""),
-                ("HISTORY_IGNORE", "*HOLDFAST_SHELL_INTEGRATION*"),
+                ("HISTORY_IGNORE", "*HOLDFAST_ZSH_INTEGRATION*"),
                 ("MYSQL_HISTFILE", "/dev/null"),
                 ("MARIADB_HISTFILE", "/dev/null"),
                 ("PSQL_HISTORY", NULL_DEVICE),
