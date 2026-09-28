@@ -1,6 +1,6 @@
 {
   "name": "holdfast",
-  "version": "0.0.7",
+  "version": "0.0.8",
   "description": "A persistent, PTY-backed shell environment for AI agents, over MCP. Sessions outlive the tool call: real terminals, real stdin, prompt detection, secret input, and a human who can attach.",
   "author": {
     "name": "Sascha Sertel",
