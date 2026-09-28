@@ -1730,20 +1730,24 @@ impl Session {
         // Typed, not exported: rc files run after the environment is read
         // and would clobber an inherited PS1 (§8.5). A write failure here
         // is not fatal — the session simply degrades to tier 2. The line is
-        // `injection_line`, not the snippet: bash's evaluates a snippet the
-        // spawn put in its environment (`Shell::injection_env`), because
-        // macOS drops a typed line past 1024 bytes.
+        // `injection_line`, not the snippet: bash's and zsh's evaluate a
+        // snippet the spawn put in their environment
+        // (`Shell::injection_env`), because macOS drops a typed line past
+        // 1024 bytes, bash's snippet is longer than that, and zsh's had
+        // reached 987 of the 1000 the pin allows.
         if let Some(shell) = config.shell_integration {
             let typed = shell.injection_line();
             // §8.5.1 rule 5 (REQ-DM-009): the ring needs to know which line
             // Holdfast typed, because "it emits no `C`" stops being true the
             // moment a foreign emitter is already installed — the user's
-            // `PS0` marks the snippet's own command line and the snippet
-            // becomes the session's first history entry.
+            // `PS0` or `preexec` marks the typed line, and it becomes the
+            // session's first history entry. The ring is given the typed
+            // line and not the snippet it evaluates, because the typed line
+            // is what the shell echoes and so what the ring captures.
             //
             // **Before the write, not after.** The reader thread is already
-            // running; a snippet whose `C` arrived before `set_injection_line`
-            // landed would be recorded.
+            // running; a typed line whose `C` arrived before
+            // `set_injection_line` landed would be recorded.
             session.history.lock().set_injection_line(typed.to_string());
             let mut line = typed.as_bytes().to_vec();
             line.push(b'\n');

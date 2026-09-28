@@ -47,8 +47,8 @@ impl Shell {
 
     /// The line Holdfast types at start-up, without its trailing newline:
     /// [`BASH_INJECTION_LINE`] for bash and [`ZSH_INJECTION_LINE`] for zsh,
-    /// whose snippets are too long to type (see there), and the snippet
-    /// itself for fish.
+    /// which evaluate their snippets from the environment (see there), and
+    /// the snippet itself for fish.
     pub fn injection_line(self) -> &'static str {
         match self {
             Self::Bash => BASH_INJECTION_LINE,
@@ -352,10 +352,11 @@ const BASH_INTEGRATION: &str = concat!(
     // entries, and after them the line Holdfast typed unless `HISTCONTROL`
     // ignores a leading space (SECURITY.md, H10). Not emptied with
     // `history -c` (GH #274): an rc that rewrites its file with `history
-    // -w`, sourced again by the agent, then wrote the emptied list over the
-    // operator's file and kept none of its entries, and no reading of what
-    // the prompt and traps run found every such rc. The session runs as the
-    // operator and can read that file whatever the list holds.
+    // -w`, sourced again by the agent, would write the emptied list over
+    // the operator's file and keep none of its entries (measured, bash 5.2
+    // and 5.3), and no reading of what the prompt and traps run finds every
+    // such rc. The session runs as the operator and can read that file
+    // whatever the list holds.
     //
     // With a session file: `__holdfast_h` appends after every command,
     // prepended to `PROMPT_COMMAND` for the reason `__holdfast_d` is and
@@ -987,7 +988,8 @@ mod tests {
     /// file, cuts the list it read from that file to the line running the
     /// snippet, ahead of the guard, and then reads back a file the call
     /// named. bash leaves its list whole, because an emptied list is what an
-    /// rc's `history -w`, sourced again, wrote over the operator's file.
+    /// rc's `history -w`, sourced again, would write over the operator's
+    /// file.
     /// `tests/shell_history.rs` in the `holdfast` crate is what lists and
     /// recalls through them.
     #[test]

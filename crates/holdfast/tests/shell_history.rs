@@ -1210,10 +1210,11 @@ const ZSH_REWRITING_RC: &str = "HISTFILE=~/.zsh_history\nHISTSIZE=1000\nSAVEHIST
 /// A zsh whose rc rewrites its history file, sourced again in the session,
 /// keeps the operator's entries in that file (review of GH #274).
 /// `source ~/.zshrc` puts the rc's `HISTFILE` and `SAVEHIST` back, and zsh
-/// then saves at exit by rewriting the file from its list. The GH #274 cut
-/// had left that list holding the session's commands alone, so the
-/// operator's file came out with nothing else in it; the snippet now cuts
-/// only a list whose rc appends (measured, zsh 5.9, exit and hangup).
+/// then saves at exit by rewriting the file from its list. A cut list holds
+/// the session's commands alone, and the operator's file comes out with
+/// nothing else in it, so the snippet cuts only a list whose rc appends, and
+/// this row goes red if it cuts this one (measured, zsh 5.9, exit and
+/// hangup).
 ///
 /// The session's own commands still reach the operator's file, as they do
 /// under any rc sourced again (SECURITY.md, H1), and that is the proof the
@@ -1329,9 +1330,10 @@ const BASH_EXIT_TRAP_RC: &str = "HISTFILE=~/.bash_history\nHISTSIZE=1000\nHISTFI
 
 /// `history -w` from `PROMPT_COMMAND` only in a shell whose integration
 /// already ran, as a guard on the snippet's own variable stands in for any
-/// rc that sets up its prompt differently when sourced again. With GH
-/// #274's emptying and the search that decided when to skip it, every row
-/// kept none of the operator's entries (measured, bash 5.2 and 5.3).
+/// rc that sets up its prompt differently when sourced again. No reading
+/// of the shell at start-up finds this `history -w`, so under it an emptied
+/// list keeps none of the operator's entries in any row (measured, bash 5.2
+/// and 5.3).
 const BASH_LATE_HISTORY_W_RC: &str = "HISTFILE=~/.bash_history\nHISTSIZE=1000\nHISTFILESIZE=2000\n\
      [[ -n ${HOLDFAST_SHELL_INTEGRATION-} ]] && PROMPT_COMMAND='history -w'\n";
 
@@ -1361,14 +1363,13 @@ const fn bash_rewriting(
 /// ~/.bashrc` puts the rc's `HISTFILE` back, and the next `history -w` —
 /// at the next prompt, or the `EXIT` trap's — writes the list over the
 /// operator's file.
-/// GH #274's bash half emptied that list, which then held the session's
-/// commands alone, so `history -w` kept none of the operator's entries; the
-/// sync recipe's `history -n` reads the file back from the line count bash
-/// last recorded, and in per_session mode that count, the session file's,
-/// skipped as many of the operator's first entries as the session had run
-/// commands. bash now keeps the list it read, and this is the row that goes
-/// red if anything empties it again (measured, bash 5.2 and 5.3, exit and
-/// hangup).
+/// An emptied list holds the session's commands alone, so `history -w`
+/// keeps none of the operator's entries, and the sync recipe's `history -n`
+/// reads the file back from the line count bash last recorded, which in
+/// per_session mode, the session file's, skips as many of the operator's
+/// first entries as the session has run commands. bash keeps the list it
+/// read, and this row goes red if anything empties it (measured, bash 5.2
+/// and 5.3, exit and hangup).
 ///
 /// The session's commands reach the operator's file, as under any rc
 /// sourced again (SECURITY.md, H1), and that is the proof the rewrite
