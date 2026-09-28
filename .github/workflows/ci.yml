@@ -152,9 +152,9 @@ jobs:
       # fired and could not. The logic moved into `scripts/release-notes.sh`
       # with the check in front of the append, and this step is the half that
       # stops it coming back. It prints its own totals rather than having a
-      # number written here: three of its cases are derived from
+      # number written here: one of its cases is derived from each of
       # `CHANGELOG.md`'s released-version headings, so any count in this
-      # comment would be stale the day 0.0.8 is cut.
+      # comment would be stale the day the next release is cut.
       #
       # Four mutations are the evidence it can fail, each named because a
       # bare count says nothing about which mutation produced it: restoring

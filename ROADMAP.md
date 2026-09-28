@@ -2,7 +2,7 @@
 
 Where Holdfast is heading. Shipped work is in [CHANGELOG.md](./CHANGELOG.md).
 
-**Read the numbers as scope groupings, not as a schedule.** `0.0.8`, `0.0.9`
+**Read the numbers as scope groupings, not as a schedule.** `0.0.9`, `0.0.10`
 and so on are working labels for coherent bundles of work in the order they are
 being built. The version a bundle actually ships under is decided at release
 time from what is in it, and no date, number, or delivery is promised here.
@@ -40,10 +40,10 @@ when it should not be, is in SECURITY.md's residual register with the issue it
 is filed as. `read_output(redact: false)` and `holdfast logs --raw` are the
 audited ways to raw bytes; SECURITY.md names the unaudited ones too.
 
-**No release carries binaries yet.** `v0.0.5` to `v0.0.7` were published
-with source only. Since then a release's binaries are attached to a draft,
-and a draft's assets are not served until it is promoted. The plugin installs
-and then says so (see Distribution).
+**No published release carries binaries yet.** `v0.0.5` to `v0.0.7` were
+published with source only. `v0.0.8` is the first tag with binaries, attached
+to a draft, and a draft's assets are not served until it is promoted. The
+plugin installs and then says so (see Distribution).
 
 **On Windows the MCP server starts, and that is close to the whole of it.**
 `holdfast mcp` serves MCP over stdio in-process and writes the §9.4 audit
@@ -54,7 +54,7 @@ idempotent and on this platform that is its only case. The PTY layer itself is
 still unported (ConPTY, below), so "the server serves" is a smaller claim than
 "the tools work", and the Windows section is where the difference is listed.
 
-## Next: 0.0.8 "Dowel"
+## 0.0.8 "Dowel": tagged, not promoted
 
 **The fixes from the September dogfood pass, integrated and gated as one
 tree.** That pass drove `main` as a user would and filed what it found.
@@ -73,6 +73,9 @@ Among the changes:
 - **Bursts no longer detach viewers.**
 - **Idle shells are hung up on `terminate`,** so it takes a fraction of a
   second instead of five.
+- **Clients and daemons that disagree about the protocol say so.** A daemon
+  outlives upgrades by design, so a call that an older daemon, or an older
+  shim, would serve differently is refused with which side to restart.
 
 The CHANGELOG has the list.
 
@@ -106,11 +109,8 @@ This group is what has to be true before that step:
     ([#254](https://github.com/Sertelegger/holdfast/issues/254)).
   - Key body in `prompt.last_line`
     ([#257](https://github.com/Sertelegger/holdfast/issues/257)).
-- **Clients and daemons that disagree about the protocol say so.** A daemon
-  outlives upgrades by design. So a client that needs something an older
-  daemon lacks should refuse with "restart the daemon" rather than have the
-  argument silently dropped. The daemon also stops carrying the first client's
-  environment into sessions that do not take the caller's.
+- **The daemon stops carrying the first client's environment** into sessions
+  that do not take the caller's, such as a `profile` session.
 - **Instruments.**
   - Property tests that judge every read surface against a whole-stream
     reference, so "does this change leak, over-mask, or make two surfaces

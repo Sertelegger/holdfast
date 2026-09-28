@@ -7,7 +7,9 @@ The **Human-Observable** in that name is a shipped property from 0.0.6:
 over — a live session from any terminal. The web UI is still to come; see
 [ROADMAP.md](https://github.com/Sertelegger/holdfast/blob/main/ROADMAP.md).
 
-> **Status: `v0.0.7` is the newest tag — early development.** Twelve
+> **Status: `v0.0.8` is the newest tag — early development.** Its release
+> is a draft that has not been promoted, so no release serves a binary and
+> the plugin cannot download one yet (see below). Twelve
 > tools, hybrid mode on Linux/macOS/WSL. Sessions live in a background
 > daemon and survive the MCP client, so a Claude Code restart no longer
 > takes them with it. On Windows there is no daemon: `holdfast mcp`
