@@ -1036,7 +1036,8 @@ async fn attach_refuses_a_daemon_that_leniently_accepted_it() {
         );
     }
     // And it sent **nothing** after the handshake — not even `Detach`.
-    let sent = stub.frames();
+    // The stub records on its own task, so wait for the `Attach` to land.
+    let sent = wait_frames(&stub, 10, |f| !f.is_empty());
     assert_eq!(
         sent.len(),
         1,
@@ -1054,7 +1055,7 @@ async fn the_attach_handshake_carries_every_non_optional_field() {
     let stub = StubDaemon::start("fullhs", Vec::new(), Duration::from_millis(300)).await;
     let _ = run_plain(stub.paths.dir(), &["attach", "sess_x"]);
 
-    let sent = stub.frames();
+    let sent = wait_frames(&stub, 10, |f| !f.is_empty());
     assert_eq!(sent.len(), 1, "{sent:?}");
     match &sent[0] {
         ClientFrame::Attach {
@@ -1235,7 +1236,11 @@ async fn watch_never_sends_a_write_frame() {
     term.type_keys(&[0x03]);
     assert_eq!(term.wait_exit(10), 0);
 
-    let sent = stub.frames();
+    // The client has exited, but the stub records on its own task: wait
+    // for the `Detach` to land before counting.
+    let sent = wait_frames(&stub, 10, |f| {
+        f.iter().any(|f| matches!(f, ClientFrame::Detach))
+    });
     assert_eq!(
         sent.len(),
         2,
@@ -1384,13 +1389,13 @@ async fn a_future_attention_frame_does_not_disturb_a_v0_1_0_client() {
         !text.contains("AttentionRequired") && !text.contains("undecodable"),
         "the client complained about a frame it is supposed to skip:\n{text}"
     );
-    // And it really did send exactly what a healthy client sends.
-    let sent = stub.frames();
+    // And it really did send exactly what a healthy client sends. The
+    // stub records on its own task, so the `Detach` the client sent just
+    // before exiting may not have landed yet.
+    let sent = wait_frames(&stub, 10, |f| {
+        f.iter().any(|f| matches!(f, ClientFrame::Detach))
+    });
     assert!(matches!(sent[0], ClientFrame::Attach { .. }), "{sent:?}");
-    assert!(
-        sent.iter().any(|f| matches!(f, ClientFrame::Detach)),
-        "{sent:?}"
-    );
 }
 
 // ------------------- the way out of a secret prompt (§6.1, REQ-SEC-019)
@@ -2509,7 +2514,7 @@ async fn client_on_a_pty(tag: &str) -> (StubDaemon, Term) {
 }
 
 fn recorded_terminal(stub: &StubDaemon) -> Option<String> {
-    match stub.frames().first() {
+    match wait_frames(stub, 10, |f| !f.is_empty()).first() {
         Some(ClientFrame::Attach { terminal, .. }) => terminal.clone(),
         other => panic!("expected a recorded Attach, got {other:?}"),
     }
