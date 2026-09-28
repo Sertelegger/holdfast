@@ -263,7 +263,12 @@ the file its config.fish names.
 
 If your rc's `PROMPT_COMMAND` re-reads the history file at every prompt
 (`history -a; history -c; history -r`), `HISTFILE=/dev/null` also empties
-the session's in-memory history: up-arrow and `!!` recall nothing.
+the session's in-memory history: up-arrow and `!!` recall nothing. On bash
+4.3 and older, macOS's `/bin/bash` among them, an rc that syncs with
+`history -n; history -w; history -c; history -r` and is sourced again in
+the session rewrites your history file without its oldest entry, or
+without any entry when `source` was the session's first command
+(SECURITY.md's H1).
 
 To keep a record of what an agent ran instead, set
 
