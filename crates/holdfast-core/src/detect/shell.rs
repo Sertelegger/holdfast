@@ -495,14 +495,14 @@ const BASH_INJECTION_LINE: &str =
 ///
 /// **Nothing in it may abort, print, or end the shell because of how an rc
 /// configured it**, for bash's reasons (see `BASH_INTEGRATION`). An
-/// assignment to a readonly variable discards the rest of the typed line,
-/// so a readonly `HISTFILE`, `SAVEHIST` or `HISTSIZE` would cost the
+/// assignment to a readonly variable discards the rest of the snippet, so
+/// a readonly `HISTFILE`, `SAVEHIST` or `HISTSIZE` would cost the
 /// session all of its integration and print *read-only variable*, and a
 /// readonly `PS1` ends an `err_exit` shell at start-up. Each is tested with
 /// `${(t)NAME-}`, whose type names `readonly` for a readonly parameter. The
 /// `-` is for an rc that unsets one under `nounset`, the usual way to turn
 /// history off: `${(t)HISTFILE}` is then *parameter not set*, and the rest
-/// of the typed line is discarded (measured, zsh 5.9). zsh has no readonly
+/// of the snippet is discarded (measured, zsh 5.9). zsh has no readonly
 /// unset parameter: `typeset -r` on an unset name makes an empty one, and
 /// `unset` refuses a readonly one. The history clause is skipped whole when
 /// any of its three is readonly: pointing `HISTFILE` at a session file
@@ -539,7 +539,7 @@ const ZSH_INTEGRATION: &str = concat!(
     // where `fc -P` brings it back and zsh saves it at exit (measured).
     // The value is read as `${HISTSIZE-30}` for an rc that unsets
     // `HISTSIZE` under `nounset`: a bare `$HISTSIZE` is then *parameter not
-    // set*, which discards the rest of the typed line, the history policy
+    // set*, which discards the rest of the snippet, the history policy
     // and the integration with it, so the session's commands went to the
     // rc's file and nothing marked its prompt (measured, zsh 5.9). 30 is
     // zsh's own default; an unset `HISTSIZE` keeps whatever limit it last
@@ -561,8 +561,8 @@ const ZSH_INTEGRATION: &str = concat!(
     // A session file is then read with `fc -R`, which finds nothing in a
     // new per-session file and loads a file the call named itself as zsh
     // would have at start, and only when it is readable: `fc -R` on an
-    // unreadable file that holds anything discards the rest of the typed
-    // line, integration and all, `err_exit` or not (measured, zsh 5.9).
+    // unreadable file that holds anything discards the rest of the
+    // snippet, integration and all, `err_exit` or not (measured, zsh 5.9).
     r#" if [[ ${(t)HISTFILE-}${(t)SAVEHIST-}${(t)HISTSIZE-} != *readonly* ]]; then "#,
     r#"[[ -o append_history || -o inc_append_history || -o share_history ]] && "#,
     r#"() { HISTSIZE=1; HISTSIZE=$1 } ${HISTSIZE-30}; "#,
