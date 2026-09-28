@@ -2512,8 +2512,12 @@ mod tests {
     }
 
     /// Until the ring's head reaches `n` — a published fact, not a sleep.
+    ///
+    /// The deadline only bounds a real failure: the wait returns the moment
+    /// the bytes are published, and 2 MiB through 8 KiB chunks can take
+    /// several seconds on a loaded runner at 16 test threads.
     async fn wait_head(session: &crate::session::Session, n: u64) {
-        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
         while session.buffer_head() < n && std::time::Instant::now() < deadline {
             tokio::time::sleep(std::time::Duration::from_millis(2)).await;
         }
