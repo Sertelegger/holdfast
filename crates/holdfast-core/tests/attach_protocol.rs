@@ -3089,17 +3089,25 @@ async fn a_signal_frame_reaches_the_foreground_process_group() {
     let s = d.real_session();
 
     let mut c = attach_ok(&d, &s.id, AttachMode::ReadWrite).await;
+    // **The signal waits for output the job prints after its own `exec`**
+    // (GH #263). Neither the echo of the line nor a pause after it makes
+    // the job ready for a SIGINT. The echo comes before the fork, and a
+    // pause is a guess. bash's child also takes the terminal before it
+    // stops running the interactive shell's SIGINT handler, which records
+    // the signal and lets the `exec` discard it, so a signal sent in
+    // between leaves `sleep 300` running. A marker printed by the exec'd
+    // `sh` comes after all of that.
+    // `interrupt_reaches_the_foreground_job_not_the_shell` in
+    // `integration.rs` carries the measurement.
     send(
         &mut c,
         &ClientFrame::Input {
-            bytes: b"sleep 300\n".to_vec(),
+            bytes: b"sh -c 'echo JOB''_UP; exec sleep 300'\n".to_vec(),
         },
     )
     .await;
-    // The echoed command line proves the shell has it; the sleep is now
-    // the foreground job.
-    stream_until(&mut c, b"sleep 300", 10).await;
-    tokio::time::sleep(Duration::from_millis(300)).await;
+    // Panics with the stream if the marker never comes.
+    stream_until(&mut c, b"JOB_UP", 10).await;
 
     send(
         &mut c,

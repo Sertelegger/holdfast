@@ -14,23 +14,53 @@ fn bash() -> PtySpawnConfig {
 /// writing `echo MARKER` matches the echo and proves nothing about
 /// whether the child ever ran. Every marker below is written with an
 /// embedded `''` so the echoed form differs from the executed output.
+///
+/// **The deadline holds across a blocking read.** `PtyBackend::read`
+/// returns for bytes or EOF and nothing else, so a loop that checks the
+/// clock only between reads waits for as long as the session stays quiet.
+/// A swallowed SIGINT (GH #263) then costs the whole `sleep 300` it failed
+/// to stop before the row can say so. A watchdog thread wakes the read at
+/// the deadline by writing a newline, which the line discipline echoes
+/// back — the same way `draining` retires its reader. A session with echo
+/// off does not answer that, so if the read is still parked `WAKE_GRACE`
+/// later the watchdog kills the session, which ends the read with EOF.
+/// Neither step is taken when the needle arrives in time, so a caller
+/// that succeeds never sees the newline.
 fn read_until(pty: &dyn PtyBackend, needle: &str, timeout: Duration) -> String {
+    use std::sync::mpsc::{channel, RecvTimeoutError};
+    const WAKE_GRACE: Duration = Duration::from_secs(5);
     let deadline = Instant::now() + timeout;
-    let mut acc = String::new();
-    let mut buf = [0u8; 4096];
-    while Instant::now() < deadline {
-        match pty.read(&mut buf) {
-            Ok(0) => break,
-            Ok(n) => {
-                acc.push_str(&String::from_utf8_lossy(&buf[..n]));
-                if acc.contains(needle) {
-                    return acc;
+    let (finished, watch) = channel::<()>();
+    std::thread::scope(|s| {
+        s.spawn(move || {
+            // `Disconnected` is the read loop having returned and dropped
+            // `finished`. Only `Timeout` means the loop may still be parked.
+            if let Err(RecvTimeoutError::Timeout) = watch.recv_timeout(timeout) {
+                let _ = pty.write(b"\n");
+                if let Err(RecvTimeoutError::Timeout) = watch.recv_timeout(WAKE_GRACE) {
+                    let _ = pty.signal(Signal::Kill);
                 }
             }
-            Err(_) => break,
+        });
+        // Moved into the closure so that it is dropped when the loop
+        // returns, by either exit, and before the scope joins the watchdog.
+        let _finished = finished;
+        let mut acc = String::new();
+        let mut buf = [0u8; 4096];
+        while Instant::now() < deadline {
+            match pty.read(&mut buf) {
+                Ok(0) => break,
+                Ok(n) => {
+                    acc.push_str(&String::from_utf8_lossy(&buf[..n]));
+                    if acc.contains(needle) {
+                        return acc;
+                    }
+                }
+                Err(_) => break,
+            }
         }
-    }
-    acc
+        acc
+    })
 }
 
 fn wait_for_exit(pty: &dyn PtyBackend, timeout: Duration) {
@@ -243,30 +273,58 @@ fn interrupt_reaches_the_foreground_job_not_the_shell() {
     let at_prompt = poll_foreground(&pty, |g| g.is_some(), Duration::from_secs(5));
     assert!(at_prompt.is_some(), "the shell never took the terminal");
 
-    // Foreground sleep: job control gives it its own process group, which
+    // A foreground job: job control gives it its own process group, which
     // becomes the terminal's foreground group.
-    pty.write(b"sleep 300\n").unwrap();
-    // **Waited for, not slept through.** This was a flat 500 ms, and the
-    // thing it was guessing at is the subject of the test: `signal`
-    // targets `tcgetpgrp(master)`, and the shell owns that until it has
-    // forked the job and handed the terminal over. Its server-level twin
-    // guessed with `interaction_mode`, which the shell raises *before*
-    // the handover, and failed 1 whole-binary run in 30 under
-    // `taskset -c 0,1 --test-threads=16` for exactly that reason. Here
-    // the precondition is readable, so it is read rather than waited out.
     //
-    // Drained across the poll, and the echo drained before it: on macOS a
-    // pty nobody reads from fills, and the shell then blocks part way
-    // through echoing the line — before the fork — so the group this is
-    // waiting on never changes. Inert on Linux.
-    read_until(&pty, "sleep 300", Duration::from_secs(5));
-    let running = draining(&pty, || {
-        poll_foreground(&pty, |g| g != at_prompt, Duration::from_secs(10))
-    });
-    assert_ne!(
-        running, at_prompt,
-        "the shell never handed the terminal to the job, so there is \
-         nothing here to tell a foreground-group signal from a session one"
+    // **The signal waits for output the job prints after its own `exec`**
+    // (GH #263). `signal` targets `tcgetpgrp(master)`, and two gates that
+    // look sufficient do not make that group ready to be interrupted:
+    //
+    // - `interaction_mode`. The shell raises it *before* it forks and hands
+    //   over the terminal, so the SIGINT can reach the shell's own group.
+    //   The server-level twin failed 1 whole-binary run in 30 under
+    //   `taskset -c 0,1 --test-threads=16` on that gate.
+    // - The foreground group leaving the shell's. That is after the
+    //   handover but not after the job can take a SIGINT: bash's child
+    //   calls `give_terminal_to` in `make_child` and resets SIGINT to its
+    //   default only in `restore_original_signals`, just before `execve`.
+    //   In between it owns the terminal and still runs the interactive
+    //   shell's handler, which records the signal in a flag that the
+    //   `exec` discards, and `sleep 300` then runs to completion. Measured
+    //   with bash 5.2 outside Holdfast, 70 of 120 signals sent the moment
+    //   the group changed were lost. Polled every 30 ms, as
+    //   `poll_foreground` does, this row lost 52 of 1000 runs, eight at a
+    //   time on two cores, and the weekly flake hunt lost it twice.
+    //
+    // `JOB_UP` is printed by a non-interactive `sh`, whose SIGINT handling
+    // ends the job whichever `sh` it is. bash-as-sh (macOS) leaves SIGINT
+    // at its default. dash catches it, but only to reset it and raise it
+    // again. `exec` hands `sleep` the default. So once the marker is out,
+    // no handler is left that would record the signal and carry on. It
+    // lost 0 of 310 in the measurement above and 0 of 1000 in this row's.
+    // Reading until the marker also drains the echo, which macOS needs
+    // (see `draining`), and nothing prints after it.
+    pty.write(b"sh -c 'echo JOB''_UP; exec sleep 300'\n")
+        .unwrap();
+    let out = read_until(&pty, "JOB_UP", Duration::from_secs(10));
+    assert!(
+        out.contains("JOB_UP"),
+        "the foreground job never started: {out:?}"
+    );
+    // A precondition now rather than the gate, and still asserted because
+    // it is what makes this a row about the foreground group: a job that
+    // never held the terminal would leave nothing to tell a
+    // foreground-group signal from a session one.
+    let running = poll_foreground(
+        &pty,
+        |g| g.is_some() && g != at_prompt,
+        Duration::from_secs(5),
+    );
+    assert!(
+        running.is_some() && running != at_prompt,
+        "the job printed but does not hold the terminal ({running:?}, the \
+         shell's is {at_prompt:?}), so there is nothing here to tell a \
+         foreground-group signal from a session one"
     );
 
     pty.signal(Signal::Interrupt).unwrap();
@@ -5092,12 +5150,15 @@ async fn a_job_owns_the_terminal_by_its_first_output_and_not_by_its_executing_mo
         tokio::time::sleep(Duration::from_millis(25)).await;
     }
 
-    // And the gate that holds: `( … )` is one job, so bash hands it the
-    // terminal *before* running its body, and the marker cannot reach
-    // this buffer until the handover is done. The identical pad is in
-    // front of it, so the two halves differ in nothing but the gate.
+    // And the gate that holds: the marker is printed by the `sh` bash
+    // forked and exec'd, and bash's child hands itself the terminal before
+    // it execs, so the marker cannot reach this buffer until the handover
+    // is done. The identical pad is in front of it, so the two halves
+    // differ in nothing but the gate. That the job can also *take* the
+    // signal by then is the other half of the gate (GH #263), and it is
+    // `interrupt_reaches_the_foreground_job_not_the_shell`'s to explain.
     session
-        .write_input(b"x=${HFPAD//0/1}; ( echo RUN''NING; sleep 30 )\n")
+        .write_input(b"x=${HFPAD//0/1}; sh -c 'echo RUN''NING; exec sleep 30'\n")
         .unwrap();
     let out = read_until_contains(&server, &id, "RUNNING", 200).await;
     assert!(
@@ -5174,16 +5235,24 @@ async fn interrupt_stops_a_running_command_and_leaves_the_shell_alive() {
     // survived once. Injecting a delay between the marker and the fork —
     // a `${var//x/y}`, which is shell-side work with no fork in it —
     // opens the window in all 30 trials it was tried in with no
-    // contention at all (20 at 32 KB, 10 at 200 KB), and leaves it shut
-    // in 10 of 10 against the gate below.
+    // contention at all (20 at 32 KB, 10 at 200 KB), and an output gate
+    // keeps it shut: `a_job_owns_the_terminal_by_its_first_output_…` runs
+    // the gate below behind the same pad on every run.
     //
-    // A subshell is what closes it: `( … )` is one job, so bash gives it
-    // the terminal *before* running its body, and `RUNNING` can therefore
-    // not reach this buffer until the handover is complete. `sleep 30`
-    // then runs inside that same group, so the interrupt still has to
-    // find a group the shell does not belong to.
+    // Output from the job closes it, and it has to be output printed after
+    // the job's own `exec` (GH #263). bash's child takes the terminal in
+    // `make_child` and resets SIGINT to its default only just before
+    // `execve`, so a job that holds the terminal can still be running the
+    // interactive shell's handler, which records a SIGINT and lets the
+    // `exec` discard it. A subshell, `( echo RUNNING; sleep 30 )`, proves
+    // the handover but not that: measured outside Holdfast, 1 SIGINT in
+    // 310 sent on its marker was lost. After `sh -c '…; exec sleep 30'`
+    // prints `RUNNING` no handler is left that swallows the signal (see
+    // `interrupt_reaches_the_foreground_job_not_the_shell`), and it lost 0
+    // in 310. `sleep 30` is still in its own group, so the interrupt still
+    // has to find a group the shell does not belong to.
     session
-        .write_input(b"( echo RUN''NING; sleep 30 )\n")
+        .write_input(b"sh -c 'echo RUN''NING; exec sleep 30'\n")
         .unwrap();
     let out = read_until_contains(&server, &id, "RUNNING", 60).await;
     // Asserted rather than merely waited for: if the job never started,
