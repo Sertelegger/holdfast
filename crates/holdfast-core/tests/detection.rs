@@ -1992,6 +1992,57 @@ async fn zsh_hands_the_carrier_of_its_snippet_to_nothing_the_agent_runs() {
     assert_carrier_is_gone(program("zsh", &["-f"]), carrier).await;
 }
 
+/// A call whose `env` names the carrier does not choose what the typed line
+/// evaluates: `start_session` sets the carrier after the call's own `env`.
+/// Were the call's value to win, the line would run it in place of the
+/// snippet, and the session would start with neither integration nor the
+/// snippet's history policy. The wait is on Holdfast's own markers, which
+/// only the snippet emits.
+async fn assert_the_call_cannot_replace_the_carrier(mut args: StartSessionArgs, carrier: &str) {
+    args.env
+        .get_or_insert_with(HashMap::new)
+        .insert(carrier.into(), "echo CALLS''_OWN_SNIPPET".into());
+    let server = HoldfastServer::new();
+    let id = start(&server, args).await;
+    let deadline = Instant::now() + Duration::from_secs(20);
+    loop {
+        let out = raw(&server, &id).await;
+        assert!(
+            !out.contains("CALLS_OWN_SNIPPET"),
+            "{carrier}: the line evaluated the call's value: {out:?}"
+        );
+        let ours = markers(&out)
+            .iter()
+            .filter(|m| m.ends_with(";holdfast=1"))
+            .count();
+        if ours >= 3 {
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "{carrier}: the snippet never ran: {out:?}"
+        );
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    kill(&server, &id).await;
+}
+
+#[tokio::test]
+async fn a_calls_env_cannot_replace_the_carrier_of_bashs_snippet() {
+    let carrier = holdfast_core::detect::shell::BASH_INTEGRATION_CARRIER;
+    assert_the_call_cannot_replace_the_carrier(bash(), carrier).await;
+}
+
+#[tokio::test]
+async fn a_calls_env_cannot_replace_the_carrier_of_zshs_snippet() {
+    if !have(Need::Program("zsh")) {
+        eprintln!("skipping: zsh not installed");
+        return;
+    }
+    let carrier = holdfast_core::detect::shell::ZSH_INTEGRATION_CARRIER;
+    assert_the_call_cannot_replace_the_carrier(program("zsh", &["-f"]), carrier).await;
+}
+
 #[tokio::test]
 async fn zsh_integration_emits_the_measured_marker_stream_and_exact_exit_codes() {
     // REQ-PD-005. §8.5 requires the marker stream to be *identical* to
@@ -2300,6 +2351,58 @@ async fn a_prompt_that_already_emits_osc_133_meets_the_injected_snippet() {
     let s = status(&server, &id).await;
     assert_eq!(s["osc133_source"], "external", "status: {s}");
     assert_eq!(s["shell_integration"], "bash", "status: {s}");
+    kill(&server, &id).await;
+}
+
+/// REQ-DM-009 at a zsh whose rc marks its own commands, as iTerm2's,
+/// WezTerm's and VS Code's integrations do: its `preexec` marks the line
+/// Holdfast typed, and only the ring's knowing that line keeps it out of
+/// the history. zsh's typed line is not its snippet but the line that
+/// evaluates it (`detect::shell::ZSH_INJECTION_LINE`), so the ring has to
+/// be given the line typed: given the snippet, it records the typed line as
+/// the session's first entry. The rc's `PS1` holds its markers literally,
+/// so the snippet declines and every marker is the rc's.
+#[tokio::test]
+async fn a_zsh_rc_that_marks_its_own_commands_does_not_record_the_typed_line() {
+    if !have(Need::Program("zsh")) {
+        eprintln!("skipping: zsh not installed");
+        return;
+    }
+    let dir = Scratch::new("marking-zsh");
+    let rc = concat!(
+        r"precmd() { print -n '\e]133;D;'$?'\a' }",
+        "\n",
+        r"preexec() { print -n '\e]133;C\a' }",
+        "\n",
+        r"PS1=$'%{\e]133;A\a%}%# %{\e]133;B\a%}'",
+        "\n",
+    );
+    let server = HoldfastServer::new();
+    let id = start(&server, zsh_with_rc(&dir, rc, false)).await;
+    // The rc's first prompt, then the typed line: `C`, its `D` and the
+    // next prompt's `A` and `B`. The line has run once all seven are in.
+    const TYPED_LINE_DONE: [&str; 7] = ["D;0", "A", "B", "C", "D;0", "A", "B"];
+    let seen = await_markers(&server, &id, TYPED_LINE_DONE.len()).await;
+    assert_eq!(
+        seen, TYPED_LINE_DONE,
+        "the rc is not marking as this row needs"
+    );
+    send(&server, &id, "echo AGENT''_ONE").await;
+    await_markers(&server, &id, TYPED_LINE_DONE.len() + 4).await;
+    let h = await_closed_history(&server, &id, 1).await;
+    let entries = h["data"]["entries"].as_array().expect("entries");
+    let commands: Vec<&str> = entries
+        .iter()
+        .map(|e| e["command"].as_str().unwrap_or(""))
+        .collect();
+    assert_eq!(
+        commands,
+        vec!["echo AGENT''_ONE"],
+        "the typed line became a history entry, or the agent's did not: {h}"
+    );
+    let s = status(&server, &id).await;
+    assert_eq!(s["osc133_source"], "external", "status: {s}");
+    assert_eq!(s["shell_integration"], "zsh", "status: {s}");
     kill(&server, &id).await;
 }
 
