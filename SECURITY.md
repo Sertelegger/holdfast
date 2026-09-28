@@ -803,9 +803,10 @@ and Python 3.12.
     in the list rather than those read from the file, the sync recipe
     and `historymerge` sourced again in `none` mode, whose prompt empties
     the list itself by reading back `/dev/null`. After another command
-    they lose the operator's oldest entry; as the session's first
-    command, every entry, which GH #274's emptying had kept (measured,
-    bash 3.2.57, macOS's `/bin/bash`; 4.2 and 4.3 by their source);
+    they lose the operator's oldest entry, as they did with GH #274's
+    emptying; as the session's first command, every entry, where the
+    emptying kept them all (measured, bash 3.2.57, macOS's `/bin/bash`;
+    4.2 and 4.3 by their source);
   - bash's own save at exit appends, unless the session has run more
     commands than `HISTSIZE` holds, when it rewrites the file from a list
     that holds only the newest of them.
