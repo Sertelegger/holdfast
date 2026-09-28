@@ -1014,35 +1014,16 @@ const ZSH_OPERATOR_HISTORY: &str = ": 1700000000:0;echo OPERATORS_OWN_HISTORY_1\
 
 /// Shells whose rc names a history file the operator has already filled.
 /// bash and zsh read it as they start, before the snippet runs (GH #274).
-/// One bash rc appends to its file from `PROMPT_COMMAND`, which does not
-/// rewrite it, and one defines a function that runs `history -w` and that
-/// nothing at a prompt calls, as fzf's key bindings do: the snippet
-/// empties the list under both, and under an rc whose prompt or traps run
-/// `history -w` it does not (see [`BASH_REWRITING_RCS`]).
-const OPERATOR_HISTORY: [Case; 4] = [
+/// One bash rc appends to its file from `PROMPT_COMMAND`, which writes only
+/// the lines entered in the session, so a per-session file gets none of the
+/// operator's; an rc's `history -w` would write them all there.
+const OPERATOR_HISTORY: [Case; 3] = [
     Case {
         name: "bash-operator-history",
         command: "bash",
         args: &[],
         files: &[
             (".bashrc", "HISTFILE=~/.bash_history\n"),
-            (".bash_history", BASH_OPERATOR_HISTORY),
-        ],
-        integration: true,
-        before: &[],
-        hung_up: true,
-        needs: "bash",
-    },
-    Case {
-        name: "bash-operator-history-unused-rewriter",
-        command: "bash",
-        args: &[],
-        files: &[
-            (
-                ".bashrc",
-                "HISTFILE=~/.bash_history\n\
-                 __fzf_history_delete() { builtin history -d 1; builtin history -w; }\n",
-            ),
             (".bash_history", BASH_OPERATOR_HISTORY),
         ],
         integration: true,
@@ -1099,20 +1080,23 @@ fn await_count(shim: &mut Shim, s: &Started, needle: &str, n: usize) {
 }
 
 /// GH #274: bash and zsh read the history file an rc names as they start,
-/// before the snippet runs, so the operator's own history was in the
-/// session's memory, and `history`, `fc -l` and up-arrow put it into the
-/// output the agent reads. The snippet now empties that list in either
-/// mode — zsh keeps one entry, the line that ran the snippet — and reads
-/// back only what the session's own `HISTFILE` holds.
+/// before the snippet runs, so the operator's own history is in the
+/// session's memory, where `history`, `fc -l` and up-arrow put it into the
+/// output the agent reads. zsh's snippet cuts that list, when the rc
+/// appends to its file, to one entry, the line Holdfast typed, and reads
+/// back only what the session's own `HISTFILE` holds. bash's keeps the
+/// list whole: emptied, it is what an rc's `history -w`, sourced again,
+/// writes over the operator's file (see
+/// [`a_bash_rc_that_rewrites_its_history_file_keeps_the_operators_entries_when_sourced_again`]).
 ///
-/// Emptying must not cost recall of what the agent typed afterwards, so
-/// each session recalls a command two back with up-arrow and the last with
-/// `!!`, and lists after that: its own commands present, none of the
-/// operator's. A per-session file keeps every command the agent ran and
-/// none of the operator's, and no longer starts with the snippet's line;
-/// the operator's file is untouched either way.
+/// Each session recalls a command two back with up-arrow and the last with
+/// `!!`, and lists after that: its own commands present, and in zsh none of
+/// the operator's, in bash every one. A per-session file keeps every
+/// command the agent ran and none of the operator's, since the snippet's
+/// per-command append writes only lines entered in the session, and the
+/// operator's file is byte for byte what it was.
 #[test]
-fn bash_and_zsh_list_and_recall_none_of_the_operators_history() {
+fn zsh_lists_none_of_the_operators_history_and_bash_keeps_all_of_it() {
     let cases = available(&OPERATOR_HISTORY);
     for per_session in [false, true] {
         let inst = Instance::new(if per_session { "op-ps" } else { "op" });
@@ -1122,6 +1106,7 @@ fn bash_and_zsh_list_and_recall_none_of_the_operators_history() {
         let mut shim = Shim::launch(&inst);
         let mut ended = Vec::new();
         for case in &cases {
+            let row = format!("{} / per_session {per_session}", case.name);
             let s = start(&inst, &mut shim, *case, "Operator");
             send(&mut shim, &s, "echo RECALL''_ONE", true);
             await_count(&mut shim, &s, "RECALL_ONE", 1);
@@ -1140,12 +1125,8 @@ fn bash_and_zsh_list_and_recall_none_of_the_operators_history() {
             await_prompt(&mut shim, &s);
 
             let listed_from = output(&mut shim, &s).len();
-            let list = if case.command == "zsh" {
-                "fc -l 1"
-            } else {
-                "history"
-            };
-            send(&mut shim, &s, list, true);
+            let zsh = case.command == "zsh";
+            send(&mut shim, &s, if zsh { "fc -l 1" } else { "history" }, true);
             // Only the listing prints the marker's command with its quotes
             // after this point.
             await_output_after(&mut shim, &s, listed_from, "HISTMARK_''");
@@ -1154,17 +1135,22 @@ fn bash_and_zsh_list_and_recall_none_of_the_operators_history() {
             let listed = listed.get(listed_from..).unwrap_or(&listed);
             assert!(
                 listed.contains("echo RECALL''_TWO"),
-                "{} / per_session {per_session}: the listing lacks the agent's own \
-                 commands: {listed:?}",
-                case.name
+                "{row}: the listing lacks the agent's own commands: {listed:?}"
             );
-            let out = output(&mut shim, &s);
-            assert!(
-                !out.contains("OPERATORS_OWN_HISTORY"),
-                "{} / per_session {per_session}: the operator's history reached the \
-                 output: {out:?}",
-                case.name
-            );
+            if zsh {
+                let out = output(&mut shim, &s);
+                assert!(
+                    !out.contains("OPERATORS_OWN_HISTORY"),
+                    "{row}: the operator's history reached the output: {out:?}"
+                );
+            } else {
+                for entry in BASH_OPERATOR_HISTORY.lines() {
+                    assert!(
+                        listed.contains(entry),
+                        "{row}: bash's list lost the operator's `{entry}`: {listed:?}"
+                    );
+                }
+            }
             end(&mut shim, &s, Ending::ForceTerminate);
             ended.push((s, Ending::ForceTerminate));
         }
@@ -1196,7 +1182,12 @@ fn bash_and_zsh_list_and_recall_none_of_the_operators_history() {
                     file.display()
                 );
             }
-            for needle in std::iter::once("OPERATORS_OWN_HISTORY").chain(SNIPPET_MARKS) {
+            // bash's file begins with the line Holdfast typed, which is in
+            // its list like any other and names only bash's carrier.
+            let marks = SNIPPET_MARKS
+                .into_iter()
+                .filter(|m| s.case.command == "zsh" || *m != "HOLDFAST_BASH_INTEGRATION");
+            for needle in std::iter::once("OPERATORS_OWN_HISTORY").chain(marks) {
                 assert!(
                     !text.contains(needle),
                     "{}: {} holds {needle}: {text:?}",
@@ -1277,15 +1268,12 @@ fn a_zsh_rc_that_rewrites_its_history_file_keeps_the_operators_entries_when_sour
 }
 
 /// bash rc files that hard-set `HISTFILE` and rewrite it from the
-/// in-memory list: at every prompt, by `history -w` alone, by the sync
-/// recipe that first reads what other shells appended, by an alias
-/// `PROMPT_COMMAND` names, and from a framework's hook array; by that
-/// recipe as the `historymerge` function and `EXIT` trap it is usually
-/// shared as; and at exit alone, by a trap. The snippet follows
-/// `PROMPT_COMMAND`, the hook arrays and the traps to each alias and
-/// function they reach. Limits above anything a row writes, so none trims
-/// what it measures.
-const BASH_REWRITING_RCS: [Case; 6] = [
+/// in-memory list: at every prompt, by `history -w` alone and by the sync
+/// recipe that first reads what other shells appended; by that recipe as
+/// the `historymerge` function and `EXIT` trap it is usually shared as;
+/// and at exit alone, by a trap. Limits above anything a row writes, so
+/// none trims what it measures.
+const BASH_REWRITING_RCS: [Case; 4] = [
     bash_rewriting(
         "bash-history-w-resourced",
         &[
@@ -1314,20 +1302,6 @@ const BASH_REWRITING_RCS: [Case; 6] = [
             (".bash_history", BASH_OPERATOR_HISTORY),
         ],
     ),
-    bash_rewriting(
-        "bash-history-w-alias-resourced",
-        &[
-            (".bashrc", BASH_HISTORY_W_ALIAS_RC),
-            (".bash_history", BASH_OPERATOR_HISTORY),
-        ],
-    ),
-    bash_rewriting(
-        "bash-hook-arrays-resourced",
-        &[
-            (".bashrc", BASH_HOOK_ARRAYS_RC),
-            (".bash_history", BASH_OPERATOR_HISTORY),
-        ],
-    ),
 ];
 
 const BASH_HISTORY_W_RC: &str = "HISTFILE=~/.bash_history\nHISTSIZE=1000\nHISTFILESIZE=2000\n\
@@ -1342,26 +1316,6 @@ const BASH_HISTORYMERGE_RC: &str = "HISTFILE=~/.bash_history\nHISTSIZE=1000\nHIS
 
 const BASH_EXIT_TRAP_RC: &str = "HISTFILE=~/.bash_history\nHISTSIZE=1000\nHISTFILESIZE=2000\n\
                                  trap 'history -w' EXIT\n";
-
-const BASH_HISTORY_W_ALIAS_RC: &str =
-    "HISTFILE=~/.bash_history\nHISTSIZE=1000\nHISTFILESIZE=2000\n\
-                                       alias hw='history -w'\nPROMPT_COMMAND=hw\n";
-
-/// Two hook arrays, as bash-it and oh-my-bash lay them out, run by a
-/// `PROMPT_COMMAND` function that names neither hook. bash-it's precmd hook
-/// holds a `history -a && history -c && history -r` that runs only when
-/// `HISTCONTROL` holds `auto`: taken for the sync recipe's `history -c`, it
-/// emptied the list in none mode, and a `history -w` then lost every entry
-/// (measured with bash-it itself and an `EXIT` trap). The `history -w` is
-/// behind oh-my-bash's `_omb_util_prompt_command`, which the snippet reads
-/// by name.
-const BASH_HOOK_ARRAYS_RC: &str = "HISTFILE=~/.bash_history\nHISTSIZE=1000\nHISTFILESIZE=2000\n\
-     HISTCONTROL=ignoreboth\n\
-     __auto() { if [[ $HISTCONTROL == *auto* ]]; then history -a && history -c && history -r; fi; }\n\
-     precmd_functions=(__auto)\n\
-     __hw() { history -w; }\n_omb_util_prompt_command=(__hw)\n\
-     __run() { local f; for f in \"${precmd_functions[@]}\" \"${_omb_util_prompt_command[@]}\"; do \"$f\"; done; }\n\
-     PROMPT_COMMAND=__run\n";
 
 /// A bash session under one of [`BASH_REWRITING_RCS`]'s rc files, which
 /// runs a command and then sources the rc again before its marker. The
@@ -1389,13 +1343,14 @@ const fn bash_rewriting(
 /// ~/.bashrc` puts the rc's `HISTFILE` back, and the next `history -w` —
 /// at the next prompt, or the `EXIT` trap's — writes the list over the
 /// operator's file.
-/// The GH #274 emptying had left that list holding the session's commands
-/// alone, so `history -w` kept none of the operator's entries; the sync
-/// recipe's `history -n` reads the file back from the line count bash last
-/// recorded, and in per_session mode that count, the session file's, skipped
-/// as many of the operator's first entries as the session had run commands.
-/// The snippet now empties no list such an rc rewrites from (measured,
-/// bash 5.2 and 5.3, exit and hangup).
+/// GH #274's bash half emptied that list, which then held the session's
+/// commands alone, so `history -w` kept none of the operator's entries; the
+/// sync recipe's `history -n` reads the file back from the line count bash
+/// last recorded, and in per_session mode that count, the session file's,
+/// skipped as many of the operator's first entries as the session had run
+/// commands. bash now keeps the list it read, and this is the row that goes
+/// red if anything empties it again (measured, bash 5.2 and 5.3, exit and
+/// hangup).
 ///
 /// The session's commands reach the operator's file, as under any rc
 /// sourced again (SECURITY.md, H1), and that is the proof the rewrite

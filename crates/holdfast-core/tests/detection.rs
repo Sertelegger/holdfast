@@ -3490,29 +3490,40 @@ async fn a_readonly_ps1_leaves_zsh_unintegrated_and_alive() {
     assert_unintegrated_and_alive("zsh", zsh_with_rc(&dir, rc, false)).await;
 }
 
-/// A history file the call names itself is what the session lists, as it
-/// would have been had no rc named another (GH #274). The snippet empties
-/// the list the shell read from the rc's file, and then reads the one
-/// `HISTFILE` now names — for `/dev/null` and a new per-session file,
-/// nothing.
-async fn assert_lists_the_calls_own_file(shell: &str, args: StartSessionArgs, list: &str) {
+/// What a session lists under an rc that names the operator's history file
+/// when the call named a history file of its own (GH #274): `listed` must
+/// appear in the listing and `unlisted` nowhere in the output.
+async fn assert_lists(
+    shell: &str,
+    args: StartSessionArgs,
+    list: &str,
+    listed: &str,
+    unlisted: &str,
+) {
     let server = HoldfastServer::new();
     let id = start(&server, args).await;
     await_markers(&server, &id, 3).await;
-    send(&server, &id, list).await;
+    send(&server, &id, &format!("{list}; echo LIST''_END")).await;
     let deadline = Instant::now() + Duration::from_secs(20);
     let all = loop {
         let all = raw(&server, &id).await;
-        if all.contains("CALLERS_OWN_ENTRY") {
+        if all.contains("LIST_END") {
             break all;
         }
         assert!(
             Instant::now() < deadline,
-            "{shell}: `{list}` never listed the call's own file: {all:?}"
+            "{shell}: `{list}` never finished: {all:?}"
         );
         tokio::time::sleep(Duration::from_millis(50)).await;
     };
-    assert!(!all.contains("OPERATORS_OWN_HISTORY"), "{shell}: {all:?}");
+    assert!(
+        all.contains(listed),
+        "{shell}: `{list}` lacks {listed}: {all:?}"
+    );
+    assert!(
+        !all.contains(unlisted),
+        "{shell}: {unlisted} was listed: {all:?}"
+    );
     kill(&server, &id).await;
 }
 
@@ -3526,14 +3537,29 @@ fn calls_own_history(dir: &Scratch) {
     std::fs::write(dir.history_file(), "echo CALLERS_OWN_ENTRY\n").expect("call's history");
 }
 
+/// bash lists the history its rc's file held, as it loaded it: the snippet
+/// re-points `HISTFILE` for what the session saves and neither empties the
+/// list nor reads the call's file into it. Emptied, the list is what an
+/// rc's `history -w`, sourced again, writes over the operator's file
+/// (`tests/shell_history.rs` in the `holdfast` crate).
 #[tokio::test]
-async fn a_history_file_the_call_names_is_what_bash_lists() {
+async fn bash_lists_the_history_its_rc_loaded_and_not_the_calls_own_file() {
     let dir = Scratch::new("own-bash");
     let args = bash_with_rc(&dir, "HISTFILE=~/.op_history\n", true);
     calls_own_history(&dir);
-    assert_lists_the_calls_own_file("bash", args, "history").await;
+    assert_lists(
+        "bash",
+        args,
+        "history",
+        "OPERATORS_OWN_HISTORY",
+        "CALLERS_OWN_ENTRY",
+    )
+    .await;
 }
 
+/// zsh lists the call's own file, as it would have had no rc named another:
+/// the snippet cuts the list it read from the rc's file, and then reads the
+/// one `HISTFILE` now names.
 #[tokio::test]
 async fn a_history_file_the_call_names_is_what_zsh_lists() {
     if !have(Need::Program("zsh")) {
@@ -3544,7 +3570,14 @@ async fn a_history_file_the_call_names_is_what_zsh_lists() {
     let rc = "HISTFILE=~/.op_history\nHISTSIZE=100\nSAVEHIST=100\n";
     let args = zsh_with_rc(&dir, rc, true);
     calls_own_history(&dir);
-    assert_lists_the_calls_own_file("zsh", args, "fc -l 1").await;
+    assert_lists(
+        "zsh",
+        args,
+        "fc -l 1",
+        "CALLERS_OWN_ENTRY",
+        "OPERATORS_OWN_HISTORY",
+    )
+    .await;
 }
 
 /// A history file the call names and zsh cannot read costs the session
