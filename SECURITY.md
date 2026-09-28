@@ -445,7 +445,7 @@ only a shell whose markers arrive. These still pass on echo alone:
 - **a shell whose markers stop at its prompt**: an rc that assigns
   `PROMPT_COMMAND` and is sourced again in the session, or makes it
   readonly and regenerates `PS1` from it. Each leaves the idle prompt with
-  no `A`, `B` or `D` after the last `C` (measured, bash 5.2);
+  no `A`, `B` or `D` after the last `C` (measured, bash 5.2; GH #281);
 - **a remote shell under `ssh`**, unless the remote shell emits the
   markers itself;
 - **a prompt the reader has not scanned yet**, for as long as the reader
@@ -664,7 +664,7 @@ mechanisms prevent it:
 - **The environment.** Every session starts with these variables:
   - `HISTFILE=/dev/null`;
   - an empty `fish_history`;
-  - a zsh `HISTORY_IGNORE` that matches the snippet;
+  - a zsh `HISTORY_IGNORE` that matches the line Holdfast types;
   - the history files of common REPLs and database clients switched off:
     `PYTHON_HISTORY=/dev/null`, `NODE_REPL_HISTORY=` (empty),
     `TS_NODE_HISTORY=` (one space), `PSQL_HISTORY=/dev/null`,
@@ -674,14 +674,16 @@ mechanisms prevent it:
     as `\dev\null` on the current drive;
   - `SHELL_SESSIONS_DISABLE=1`, for macOS Terminal's per-window zsh
     history;
-  - for a bash session with shell integration,
-    `HOLDFAST_BASH_INTEGRATION`, which carries the integration snippet to
-    the line Holdfast types and is unset by that line; a call's `env`
-    cannot replace it. It fails to reach bash when an rc re-execs bash
-    through `env -i` or `env -u` or defines its own `eval` function or
-    alias, and is expected to for WSL's `bash.exe` started from native
-    Windows (not measured), and such a session gets neither integration
-    nor the snippet's half of this policy.
+  - for a bash or zsh session with shell integration,
+    `HOLDFAST_BASH_INTEGRATION` or `HOLDFAST_ZSH_INTEGRATION`, which
+    carries the integration snippet to the line Holdfast types and is
+    unset by that line; a call's `env` cannot replace it. It fails to
+    reach the shell when an rc re-execs it through `env -i` or `env -u`
+    or defines its own `eval` function or alias, and is expected to for
+    WSL's `bash.exe` started from native Windows (not measured), and such
+    a session gets neither integration nor the snippet's half of this
+    policy. An rc that reads the whole line at start-up (H12) leaves the
+    variable set for everything the session starts.
 
   A call's own `env` overrides any of them but the last. `SQLITE_HISTORY`
   is empty rather than `/dev/null` because libedit `fchmod`s the history
@@ -699,16 +701,18 @@ mechanisms prevent it:
   `/dev/null` and does not unset the variable, for two reasons:
   oh-my-zsh and prezto re-arm an empty `HISTFILE` when the rc is sourced
   again, and a nested shell or `exec` does not inherit an unset one.
-  It then empties the history the shell has already read from the file
-  the rc names (GH #274; see H10), and reads back only a file the
-  session's own `HISTFILE` names. It leaves that list whole where the
-  shell rewrites its file from the list: a bash whose prompt or traps run
-  `history -w`, and a zsh whose rc turns off `append_history`,
-  `inc_append_history` and `share_history`. After the agent sources such
-  an rc again, an emptied list would replace the operator's file with the
-  session's commands. When `HISTFILE` is readonly, or in zsh `SAVEHIST`
-  or `HISTSIZE`, it leaves the history variables and the list alone (see
-  H1).
+  In zsh it then cuts the history the shell has already read from the
+  file the rc names to one entry, the line Holdfast typed (GH #274; see
+  H10), and reads back only a file the session's own `HISTFILE` names. It
+  cuts only where the rc appends to its file (`append_history`,
+  `inc_append_history` or `share_history`): a zsh that saves by rewriting
+  its file from the list would, once the agent sources the rc again,
+  replace the operator's file with the session's commands. In bash it
+  leaves the list the rc loaded whole. Emptied, that list is what an rc
+  that runs `history -w`, sourced again, writes over the operator's file,
+  and nothing the snippet can read at start-up finds every such rc. When
+  `HISTFILE` is readonly, or in zsh `SAVEHIST` or `HISTSIZE`, it leaves
+  the history variables and the list alone (see H1).
   In zsh it also sets `SAVEHIST=0` and unsets `hist_save_by_copy`. With
   `SAVEHIST` set by an rc, zsh saves at exit and locks first by creating
   `/dev/null.LOCK`. As any user but root that fails, and *zsh: locking
@@ -783,41 +787,28 @@ and Python 3.12.
     cannot test for it, and there the snippet's assignment still fails
     and takes the integration with it (not measured).
 
-  Since GH #274 the first case could cost the operator's bash history
-  rather than add to it. An rc that hard-sets `HISTFILE` and rewrites it
-  with `history -w`, sourced again, writes the session's list over the
-  operator's file, and the list the snippet empties holds only the
-  session's commands: none of the operator's entries survived, and the
-  `history -n; history -w; history -c; history -r` sync recipe lost the
-  first ones in `per_session` mode. The snippet therefore leaves such a
-  bash's list whole. It finds `history -w` by following
-  `PROMPT_COMMAND`, the hook arrays of bash-preexec (`precmd_functions`,
-  `preexec_functions`) and oh-my-bash (`_omb_util_prompt_command`), and
-  the traps, through the aliases and functions they name. So the
-  `historymerge` function and its `EXIT` trap are found, and a function
-  nothing at the prompt calls, such as fzf's history-deletion key
-  binding, is not. A search that fails keeps the list rather than risk
-  the file. Under ble.sh, which rewrites the file at exit through a hook
-  of its own whenever `histappend` is off, the list is always kept. The
-  operator's file then keeps every entry (measured, bash 5.2 and 5.3,
-  both modes, by `exit` and by hangup, under `history -w` alone, the sync
-  recipe, `historymerge`, an `EXIT` trap, an alias, a hook array,
-  bash-it and ble.sh). What still loses entries:
-  - a `history -w` that exists only once the rc is sourced again, or is
-    reached only through a variable or a hook array not named above,
-    rewrites the file from the emptied list and loses every entry;
+  The first case adds the session's commands to the operator's file. Where
+  the rc rewrites that file from the shell's list, it keeps every entry
+  the file held, because the list still holds them: bash keeps the list
+  its rc loaded (H10). Measured through Holdfast on bash 5.2 and 5.3, both
+  modes, by `exit` and by hangup, sourced after another command, under
+  `history -w` at the prompt, the `history -n; history -w; history -c;
+  history -r` sync recipe, the `historymerge` function with its `EXIT`
+  trap, an `EXIT` trap alone, and an rc that sets `history -w` only once
+  it is sourced again: all five of the operator's entries survived every
+  row. When GH #274 emptied bash's list, that last rc lost all five in
+  every row, and no reading of the shell at start-up can find it. What
+  still loses entries:
   - on bash 4.3 and older, whose `history -n` counts the lines already
     in the list rather than those read from the file, the sync recipe
-    sourced again in `none` mode after another command loses the
-    operator's oldest entry, as it did before the snippet emptied
-    anything (measured, bash 3.2.57, macOS's `/bin/bash`; 4.2 and 4.3 by
-    their source). Sourced as the session's first command it loses
-    nothing, because in `none` mode the snippet empties the list when
-    the prompt runs `history -c` after `history -w`; keeping it lost
-    every entry;
+    and `historymerge` sourced again in `none` mode, whose prompt empties
+    the list itself by reading back `/dev/null`. After another command
+    they lose the operator's oldest entry; as the session's first
+    command, every entry, which GH #274's emptying had kept (measured,
+    bash 3.2.57, macOS's `/bin/bash`; 4.2 and 4.3 by their source);
   - bash's own save at exit appends, unless the session has run more
-    commands than `HISTSIZE` holds, when it rewrites the file from the
-    list with or without the emptying.
+    commands than `HISTSIZE` holds, when it rewrites the file from a list
+    that holds only the newest of them.
 
   zsh's equivalent, an rc that saves by rewriting its history file, is
   left whole for the same reason (H10).
@@ -840,9 +831,9 @@ and Python 3.12.
   overrides it. A fish nested inside a fish that Holdfast started saves
   nothing, but see H10. The same holds for a fish whose call set a
   non-empty `fish_history`.
-- **H6. The snippet's own line, under a user-set zsh `HISTORY_IGNORE`.**
+- **H6. The line Holdfast types, under a user-set zsh `HISTORY_IGNORE`.**
   The user's value replaces Holdfast's. So under `inc_append_history` or
-  `share_history`, without `hist_ignore_space`, the snippet's own line
+  `share_history`, without `hist_ignore_space`, the line Holdfast types
   reaches the history file that the rc names. The agent's commands do
   not.
 - **H7. REPLs that the environment does not reach.**
@@ -895,43 +886,42 @@ and Python 3.12.
   standing in for `/dev/null`: the exec'd and nested shells replaced it
   (new inode, the commands inside), and the re-sourced shell wrote into
   it in place.
-- **H10. Reading the operator's history, where the snippet does not
-  reach.** bash and zsh load the history file that an rc names as they
-  start, before the snippet runs. The snippet then empties that list, so
-  in a session Holdfast types into, `history`, `fc -l`, up-arrow and `!!`
-  offer only what was typed after it (GH #274). zsh's list keeps one
-  entry, the snippet's own line. Measured on bash 5.2 and 5.3 and zsh
-  5.9, in both history modes, under rc files that name a filled history
-  file. What still reads it:
+- **H10. Reading the operator's history.** bash and zsh load the history
+  file that an rc names as they start, before the snippet runs, and the
+  session runs as the operator, so `cat ~/.bash_history` works as it
+  always did. In zsh the snippet then cuts that list to one entry, the
+  line Holdfast typed, so `fc -l`, up-arrow and `!!` offer only what was
+  typed after it (GH #274; measured on zsh 5.9, in both history modes,
+  under rc files that name a filled history file). What still offers the
+  operator's history:
+  - **every bash session.** The snippet leaves bash's list as the rc
+    loaded it, so `history`, `fc -l`, up-arrow and `!!` offer the
+    operator's entries, followed by the line Holdfast typed unless
+    `HISTCONTROL` ignores a leading space. Emptied, that list is what an
+    rc that runs `history -w`, sourced again, wrote over the operator's
+    file (H1). In `per_session` mode the session's file begins with the
+    typed line, and a prompt or `EXIT` trap that runs `history -w` writes
+    the whole list into it, the operator's entries included; an rc that
+    only appends with `history -a`, or runs no history command at all,
+    puts none of them there (measured, bash 5.2 and 5.3);
   - a bash or zsh started inside a session, or by `exec`, which loads the
     file its own rc names, where the agent can list and recall it;
   - a zsh whose rc turns off `append_history`, `inc_append_history` and
     `share_history`. Such a zsh saves by rewriting its file from the
-    list, so after `source ~/.zshrc` an emptied list replaced the
-    operator's file with the session's commands (measured, zsh 5.9), and
-    the snippet leaves its list whole instead;
-  - a bash whose prompt or traps run `history -w`, for the same reason
-    (H1), except in `none` mode where the prompt runs `history -c` after
-    it and so empties the list itself; and any bash under ble.sh, where
-    in `per_session` mode nothing needs the list. Its list also keeps the
-    line Holdfast typed to install the snippet, unless `HISTCONTROL`
-    ignores a leading space. In `per_session` mode a prompt's `history
-    -w` rewrites the session's file from that list, so the file holds the
-    operator's entries and that line as well as the agent's commands
-    (measured, bash 5.2 and 5.3);
-  - a session whose `HISTFILE` is readonly, or in zsh whose `SAVEHIST` or
-    `HISTSIZE` is (H1), a session with `shell_integration: false`, a bash
-    the snippet's carrier does not reach, and a session whose rc reads the
-    terminal at start-up (H12), none of which get the emptying;
-  - anything that reads the file itself: the session runs as the
-    operator, so `cat ~/.bash_history` works as it always did.
+    list, so after `source ~/.zshrc` a cut list replaced the operator's
+    file with the session's commands (measured, zsh 5.9), and the snippet
+    leaves its list whole instead;
+  - a zsh whose `HISTFILE`, `SAVEHIST` or `HISTSIZE` is readonly (H1), a
+    zsh with `shell_integration: false`, one the snippet's carrier does
+    not reach, and one whose rc reads the terminal at start-up (H12),
+    none of which get the cut.
 
   A fish nested inside a Holdfast fish session reads the history file its
   own config.fish names in the same way. It offers the lines as
   autosuggestions and lists them in `history`, and it can create an empty
   file where there was none. Measured on fish 3.7.0, 4.0.2 and 4.9.3. A
   fish that Holdfast starts reads nothing.
-- **H11. A history recorder that an rc installs as a hook.** atuin,
+- **H11. A history recorder that an rc installs as a hook (GH #277).** atuin,
   zsh-histdb, mcfly and loggers built on bash-preexec run from a shell
   hook, such as a `preexec` function or zsh's `zshaddhistory`, and write
   each command to a store of their own as it runs. Nothing the
@@ -941,15 +931,18 @@ and Python 3.12.
   its master branch: a logger hooked through it wrote every agent command
   to a file under `$HOME`, whatever `HISTFILE` said. atuin itself was not
   measured.
-- **H12. An rc file that reads the terminal at start-up.** Holdfast writes
-  its integration line as the session spawns, and the shell reads it as
-  its first input. A `read` in `.zshrc`, oh-my-zsh's update question or
-  zsh's new-user menu takes the line as its answer, and the snippet, with
-  its half of the history policy, never runs. Measured on zsh 5.9 with
-  `HISTFILE` and `SAVEHIST` set in `.zshrc` followed by a `read`: the
-  agent's commands were written to `~/.zsh_history` on `exit`. bash 5.2
-  under the same `read` saved nothing. fish's policy runs from `-C` and
-  was not measured under an rc-time prompt. Such a session also keeps the
+- **H12. An rc file that reads the terminal at start-up (GH #278).**
+  Holdfast writes its integration line as the session spawns, and the
+  shell reads it as its first input. A `read` in `.zshrc`, oh-my-zsh's
+  update question or zsh's new-user menu takes the line as its answer,
+  and the snippet, with its half of the history policy, never runs.
+  Measured on zsh 5.9 with `HISTFILE` and `SAVEHIST` set in `.zshrc`
+  followed by a `read`: the agent's commands were written to
+  `~/.zsh_history` on `exit`. bash 5.2 under the same `read` saved
+  nothing. In bash and zsh the variable carrying the snippet is then
+  never unset, and everything the session starts inherits it (measured,
+  bash 5.2 and 5.3, zsh 5.9). fish's policy runs from `-C` and was not
+  measured under an rc-time prompt. Such a session also keeps the
   history the shell read (H10).
 
 #### The out-of-band secret channel

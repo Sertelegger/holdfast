@@ -158,9 +158,10 @@ Pass `shell_integration: false` to `start_session` to skip it.
 It is **typed into the session, never installed**: there is nothing to add
 to an rc file, and `crates/holdfast-core/src/detect/shell.rs` holds the only
 copy of each snippet. bash's snippet is longer than macOS lets a line typed
-at start-up be, so for bash Holdfast types a short line that runs the
-snippet from `HOLDFAST_BASH_INTEGRATION`, which the session starts with and
-that line unsets. Anything else — `dash`, `sh`, a REPL, a plain
+at start-up be, and zsh's nearly as long, so for both Holdfast types a short
+line that runs the snippet from `HOLDFAST_BASH_INTEGRATION` or
+`HOLDFAST_ZSH_INTEGRATION`, which the session starts with and that line
+unsets. Anything else — `dash`, `sh`, a REPL, a plain
 program — degrades silently to `terminal_mode` or `heuristic`, with no
 configuration and no error.
 
@@ -196,7 +197,7 @@ A session's shell writes nothing to the history files under `$HOME` (GH
 #252), however the session ends: `exit`, EOF, `terminate`, `holdfast
 daemon stop` or a daemon crash. Every session starts with
 `HISTFILE=/dev/null`, an empty `fish_history` and a zsh `HISTORY_IGNORE`
-matching Holdfast's snippet. The integration snippet, which begins with a
+matching the line Holdfast types. The integration snippet, which begins with a
 space, sets `HISTFILE=/dev/null` again in bash and zsh after your rc files
 have run, and zsh's `SAVEHIST=0`, so zsh does not try to lock and save
 `/dev/null` as it exits. fish is started with an init command (`-C`) that
@@ -226,7 +227,7 @@ Except:
   when an rc sets `savehist`;
 - a fish started inside a bash or zsh session, or through a wrapper such
   as `env fish`, whose config.fish sets `fish_history`;
-- a zsh `HISTORY_IGNORE` of your own, which lets Holdfast's snippet line
+- a zsh `HISTORY_IGNORE` of your own, which lets the line Holdfast types
   — not the agent's commands — into a history file your rc names;
 - as root, a zsh started inside a session or by `exec zsh`, under an rc
   that sets `SAVEHIST` and unsets `append_history` without setting
@@ -244,18 +245,20 @@ Except:
   program with a history file of its own, PowerShell's PSReadLine among
   them.
 
-Reading is covered in the session's own shell: bash and zsh load the
-history file your rc names as they start, and the snippet then empties
-that list, so the agent cannot list your history with `history` or recall
-it with up-arrow. A bash or zsh started inside the session loads its rc's
-file again. A readonly `HISTFILE` leaves the list as your rc loaded it,
-and so does a bash rc whose prompt or traps run `history -w`
-(SECURITY.md's H1 lists the hooks Holdfast can see), ble.sh, or a zsh rc
-that turns off `append_history`, `inc_append_history` and
-`share_history`, because emptying it would let a later save replace your
-file. Nothing empties it with `shell_integration: false`, or under an rc
-that takes the integration line. A fish started inside a fish session
-reads the file its config.fish names.
+Reading is covered only in zsh. bash and zsh load the history file your
+rc names as they start, and in zsh the snippet then cuts that list, so the
+agent cannot list your history with `fc -l` or recall it with up-arrow.
+It leaves the list whole under a zsh rc that turns off `append_history`,
+`inc_append_history` and `share_history`, where a later save would rewrite
+your file from the cut list, and under a readonly `HISTFILE`. bash keeps
+the list your rc loaded, and the agent can list and recall it: emptied, it
+is what a bash rc that runs `history -w`, sourced again, wrote over your
+file (SECURITY.md's H1 and H10). A bash or zsh started inside the session
+loads its rc's file again, and the session runs as you, so `cat
+~/.bash_history` works either way. Nothing is cut with
+`shell_integration: false`, or under an rc that takes the integration
+line. A fish started inside a fish session reads the file its config.fish
+names.
 
 If your rc's `PROMPT_COMMAND` re-reads the history file at every prompt
 (`history -a; history -c; history -r`), `HISTFILE=/dev/null` also empties
@@ -281,8 +284,10 @@ saves one; fish sessions get none.
 
 It is a convenience record, not an audit trail. A call's own `env` can
 point `HISTFILE` somewhere else, your rc's history options still apply —
-Debian's `HISTCONTROL=ignoreboth` drops commands that begin with a space —
-an rc sourced again that sets `HISTFILESIZE`, or one that makes it
+Debian's `HISTCONTROL=ignoreboth` drops commands that begin with a space,
+and without it each bash file begins with the line Holdfast typed, and holds
+your own history too if your rc runs `history -w` — an rc sourced again
+that sets `HISTFILESIZE`, or one that makes it
 readonly, truncates the file when bash exits, and anything in the list
 above that re-points `HISTFILE` takes the rest of the session's commands
 with it.

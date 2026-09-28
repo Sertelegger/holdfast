@@ -103,9 +103,9 @@ session), then restart Claude Code. Until both, each side refuses a
 - Sessions no longer write the agent's commands into your shell, REPL or
   database-client history files ([#252]), but hook-based recorders such as
   atuin, zsh-histdb, mcfly and bash-preexec loggers still do (SECURITY.md, H11).
-- A bash or zsh session no longer lists or recalls your own shell history: the
-  snippet empties the list the shell read from your rc's history file, except
-  where SECURITY.md's H10 says it cannot safely, as for `history -w` ([#274]).
+- A zsh session no longer lists or recalls your own history where your rc
+  appends to its history file. bash keeps the list your rc loaded, and the agent
+  can list it (SECURITY.md, H10) ([#274]).
 - `SECURITY.md` states a two-tier redaction contract and each guarantee's status
   today, and keeps a residual register of known leaks ([#253], [#254], [#255],
   [#256], [#257], [#258], [#259]).
