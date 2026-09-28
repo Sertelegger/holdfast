@@ -2244,12 +2244,26 @@ async fn a_wrong_request_id_writes_nothing_and_the_right_one_still_works() {
         },
     )
     .await;
-    match recv(&mut c).await {
-        ServerFrame::ProtocolError { reason, frame_kind } => {
-            assert_eq!(reason, "unknown_request_id");
-            assert_eq!(frame_kind.as_deref(), Some("SecretInput"));
+    // The fixture's own output can still be in flight ahead of the answer
+    // — its "Password: " arrives whenever the child gets the CPU — so skip
+    // `Output` and `Resize`, and nothing else: a `SecretRequestClosed` here
+    // would be the wrong-id submission closing the request, which is the
+    // failure this row exists to catch.
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+    loop {
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "no ProtocolError answered the wrong id"
+        );
+        match recv(&mut c).await {
+            ServerFrame::ProtocolError { reason, frame_kind } => {
+                assert_eq!(reason, "unknown_request_id");
+                assert_eq!(frame_kind.as_deref(), Some("SecretInput"));
+                break;
+            }
+            ServerFrame::Output { .. } | ServerFrame::Resize { .. } => {}
+            other => panic!("expected ProtocolError, got {other:?}"),
         }
-        other => panic!("expected ProtocolError, got {other:?}"),
     }
 
     // The connection is still usable and the child is still blocked: the
