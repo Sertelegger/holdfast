@@ -1270,10 +1270,12 @@ fn a_zsh_rc_that_rewrites_its_history_file_keeps_the_operators_entries_when_sour
 /// bash rc files that hard-set `HISTFILE` and rewrite it from the
 /// in-memory list: at every prompt, by `history -w` alone and by the sync
 /// recipe that first reads what other shells appended; by that recipe as
-/// the `historymerge` function and `EXIT` trap it is usually shared as;
-/// and at exit alone, by a trap. Limits above anything a row writes, so
-/// none trims what it measures.
-const BASH_REWRITING_RCS: [Case; 4] = [
+/// the `historymerge` function and `EXIT` trap it is usually shared as; at
+/// exit alone, by a trap; and at every prompt once the rc runs in a shell
+/// Holdfast has integrated, which is a `history -w` nothing that reads the
+/// shell at start-up can see. Limits above anything a row writes, so none
+/// trims what it measures.
+const BASH_REWRITING_RCS: [Case; 5] = [
     bash_rewriting(
         "bash-history-w-resourced",
         &[
@@ -1302,6 +1304,13 @@ const BASH_REWRITING_RCS: [Case; 4] = [
             (".bash_history", BASH_OPERATOR_HISTORY),
         ],
     ),
+    bash_rewriting(
+        "bash-late-history-w-resourced",
+        &[
+            (".bashrc", BASH_LATE_HISTORY_W_RC),
+            (".bash_history", BASH_OPERATOR_HISTORY),
+        ],
+    ),
 ];
 
 const BASH_HISTORY_W_RC: &str = "HISTFILE=~/.bash_history\nHISTSIZE=1000\nHISTFILESIZE=2000\n\
@@ -1316,6 +1325,14 @@ const BASH_HISTORYMERGE_RC: &str = "HISTFILE=~/.bash_history\nHISTSIZE=1000\nHIS
 
 const BASH_EXIT_TRAP_RC: &str = "HISTFILE=~/.bash_history\nHISTSIZE=1000\nHISTFILESIZE=2000\n\
                                  trap 'history -w' EXIT\n";
+
+/// `history -w` from `PROMPT_COMMAND` only in a shell whose integration
+/// already ran, as a guard on the snippet's own variable stands in for any
+/// rc that sets up its prompt differently when sourced again. With GH
+/// #274's emptying and the search that decided when to skip it, every row
+/// kept none of the operator's entries (measured, bash 5.2 and 5.3).
+const BASH_LATE_HISTORY_W_RC: &str = "HISTFILE=~/.bash_history\nHISTSIZE=1000\nHISTFILESIZE=2000\n\
+     [[ -n ${HOLDFAST_SHELL_INTEGRATION-} ]] && PROMPT_COMMAND='history -w'\n";
 
 /// A bash session under one of [`BASH_REWRITING_RCS`]'s rc files, which
 /// runs a command and then sources the rc again before its marker. The
