@@ -188,7 +188,8 @@ pub struct StartSessionArgs {
     /// Arguments passed to the program. Only with `command`.
     #[serde(default)]
     pub args: Vec<String>,
-    /// Name of an operator-declared session profile to start (spec §9.6).
+    // Spec §9.6.
+    /// Name of an operator-declared session profile to start.
     /// The operator wrote the command line; supply values for its slots in
     /// `vars`. Mutually exclusive with `command`/`args`. **Only a
     /// profile-started session can be given a keychain credential.**
@@ -212,7 +213,8 @@ pub struct StartSessionArgs {
     /// environment of the Holdfast MCP server your client launched. PAGER,
     /// GIT_PAGER, MANPAGER and SYSTEMD_PAGER default to `cat`, because a
     /// pager waits for keystrokes; set one here to get a pager back. Do not
-    /// pass secrets: these values cross the MCP boundary (spec §5.2).
+    /// pass secrets: these values cross the MCP boundary.
+    // Spec §5.2.
     #[serde(default)]
     pub env: Option<HashMap<String, String>>,
     /// Terminal width in columns, 1 to 1000. Defaults to 120. A value
@@ -223,7 +225,8 @@ pub struct StartSessionArgs {
     /// outside that range is clamped to it, not rejected.
     #[serde(default)]
     pub rows: Option<u16>,
-    /// Tier-B VT100 emulation: "off", "adaptive" (default), or "on".
+    // Tier B (§4.5).
+    /// VT100 emulation: "off", "adaptive" (default), or "on".
     /// Full emulation costs ~11.6 ms per MiB on the write path, so
     /// "adaptive" turns it on only when something needs the rendered
     /// screen. Leave it alone unless you are profiling.
@@ -243,7 +246,9 @@ pub struct StartSessionArgs {
     /// Inject OSC 133 shell integration when the command is bash, zsh,
     /// or fish. Defaults to true. `false` also skips the snippet's history
     /// line, so an rc file that sets `HISTFILE` decides where bash and zsh
-    /// save history.
+    /// save history. An rc file that reads the terminal at start-up (a
+    /// `read`, oh-my-zsh's update question) takes the injected line as its
+    /// answer, and the session starts without integration.
     #[serde(default)]
     pub shell_integration: Option<bool>,
     /// Answer the closed terminal-query set (Primary Device Attributes
@@ -553,10 +558,10 @@ impl HoldfastServer {
             output_broadcast_capacity: self.config.limits.output_broadcast_capacity,
             ..SessionConfig::default()
         };
-        // What the typed line needs (`Shell::injection_env`): bash's line
-        // evaluates its snippet from the environment. Only for a session
-        // whose line will be typed, and after the call's own `env`, so a
-        // key the call sets cannot replace the snippet.
+        // What the typed line needs (`Shell::injection_env`): bash's and
+        // zsh's lines evaluate their snippet from the environment. Only for
+        // a session whose line will be typed, and after the call's own
+        // `env`, so a key the call sets cannot replace the snippet.
         if let Some(shell) = config.shell_integration {
             cfg.env.extend(
                 shell
@@ -631,8 +636,8 @@ impl HoldfastServer {
                 if let (true, Some(file)) = (created_history_file, &history_file) {
                     let _ = std::fs::remove_file(file);
                 }
-                // `brief` matters here: portable-pty's spawn error embeds
-                // the whole $PATH, which would land in the transcript.
+                // `spawn_failure` has already replaced portable-pty's `$PATH`
+                // line; `brief` bounds what is left.
                 //
                 // `reservation` drops on this return, so the name goes
                 // back immediately. It has to: §4.1 makes a name unique
@@ -2025,11 +2030,17 @@ impl HoldfastServer {
     /// corroborated with `status` before acting on it.
     ///
     /// `command` is best-effort: it is reconstructed from the terminal's
-    /// echo of what was typed, so a command longer than the terminal width
-    /// is captured truncated to its tail (125 characters at 80 columns
-    /// yields 47), and non-ASCII bytes are recorded as Latin-1. A truncated
-    /// tail looks exactly like a complete shorter command, with no ellipsis
-    /// and no error, so do not read `command` as a transcript of what ran.
+    /// echo of what was typed, not reported by the shell, so do not read it
+    /// as a transcript of what ran. A command wider than the terminal is
+    /// where it goes wrong, and how depends on the shell. bash records it
+    /// whole. zsh's redraw at the right margin loses the front of the line:
+    /// when that loss is detected, `command` is `[REDACTED:unresolved]`,
+    /// which means the text was withheld, not that it held a secret; when it
+    /// is not, the tail is reported as if it were the whole command, with no
+    /// ellipsis and no error. fish can put a copy of part of the command in
+    /// front of it, sometimes on a line of its own. A line edited in place,
+    /// such as one recalled from history, can also lose its front or keep
+    /// text that did not run. Non-ASCII text is recorded as typed.
     /// `command` is null when no text was captured at all: the command's
     /// `C` marker had no `B` marker in front of it. A prompt framework that
     /// regenerates the prompt over the markers does this, as does a shell
@@ -2124,7 +2135,19 @@ impl HoldfastServer {
     /// back is a byte count. You cannot name a secret either: a binding
     /// fires only for a session started from an operator-declared
     /// `profile`, optionally narrowed by the observed prompt, and
-    /// `prompt_text` reaches no lookup (§9.6, REQ-SEC-012).
+    /// `prompt_text` reaches no lookup.
+    ///
+    /// **Call it while a command is waiting for the secret.** At the idle
+    /// prompt of a shell Holdfast reads markers from (bash, zsh and fish by
+    /// default) it asks nobody and returns `secret_cancelled` with reason
+    /// `at_shell_prompt`, because the shell would show the value, run it
+    /// and save it to history. A REPL's prompt, or a shell started inside
+    /// the session, is not refused and does the same. Run the command that
+    /// reads the secret first, and call this once `interaction_mode` is
+    /// `AwaitingSecret`.
+    //
+    // §9.6 and REQ-SEC-012 (no named secrets); GH #262 (the shell-prompt
+    // refusal).
     #[tool(
         annotations(
             title = "Request a secret from the user",
@@ -2254,6 +2277,25 @@ impl HoldfastServer {
                 json!({ "exit_code": session.exit_code() }),
                 "session has exited",
             ));
+        }
+
+        // **GH #262: nothing is asked for at an idle shell prompt.** A
+        // shell sitting at its own prompt has `ECHO` off, because its line
+        // editor draws what is typed, so the writer's echo test admits it —
+        // and a secret written there is drawn on every surface, run as a
+        // command, and saved to history. The writer refuses that too
+        // (`write_secret_if_unread`), and this check is not instead of it:
+        // it is what keeps the refusal from costing a human's typing or a
+        // provider run. Before step 1, so no binding resolves, no approval
+        // is asked and no `max_uses` claim is spent; before the raise, so no
+        // attached human is asked to type a credential that will be
+        // dropped.
+        //
+        // Checked a second time just before the raise, because step 1 can
+        // be away for a provider's timeout or a human approval. The writer
+        // checks a third time, one statement before the write.
+        if session.at_shell_prompt() {
+            return Ok(at_shell_prompt_refusal());
         }
 
         // **The request's one context** (GH #126, GH #127), built here
@@ -2405,8 +2447,9 @@ impl HoldfastServer {
         // adopted* request and this call raised none, so a lone
         // `secret_input_resolved` would name nothing and a
         // `secret_input_request` with no id would not be §9.4's shape.
-        // `schema::RequestSecretInput.request_id` is an `Option` and this
-        // is the one path that leaves it unset.
+        // `schema::RequestSecretInput.request_id` is an `Option`, and this
+        // and `at_shell_prompt_refusal` are the two paths that leave it
+        // unset.
         //
         // **The child's affordance is left exactly as found.** Whatever
         // raise §8.3's edge produced is still outstanding and still
@@ -2417,6 +2460,11 @@ impl HoldfastServer {
                 json!({ "reason": CancelReason::CallerCancelled.as_str() }),
                 "the request was cancelled by its caller before a secret was requested",
             ));
+        }
+        // GH #262's second check, for a step 1 that was away long enough
+        // for the command that asked to end — see the first, above.
+        if session.at_shell_prompt() {
+            return Ok(at_shell_prompt_refusal());
         }
 
         // REQ-SEC-010a. Raise if the slot is vacant, **adopt** if an echo
@@ -2558,6 +2606,20 @@ impl HoldfastServer {
                 ),
                 format!("{bytes_written} byte(s) written to the session"),
             ),
+            // The writer's GH #262 refusal gets the same guidance as the
+            // request-time one: the bare word does not say that a human's
+            // answer was thrown away, or what the agent does next.
+            Resolution::Cancelled(CancelReason::AtShellPrompt) => envelope::envelope(
+                Status::SecretCancelled,
+                json!({
+                    "request_id": request_id,
+                    "reason": CancelReason::AtShellPrompt.as_str(),
+                }),
+                "the answer was not written: the command that asked for it had ended and \
+                 the session was back at its shell prompt, where it would have been shown, \
+                 run as a command and saved to history. Run the command that asks for the \
+                 secret again, and call this while it waits",
+            ),
             Resolution::Cancelled(reason) => envelope::envelope(
                 Status::SecretCancelled,
                 json!({ "request_id": request_id, "reason": reason.as_str() }),
@@ -2570,6 +2632,48 @@ impl HoldfastServer {
             ),
         })
     }
+}
+
+/// `request_secret_input`'s answer at an idle shell prompt (GH #262).
+///
+/// **`secret_cancelled` with no `request_id`**, the shape GH #127's
+/// already-cancelled call set: nothing was raised, so there is no request
+/// to name, and no §9.4 pair is written for the same reason.
+///
+/// **One text for both call sites, so it claims only what is true at
+/// both.** Before step 1 nothing has run. Before the raise a binding's
+/// provider may have run, and its value been refused by the writer for
+/// this same reason. That leaves a `binding_resolved` audit line with no
+/// request pair after it. So the text says nothing was written, not that
+/// nothing was requested.
+///
+/// **The details say what to do, not only what happened.** An agent that
+/// meets this has usually just watched a command fail, such as a `read -s`
+/// that zsh parses differently, and is about to ask again. What it needs is
+/// to run the command that reads the secret and ask while it waits. Not
+/// told to retry as it is, and not told to find a human: neither changes a
+/// shell's prompt into a secret prompt. **But told what to do if it has
+/// just started the command**, because a call made in the same instant as
+/// the `send_input` that runs it arrives before the shell has read that
+/// line. Measured: 2 of 3 such calls refused with no gap, none at a gap of
+/// 5 ms. Without that sentence, the remedy the details name would send such
+/// an agent to run the command a second time, into its own password prompt.
+/// The wait it names is the pattern-less one, which returns at
+/// `AwaitingSecret` and at the prompt of a command that failed. A pattern
+/// for the password prompt scans only output that arrives after the call
+/// by default, so a prompt already drawn is missed and the wait runs to
+/// its deadline (measured with `read -s -p`).
+fn at_shell_prompt_refusal() -> CallToolResult {
+    envelope::envelope(
+        Status::SecretCancelled,
+        json!({ "reason": CancelReason::AtShellPrompt.as_str() }),
+        "nothing was written: the session is at its shell prompt, where a secret \
+         would be shown, run as a command and saved to history. Run the command \
+         that asks for the secret first, and call this while it waits; if you have \
+         just started it, call wait_for_pattern with no pattern and call this again \
+         once interaction_mode is AwaitingSecret. If the command has already failed \
+         or ended, fix it and run it again",
+    )
 }
 
 impl HoldfastServer {
@@ -2773,7 +2877,8 @@ impl HoldfastServer {
         // `AwaitingSecret` — and `request_secret_input` had no echo-state
         // precondition before that check existed. The writer gates on the
         // echo state itself, which is the condition the harm actually
-        // turns on.
+        // turns on — and, since GH #262, on whether the session's shell is
+        // back at its own prompt, where `ECHO` is off and the harm is worse.
         //
         // ## And the question that is not about the slot at all (GH #126)
         //
@@ -4474,7 +4579,8 @@ pub struct ReadOutputArgs {
     /// Read the last N bytes instead.
     #[serde(default)]
     pub tail_bytes: Option<usize>,
-    /// Apply §4.1's targeted secret holdback to a `tail_lines`/`tail_bytes`
+    // §4.1's targeted holdback.
+    /// Apply the targeted secret holdback to a `tail_lines`/`tail_bytes`
     /// read, which bypasses it by default. Only `true` is accepted:
     /// the bypass has exactly one licensed spelling — naming one of those
     /// two arguments — and `redact: false` is the audited escape hatch.
@@ -4529,14 +4635,19 @@ pub struct WaitForPatternArgs {
     /// removed, as read_output returns it — and as raw bytes; the earlier
     /// match wins. match.offset is always a raw byte offset.
     ///
-    /// **Omit it to wait for the session to stop executing instead. An empty      string is rejected rather than treated as either, because it is a likely client      encoding of \"omit\" and it used to match at offset zero and complete instantly** —
-    /// which is not the same claim as "the command finished"; see
-    /// `run_wait_for_idle` for what each tier can actually establish. A
-    /// shell-prompt regex is a guess about the operator's `$PS1` and
-    /// silently never matches a customised one, so "wait until the
-    /// command finishes" is answered from the detector rather than from
-    /// text. Supply this only for a *program's* prompt — `Password:`,
-    /// `(gdb)`, `>>>` — which is text no detector knows about.
+    /// **Omit it to wait for the session to stop executing instead.** An
+    /// empty string is refused as an invalid argument rather than read as
+    /// either form; omit the key to mean "no pattern". Supply a pattern
+    /// only for a *program's* prompt — `Password:`, `(gdb)`, `>>>` — which
+    /// no detector knows about. Never pass one for the shell's own prompt:
+    /// it is a guess about the operator's `$PS1`, silently never matches a
+    /// customised one, and so times out on a command that has finished.
+    //
+    // Everything in `///` above is this argument's published description,
+    // so it says what a caller does and nothing about the code. Why `""`
+    // is refused is at the top of `wait_for_pattern`; what the pattern-less
+    // wait can establish at each detection tier is `run_wait_for_idle`'s
+    // doc.
     #[serde(default)]
     pub pattern: Option<String>,
     /// Deadline in seconds. Defaults to 30. 0 means "no caller deadline"
@@ -4597,19 +4708,20 @@ pub struct StatusArgs {
 #[derive(Debug, Default, Deserialize, Serialize, schemars::JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct RequestSecretInputArgs {
-    /// Session id or live session name. **The only selector.** §5.2: the
-    /// tool takes `session`, never a `request_id` — the id is returned to
-    /// you and never accepted from you (REQ-SEC-010a).
+    /// Session id or live session name. **The only selector.** The tool
+    /// takes `session`, never a `request_id`: the id is returned to you and
+    /// never accepted from you.
+    // §5.2, REQ-SEC-010a.
     pub session: String,
     /// What is being asked for, e.g. "sudo password for deploy-user". At
-    /// most 512 bytes of UTF-8 (§9.5). This reaches no credential lookup:
-    /// bindings match the operator-declared `profile` the session was
-    /// started from, optionally narrowed by the observed prompt — never
-    /// this string (§9.6, REQ-SEC-012).
+    /// most 512 bytes of UTF-8. This reaches no credential lookup: bindings
+    /// match the operator-declared `profile` the session was started from,
+    /// optionally narrowed by the observed prompt, never this string.
+    // §9.5 (the cap), §9.6 and REQ-SEC-012 (no lookup).
     pub prompt_text: String,
-    /// Default true. §5.2's normalisation is the daemon's job, not the
-    /// client's: exactly one trailing `\r\n` or `\n` is stripped from the
-    /// received bytes, then `\n` is appended when this is true.
+    /// Default true. Exactly one trailing `\r\n` or `\n` is stripped from
+    /// the received bytes, then `\n` is appended when this is true.
+    // §5.2's normalisation, which is the daemon's job, not the client's.
     #[serde(default)]
     pub append_newline: Option<bool>,
     /// Default 120. Rejected when 0 or above
@@ -6167,19 +6279,29 @@ mod tests {
     #[test]
     fn get_command_history_description_carries_its_caveats() {
         let tool = HoldfastServer::get_command_history_tool_attr();
-        let description = tool.description.as_deref().unwrap_or("");
-        // `80 columns` and `Latin-1` are here because the needle set was
-        // narrower than the caveat it guards: deleting the quantification
-        // ("125 characters at 80 columns yields 47") *and* the Latin-1
-        // clause while keeping the phrase `truncated to its tail` survived
-        // the whole suite. Those two are what tell the agent *how* wrong
-        // `command` gets and on which inputs, and they are the first
-        // casualties of a reword — the bare phrase would still be there.
+        // Collapsed, because the description keeps its source line breaks
+        // and a needle should not depend on where a reflow puts them.
+        let description = tool
+            .description
+            .as_deref()
+            .unwrap_or("")
+            .split_whitespace()
+            .collect::<Vec<_>>()
+            .join(" ");
+        // The per-shell needles are here because a bare "best-effort" is
+        // the reword that survives a phrase check: what tells the agent
+        // *how* wrong `command` gets, and on which inputs, is the wide
+        // command, zsh's refusal that it must not read as a secret, the
+        // silent tail and fish's duplicated text — and those are the first
+        // casualties of a shortening.
         for needle in [
             "nested integrated shell",
-            "truncated to its tail",
-            "80 columns",
-            "Latin-1",
+            "wider than the terminal",
+            "bash records it whole",
+            "`[REDACTED:unresolved]`, which means the text was withheld",
+            "the tail is reported as if it were the whole command",
+            "fish can put a copy of part of the command in front of it",
+            "Non-ASCII text is recorded as typed",
             "null when no text was captured",
             "in its own output",
             "cannot predict the next",
@@ -6188,6 +6310,17 @@ mod tests {
                 description.contains(needle),
                 "get_command_history's advertised description dropped \
                  {needle:?}:\n{description}"
+            );
+        }
+        // What it said until GH #270 and the per-shell measurement: a
+        // decoding bug that is fixed, and a quantification no shell
+        // matches (bash records 125 characters at 80 columns whole). Both
+        // were pinned *in*, which is how they outlived the behaviour.
+        for stale in ["Latin-1", "yields 47", "truncated to its tail"] {
+            assert!(
+                !description.contains(stale),
+                "get_command_history's advertised description still says \
+                 {stale:?}, which the code no longer does:\n{description}"
             );
         }
     }

@@ -1775,10 +1775,11 @@ mod tests {
         }
     }
 
-    /// Put a value on the write queue exactly as `attach::conn`'s
-    /// `SecretInput` arm does, which is what a human at an attached client
-    /// is — §5.2's normalisation applied by the daemon, and the value in
-    /// the one type whose `Drop` zeroes it.
+    /// Put a value on the write queue as a human at an attached client's
+    /// answer arrives — §5.2's normalisation applied by the daemon, and the
+    /// value in the one type whose `Drop` zeroes it — but as a write no gate
+    /// refuses, which `attach::conn`'s `SecretInput` arm no longer performs
+    /// (it sends a gated write since GH #262).
     async fn write_as_a_human(s: &Session, bytes: &[u8]) {
         let (req, ack) =
             crate::session::WriteRequest::secret(SecretBytes::normalise(bytes.to_vec(), true));
@@ -3853,9 +3854,10 @@ mod tests {
             .decide(session_id, approval_id, decision, who)
     }
 
-    /// Answer the outstanding secret request exactly as `attach::conn`'s
+    /// Answer the outstanding secret request as `attach::conn`'s
     /// `SecretInput` arm does: take the slot by id, write through the
-    /// queue, then answer the waiting call with the **count**.
+    /// queue, then answer the waiting call with the **count**. The write is
+    /// one no gate refuses, which that arm no longer sends (GH #262).
     ///
     /// This is what makes "falls through to the human-prompt path" an
     /// assertion about a human completing the call, rather than about a
@@ -8857,6 +8859,188 @@ mod tests {
             contains(&seen, want.as_bytes()),
             "the child did not run in the profile's `cwd` with the profile's `env`: {}",
             String::from_utf8_lossy(&seen)
+        );
+        let _ = s.signal(Signal::Kill);
+    }
+
+    // ------------------------------------------ GH #262: the shell prompt
+
+    /// A profile that starts a real interactive `bash`, so its idle prompt
+    /// is readline's and its markers are Holdfast's own integration — the
+    /// arrangement of GH #262's keychain rows, with no rc file and no
+    /// human.
+    const BASH_PROFILE: &str = "gh262-bash";
+
+    fn bash_profile(bindings: Vec<SecretBinding>) -> SecurityConfig {
+        let mut security = keychain_mode(bindings);
+        security.profiles = vec![crate::config::SessionProfile {
+            name: BASH_PROFILE.to_string(),
+            program: "bash".to_string(),
+            args: vec!["--norc".to_string(), "--noprofile".to_string()],
+            vars: Default::default(),
+            // `tests/detection.rs`'s reason: a line editor on the test
+            // runner's possibly-dumb terminal is not the one measured.
+            env: [("TERM".to_string(), "xterm-256color".to_string())]
+                .into_iter()
+                .collect(),
+            cwd: None,
+        }];
+        security
+    }
+
+    async fn start_bash(server: &HoldfastServer) -> Arc<Session> {
+        let id = start_via_tool(
+            server,
+            crate::mcp::tools::StartSessionArgs {
+                profile: Some(BASH_PROFILE.into()),
+                ..Default::default()
+            },
+        )
+        .await
+        .expect("the bash profile starts");
+        server.registry.get(&id).expect("the session")
+    }
+
+    /// Poll until `pred` holds of the session, or fail naming `what`.
+    async fn await_session(s: &Session, what: &str, pred: impl Fn(&Session) -> bool) {
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(20);
+        while !pred(s) {
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "the session never reached {what}; line discipline {:?}, detection {:?}",
+                s.line_discipline(),
+                s.detection()
+            );
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    }
+
+    /// Everything the shell was given before this has been read once the
+    /// fence's output is back: `echo HOLDFAST''_FENCE` is echoed as typed
+    /// and prints `HOLDFAST_FENCE`, and only the second is searched for.
+    async fn fence(server: &HoldfastServer, s: &Session) {
+        call_send_input(server, &s.id, "echo HOLDFAST''_FENCE").await;
+        buffer_until(s, b"HOLDFAST_FENCE", 20).await;
+    }
+
+    /// **GH #262, the keychain row, at the request.** A profile session
+    /// whose `bash` sits at its idle prompt: `ECHO` is off, so the echo
+    /// test alone let the binding resolve and write, with no human
+    /// anywhere, and one `read_output` then handed the operator's
+    /// credential to the agent. The request is refused before step 1, so
+    /// no provider runs and no `binding_resolved` line is written.
+    #[tokio::test]
+    async fn a_binding_resolves_nothing_for_a_shell_at_its_idle_prompt() {
+        let mut sc = Scratch::new("gh262idle");
+        let b = sc.binding("idle", BASH_PROFILE, &format!("printf '{PROBE}\\n'\n"));
+        let server = server_with(bash_profile(vec![b]), &sc.audit_log());
+        let s = start_bash(&server).await;
+        await_session(&s, "its idle prompt", |s| s.at_shell_prompt()).await;
+        assert_eq!(
+            s.line_discipline().echo,
+            Some(false),
+            "readline has ECHO on here, so this row cannot show the echo test admits it"
+        );
+
+        let payload = call(&server, secret_args(&s.id, 5)).await;
+        assert_eq!(payload["status"], "secret_cancelled", "{payload}");
+        assert_eq!(payload["data"]["reason"], "at_shell_prompt", "{payload}");
+        assert!(
+            !sc.ran("idle"),
+            "the provider ran for a shell at its idle prompt"
+        );
+        assert!(
+            !sc.kinds(&s.id).iter().any(|k| k == "binding_resolved"),
+            "a binding resolved for a shell at its idle prompt: {:?}",
+            sc.kinds(&s.id)
+        );
+        fence(&server, &s).await;
+        assert!(
+            !contains(&buffered(&s), PROBE.as_bytes()),
+            "the credential reached the shell:\n{}",
+            String::from_utf8_lossy(&buffered(&s))
+        );
+        let _ = s.signal(Signal::Kill);
+    }
+
+    /// **GH #262, the keychain row, at the write.** The request is made
+    /// while a command sits at an echo-off read, which is admitted; the
+    /// command gives up while the provider is still answering, and the
+    /// shell is back at its prompt when the value arrives. The writer
+    /// refuses it and the call answers `at_shell_prompt`.
+    ///
+    /// **`binding_resolved` is the witness that the refusal was the
+    /// writer's**: the store did answer, and §9.6 counts resolutions from
+    /// the store, so the line stands and the value still never reached
+    /// the shell.
+    #[tokio::test]
+    async fn a_value_resolved_after_the_command_ended_is_not_written_into_the_prompt() {
+        let mut sc = Scratch::new("gh262late");
+        let provider_gate = sc.path("provider.gate");
+        let child_gate = sc.path("child.gate");
+        let b = sc.binding(
+            "late",
+            BASH_PROFILE,
+            &format!(
+                "until [ -f '{}' ]; do sleep 1; done\nprintf '{PROBE}\\n'\n",
+                provider_gate.display()
+            ),
+        );
+        let server = Arc::new(server_with(bash_profile(vec![b]), &sc.audit_log()));
+        let s = start_bash(&server).await;
+        await_session(&s, "its idle prompt", |s| s.at_shell_prompt()).await;
+
+        // A command at an echo-off read that ends without reading, when
+        // the row opens `child_gate`. `Pass''word` so that the command
+        // line's own echo does not contain the prompt text.
+        call_send_input(
+            &server,
+            &s.id,
+            &format!(
+                "stty -echo; printf 'Pass''word: '; until [ -f '{}' ]; do sleep 1; done; \
+                 stty echo",
+                child_gate.display()
+            ),
+        )
+        .await;
+        await_session(&s, "the echo-off read", |s| {
+            !s.at_shell_prompt()
+                && s.detection().interaction_mode == crate::detect::InteractionMode::AwaitingSecret
+        })
+        .await;
+
+        let call = {
+            let server = Arc::clone(&server);
+            // Above `keychain_mode`'s five-second provider budget, for the
+            // reason `a_human_answering_during_the_provider_call_is_not_overwritten`
+            // gives.
+            let args = secret_args(&s.id, 8);
+            tokio::spawn(async move { server.request_secret_input(Parameters(args)).await })
+        };
+        await_ran(&sc, "late").await;
+        std::fs::write(&child_gate, b"go").expect("release the command");
+        await_session(&s, "its prompt again", |s| s.at_shell_prompt()).await;
+        std::fs::write(&provider_gate, b"go").expect("release the provider");
+
+        let payload = body(
+            &tokio::time::timeout(Duration::from_secs(60), call)
+                .await
+                .expect("the call never returned")
+                .expect("the call task")
+                .expect("request_secret_input"),
+        );
+        assert_eq!(payload["status"], "secret_cancelled", "{payload}");
+        assert_eq!(payload["data"]["reason"], "at_shell_prompt", "{payload}");
+        assert!(
+            sc.kinds(&s.id).iter().any(|k| k == "binding_resolved"),
+            "the store never answered, so this row did not reach the write: {:?}",
+            sc.kinds(&s.id)
+        );
+        fence(&server, &s).await;
+        assert!(
+            !contains(&buffered(&s), PROBE.as_bytes()),
+            "the credential reached the shell's prompt:\n{}",
+            String::from_utf8_lossy(&buffered(&s))
         );
         let _ = s.signal(Signal::Kill);
     }

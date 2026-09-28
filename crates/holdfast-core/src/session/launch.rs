@@ -64,19 +64,23 @@
 //! verbatim, so an agent that typed `@client` into `start_session` had
 //! it read as a launch context: its `env` replaced the session's, and
 //! `session_start`'s `env_keys` recorded none of it. The daemon now takes
-//! the key only from a peer whose protocol has it (1.5), and an older
-//! shim's is refused as the unknown argument it is.
+//! the key only from a peer whose protocol has it (1.5). An older shim's
+//! is refused: in a `profile` call as the unknown argument it is, and in
+//! any other with the whole call (`daemon::server::older_peer_start_refusal`).
 //!
 //! ## What is still scrubbed, and why that is a fallback
 //!
 //! A daemon-hosted session that has **no** client environment — a
-//! `profile` session, or a request from a shim that predates this — still
+//! `profile` session, or a request from a 1.5 peer that sent none — still
 //! starts from the daemon's own environment. For those, the variables
 //! Claude Code marks its children with ([`names_the_spawning_client`])
 //! are removed, because they describe the process that spawned the
 //! daemon and are guaranteed wrong for anyone else. That is the narrow
 //! list the paragraph above argues against as a *fix*; as a fallback for
 //! the paths the fix cannot reach, it is strictly better than nothing.
+//! A shim that predates the key is not one of those paths: its
+//! `start_session` is refused unless it names a `profile`
+//! (`daemon::server::older_peer_start_refusal`).
 //!
 //! ## Defaults every session gets (GH #239, GH #252)
 //!
@@ -101,7 +105,9 @@ use std::future::Future;
 ///
 /// **Taken only from a shim that sends one.** A shim older than protocol
 /// 1.5 forwards the agent's arguments verbatim, so from one the key is
-/// the agent's text; the daemon leaves it in the arguments and the tool
+/// the agent's text. Such a shim's `start_session` is refused whole unless
+/// it names a `profile` (`daemon::server::older_peer_start_refusal`); in a
+/// profile call the daemon leaves the key in the arguments, and the tool
 /// refuses it the same way (`daemon::server::Peer::sends_launch_context`).
 ///
 /// Declared in `protocol::method`, which is where the wire-shape record
@@ -232,8 +238,10 @@ pub fn take_client_param(
 pub enum StartDir<'a> {
     /// This process's own directory. Right in-process, where this process
     /// is the client's; right for a `profile` session, whose directory is
-    /// the operator's (GH #55); and the pre-GH-#229 behaviour for a shim
-    /// too old to say where it is, which is the best a daemon can do.
+    /// the operator's (GH #55); and the fallback for a 1.5 peer that sent
+    /// no context. A shim too old to say where it is does not reach it:
+    /// its `start_session` is refused unless it names a `profile`
+    /// (`daemon::server::older_peer_start_refusal`).
     Own,
     /// The calling client's directory, as its shim stated it.
     Client(&'a str),
@@ -346,9 +354,10 @@ pub enum History<'a> {
 /// assigns it back; empty means nowhere.
 pub const HISTFILE_CARRIER: &str = "HOLDFAST_HISTFILE";
 
-/// zsh's `HISTORY_IGNORE`: a pattern matching the integration snippet and
-/// nothing a user is likely to type. See [`history_defaults`].
-pub const ZSH_HISTORY_IGNORE: &str = "*HOLDFAST_SHELL_INTEGRATION*";
+/// zsh's `HISTORY_IGNORE`: a pattern matching the line Holdfast types into
+/// zsh, which names the variable carrying the snippet, and nothing a user
+/// is likely to type. See [`history_defaults`].
+pub const ZSH_HISTORY_IGNORE: &str = "*HOLDFAST_ZSH_INTEGRATION*";
 
 /// History a session's other interactive programs would keep under
 /// `$HOME`, switched off (GH #252). Each measured through a PTY with a
@@ -488,10 +497,12 @@ pub const NULL_DEVICE: &str = "nul";
 ///   config.fish names.
 /// - **`HISTORY_IGNORE`**, [`ZSH_HISTORY_IGNORE`]. zsh's
 ///   `inc_append_history` and `share_history` write a line when it is
-///   entered, before it runs, so the snippet's own line reached the rc's
+///   entered, before it runs, so the line Holdfast types reached the rc's
 ///   history file whenever `hist_ignore_space` was off (measured). The
-///   pattern matches only lines that name the snippet's guard variable,
-///   so a history file zsh rewrites keeps every other line (measured).
+///   pattern matches only a line that names the snippet's carrier: the
+///   typed line does, and the snippet it evaluates never enters the
+///   history list. So a history file zsh rewrites keeps every other line
+///   (measured).
 ///
 /// - **[`CLIENT_HISTORY_DEFAULTS`]**, for the REPLs and database clients
 ///   that keep a history file of their own, in either mode: they are not
@@ -785,7 +796,7 @@ mod tests {
                 ("HISTFILE", "/dev/null"),
                 ("HOLDFAST_HISTFILE", ""),
                 ("fish_history", ""),
-                ("HISTORY_IGNORE", "*HOLDFAST_SHELL_INTEGRATION*"),
+                ("HISTORY_IGNORE", "*HOLDFAST_ZSH_INTEGRATION*"),
                 ("MYSQL_HISTFILE", "/dev/null"),
                 ("MARIADB_HISTFILE", "/dev/null"),
                 ("PSQL_HISTORY", NULL_DEVICE),

@@ -490,6 +490,16 @@ async fn start_session_reports_spawn_failed_without_leaking_the_path() {
         );
     }
     assert!(details.chars().count() <= 220, "details: {details:?}");
+    // The cause, not only its headline: portable-pty's message is several
+    // lines and the envelope keeps one, which used to leave the agent
+    // `Unable to spawn … because:` with nothing after the colon.
+    assert!(
+        details.ends_with(
+            "Unable to spawn holdfast_definitely_not_a_real_program because: \
+             not found on PATH"
+        ),
+        "the spawn error lost its cause: {details:?}"
+    );
 }
 
 // ---- GH #131: a refused `start_session` has not run its command ------

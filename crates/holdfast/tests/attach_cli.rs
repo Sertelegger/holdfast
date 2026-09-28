@@ -1490,6 +1490,71 @@ async fn a_declined_secret_is_reported_to_the_client_that_submitted_it() {
     );
 }
 
+/// **GH #262, client side: the shell-prompt decline gets its sentence
+/// too**, under `--allow-echo`, because that is the flag the human would
+/// otherwise reach for. The daemon's writer refuses a value whose shell is
+/// back at its own prompt whatever `allow_echo` says; a client that
+/// printed only `secret request at_shell_prompt` would leave the human
+/// believing the password went somewhere.
+///
+/// Answered by the stub after the `SecretInput`, for the reason the
+/// `not_echo_off` row above is.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_shell_prompt_decline_says_the_value_was_discarded_whatever_allow_echo_says() {
+    let stub = StubDaemon::start_reacting(
+        "secretatprompt",
+        vec![
+            enc(&ServerFrame::Attached {
+                session_id: "sess_stub01".into(),
+                name: None,
+                cols: 80,
+                rows: 24,
+                state: "Running".into(),
+                exit_code: None,
+                protocol_major: PROTOCOL_MAJOR,
+                protocol_minor: PROTOCOL_MINOR,
+            }),
+            enc(&ServerFrame::AwaitingSecret {
+                request_id: "req_sp01".into(),
+                prompt_text: "Password: ".into(),
+                raised_by: None,
+            }),
+        ],
+        |f| matches!(f, ClientFrame::SecretInput { .. }),
+        enc(&ServerFrame::SecretRequestClosed {
+            request_id: "req_sp01".into(),
+            outcome: "at_shell_prompt".into(),
+        }),
+        Duration::from_secs(15),
+    )
+    .await;
+
+    let mut term = Term::spawn(
+        stub.paths.dir(),
+        &["attach", "sess_stub01", "--allow-echo"],
+        80,
+        24,
+    );
+    term.wait_for(SECRET_PROMPT_DRAWN, 10);
+    term.type_keys(b"hunter2\r");
+
+    // The sentence's last words, so the whole line is in by then.
+    let seen = term.wait_for(b"has to be run again", 10);
+    let needles: [&[u8]; 3] = [
+        b"at_shell_prompt",
+        b"discarded",
+        b"`--allow-echo` does not change this",
+    ];
+    for needle in needles {
+        assert!(
+            contains(&seen, needle),
+            "the shell-prompt decline did not say {:?}:\n{}",
+            String::from_utf8_lossy(needle),
+            String::from_utf8_lossy(&seen)
+        );
+    }
+}
+
 /// **A close for a request this client already answered must not tear
 /// down a prompt it is currently showing** (GH #137, review finding).
 ///
@@ -1657,6 +1722,168 @@ async fn allow_echo_sets_the_flag_on_the_submitted_frame() {
         "--allow-echo turned off the client's own masking:\n{}",
         String::from_utf8_lossy(&term.snapshot())
     );
+}
+
+/// **A daemon older than the echo gate is sent no secret without
+/// `--allow-echo`** — 1.3's `SecretInput.allow_echo`, across the upgrade
+/// window.
+///
+/// The frame this client sends without the flag means *do not write this
+/// into a program that echoes it* to a daemon of 1.3 or later, and
+/// nothing at all to v0.0.7's 1.1, which writes the secret regardless —
+/// into the session's output, where `read_output` hands it to the agent.
+/// So against such a daemon the typed value is collected, masked, and
+/// discarded, and the person is told why before and after typing it.
+///
+/// Paired with the same daemon and `--allow-echo`, which means on that
+/// daemon what it always meant, and is sent: a client that refused every
+/// secret to an older daemon would pass the first half.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_secret_is_not_sent_to_a_daemon_without_the_echo_gate_unless_allowed() {
+    for allow_echo in [false, true] {
+        let stub = StubDaemon::start(
+            "secretoldgate",
+            vec![
+                enc(&ServerFrame::Attached {
+                    session_id: "sess_stub01".into(),
+                    name: None,
+                    cols: 80,
+                    rows: 24,
+                    state: "Running".into(),
+                    exit_code: None,
+                    protocol_major: PROTOCOL_MAJOR,
+                    protocol_minor: 1,
+                }),
+                enc(&ServerFrame::AwaitingSecret {
+                    request_id: "req_old01".into(),
+                    prompt_text: "Password: ".into(),
+                    raised_by: None,
+                }),
+            ],
+            Duration::from_secs(15),
+        )
+        .await;
+        let mut args = vec!["attach", "sess_stub01"];
+        if allow_echo {
+            args.push("--allow-echo");
+        }
+        let mut term = Term::spawn(stub.paths.dir(), &args, 80, 24);
+        term.wait_for(SECRET_PROMPT_DRAWN, 10);
+        term.type_keys(b"hunter2\r");
+
+        if allow_echo {
+            let sent = wait_frames(&stub, 10, |f| {
+                f.iter()
+                    .any(|x| matches!(x, ClientFrame::SecretInput { .. }))
+            });
+            assert!(
+                sent.iter().any(|f| matches!(
+                    f,
+                    ClientFrame::SecretInput {
+                        allow_echo: true,
+                        ..
+                    }
+                )),
+                "`--allow-echo` must still reach an older daemon: {sent:?}"
+            );
+        } else {
+            let seen = term.wait_for(b"not sent", 10);
+            for needle in [
+                // Said on joining, before the terminal went raw...
+                &b"holdfast attach: this daemon speaks protocol 1.1, older than this client's"[..],
+                // ...and again at the prompt, before anything is typed.
+                b"which predates the echo check",
+                b"will not be sent",
+                b"--allow-echo",
+            ] {
+                assert!(
+                    contains(&seen, needle),
+                    "`{}` was never said:\n{}",
+                    String::from_utf8_lossy(needle),
+                    String::from_utf8_lossy(&seen)
+                );
+            }
+            // Past the point it would have gone: the refusal is drawn
+            // after the decision, so a frame sent is already recorded.
+            std::thread::sleep(Duration::from_millis(300));
+            assert!(
+                !stub
+                    .frames()
+                    .iter()
+                    .any(|f| matches!(f, ClientFrame::SecretInput { .. })),
+                "a secret was sent to a daemon that would write it into an echoing \
+                 program: {:?}",
+                stub.frames()
+            );
+        }
+        assert!(
+            !contains(&term.snapshot(), b"hunter2"),
+            "the value was drawn on the local terminal:\n{}",
+            String::from_utf8_lossy(&term.snapshot())
+        );
+    }
+}
+
+/// **`watch` says, on joining an older daemon, what that daemon will not
+/// send it** — a burst it drops (1.4's `OutputGap`) and the screen as it
+/// stands (1.5's `ScreenSnapshot`) — because a view missing either looks
+/// exactly like a quiet session. Once, on stderr, so the stream on
+/// stdout is the session's own. Paired with a daemon of this build, which
+/// is owed no note, and never with `attach`'s secret clause: `watch`
+/// sends no secret.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn watch_says_on_joining_an_older_daemon_what_it_will_not_be_sent() {
+    for (minor, noted) in [(1, true), (PROTOCOL_MINOR, false)] {
+        let stub = StubDaemon::start(
+            "watcholder",
+            vec![
+                enc(&ServerFrame::Attached {
+                    session_id: "sess_wold".into(),
+                    name: None,
+                    cols: 80,
+                    rows: 24,
+                    state: "Running".into(),
+                    exit_code: None,
+                    protocol_major: PROTOCOL_MAJOR,
+                    protocol_minor: minor,
+                }),
+                enc(&ServerFrame::Output {
+                    session: "sess_wold".into(),
+                    bytes: b"JOINED\n".to_vec(),
+                }),
+            ],
+            Duration::from_millis(600),
+        )
+        .await;
+        let out = tokio::task::spawn_blocking({
+            let dir = stub.paths.dir().to_path_buf();
+            move || run_plain(&dir, &["watch", "sess_wold"])
+        })
+        .await
+        .expect("join");
+        let err = String::from_utf8_lossy(&out.stderr).to_string();
+        let stdout = String::from_utf8_lossy(&out.stdout).to_string();
+        assert!(stdout.contains("JOINED"), "1.{minor}: {stdout}");
+        assert_eq!(
+            err.contains("holdfast watch: this daemon speaks protocol 1.1, older than"),
+            noted,
+            "1.{minor}: all stderr:\n{err}"
+        );
+        if noted {
+            assert!(
+                err.contains("drops output") && err.contains("picture of the screen"),
+                "{err}"
+            );
+            assert!(
+                !err.contains("--allow-echo"),
+                "`watch` sends no secret: {err}"
+            );
+            assert!(
+                !stdout.contains("older than"),
+                "the note is in the session's stream: {stdout}"
+            );
+        }
+    }
 }
 
 /// The frames the stub has recorded, once `pred` holds — or a failure on
@@ -3153,6 +3380,92 @@ async fn the_same_secret_request_announced_twice_keeps_what_was_typed() {
         vec![b"abc".as_slice()],
         "the second announcement emptied the line: the child would have received the \
          tail of what the human typed"
+    );
+    term.type_keys(&[0x02, b'd']);
+    assert_eq!(term.wait_exit(10), 0);
+}
+
+/// **A request that closes while the human is still typing does not hand
+/// the rest of the password to the session** (GH #262's review).
+///
+/// The command that asked can end under the human's hands: `read -t`
+/// times out, `sudo` gives up, the agent interrupts it. The client used to
+/// drop the prompt on the close and send every later keystroke as `Input`,
+/// so the tail of the password, Enter included, reached a shell back at
+/// its prompt, which drew it, ran it and saved it to history (measured on
+/// bash 5.2 and zsh 5.9 through a real daemon). The daemon's shell-prompt
+/// check cannot see that: it is not a secret.
+///
+/// The stub closes the request **in answer to a resize**, so the close
+/// lands after the first half is typed rather than racing it, and an
+/// `Output` behind it says when the client has read it. Asserted on the
+/// wire: no byte of either half leaves as `Input`, and what is typed after
+/// the Enter does, so a client that swallowed the keyboard for good fails
+/// too.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_request_closed_mid_typing_discards_what_is_typed_up_to_enter() {
+    const SEEN_IT: &[u8] = b"CLOSE-WAS-READ";
+    let mut closed = enc(&ServerFrame::SecretRequestClosed {
+        request_id: "req_mid1".into(),
+        outcome: "user_cancelled".into(),
+    });
+    closed.extend(enc(&ServerFrame::Output {
+        session: "sess_mid".into(),
+        bytes: SEEN_IT.to_vec(),
+    }));
+    let stub = StubDaemon::start_reacting(
+        "secretmidclose",
+        vec![
+            attached_stub("sess_mid"),
+            enc(&ServerFrame::AwaitingSecret {
+                request_id: "req_mid1".into(),
+                prompt_text: "Password: ".into(),
+                raised_by: None,
+            }),
+        ],
+        |f| matches!(f, ClientFrame::Resize { cols: 101, .. }),
+        closed,
+        Duration::from_secs(20),
+    )
+    .await;
+    let mut term = Term::spawn(stub.paths.dir(), &["attach", "sess_mid"], 100, 30);
+    term.wait_for(SECRET_PROMPT_DRAWN, 15);
+    term.type_keys(b"fakeHEAD");
+    // Only so the first half is read before the close is asked for.
+    std::thread::sleep(Duration::from_millis(500));
+    term.resize(101, 30);
+    term.wait_for(SEEN_IT, 15);
+    term.wait_for(b"discarded, not sent to the session", 10);
+    term.type_keys(b"fakeTAIL\r");
+    term.wait_for(b"the keyboard is the session's again", 10);
+    term.type_keys(b"after");
+
+    let sent = wait_frames(&stub, 10, |f| {
+        f.iter()
+            .any(|x| matches!(x, ClientFrame::Input { bytes } if contains(bytes, b"after")))
+    });
+    let typed: Vec<u8> = sent
+        .iter()
+        .filter_map(|f| match f {
+            ClientFrame::Input { bytes } => Some(bytes.clone()),
+            _ => None,
+        })
+        .flatten()
+        .collect();
+    assert!(
+        contains(&typed, b"after"),
+        "the keyboard never went back to the session: {sent:?}"
+    );
+    assert!(
+        !contains(&typed, b"fake"),
+        "part of the password reached the session as keystrokes: {:?}",
+        String::from_utf8_lossy(&typed)
+    );
+    assert!(
+        !sent
+            .iter()
+            .any(|f| matches!(f, ClientFrame::SecretInput { .. })),
+        "a closed request was answered: {sent:?}"
     );
     term.type_keys(&[0x02, b'd']);
     assert_eq!(term.wait_exit(10), 0);

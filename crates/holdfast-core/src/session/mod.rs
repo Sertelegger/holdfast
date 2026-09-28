@@ -636,7 +636,13 @@ pub enum WriteRequest {
         /// care; the send then fails and is ignored.
         ack: tokio::sync::oneshot::Sender<Result<usize>>,
     },
-    /// §7.5's `SecretInput`, already normalised (§5.2).
+    /// A secret written **unconditionally**, already normalised (§5.2).
+    ///
+    /// **No production path submits this since GH #262.** It was §7.5's
+    /// `SecretInput` under `allow_echo`, and that now reaches
+    /// [`WriteRequest::secret_echo_allowed`], which still refuses a shell
+    /// at its own prompt. It stays for test rows that need a secret write
+    /// no gate can refuse.
     ///
     /// The writer calls `secret.with_bytes(|b| …)` and then drops the
     /// `SecretBytes`, so the zeroing happens in the writer after the PTY
@@ -710,6 +716,15 @@ pub enum WriteRequest {
         /// making a brand-new session the one case where the check is
         /// silently off.
         expect_writes: Option<u64>,
+        /// Whether the echo condition applies. `false` only for a human's
+        /// `SecretInput.allow_echo` (see [`WriteRequest::secret_echo_allowed`]).
+        ///
+        /// **The shell-prompt condition has no switch** (GH #262). It
+        /// applies to every variant this request has, because `allow_echo`
+        /// accepts that a secret prompt echoes, and an idle shell prompt is
+        /// not a secret prompt: what it does with the value is run it and
+        /// save it to history.
+        require_echo_off: bool,
         ack: tokio::sync::oneshot::Sender<Result<SecretWrite>>,
     },
 }
@@ -730,17 +745,21 @@ pub enum SecretWrite {
 
 /// Which of [`WriteRequest::SecretIfUnread`]'s conditions refused.
 ///
-/// Two, and they are **not** the same condition seen twice: a child that
-/// abandons its own read moves no counter, and bytes written ahead of the
+/// Three, and they are **not** one condition seen three ways: a child that
+/// abandons its own read moves no counter, bytes written ahead of the
 /// credential can satisfy the read long before the child gets far enough
-/// to restore echo. Each has its own row.
+/// to restore echo, and a shell at its idle prompt has `ECHO` off. Each has
+/// its own row.
 ///
-/// **Not every submission is subject to both** (GH #137). A request with
-/// `expect_writes: None` is judged on the echo condition alone, so
+/// **Not every submission is subject to all three** (GH #137). A request
+/// with `expect_writes: None` is judged without the counter, so
 /// [`DeclineReason::OtherWriteIntervened`] is unreachable for it —
 /// asserted by `a_submission_with_no_expected_write_count_is_judged_on_echo_alone`
 /// rather than left as a claim, because a caller that maps a decline to
-/// a reason for its own caller has to know which ones it can see.
+/// a reason for its own caller has to know which ones it can see. A
+/// request with `require_echo_off: false` cannot see
+/// [`DeclineReason::NotEchoOff`] either. Every request can see
+/// [`DeclineReason::AtShellPrompt`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum DeclineReason {
     /// The child is no longer at an echo-off read — or the backend cannot
@@ -749,6 +768,11 @@ pub enum DeclineReason {
     /// Something else was written to this child between the decision and
     /// this write.
     OtherWriteIntervened,
+    /// GH #262: the session's shell is at its own prompt, by its OSC 133
+    /// markers ([`Session::at_shell_prompt`]). The line editor would draw
+    /// the value, the newline would run it, and the shell would save it to
+    /// history.
+    AtShellPrompt,
 }
 
 impl WriteRequest {
@@ -783,6 +807,7 @@ impl WriteRequest {
             Self::SecretIfUnread {
                 secret,
                 expect_writes: Some(expect_writes),
+                require_echo_off: true,
                 ack,
             },
             rx,
@@ -813,8 +838,9 @@ impl WriteRequest {
     /// `None`. One condition, not none.
     ///
     /// The opt-out is `SecretInput.allow_echo`, which reaches
-    /// [`WriteRequest::secret`] instead — chosen by a human who can see
-    /// the terminal, never by the agent and never by a default.
+    /// [`WriteRequest::secret_echo_allowed`] instead — chosen by a human
+    /// who can see the terminal, never by the agent and never by a
+    /// default.
     pub fn secret_if_echo_off(
         secret: SecretBytes,
     ) -> (Self, tokio::sync::oneshot::Receiver<Result<SecretWrite>>) {
@@ -823,6 +849,40 @@ impl WriteRequest {
             Self::SecretIfUnread {
                 secret,
                 expect_writes: None,
+                require_echo_off: true,
+                ack,
+            },
+            rx,
+        )
+    }
+
+    /// A human's submission sent with `SecretInput.allow_echo`: the echo
+    /// condition waived, and the shell-prompt condition still applied
+    /// (GH #262).
+    ///
+    /// **`allow_echo` accepts an echoing secret prompt, not a shell.** It
+    /// exists for a prompt that asks for a code without clearing `ECHO`,
+    /// where the cost the human accepts is that the value lands in the
+    /// session's output. At an idle shell prompt the cost is different in
+    /// kind: the line editor draws the value, the newline runs it as a
+    /// command, and the shell saves it to history. Nobody at an attached
+    /// terminal needs a *secret* channel to type a command, and the flag
+    /// is connection-wide, so a human who set it for one echoing prompt
+    /// would otherwise have it apply to every later request on that
+    /// connection. The flag therefore waives the echo test and nothing
+    /// else.
+    ///
+    /// Not [`WriteRequest::secret`], which performs the write
+    /// unconditionally and which this path used until GH #262.
+    pub fn secret_echo_allowed(
+        secret: SecretBytes,
+    ) -> (Self, tokio::sync::oneshot::Receiver<Result<SecretWrite>>) {
+        let (ack, rx) = tokio::sync::oneshot::channel();
+        (
+            Self::SecretIfUnread {
+                secret,
+                expect_writes: None,
+                require_echo_off: false,
                 ack,
             },
             rx,
@@ -830,15 +890,27 @@ impl WriteRequest {
     }
 }
 
-/// [`WriteRequest::SecretIfUnread`]'s two conditions and the write they
+/// [`WriteRequest::SecretIfUnread`]'s three conditions and the write they
 /// guard, on the writer thread.
 ///
 /// **Order matters, and it is the cheap-and-certain one first.**
-/// `expect_writes` is a load of an atomic; the echo test is a syscall.
-/// Both refuse, so the order is not a correctness question — but the
-/// counter is also the condition that can be true while the child is
-/// *still* at its prompt (bytes ahead of the credential have not been
-/// consumed yet), which is the case a termios read cannot see at all.
+/// `expect_writes` is a load of an atomic; the other two share one sample,
+/// which takes the detector's lock and makes two syscalls. All three
+/// refuse, so the order is
+/// not a correctness question — but the counter is also the condition
+/// that can be true while the child is *still* at its prompt (bytes ahead
+/// of the credential have not been consumed yet), which is the case a
+/// termios read cannot see at all.
+///
+/// **The shell-prompt test comes before the echo test** (GH #262), because
+/// at a shell prompt that echoes (`bash --noediting`) both refuse, and only
+/// its reason has the right remedy. `not_echo_off` tells the human to
+/// re-attach with `--allow-echo`, which does not waive this test. The
+/// test is [`Session::at_shell_prompt`], read here rather than passed in by
+/// the caller, because a human answers a request seconds or minutes after
+/// `request_secret_input` checked the same thing, and a command that asked
+/// for the secret can have ended in between. The echo test reads the line
+/// discipline that test was judged on, so both describe one instant.
 ///
 /// **`echo != Some(false)` and not `echo == Some(true)`.** A backend that
 /// cannot sample the line discipline reports `None`, and "we cannot
@@ -847,10 +919,27 @@ impl WriteRequest {
 /// `echo == Some(false)`, so a caller that got this far on such a backend
 /// is already impossible; this is the belt to that braces.
 ///
-/// The value is dropped — and therefore zeroed — on both refusals,
+/// The value is dropped — and therefore zeroed — on every refusal,
 /// before returning.
 ///
-/// ## What neither condition can see, and why (GH #43)
+/// ## What the shell-prompt test cannot see (GH #262)
+///
+/// **Any line editor that is not a marked shell's.** It reads the shell's
+/// own OSC 133 markers, so a Python or Node REPL, a nested shell with no
+/// integration, `exec zsh`, and a session whose integration is off all
+/// still pass on `ECHO` alone. That is the interim guard's known gap; the
+/// full fix is the classifier's predicate (echo off, still canonical, no
+/// bracketed paste) with a per-submission human override. **And output
+/// the reader has not yet fed**: a shell that has just printed its prompt
+/// markers, and whose chunk the reader thread has not scanned yet, still
+/// reads as running its command. That window is the reader's latency,
+/// not a human's typing time. **And a marked prompt whose terminal reads
+/// as a secret line read** (`ECHO` off, `ICANON` on), which the test
+/// admits on purpose so that a shell's own `read -s` is answered where no
+/// `C` ever arrives; [`PromptDetector::shell_at_prompt`] says what else
+/// that admits.
+///
+/// ## What neither of the first two conditions can see, and why (GH #43)
 ///
 /// **Bytes written *before* the decision that the child has not yet
 /// consumed.** Both tests then pass, correctly and on their own terms:
@@ -879,16 +968,21 @@ fn write_secret_if_unread(
     session: &Arc<Session>,
     secret: SecretBytes,
     expect_writes: Option<u64>,
+    require_echo_off: bool,
 ) -> Result<SecretWrite> {
     // **`None` skips this condition and nothing else** (GH #137). The
-    // echo test below is not optional on any path: it is the one this
-    // function exists for, and the one a submission from an attached
-    // human needs just as much as the autofill does.
+    // echo test below is optional only for a human's `allow_echo`, and the
+    // shell-prompt test is optional on no path.
     if expect_writes.is_some_and(|e| session.writes_performed() != e) {
         drop(secret);
         return Ok(SecretWrite::Declined(DeclineReason::OtherWriteIntervened));
     }
-    if session.line_discipline().echo != Some(false) {
+    let (at_shell_prompt, line) = session.shell_prompt_sample();
+    if at_shell_prompt {
+        drop(secret);
+        return Ok(SecretWrite::Declined(DeclineReason::AtShellPrompt));
+    }
+    if require_echo_off && line.echo != Some(false) {
         drop(secret);
         return Ok(SecretWrite::Declined(DeclineReason::NotEchoOff));
     }
@@ -1603,9 +1697,15 @@ impl Session {
                     WriteRequest::SecretIfUnread {
                         secret,
                         expect_writes,
+                        require_echo_off,
                         ack,
                     } => {
-                        let _ = ack.send(write_secret_if_unread(&session, secret, expect_writes));
+                        let _ = ack.send(write_secret_if_unread(
+                            &session,
+                            secret,
+                            expect_writes,
+                            require_echo_off,
+                        ));
                     }
                 }
             }
@@ -1630,20 +1730,24 @@ impl Session {
         // Typed, not exported: rc files run after the environment is read
         // and would clobber an inherited PS1 (§8.5). A write failure here
         // is not fatal — the session simply degrades to tier 2. The line is
-        // `injection_line`, not the snippet: bash's evaluates a snippet the
-        // spawn put in its environment (`Shell::injection_env`), because
-        // macOS drops a typed line past 1024 bytes.
+        // `injection_line`, not the snippet: bash's and zsh's evaluate a
+        // snippet the spawn put in their environment
+        // (`Shell::injection_env`), because macOS drops a typed line past
+        // 1024 bytes, bash's snippet is longer than that, and zsh's had
+        // reached 987 of the 1000 the pin allows.
         if let Some(shell) = config.shell_integration {
             let typed = shell.injection_line();
             // §8.5.1 rule 5 (REQ-DM-009): the ring needs to know which line
             // Holdfast typed, because "it emits no `C`" stops being true the
             // moment a foreign emitter is already installed — the user's
-            // `PS0` marks the snippet's own command line and the snippet
-            // becomes the session's first history entry.
+            // `PS0` or `preexec` marks the typed line, and it becomes the
+            // session's first history entry. The ring is given the typed
+            // line and not the snippet it evaluates, because the typed line
+            // is what the shell echoes and so what the ring captures.
             //
             // **Before the write, not after.** The reader thread is already
-            // running; a snippet whose `C` arrived before `set_injection_line`
-            // landed would be recorded.
+            // running; a typed line whose `C` arrived before
+            // `set_injection_line` landed would be recorded.
             session.history.lock().set_injection_line(typed.to_string());
             let mut line = typed.as_bytes().to_vec();
             line.push(b'\n');
@@ -1723,6 +1827,48 @@ impl Session {
     /// on arrival. `None` until the first marker arrives.
     pub fn osc133_source(&self) -> Option<Osc133Source> {
         self.detector.lock().osc133_source()
+    }
+
+    /// Whether this session's shell says, by its own OSC 133 markers, that
+    /// it is sitting at its prompt with no command started since (GH #262),
+    /// and the terminal is not at a secret line read. See
+    /// [`PromptDetector::shell_at_prompt`] for what counts and what it
+    /// cannot see.
+    ///
+    /// **The secret gate's question, asked at the request and at the
+    /// write.** `request_secret_input` asks it before it raises anything
+    /// or runs a provider, and again just before the raise.
+    /// `write_secret_if_unread` asks it on the writer thread one statement
+    /// before the write, because a command that asked for the secret can
+    /// end while a human is still typing it.
+    pub fn at_shell_prompt(&self) -> bool {
+        self.shell_prompt_sample().0
+    }
+
+    /// [`at_shell_prompt`](Self::at_shell_prompt), and the line discipline
+    /// it was judged on. The writer takes both, so its echo test reads the
+    /// same `tcgetattr` the shell-prompt test did, not a second one that
+    /// could describe a different instant.
+    ///
+    /// **The foreground and line-discipline samples are taken with the
+    /// detector held**, as in [`detection`](Self::detection): they decide
+    /// whether the marker the detector holds still belongs to the program
+    /// at the terminal and whether that program is at a secret line read,
+    /// and a chunk fed between the samples would let them describe
+    /// different instants. Nothing here blocks: a `WNOHANG` wait, one lock
+    /// and two ioctls.
+    ///
+    /// **`false` for a child that has exited**, whose last marker describes
+    /// nothing. The classifier answers liveness before any marker for the
+    /// same reason. Without it a session that died while a provider was
+    /// answering would be refused `at_shell_prompt` instead of reaching the
+    /// `session_died` its caller is owed.
+    fn shell_prompt_sample(&self) -> (bool, crate::pty::LineDiscipline) {
+        let alive = self.backend.is_alive();
+        let detector = self.detector.lock();
+        let line = self.backend.line_discipline();
+        let foreground = self.backend.foreground_group();
+        (alive && detector.shell_at_prompt(foreground, line), line)
     }
 
     /// True once any OSC 133 marker has arrived, i.e. shell integration is
@@ -3094,9 +3240,237 @@ mod tests {
             req,
             WriteRequest::SecretIfUnread {
                 expect_writes: Some(7),
+                require_echo_off: true,
                 ..
             }
         ));
+    }
+
+    /// **GH #262.** `allow_echo` waives the echo condition and nothing
+    /// else, and the two constructors that are not `allow_echo` keep it.
+    ///
+    /// Structural for the same reason as the row above: the echo half is
+    /// a field, and a constructor that set it wrongly would pass every
+    /// run whose child happens to have `ECHO` off.
+    #[test]
+    fn only_allow_echo_waives_the_echo_condition() {
+        let (req, _rx) =
+            WriteRequest::secret_echo_allowed(SecretBytes::normalise(b"hunter2".to_vec(), true));
+        assert!(
+            matches!(
+                req,
+                WriteRequest::SecretIfUnread {
+                    expect_writes: None,
+                    require_echo_off: false,
+                    ..
+                }
+            ),
+            "`allow_echo` is a human's decision about one condition, the echo one"
+        );
+        let (req, _rx) =
+            WriteRequest::secret_if_echo_off(SecretBytes::normalise(b"hunter2".to_vec(), true));
+        assert!(
+            matches!(
+                req,
+                WriteRequest::SecretIfUnread {
+                    require_echo_off: true,
+                    ..
+                }
+            ),
+            "a default submission lost the echo condition, which is GH #137 again"
+        );
+    }
+
+    /// What a Holdfast-integrated shell prints around an idle prompt: `D`
+    /// for the command that just ended, then `A`, the prompt, and `B`.
+    const IDLE_PROMPT: &[u8] =
+        b"\x1b]133;D;0;holdfast=1\x07\x1b]133;A;holdfast=1\x07$ \x1b]133;B;holdfast=1\x07";
+    /// What it prints when the next command line is submitted.
+    const COMMAND_STARTED: &[u8] = b"\r\n\x1b]133;C;holdfast=1\x07";
+    /// And when that command ends, before the next `A`.
+    const COMMAND_ENDED: &[u8] = b"\x1b]133;D;0;holdfast=1\x07";
+
+    fn submit(s: &Arc<Session>, expect_writes: Option<u64>, require_echo_off: bool) -> SecretWrite {
+        write_secret_if_unread(
+            s,
+            SecretBytes::normalise(b"hunter2".to_vec(), true),
+            expect_writes,
+            require_echo_off,
+        )
+        .expect("the writer answered")
+    }
+
+    /// **GH #262, at the writer.** A shell at its own idle prompt has
+    /// `ECHO` off, because its line editor draws what is typed — so the
+    /// echo test admits it, and a secret written there is drawn, run as a
+    /// command and saved to history. The shell-prompt test refuses it on
+    /// every spelling of the request, `allow_echo` included, and writes
+    /// nothing.
+    ///
+    /// **The controls are what make it a test of the prompt and not of
+    /// the session.** The same session with the same termios takes the
+    /// write before any marker arrives (the interim guard's known gap: a
+    /// line editor with no markers) and after a `C` (a command reading
+    /// the secret). And `D` alone refuses again, which is the letter the
+    /// classifier's own prompt rung leaves out.
+    #[test]
+    fn no_secret_write_reaches_a_marked_shell_prompt() {
+        let (s, pty) = mock_session();
+        // readline's shape at an idle prompt, measured in GH #262.
+        pty.set_echo(Some(false));
+        pty.set_canonical(Some(false));
+
+        // No markers yet: nothing says this is a shell, so `ECHO` decides.
+        assert!(!s.at_shell_prompt());
+        assert_eq!(submit(&s, None, true), SecretWrite::Written(8));
+        let written_before = pty.written().len();
+
+        pty.queue_output(IDLE_PROMPT);
+        wait_until("the detector to scan the idle prompt", || {
+            s.at_shell_prompt()
+        });
+        let writes = s.writes_performed();
+        for (expect_writes, require_echo_off, which) in [
+            (Some(writes), true, "a provider's value"),
+            (None, true, "a human's submission"),
+            (None, false, "a human's submission under allow_echo"),
+        ] {
+            assert_eq!(
+                submit(&s, expect_writes, require_echo_off),
+                SecretWrite::Declined(DeclineReason::AtShellPrompt),
+                "{which} was written into an idle shell prompt, where the line editor \
+                 echoes it, the newline runs it and the shell saves it to history"
+            );
+        }
+        // A shell whose prompt echoes (`bash --noediting`) is refused for
+        // the prompt, not for the echo: `not_echo_off` would send the human
+        // to `--allow-echo`, which does not waive this.
+        pty.set_echo(Some(true));
+        assert_eq!(
+            submit(&s, None, true),
+            SecretWrite::Declined(DeclineReason::AtShellPrompt),
+            "an echoing shell prompt was refused with the reason whose remedy fails"
+        );
+        pty.set_echo(Some(false));
+        assert_eq!(
+            pty.written().len(),
+            written_before,
+            "a declined value still reached the PTY"
+        );
+
+        // A command started: the shell is no longer the reader.
+        pty.queue_output(COMMAND_STARTED);
+        wait_until("the detector to scan the `C`", || !s.at_shell_prompt());
+        pty.set_canonical(Some(true)); // `read -s`'s shape
+        assert_eq!(
+            submit(&s, None, true),
+            SecretWrite::Written(8),
+            "a command's own echo-off read was refused as if it were the prompt"
+        );
+
+        // It ended, and the prompt is not drawn yet: still the shell's. The
+        // terminal has left `read -s`'s shape, and keeps `ECHO` off so that
+        // only the prompt test stands between the value and the shell.
+        pty.set_canonical(Some(false));
+        pty.queue_output(COMMAND_ENDED);
+        wait_until("the detector to scan the `D`", || s.at_shell_prompt());
+        assert_eq!(
+            submit(&s, None, true),
+            SecretWrite::Declined(DeclineReason::AtShellPrompt),
+            "`D` with no `C` since is the shell between commands"
+        );
+    }
+
+    /// **GH #262.** The markers speak for the program that emitted them,
+    /// and only while it holds the terminal — §8.3's scope rule, the same
+    /// one the classifier's T1 rungs use. Unknown is not a change
+    /// (REQ-PD-025), so an unsampleable foreground still refuses.
+    #[test]
+    fn the_shell_prompt_test_is_scoped_to_the_program_holding_the_terminal() {
+        let (s, pty) = mock_session();
+        pty.set_echo(Some(false));
+        pty.set_canonical(Some(false));
+        pty.set_foreground_group(Some(100));
+        pty.queue_output(IDLE_PROMPT);
+        wait_until("the detector to scan the idle prompt", || {
+            s.at_shell_prompt()
+        });
+
+        pty.set_foreground_group(Some(200));
+        assert!(
+            !s.at_shell_prompt(),
+            "another program holds the terminal, so the shell's markers say nothing \
+             about who reads the write"
+        );
+        assert_eq!(submit(&s, None, true), SecretWrite::Written(8));
+
+        pty.set_foreground_group(None);
+        assert_eq!(
+            submit(&s, None, true),
+            SecretWrite::Declined(DeclineReason::AtShellPrompt),
+            "an unknown foreground withdrew the licence, which REQ-PD-025 says it must not"
+        );
+
+        // A shell that has exited is at no prompt: its last marker is a
+        // record, not a state, and its caller is owed `session_died`.
+        pty.exit(0);
+        assert!(
+            !s.at_shell_prompt(),
+            "a dead shell's last marker still read as a prompt"
+        );
+    }
+
+    /// **GH #262, the markers that never say a command started.** A bash
+    /// older than 4.4 has no `PS0`, so its stream is `D`/`A`/`B` with no
+    /// `C`, and a user integration that marks only the prompt is `A`/`B`.
+    /// Under either, the shell's own `read -s` runs with `B` still last.
+    /// The terminal is what tells the two states apart: `read -s` is `ECHO`
+    /// off with `ICANON` on, and no line editor reads that way.
+    ///
+    /// **The refusals are the other half.** The same markers with the
+    /// terminal in a line editor's shape, in the echoing shape of a prompt
+    /// with no line editor, or with `ICANON` unreadable, all still refuse.
+    #[test]
+    fn a_shells_own_secret_read_is_answered_where_no_c_arrives() {
+        let (s, pty) = mock_session();
+        pty.set_echo(Some(false));
+        pty.set_canonical(Some(false));
+        pty.queue_output(b"\x1b]133;A\x07fab$ \x1b]133;B\x07");
+        wait_until("the detector to scan the prompt-only markers", || {
+            s.at_shell_prompt()
+        });
+
+        // The line was submitted and `read -s` runs: no `C` arrives.
+        pty.set_canonical(Some(true));
+        assert!(
+            !s.at_shell_prompt(),
+            "a secret line read under prompt-only markers read as the shell's prompt"
+        );
+        assert_eq!(
+            submit(&s, None, true),
+            SecretWrite::Written(8),
+            "a shell's own `read -s` was refused because no `C` said it had started"
+        );
+        let written = pty.written().len();
+
+        for (echo, canonical, which) in [
+            (Some(false), Some(false), "a line editor's prompt"),
+            (Some(true), Some(true), "a prompt with no line editor"),
+            (Some(false), None, "an unreadable ICANON"),
+        ] {
+            pty.set_echo(echo);
+            pty.set_canonical(canonical);
+            assert_eq!(
+                submit(&s, None, false),
+                SecretWrite::Declined(DeclineReason::AtShellPrompt),
+                "{which} under the shell's own markers took a write"
+            );
+        }
+        assert_eq!(
+            pty.written().len(),
+            written,
+            "a declined value still reached the PTY"
+        );
     }
 
     /// **GH #137.** `expect_writes: None` turns off the counter condition
@@ -3125,7 +3499,8 @@ mod tests {
             write_secret_if_unread(
                 &s,
                 SecretBytes::normalise(b"hunter2".to_vec(), true),
-                Some(stale)
+                Some(stale),
+                true
             )
             .expect("the writer answered"),
             SecretWrite::Declined(DeclineReason::OtherWriteIntervened),
@@ -3133,8 +3508,13 @@ mod tests {
              this row cannot show that `None` is what switches it off"
         );
         assert_eq!(
-            write_secret_if_unread(&s, SecretBytes::normalise(b"hunter2".to_vec(), true), None)
-                .expect("the writer answered"),
+            write_secret_if_unread(
+                &s,
+                SecretBytes::normalise(b"hunter2".to_vec(), true),
+                None,
+                true
+            )
+            .expect("the writer answered"),
             SecretWrite::Written(8),
             "`None` refused a write on a condition it was told not to evaluate"
         );
@@ -3142,16 +3522,26 @@ mod tests {
         // ...and the echo test is untouched by `None`.
         pty.set_echo(Some(true));
         assert_eq!(
-            write_secret_if_unread(&s, SecretBytes::normalise(b"hunter2".to_vec(), true), None)
-                .expect("the writer answered"),
+            write_secret_if_unread(
+                &s,
+                SecretBytes::normalise(b"hunter2".to_vec(), true),
+                None,
+                true
+            )
+            .expect("the writer answered"),
             SecretWrite::Declined(DeclineReason::NotEchoOff),
             "`None` switched off the echo condition too, which is GH #137 again"
         );
         // A backend that cannot say is refused for the same reason.
         pty.set_echo(None);
         assert_eq!(
-            write_secret_if_unread(&s, SecretBytes::normalise(b"hunter2".to_vec(), true), None)
-                .expect("the writer answered"),
+            write_secret_if_unread(
+                &s,
+                SecretBytes::normalise(b"hunter2".to_vec(), true),
+                None,
+                true
+            )
+            .expect("the writer answered"),
             SecretWrite::Declined(DeclineReason::NotEchoOff),
         );
     }

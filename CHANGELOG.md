@@ -12,8 +12,8 @@ is cut, named and published is in
 ## [Unreleased]
 
 **Upgrading:** run `holdfast daemon stop` after installing (it ends every
-session), start the new daemon as `README.md` describes, and restart Claude
-Code: a 0.0.7 daemon answers `holdfast logs --tail` with no holdback ([#169]).
+session), then restart Claude Code. Until both, each side refuses a
+`start_session` the other would misplace, and says which to restart ([#229]).
 
 ### Added
 
@@ -29,15 +29,17 @@ Code: a 0.0.7 daemon answers `holdfast logs --tail` with no holdback ([#169]).
 - An MCP `notifications/cancelled` cancels the daemon-side work: a cancelled
   `request_secret_input` frees its slot at once and ends `caller_cancelled`
   ([#127], [#105]).
+- `[terminal] shell_history_file = "per_session"` keeps each bash and zsh
+  session's commands in a `0600` file of its own, unredacted ([#252]).
 
 ### Changed
 
 - **Breaking:** every tool refuses an argument it does not declare, and names
   it: JSON-RPC `-32602` through the daemon, an `isError` result under
   `--no-daemon`. Each `inputSchema` says `additionalProperties: false` ([#219]).
-- **Breaking:** control and attach protocol **1.5** (0.0.7 spoke 1.1). The
-  daemon takes `start_session`'s `@client` context only from a 1.5 peer; from an
-  older shim it is an unknown argument and is refused ([#229]).
+- **Breaking:** control and attach protocol **1.5** (0.0.7 spoke 1.1). Across
+  the skew, a shim or daemon refuses a `start_session` (or argument) the other
+  side would misplace or drop silently, and says which to restart ([#229]).
 - **Breaking:** a history entry whose text was not captured is `command: null`,
   not `""`, and `status`/`list_sessions` gain `command_capture`. A prompt that
   regenerates `PS1`, such as starship's, no longer loses the text ([#220]).
@@ -53,8 +55,12 @@ Code: a 0.0.7 daemon answers `holdfast logs --tail` with no holdback ([#169]).
 - `watch` and `attach` survive bursts: a lagging viewer resumes from the ring
   buffer and is detached only after 30 s of reading nothing, when `attach` holds
   the terminal. A view that missed output exits 3, not 0 ([#200], [#210]).
-- Under `ansi: "strip"` a progress bar reads back as its last frame: a line the
-  stream erases after a `\r` is not shown. `ansi: "raw"` is unchanged ([#247]).
+- Under `ansi: "strip"` a progress bar that erases the line it redraws (`\e[K`
+  after a `\r`, as cargo's does) reads back as its last frame; one that only
+  overwrites after a `\r` (tqdm, wget) still reads back every frame ([#247]).
+- While a command runs, `detection_tier` is `heuristic` (reason `no
+  deterministic signal`) where 0.0.7 said `semantic`: a shell's markers no
+  longer vouch for a program it started. The mode is unchanged ([#240]).
 - One non-ASCII byte no longer slows redaction 456-fold, a slow read no longer
   stalls other clients, and finished sessions are capped at 64 records and
   16 MiB of output ([#194], [#163], [#201], [#129]).
@@ -79,12 +85,27 @@ Code: a 0.0.7 daemon answers `holdfast logs --tail` with no holdback ([#169]).
 - `request_secret_input` writes a credential only once the child's terminal has
   stopped echoing, and says `not_echo_off` otherwise; `holdfast attach
   --allow-echo` is the opt-out. Refused submissions are zeroed ([#137], [#57]).
+- `request_secret_input` refuses a shell idle at its own prompt by its markers
+  (`at_shell_prompt`), where a secret was shown, run and saved to history, even
+  with `--allow-echo`. A REPL still passes; the full fix is open ([#262]).
 - `holdfast logs --tail` no longer bypasses the holdback: it sends the new
   `read_output` argument `apply_holdback: true`, and every read says why it is
   held back in `held_back_cause` ([#169], [#160], [#195]).
+- Against a 0.0.7 daemon, `holdfast logs --tail` withholds a token still
+  arriving and says where that daemon stops short, and `holdfast attach` sends
+  a secret only with `--allow-echo` ([#169], [#195], [#137]).
+- Against a 0.0.7 daemon, which asks even at an idle shell prompt, the server
+  refuses `request_secret_input`, and `holdfast attach` warns under the prompt
+  before `--allow-echo` sends a secret there ([#262]).
+- `holdfast attach` discards what is typed up to Enter after a secret request
+  closes mid-entry (a timeout, the agent's `interrupt`), where the rest of the
+  password went to the shell as keystrokes and ran as a command.
 - Sessions no longer write the agent's commands into your shell, REPL or
-  database-client history ([#252]); `[terminal] shell_history_file =
-  "per_session"` keeps a per-session record instead. SECURITY.md lists the gaps.
+  database-client history files ([#252]), but hook-based recorders such as
+  atuin, zsh-histdb, mcfly and bash-preexec loggers still do (SECURITY.md, H11).
+- A zsh session no longer lists or recalls your own history where your rc
+  appends to its history file. bash keeps the list your rc loaded, and the agent
+  can list it (SECURITY.md, H10) ([#274]).
 - `SECURITY.md` states a two-tier redaction contract and each guarantee's status
   today, and keeps a residual register of known leaks ([#253], [#254], [#255],
   [#256], [#257], [#258], [#259]).
@@ -123,6 +144,14 @@ Code: a 0.0.7 daemon answers `holdfast logs --tail` with no holdback ([#169]).
   such as starship's, is recorded whole, not from its last redraw on ([#220]).
 - `get_command_history` returns a non-ASCII command as typed, not as its UTF-8
   bytes read one to a character (`echo hÃ©llo`) ([#270]).
+- A session no longer ends at the first `false && true` under an rc's
+  `set -e` (zsh `err_exit`), and a readonly `PROMPT_COMMAND` or `PS1` no
+  longer prints an error into it or, under `set -e`, ends it at start-up.
+- `start_session` for a program that is not installed says it was not found
+  on PATH; the message used to stop at `because:`.
+- Most tool descriptions and schemas no longer cite spec sections or name
+  internal functions, and `get_command_history`'s says how bash, zsh and fish
+  record a command wider than the terminal ([#276]).
 
 ### Known limitations
 
@@ -140,6 +169,15 @@ Code: a 0.0.7 daemon answers `holdfast logs --tail` with no holdback ([#169]).
 - The plugin's Windows entrypoint is unverified on Windows, and there the
   runtime directory, logs and `config.toml` keep their inherited ACL, with a
   warning rather than a check.
+- Under zsh, a command line wider than the terminal can split a token past the
+  redactor on `read_output`, and is recorded as `[REDACTED:unresolved]` or an
+  unmarked tail; fish repeats part of such a command in front of it ([#276]).
+- An rc file that reads the terminal at start-up (a `read`, oh-my-zsh's update
+  question, zsh's new-user menu) takes the integration line as its answer: the
+  session starts without it, and zsh saves to the history file the rc names.
+- By default, on bash 4.3 and older (macOS's `/bin/bash`), an rc whose prompt
+  runs `history -n; history -w; history -c; history -r`, sourced again, loses
+  your oldest history entry, or every entry if sourced first ([#282]).
 
 ## [0.0.7] — 2026-09-01 (Carabiner)
 
@@ -635,3 +673,7 @@ residuals that are known and accepted.
 [#259]: https://github.com/Sertelegger/holdfast/issues/259
 [#252]: https://github.com/Sertelegger/holdfast/issues/252
 [#270]: https://github.com/Sertelegger/holdfast/issues/270
+[#262]: https://github.com/Sertelegger/holdfast/issues/262
+[#274]: https://github.com/Sertelegger/holdfast/issues/274
+[#276]: https://github.com/Sertelegger/holdfast/issues/276
+[#282]: https://github.com/Sertelegger/holdfast/issues/282

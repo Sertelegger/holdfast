@@ -260,11 +260,16 @@ pub fn from_error(e: &crate::HoldfastError) -> Result<CallToolResult, ErrorData>
     Ok(envelope(status, json!({}), e.to_string()))
 }
 
-/// Trim a third-party error string before it enters the MCP transcript.
+/// Trim a third-party error string before it enters the MCP transcript:
+/// its first line, bounded to 200 characters.
 ///
-/// `portable-pty` embeds the entire `$PATH` in its "no viable candidates"
-/// message; that is both noise and a small information leak into the
-/// agent's conversation history.
+/// A spawn failure arrives here already on one line
+/// (`pty::in_process::spawn_failure`), with portable-pty's line quoting the
+/// whole `$PATH` replaced by *not found on PATH*; each candidate that
+/// exists but cannot run is kept by its full path. That path is built from
+/// the session's own `$PATH` and working directory, which the agent can
+/// read from any session, so it discloses nothing the agent's shell does
+/// not.
 pub fn brief(e: &dyn std::fmt::Display) -> String {
     const MAX: usize = 200;
     let s = e.to_string();

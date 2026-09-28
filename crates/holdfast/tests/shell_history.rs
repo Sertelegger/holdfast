@@ -33,7 +33,12 @@
 //! - tcsh with a `savehist` rc, for the endings Holdfast brings about.
 //!
 //! A zsh whose history goes nowhere must also say nothing about it at exit,
-//! which is `zsh_ends_without_a_history_error_under_an_rc_that_saves_history`.
+//! which is `zsh_ends_without_a_history_error_under_an_rc_that_saves_history`,
+//! and one whose rc rewrites its history file must leave the operator's
+//! entries in it when the agent sources that rc again, which is
+//! `a_zsh_rc_that_rewrites_its_history_file_keeps_the_operators_entries_when_sourced_again`
+//! and, for a bash rc that runs `history -w` at a prompt or at exit,
+//! `a_bash_rc_that_rewrites_its_history_file_keeps_the_operators_entries_when_sourced_again`.
 //!
 //! Every session gets its own `HOME`, and the assertion is over **every
 //! file** under it rather than over the names a shell is expected to use:
@@ -66,12 +71,13 @@ const SHELL_TIMEOUT: Duration = Duration::from_secs(30);
 const MARK: &str = "HISTMARK_";
 
 /// Text only Holdfast's integration snippets and the lines it types contain.
-/// Either reaching a history file is part of GH #252 too. bash's typed line
-/// names only the variable that carries its snippet.
-const SNIPPET_MARKS: [&str; 3] = [
+/// Either reaching a history file is part of GH #252 too. bash's and zsh's
+/// typed lines name only the variable that carries their snippet.
+const SNIPPET_MARKS: [&str; 4] = [
     "HOLDFAST_SHELL_INTEGRATION",
     "HOLDFAST_HISTFILE",
     "HOLDFAST_BASH_INTEGRATION",
+    "HOLDFAST_ZSH_INTEGRATION",
 ];
 
 const BASH_HARD_RC: &str =
@@ -92,6 +98,14 @@ const ZSH_CONDITIONAL_RC: &str = "[ -z \"$HISTFILE\" ] && HISTFILE=\"$HOME/.zsh_
                                   HISTSIZE=10000\nSAVEHIST=10000\n\
                                   setopt share_history inc_append_history\n";
 
+/// An rc that names a history file and then unsets `HISTSIZE` under
+/// `nounset`. The history cut (GH #274) reads `HISTSIZE` to put the rc's
+/// limit back; read bare, it was *parameter not set*, zsh discarded the
+/// rest of the typed line, and every command, the snippet's own line
+/// included, was saved to `~/.zsh_history` (measured, zsh 5.9).
+const ZSH_NOUNSET_UNSET_HISTSIZE_RC: &str =
+    "HISTFILE=~/.zsh_history\nSAVEHIST=100\nsetopt nounset\nunset HISTSIZE\n";
+
 /// One shell configuration.
 #[derive(Clone, Copy)]
 struct Case {
@@ -111,7 +125,7 @@ struct Case {
     needs: &'static str,
 }
 
-const BASH_AND_ZSH: [Case; 7] = [
+const BASH_AND_ZSH: [Case; 8] = [
     Case {
         name: "bash-no-rc",
         command: "bash",
@@ -179,6 +193,16 @@ const BASH_AND_ZSH: [Case; 7] = [
         files: &[(".zshrc", ZSH_CONDITIONAL_RC)],
         integration: true,
         before: &[("exec zsh", "")],
+        hung_up: true,
+        needs: "zsh",
+    },
+    Case {
+        name: "zsh-nounset-unset-histsize",
+        command: "zsh",
+        args: &[],
+        files: &[(".zshrc", ZSH_NOUNSET_UNSET_HISTSIZE_RC)],
+        integration: true,
+        before: &[],
         hung_up: true,
         needs: "zsh",
     },
@@ -982,6 +1006,438 @@ fn tcsh_is_never_hung_up_so_holdfast_ending_it_saves_nothing() {
     );
 }
 
+/// The operator's own bash history, which the rc names.
+const BASH_OPERATOR_HISTORY: &str = "echo OPERATORS_OWN_HISTORY_1\necho OPERATORS_OWN_HISTORY_2\n";
+
+/// The same in zsh's extended format, which oh-my-zsh's rc writes.
+const ZSH_OPERATOR_HISTORY: &str = ": 1700000000:0;echo OPERATORS_OWN_HISTORY_1\n\
+                                    : 1700000001:0;echo OPERATORS_OWN_HISTORY_2\n";
+
+/// Shells whose rc names a history file the operator has already filled.
+/// bash and zsh read it as they start, before the snippet runs (GH #274).
+/// One bash rc appends to its file from `PROMPT_COMMAND`, which writes only
+/// the lines entered in the session, so a per-session file gets none of the
+/// operator's; an rc's `history -w` would write them all there.
+const OPERATOR_HISTORY: [Case; 3] = [
+    Case {
+        name: "bash-operator-history",
+        command: "bash",
+        args: &[],
+        files: &[
+            (".bashrc", "HISTFILE=~/.bash_history\n"),
+            (".bash_history", BASH_OPERATOR_HISTORY),
+        ],
+        integration: true,
+        before: &[],
+        hung_up: true,
+        needs: "bash",
+    },
+    Case {
+        name: "bash-operator-history-appends",
+        command: "bash",
+        args: &[],
+        files: &[
+            (
+                ".bashrc",
+                "HISTFILE=~/.bash_history\nPROMPT_COMMAND='history -a'\n",
+            ),
+            (".bash_history", BASH_OPERATOR_HISTORY),
+        ],
+        integration: true,
+        before: &[],
+        hung_up: true,
+        needs: "bash",
+    },
+    Case {
+        name: "zsh-operator-history",
+        command: "zsh",
+        args: &[],
+        files: &[
+            (".zshrc", ZSH_OMZ_RC),
+            (".zsh_history", ZSH_OPERATOR_HISTORY),
+        ],
+        integration: true,
+        before: &[],
+        hung_up: true,
+        needs: "zsh",
+    },
+];
+
+/// Poll until `needle` has appeared `n` times in the session's output.
+fn await_count(shim: &mut Shim, s: &Started, needle: &str, n: usize) {
+    let deadline = Instant::now() + SHELL_TIMEOUT;
+    loop {
+        let out = output(shim, s);
+        if out.matches(needle).count() >= n {
+            return;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "{}: `{needle}` never appeared {n} times; output: {out:?}",
+            s.case.name
+        );
+        std::thread::sleep(Duration::from_millis(100));
+    }
+}
+
+/// GH #274: bash and zsh read the history file an rc names as they start,
+/// before the snippet runs, so the operator's own history is in the
+/// session's memory, where `history`, `fc -l` and up-arrow put it into the
+/// output the agent reads. zsh's snippet cuts that list, when the rc
+/// appends to its file, to one entry, the line Holdfast typed, and reads
+/// back only what the session's own `HISTFILE` holds. bash's keeps the
+/// list whole: emptied, it is what an rc's `history -w`, sourced again,
+/// writes over the operator's file (see
+/// [`a_bash_rc_that_rewrites_its_history_file_keeps_the_operators_entries_when_sourced_again`]).
+///
+/// Each session recalls a command two back with up-arrow and the last with
+/// `!!`, and lists after that: its own commands present, and in zsh none of
+/// the operator's, in bash every one. A per-session file keeps every
+/// command the agent ran and none of the operator's, since the snippet's
+/// per-command append writes only lines entered in the session, and the
+/// operator's file is byte for byte what it was.
+#[test]
+fn zsh_lists_none_of_the_operators_history_and_bash_keeps_all_of_it() {
+    let cases = available(&OPERATOR_HISTORY);
+    for per_session in [false, true] {
+        let inst = Instance::new(if per_session { "op-ps" } else { "op" });
+        if per_session {
+            inst.write_config("[terminal]\nshell_history_file = \"per_session\"\n");
+        }
+        let mut shim = Shim::launch(&inst);
+        let mut ended = Vec::new();
+        for case in &cases {
+            let row = format!("{} / per_session {per_session}", case.name);
+            let s = start(&inst, &mut shim, *case, "Operator");
+            send(&mut shim, &s, "echo RECALL''_ONE", true);
+            await_count(&mut shim, &s, "RECALL_ONE", 1);
+            await_prompt(&mut shim, &s);
+            send(&mut shim, &s, "echo RECALL''_TWO", true);
+            await_count(&mut shim, &s, "RECALL_TWO", 1);
+            await_prompt(&mut shim, &s);
+            // Two back: a list cut short keeps only the last.
+            send(&mut shim, &s, "\u{1b}[A", false);
+            send(&mut shim, &s, "\u{1b}[A", false);
+            send(&mut shim, &s, "\r", false);
+            await_count(&mut shim, &s, "RECALL_ONE", 2);
+            await_prompt(&mut shim, &s);
+            send(&mut shim, &s, "!!", true);
+            await_count(&mut shim, &s, "RECALL_ONE", 3);
+            await_prompt(&mut shim, &s);
+
+            let listed_from = output(&mut shim, &s).len();
+            let zsh = case.command == "zsh";
+            send(&mut shim, &s, if zsh { "fc -l 1" } else { "history" }, true);
+            // Only the listing prints the marker's command with its quotes
+            // after this point.
+            await_output_after(&mut shim, &s, listed_from, "HISTMARK_''");
+            await_prompt(&mut shim, &s);
+            let listed = output(&mut shim, &s);
+            let listed = listed.get(listed_from..).unwrap_or(&listed);
+            assert!(
+                listed.contains("echo RECALL''_TWO"),
+                "{row}: the listing lacks the agent's own commands: {listed:?}"
+            );
+            if zsh {
+                let out = output(&mut shim, &s);
+                assert!(
+                    !out.contains("OPERATORS_OWN_HISTORY"),
+                    "{row}: the operator's history reached the output: {out:?}"
+                );
+            } else {
+                for entry in BASH_OPERATOR_HISTORY.lines() {
+                    assert!(
+                        listed.contains(entry),
+                        "{row}: bash's list lost the operator's `{entry}`: {listed:?}"
+                    );
+                }
+            }
+            end(&mut shim, &s, Ending::ForceTerminate);
+            ended.push((s, Ending::ForceTerminate));
+        }
+        shim.kill();
+
+        for (s, _) in &ended {
+            let (rel, body) = s.case.files[1];
+            assert_eq!(
+                std::fs::read_to_string(s.home.join(rel)).unwrap(),
+                body,
+                "{}: the operator's history file changed",
+                s.case.name
+            );
+            if !per_session {
+                continue;
+            }
+            let file = inst
+                .dir
+                .join("logs")
+                .join("history")
+                .join(format!("{}.history", s.id));
+            let text = std::fs::read_to_string(&file)
+                .unwrap_or_else(|e| panic!("{}: no {}: {e}", s.case.name, file.display()));
+            for needle in [MARK, "echo RECALL''_ONE", "echo RECALL''_TWO"] {
+                assert!(
+                    text.contains(needle),
+                    "{}: {} lacks {needle}: {text:?}",
+                    s.case.name,
+                    file.display()
+                );
+            }
+            // bash's file begins with the line Holdfast typed, which is in
+            // its list like any other and names only bash's carrier.
+            let marks = SNIPPET_MARKS
+                .into_iter()
+                .filter(|m| s.case.command == "zsh" || *m != "HOLDFAST_BASH_INTEGRATION");
+            for needle in std::iter::once("OPERATORS_OWN_HISTORY").chain(marks) {
+                assert!(
+                    !text.contains(needle),
+                    "{}: {} holds {needle}: {text:?}",
+                    s.case.name,
+                    file.display()
+                );
+            }
+        }
+        assert_no_leaks(&ended);
+        drop(inst);
+    }
+}
+
+/// A zsh rc that saves by rewriting its history file, with none of
+/// `append_history`, `inc_append_history` and `share_history`.
+const ZSH_REWRITING_RC: &str = "HISTFILE=~/.zsh_history\nHISTSIZE=1000\nSAVEHIST=1000\n\
+                                unsetopt append_history\n";
+
+/// A zsh whose rc rewrites its history file, sourced again in the session,
+/// keeps the operator's entries in that file (review of GH #274).
+/// `source ~/.zshrc` puts the rc's `HISTFILE` and `SAVEHIST` back, and zsh
+/// then saves at exit by rewriting the file from its list. A cut list holds
+/// the session's commands alone, and the operator's file comes out with
+/// nothing else in it, so the snippet cuts only a list whose rc appends, and
+/// this row goes red if it cuts this one (measured, zsh 5.9, exit and
+/// hangup).
+///
+/// The session's own commands still reach the operator's file, as they do
+/// under any rc sourced again (SECURITY.md, H1), and that is the proof the
+/// save happened at all: without it the operator's file is intact because
+/// nothing was written, and this row measures nothing.
+#[test]
+fn a_zsh_rc_that_rewrites_its_history_file_keeps_the_operators_entries_when_sourced_again() {
+    let case = Case {
+        name: "zsh-rewriting-rc-resourced",
+        command: "zsh",
+        args: &[],
+        files: &[
+            (".zshrc", ZSH_REWRITING_RC),
+            (".zsh_history", ZSH_OPERATOR_HISTORY),
+        ],
+        integration: true,
+        before: &[("source ~/.zshrc", "")],
+        hung_up: true,
+        needs: "zsh",
+    };
+    if available(&[case]).is_empty() {
+        return;
+    }
+    let inst = Instance::new("rewriting-rc");
+    let mut shim = Shim::launch(&inst);
+    let mut ended = Vec::new();
+    for how in [Ending::Exit, Ending::Terminate] {
+        let s = start(&inst, &mut shim, case, &format!("{how:?}"));
+        end(&mut shim, &s, how);
+        ended.push((s, how));
+    }
+    shim.kill();
+    for (s, how) in &ended {
+        let file = s.home.join(".zsh_history");
+        let text = std::fs::read_to_string(&file)
+            .unwrap_or_else(|e| panic!("{} / {how:?}: {}: {e}", s.case.name, file.display()));
+        assert!(
+            text.contains(MARK),
+            "{} / {how:?}: zsh never saved to {}, so this measured nothing: {text:?}",
+            s.case.name,
+            file.display()
+        );
+        for needle in ["OPERATORS_OWN_HISTORY_1", "OPERATORS_OWN_HISTORY_2"] {
+            assert!(
+                text.contains(needle),
+                "{} / {how:?}: the operator's {} lost {needle}: {text:?}",
+                s.case.name,
+                file.display()
+            );
+        }
+    }
+    drop(inst);
+}
+
+/// bash rc files that hard-set `HISTFILE` and rewrite it from the
+/// in-memory list: at every prompt, by `history -w` alone and by the sync
+/// recipe that first reads what other shells appended; by that recipe as
+/// the `historymerge` function and `EXIT` trap it is usually shared as; at
+/// exit alone, by a trap; and at every prompt once the rc runs in a shell
+/// Holdfast has integrated, which is a `history -w` nothing that reads the
+/// shell at start-up can see. Limits above anything a row writes, so none
+/// trims what it measures.
+const BASH_REWRITING_RCS: [Case; 5] = [
+    bash_rewriting(
+        "bash-history-w-resourced",
+        &[
+            (".bashrc", BASH_HISTORY_W_RC),
+            (".bash_history", BASH_OPERATOR_HISTORY),
+        ],
+    ),
+    bash_rewriting(
+        "bash-history-sync-resourced",
+        &[
+            (".bashrc", BASH_HISTORY_SYNC_RC),
+            (".bash_history", BASH_OPERATOR_HISTORY),
+        ],
+    ),
+    bash_rewriting(
+        "bash-historymerge-resourced",
+        &[
+            (".bashrc", BASH_HISTORYMERGE_RC),
+            (".bash_history", BASH_OPERATOR_HISTORY),
+        ],
+    ),
+    bash_rewriting(
+        "bash-exit-trap-resourced",
+        &[
+            (".bashrc", BASH_EXIT_TRAP_RC),
+            (".bash_history", BASH_OPERATOR_HISTORY),
+        ],
+    ),
+    bash_rewriting(
+        "bash-late-history-w-resourced",
+        &[
+            (".bashrc", BASH_LATE_HISTORY_W_RC),
+            (".bash_history", BASH_OPERATOR_HISTORY),
+        ],
+    ),
+];
+
+const BASH_HISTORY_W_RC: &str = "HISTFILE=~/.bash_history\nHISTSIZE=1000\nHISTFILESIZE=2000\n\
+                                 PROMPT_COMMAND='history -w'\n";
+
+const BASH_HISTORY_SYNC_RC: &str = "HISTFILE=~/.bash_history\nHISTSIZE=1000\nHISTFILESIZE=2000\n\
+                                    PROMPT_COMMAND='history -n; history -w; history -c; history -r'\n";
+
+const BASH_HISTORYMERGE_RC: &str = "HISTFILE=~/.bash_history\nHISTSIZE=1000\nHISTFILESIZE=2000\n\
+                                    historymerge() { history -n; history -w; history -c; history -r; }\n\
+                                    trap historymerge EXIT\nPROMPT_COMMAND=historymerge\n";
+
+const BASH_EXIT_TRAP_RC: &str = "HISTFILE=~/.bash_history\nHISTSIZE=1000\nHISTFILESIZE=2000\n\
+                                 trap 'history -w' EXIT\n";
+
+/// `history -w` from `PROMPT_COMMAND` only in a shell whose integration
+/// already ran, as a guard on the snippet's own variable stands in for any
+/// rc that sets up its prompt differently when sourced again. No reading
+/// of the shell at start-up finds this `history -w`, so under it an emptied
+/// list keeps none of the operator's entries in any row (measured, bash 5.2
+/// and 5.3).
+const BASH_LATE_HISTORY_W_RC: &str = "HISTFILE=~/.bash_history\nHISTSIZE=1000\nHISTFILESIZE=2000\n\
+     [[ -n ${HOLDFAST_SHELL_INTEGRATION-} ]] && PROMPT_COMMAND='history -w'\n";
+
+/// A bash session under one of [`BASH_REWRITING_RCS`]'s rc files, which
+/// runs a command and then sources the rc again before its marker. The
+/// command comes first, or the sync recipe's line count is the operator's
+/// own and it loses nothing.
+const fn bash_rewriting(
+    name: &'static str,
+    files: &'static [(&'static str, &'static str)],
+) -> Case {
+    Case {
+        name,
+        command: "bash",
+        args: &[],
+        files,
+        integration: true,
+        before: &[("echo before''_source", ""), ("source ~/.bashrc", "")],
+        hung_up: true,
+        needs: "bash",
+    }
+}
+
+/// A bash whose rc rewrites its history file with `history -w`, sourced
+/// again in the session, keeps every one of the operator's entries in that
+/// file, in both history modes (SD-2, review of GH #274). `source
+/// ~/.bashrc` puts the rc's `HISTFILE` back, and the next `history -w` —
+/// at the next prompt, or the `EXIT` trap's — writes the list over the
+/// operator's file.
+/// An emptied list holds the session's commands alone, so `history -w`
+/// keeps none of the operator's entries, and the sync recipe's `history -n`
+/// reads the file back from the line count bash last recorded, which in
+/// per_session mode, the session file's, skips as many of the operator's
+/// first entries as the session has run commands. bash keeps the list it
+/// read, and this row goes red if anything empties it (measured, bash 5.2
+/// and 5.3, exit and hangup).
+///
+/// The session's commands reach the operator's file, as under any rc
+/// sourced again (SECURITY.md, H1), and that is the proof the rewrite
+/// happened at all.
+#[test]
+fn a_bash_rc_that_rewrites_its_history_file_keeps_the_operators_entries_when_sourced_again() {
+    // Every row's loss, not the first: which recipes lose what in which
+    // mode is the measurement.
+    let mut lost = Vec::new();
+    for per_session in [false, true] {
+        let inst = Instance::new(if per_session { "bash-rw-ps" } else { "bash-rw" });
+        if per_session {
+            inst.write_config("[terminal]\nshell_history_file = \"per_session\"\n");
+        }
+        let mut shim = Shim::launch(&inst);
+        let mut ended = Vec::new();
+        for case in available(&BASH_REWRITING_RCS) {
+            for how in [Ending::Exit, Ending::Terminate] {
+                let s = start(&inst, &mut shim, case, &format!("{how:?}"));
+                end(&mut shim, &s, how);
+                ended.push((s, how));
+            }
+        }
+        shim.kill();
+        for (s, how) in &ended {
+            let file = s.home.join(".bash_history");
+            let text = std::fs::read_to_string(&file)
+                .unwrap_or_else(|e| panic!("{} / {how:?}: {}: {e}", s.case.name, file.display()));
+            let row = format!("{} / per_session {per_session} / {how:?}", s.case.name);
+            if !text.contains(MARK) {
+                lost.push(format!(
+                    "{row}: nothing rewrote {}, so this measured nothing: {text:?}",
+                    file.display()
+                ));
+            }
+            let missing: Vec<&str> = BASH_OPERATOR_HISTORY
+                .lines()
+                .filter(|line| !text.lines().any(|l| l == *line))
+                .collect();
+            if !missing.is_empty() {
+                lost.push(format!(
+                    "{row}: the operator's {} lost {missing:?}: {text:?}",
+                    file.display()
+                ));
+            }
+        }
+        drop(inst);
+    }
+    assert!(lost.is_empty(), "{}", lost.join("\n"));
+}
+
+/// `await_output` for text printed after byte `from` of the output.
+fn await_output_after(shim: &mut Shim, s: &Started, from: usize, needle: &str) {
+    let deadline = Instant::now() + SHELL_TIMEOUT;
+    loop {
+        let out = output(shim, s);
+        if out.get(from..).is_some_and(|tail| tail.contains(needle)) {
+            return;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "{}: `{needle}` never appeared after byte {from}; output: {out:?}",
+            s.case.name
+        );
+        std::thread::sleep(Duration::from_millis(100));
+    }
+}
+
 /// Everything the session has printed, once it has stopped printing: the
 /// last of a shell's output can arrive after the shell has gone.
 fn settled_output(shim: &mut Shim, s: &Started) -> String {
@@ -1044,8 +1500,12 @@ fn zsh_ends_without_a_history_error_under_an_rc_that_saves_history() {
 /// - a bash with shell integration off, where only `HISTFILE` in the
 ///   environment names the file and the shell writes it when it exits;
 /// - [`BASH_APPEND_STOPPED`], whose per-command append stops after the
-///   marker.
-const PER_SESSION_EXTRA: [(Case, Ending); 5] = [
+///   marker;
+/// - a bash whose rc aliases `history`, which is expanded into the
+///   snippet's functions as it is evaluated: the per-command append failed
+///   at every prompt and the file stayed empty until the snippet called
+///   `builtin history`.
+const PER_SESSION_EXTRA: [(Case, Ending); 6] = [
     (
         Case {
             name: "bash-own-markers",
@@ -1087,13 +1547,26 @@ const PER_SESSION_EXTRA: [(Case, Ending); 5] = [
     ),
     (BASH_AND_ZSH[1], Ending::Exit),
     (BASH_APPEND_STOPPED, Ending::Exit),
+    (
+        Case {
+            name: "bash-history-alias",
+            command: "bash",
+            args: &[],
+            files: &[(".bashrc", "alias history='history 20'\n")],
+            integration: true,
+            before: &[],
+            hung_up: true,
+            needs: "bash",
+        },
+        Ending::ForceTerminate,
+    ),
 ];
 
 const BASH_SMALL_LIMITS_RC: &str = "HISTFILE=~/.bash_history\nHISTSIZE=3\nHISTFILESIZE=3\n";
 
 /// A bash whose per-command append stops once the marker is recorded, with
 /// limits of 3 — fewer than the commands typed after it. [`STOP_THE_APPEND`]
-/// shadows the `history` builtin, so the snippet's `history -a` does
+/// redefines the snippet's `__holdfast_h` to hand on the status and append
 /// nothing, as happens when something replaces `PROMPT_COMMAND`
 /// mid-session; bash's own save at exit does not go through it. That save
 /// is then all that writes: with `histappend` it appends the last three
@@ -1110,8 +1583,10 @@ const BASH_APPEND_STOPPED: Case = Case {
     needs: "bash",
 };
 
-/// Typed into [`BASH_APPEND_STOPPED`] once its marker is recorded.
-const STOP_THE_APPEND: &str = "history() { :; }";
+/// Typed into [`BASH_APPEND_STOPPED`] once its marker is recorded. Not a
+/// `history` function shadowing the builtin: the snippet calls `builtin
+/// history -a`, so that an rc's `history` alias cannot stop it.
+const STOP_THE_APPEND: &str = "__holdfast_h() { return \"${1:-0}\"; }";
 
 /// A user's own complete OSC 133 integration, untagged, which Holdfast's
 /// snippet yields to.

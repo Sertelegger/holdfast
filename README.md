@@ -85,13 +85,16 @@ tells you why rather than delivering it. `holdfast attach --allow-echo` sends it
 anyway, for the programs that ask for a code or an API key without ever clearing
 echo — the value is still masked on your own terminal, and it will still appear
 in the session's output. Echo off is not proof of a password prompt, though: a
-shell's line editor turns echo off too and draws what it is given, so a value
-sent while a shell sits at its prompt passes that test and lands in the output
-(G3 in SECURITY.md). `request_secret_input`, the tool an agent calls to *ask* for that
-password, ships in 0.0.7 and is one of the twelve above. It was not: this
-sentence said twelve while the list above it enumerated eleven, and
-`request_secret_input` — the tool the sentence is about — was the one it
-left out.
+shell's line editor turns echo off too and draws what it is given. So Holdfast
+also refuses a secret while the session's shell sits at its own prompt, which
+it knows from the shell's OSC 133 markers, and `--allow-echo` does not change
+that. A REPL, or a shell without those markers, still passes the echo test at
+its prompt and would draw, run and record the value (G3 in SECURITY.md). A
+daemon started from 0.0.7 and still running after an upgrade has neither
+check: against one, `holdfast attach` says so under the prompt, and the MCP
+server refuses `request_secret_input` until the daemon is restarted.
+`request_secret_input`, the tool an agent calls to *ask* for that
+password, ships in 0.0.7 and is one of the twelve above.
 
 Sessions outlive the MCP client: `holdfast mcp` auto-spawns a daemon on
 first use and reconnects to it afterwards. `holdfast mcp --no-daemon` runs
@@ -140,21 +143,36 @@ into the child and accept the stall.
 ### Shell integration
 
 When the session command is `bash`, `zsh` or `fish`, Holdfast types a
-one-line OSC 133 snippet at the first prompt, so the shell marks its own
-prompt, command and exit-code boundaries and detection runs at the
-`semantic` tier. The snippet wraps whatever `PS1` the shell ended up with
-instead of replacing it, does nothing when your configuration already
-emits OSC 133, and is not exported — a nested shell is integrated in its
-own right. Pass `shell_integration: false` to `start_session` to skip it.
+one-line OSC 133 snippet into the session as it spawns, so the shell marks
+its own prompt, command and exit-code boundaries and detection runs at the
+`semantic` tier. The terminal holds the line until the shell first reads
+input, which is normally at its first prompt, after your rc files have run.
+The snippet wraps whatever `PS1` the shell ended up with instead of
+replacing it, does nothing when your configuration already emits OSC 133,
+and is not exported. It is typed once, into the shell the session starts:
+a shell started inside the session, or with `exec`, gets no markers unless
+its own configuration emits them, so detection there falls back to the
+lower tiers and a secret is not refused at its prompt (G3 in SECURITY.md).
+Pass `shell_integration: false` to `start_session` to skip it.
 
 It is **typed into the session, never installed**: there is nothing to add
 to an rc file, and `crates/holdfast-core/src/detect/shell.rs` holds the only
 copy of each snippet. bash's snippet is longer than macOS lets a line typed
-at start-up be, so for bash Holdfast types a short line that runs the
-snippet from `HOLDFAST_BASH_INTEGRATION`, which the session starts with and
-that line unsets. Anything else — `dash`, `sh`, a REPL, a plain
+at start-up be, and zsh's nearly as long, so for both Holdfast types a short
+line that runs the snippet from `HOLDFAST_BASH_INTEGRATION` or
+`HOLDFAST_ZSH_INTEGRATION`, which the session starts with and that line
+unsets. Anything else — `dash`, `sh`, a REPL, a plain
 program — degrades silently to `terminal_mode` or `heuristic`, with no
 configuration and no error.
+
+**Anything an rc file reads from the terminal at start-up reads that line
+instead.** A `read` in `.bashrc` or `.zshrc`, zsh's new-user menu in a home
+with no `.zshrc`, or oh-my-zsh's update question `[Y/n]` takes the line, or
+its first characters, as its answer, and the session can start without
+integration and degrade the same way. Measured with a `read` in the rc
+file, bash and zsh both started at `terminal_mode` with no command history.
+Switch such a question off for the shells Holdfast starts; oh-my-zsh's is
+`zstyle ':omz:update' mode auto` (or `disabled`).
 
 Output is ANSI-stripped and secret-redacted by default: secrets are
 replaced with `[REDACTED:<kind>]` markers, and `read_output` with
@@ -179,7 +197,7 @@ A session's shell writes nothing to the history files under `$HOME` (GH
 #252), however the session ends: `exit`, EOF, `terminate`, `holdfast
 daemon stop` or a daemon crash. Every session starts with
 `HISTFILE=/dev/null`, an empty `fish_history` and a zsh `HISTORY_IGNORE`
-matching Holdfast's snippet. The integration snippet, which begins with a
+matching the line Holdfast types. The integration snippet, which begins with a
 space, sets `HISTFILE=/dev/null` again in bash and zsh after your rc files
 have run, and zsh's `SAVEHIST=0`, so zsh does not try to lock and save
 `/dev/null` as it exits. fish is started with an init command (`-C`) that
@@ -209,26 +227,48 @@ Except:
   when an rc sets `savehist`;
 - a fish started inside a bash or zsh session, or through a wrapper such
   as `env fish`, whose config.fish sets `fish_history`;
-- a zsh `HISTORY_IGNORE` of your own, which lets Holdfast's snippet line
+- a zsh `HISTORY_IGNORE` of your own, which lets the line Holdfast types
   — not the agent's commands — into a history file your rc names;
 - as root, a zsh started inside a session or by `exec zsh`, under an rc
   that sets `SAVEHIST` and unsets `append_history` without setting
   `HISTFILE`: it replaces `/dev/null` with a file of its commands;
 - a login bash in macOS Terminal, whose per-window history under
   `~/.bash_sessions/` only a `~/.bash_sessions_disable` file turns off;
+- a history recorder your rc installs as a hook — atuin, zsh-histdb, mcfly
+  or a bash-preexec logger — which records every command in a store of its
+  own;
+- an rc that reads the terminal at start-up, which takes the integration
+  line (see Shell integration above), so a zsh whose rc names a history
+  file saves to it;
 - Python 3.12 and older, which ignore `PYTHON_HISTORY` and write
   `~/.python_history`, a `.psqlrc` that sets `HISTFILE`, and any other
   program with a history file of its own, PowerShell's PSReadLine among
   them.
 
-Reading is not covered. bash and zsh load the history file your rc names
-as they start, before the snippet runs, so the agent can list your own
-history with `history` and recall it with up-arrow; a fish started inside
-a fish session reads the file its config.fish names the same way.
+Reading is covered only in zsh. bash and zsh load the history file your
+rc names as they start, and in zsh the snippet then cuts that list, so the
+agent cannot list your history with `fc -l` or recall it with up-arrow.
+It leaves the list whole under a zsh rc that turns off `append_history`,
+`inc_append_history` and `share_history`, where a later save would rewrite
+your file from the cut list, and under a readonly `HISTFILE`. bash keeps
+the list your rc loaded, and the agent can list and recall it: emptied, it
+is what a bash rc that runs `history -w`, sourced again, would write over
+your file (SECURITY.md's H1 and H10). A bash or zsh started inside the
+session loads its rc's file again, and the session runs as you, so `cat
+~/.bash_history` works either way. Nothing is cut with
+`shell_integration: false`, under an rc that takes the integration line,
+or in a zsh that `HOLDFAST_ZSH_INTEGRATION` does not reach, such as one an
+rc re-execs through `env -i`. A fish started inside a fish session reads
+the file its config.fish names.
 
 If your rc's `PROMPT_COMMAND` re-reads the history file at every prompt
 (`history -a; history -c; history -r`), `HISTFILE=/dev/null` also empties
-the session's in-memory history: up-arrow and `!!` recall nothing.
+the session's in-memory history: up-arrow and `!!` recall nothing. On bash
+4.3 and older, macOS's `/bin/bash` among them, an rc that syncs with
+`history -n; history -w; history -c; history -r` and is sourced again in
+the session rewrites your history file without its oldest entry, or
+without any entry when `source` was the session's first command
+(SECURITY.md's H1).
 
 To keep a record of what an agent ran instead, set
 
@@ -251,10 +291,12 @@ saves one; fish sessions get none.
 It is a convenience record, not an audit trail. A call's own `env` can
 point `HISTFILE` somewhere else, your rc's history options still apply —
 Debian's `HISTCONTROL=ignoreboth` drops commands that begin with a space,
-and without it each bash file begins with the snippet's own line — an rc
-sourced again that sets `HISTFILESIZE` truncates the file when bash exits,
-and anything in the list above that re-points `HISTFILE` takes the rest of
-the session's commands with it.
+and without it each bash file begins with the line Holdfast typed, and holds
+your own history too if your rc runs `history -w` — an rc sourced again
+that sets `HISTFILESIZE`, or one that makes it
+readonly, truncates the file when bash exits, and anything in the list
+above that re-points `HISTFILE` takes the rest of the session's commands
+with it.
 
 With `shell_integration: false` only the environment applies: an rc file
 that sets `HISTFILE` itself decides where bash and zsh save history — and
@@ -306,9 +348,12 @@ working directory, with the daemon's environment — and `cargo install --path`
 runs in this checkout, so a daemon started from the same shell would point
 every such session, in every project, at the Holdfast repository. Those
 `holdfast mcp` processes are still the old binary until each Claude Code
-session restarts; a different protocol *minor* between them and the daemon is
-allowed, and a different major is refused with a message saying which side to
-restart. `holdfast daemon status` shows what is running.
+session restarts. A different protocol *minor* between them and the daemon is
+allowed for every call that means the same to both. A call that does not is
+refused, with a message saying which side to restart; `start_session` above
+all, which would start in the daemon's directory. A different major is refused
+outright. `holdfast daemon status` shows what is running, and says on stderr
+when the daemon is older than the CLI.
 
 **One registration per Claude Code config directory.** `claude mcp add
 --scope user` writes to the config directory in effect — `~/.claude.json`, or

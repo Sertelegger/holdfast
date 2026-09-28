@@ -28,7 +28,7 @@ use holdfast_core::output::HeldBackCause;
 #[cfg(unix)]
 use holdfast_core::protocol::client::{ClientError, ControlClient};
 #[cfg(unix)]
-use holdfast_core::protocol::handshake::ClientKind;
+use holdfast_core::protocol::handshake::{ClientKind, Requirement};
 #[cfg(unix)]
 use holdfast_core::protocol::method;
 #[cfg(unix)]
@@ -398,6 +398,132 @@ pub(crate) fn secret_prompt_label(prompt_text: &str, raised_by: Option<&str>) ->
         "\r\n[holdfast] {what} — type it here; it is not shown and goes only to the \
          session. Enter sends it, Ctrl-C abandons.\r\n"
     )
+}
+
+/// Why a secret typed into `holdfast attach` will not be sent to this
+/// daemon, or `None` when it will ([`Requirement::EchoGate`]).
+///
+/// **`allow_echo: false` means "gate it" only to a daemon of 1.3 or
+/// later.** An older one has no gate and ignores the key, so the frame
+/// this client would send — the very one that means *do not write this
+/// into a terminal that echoes* — is served as an ungated write, and a
+/// secret typed at an echoing prompt lands in the session's output, where
+/// `read_output` hands it to the agent. So against such a daemon a secret
+/// goes only with `--allow-echo`, the decision of the person at the
+/// terminal. On that daemon the flag is an ungated write, into a shell's
+/// own idle prompt as much as into an echoing program, since it also
+/// predates the shell-prompt check (GH #262); so the advice to use it
+/// says to send only while the command that asks is waiting, and
+/// [`secret_unguarded_note`] says it again once the flag is given.
+#[cfg(unix)]
+pub(crate) fn secret_not_sendable(allow_echo: bool, daemon_minor: u32) -> Option<String> {
+    let gate = Requirement::EchoGate;
+    if allow_echo || gate.met_by(daemon_minor) {
+        return None;
+    }
+    let major = holdfast_core::protocol::PROTOCOL_MAJOR;
+    let only_while = if Requirement::ShellPromptGuard.met_by(daemon_minor) {
+        ""
+    } else {
+        " while the command that asks for it is waiting on screen (that daemon also cannot tell \
+         the shell's own prompt from a password prompt, and at an idle prompt the value is run \
+         as a command and saved to history)"
+    };
+    Some(format!(
+        "this daemon speaks protocol {major}.{daemon_minor}, which predates the echo check \
+         ({major}.{}): it would {}. What you type here will not be sent. Reattach with \
+         `holdfast attach --allow-echo` to send it anyway{only_while}, or restart the daemon to \
+         update it (`holdfast daemon stop` ends every session). Ctrl-C returns the keyboard to \
+         the session.",
+        gate.minor(),
+        gate.otherwise(),
+    ))
+}
+
+/// What `holdfast attach` says under a secret prompt it will send to a
+/// daemon without the shell-prompt check, or `None` when the daemon has
+/// it ([`Requirement::ShellPromptGuard`]).
+///
+/// **Said where the human is about to type, not only on joining.** Such a
+/// daemon writes the value into whatever holds the terminal, and at a
+/// shell's idle prompt the line editor draws it, the shell runs it and
+/// history keeps it (GH #262; measured with this client's `--allow-echo`
+/// against a v0.0.7 daemon, bash 5.2). The joining note says so once, and
+/// may have scrolled away by the time a request is raised; and a v0.0.7
+/// daemon sends no picture of the screen, so the human may not see that
+/// the shell is at its prompt. Only the daemon can refuse it, so this is a
+/// warning and not a refusal: the same human may be answering `sudo`.
+#[cfg(unix)]
+pub(crate) fn secret_unguarded_note(daemon_minor: u32) -> Option<String> {
+    let guard = Requirement::ShellPromptGuard;
+    if guard.met_by(daemon_minor) {
+        return None;
+    }
+    let major = holdfast_core::protocol::PROTOCOL_MAJOR;
+    Some(format!(
+        "this daemon speaks protocol {major}.{daemon_minor}, which predates the shell-prompt \
+         check ({major}.{}): it cannot tell the shell's own prompt from a password prompt. Send \
+         only while the command that asks for it is waiting on screen; at an idle prompt the \
+         value is shown, run as a command and saved to history. Ctrl-C abandons.",
+        guard.minor(),
+    ))
+}
+
+/// What `holdfast attach` or `watch` says, once, on joining a daemon older
+/// than itself — or `None` when it lacks nothing this client would miss.
+///
+/// **The frames an older daemon never sends cannot be refused**, and a
+/// client left to find out by their absence finds out never: a view that
+/// silently misses a burst the daemon dropped (1.4's `OutputGap`), or that
+/// starts blank (1.5's `ScreenSnapshot`), looks exactly like a session
+/// that printed nothing. So the difference is stated once, up front, with
+/// the way to be rid of it — and, for `attach`, what
+/// [`secret_not_sendable`] will do.
+#[cfg(unix)]
+pub(crate) fn older_daemon_note(what: &str, daemon_minor: u32) -> Option<String> {
+    let major = holdfast_core::protocol::PROTOCOL_MAJOR;
+    let ours = holdfast_core::protocol::PROTOCOL_MINOR;
+    if daemon_minor >= ours {
+        return None;
+    }
+    // The minors are the handshake log's (`protocol::handshake`): 1.3
+    // `SecretInput.allow_echo`, 1.4 `OutputGap`, 1.5 `ScreenSnapshot`, and
+    // the first release with the shell-prompt check, which is 1.5 too.
+    use holdfast_core::protocol::handshake::{OUTPUT_GAP_MINOR, SCREEN_SNAPSHOT_MINOR};
+    let mut lacks = Vec::new();
+    if what == "attach" && !Requirement::EchoGate.met_by(daemon_minor) {
+        lacks.push(format!(
+            "it cannot check that a program will not echo a secret back into the session, so a \
+             secret typed here is sent only with `--allow-echo` ({major}.{})",
+            Requirement::EchoGate.minor()
+        ));
+    }
+    if what == "attach" && !Requirement::ShellPromptGuard.met_by(daemon_minor) {
+        lacks.push(format!(
+            "it does not refuse a secret while the session's shell sits at its own prompt, where \
+             the value is shown, run as a command and saved to history ({major}.{})",
+            Requirement::ShellPromptGuard.minor()
+        ));
+    }
+    if daemon_minor < OUTPUT_GAP_MINOR {
+        lacks.push(format!(
+            "it does not say when it drops output under load ({major}.{OUTPUT_GAP_MINOR})"
+        ));
+    }
+    if daemon_minor < SCREEN_SNAPSHOT_MINOR {
+        lacks.push(format!(
+            "it sends no picture of the screen on joining ({major}.{SCREEN_SNAPSHOT_MINOR})"
+        ));
+    }
+    if lacks.is_empty() {
+        return None;
+    }
+    Some(format!(
+        "holdfast {what}: this daemon speaks protocol {major}.{daemon_minor}, older than this \
+         client's {major}.{ours}: {}. Restart it to update it: `holdfast daemon stop` (this ends \
+         every session it holds), then `holdfast daemon start`.",
+        lacks.join("; ")
+    ))
 }
 
 /// Whether an `AwaitingSecret` for `request_id` is a prompt `holdfast
@@ -1302,6 +1428,21 @@ pub async fn daemon_status(as_json: bool) -> ExitCode {
             status.attach_clients,
         ));
     }
+    // **The command an operator runs to find out what a refusal meant**,
+    // so it says what the refusals are about: a daemon older than this
+    // CLI. On stderr, so neither output format changes shape.
+    let daemon = client.daemon_info();
+    if daemon.protocol_minor < holdfast_core::protocol::PROTOCOL_MINOR {
+        diag!(
+            "holdfast daemon status: this daemon is {} (protocol {}.{}), older than {}; \
+             `holdfast daemon stop` ends it and every session it holds, and the next daemon \
+             started from this binary is this build's",
+            daemon.daemon_version,
+            daemon.protocol_major,
+            daemon.protocol_minor,
+            holdfast_core::protocol::handshake::this_build_beside(&daemon.daemon_version),
+        );
+    }
     ExitCode::SUCCESS
 }
 
@@ -1531,6 +1672,10 @@ struct Drained {
     /// The page that ended the drain at a holdback, if one did. Never a
     /// holdback a later page read past: that one withheld nothing.
     held: Option<Value>,
+    /// Where a holdback that made no progress stopped the drain, and the
+    /// head it was reading to — so the notes can say how far short of the
+    /// end the output stops. `None` when the drain reached the head.
+    stopped: Option<(u64, u64)>,
 }
 
 /// Every page from the ring's oldest byte to the head as it stood at the
@@ -1586,6 +1731,7 @@ async fn drain(r: &LogReader<'_>, mut sink: impl FnMut(&str)) -> Result<Drained,
             // nothing. Stop, and keep the page for the note.
             Some(_) if page.held_back => {
                 seen.held = Some(page.data);
+                seen.stopped = Some((cursor, head));
                 break;
             }
             // Since GH #195 every other read makes progress, so this is a
@@ -1610,6 +1756,9 @@ async fn logs_all(r: &LogReader<'_>) -> Result<(), ExitCode> {
     if let Some(held) = &seen.held {
         diag!("holdfast logs: {}", held_back_note(r.raw, held));
     }
+    if let Some(note) = stopped_short_note(r.raw, &seen, None) {
+        diag!("holdfast logs: {note}");
+    }
     Ok(())
 }
 
@@ -1632,21 +1781,42 @@ async fn logs_all(r: &LogReader<'_>) -> Result<(), ExitCode> {
 /// `DEFAULT_BUFFER_BYTES`, a few pages — and keeps the last N lines of it
 /// here. The drain applies the holdback exactly as the tail read did, so
 /// the fallback withholds nothing less.
+///
+/// **A daemon that predates `apply_holdback` is read through the drain
+/// alone** ([`Requirement::TailHoldback`]). Sent the tail read, such a
+/// daemon drops the argument without a word and serves §4.1's bypass the
+/// CLI declined — measured against v0.0.7, which printed a fake token
+/// that was still arriving in the clear. Its cursor reads withhold that
+/// token, measured on the same build, so the drain keeps `--tail` working
+/// across the upgrade window without handing back what the flag declined.
+///
+/// **What the drain cannot give on such a daemon, and what it says
+/// instead.** Its cursor reads are not a current daemon's. Before GH
+/// #195 a candidate key block that begins and never ends could stop a
+/// cursor read at its start for good, however often it was retried —
+/// measured on v0.0.7 with 300 KB after it — and a body short enough to
+/// reach the head came back raw, as it did from that daemon's tail read.
+/// Neither is a regression on the tail read the CLI used to send, but the
+/// first means the last N lines of what the drain returned are not the
+/// session's last, so [`stopped_short_note`] says where they end rather
+/// than letting them pass for the tail.
 #[cfg(unix)]
 async fn logs_tail(r: &LogReader<'_>, n: usize) -> Result<(), ExitCode> {
-    let page = r
-        .read(json!({
-            "tail_lines": n,
-            "apply_holdback": true,
-            "max_bytes": LOGS_PAGE_BYTES,
-        }))
-        .await?;
-    if !page.truncated_for_size {
-        crate::out::text(&page.output);
-        if page.held_back {
-            diag!("holdfast logs: {}", held_back_note(r.raw, &page.data));
+    if r.client.require(Requirement::TailHoldback).is_ok() {
+        let page = r
+            .read(json!({
+                "tail_lines": n,
+                "apply_holdback": true,
+                "max_bytes": LOGS_PAGE_BYTES,
+            }))
+            .await?;
+        if !page.truncated_for_size {
+            crate::out::text(&page.output);
+            if page.held_back {
+                diag!("holdfast logs: {}", held_back_note(r.raw, &page.data));
+            }
+            return Ok(());
         }
-        return Ok(());
     }
 
     let mut all = String::new();
@@ -1662,7 +1832,55 @@ async fn logs_tail(r: &LogReader<'_>, n: usize) -> Result<(), ExitCode> {
     if let Some(held) = &seen.held {
         diag!("holdfast logs: {}", held_back_note(r.raw, held));
     }
+    if let Some(note) = stopped_short_note(r.raw, &seen, Some(n)) {
+        diag!("holdfast logs: {note}");
+    }
     Ok(())
+}
+
+/// Where a drain that stopped at a holdback short of the head left off,
+/// for the line after [`held_back_note`] — or `None` when it reached the
+/// head, or when there is nothing to add.
+///
+/// **For `--tail` (`tail` is `Some(n)`), always.** Its lines are the last
+/// N of what the drain returned, so when the drain stopped short they end
+/// where it stopped, and printed alone they pass for the session's last.
+///
+/// **For a daemon older than GH #195, always, and with why.** Such a
+/// daemon's cursor could stop for good at a candidate key block that
+/// begins and does not end — measured on v0.0.7 — where
+/// [`held_back_note`]'s *"read again"* never helps. It is recognised by
+/// sending no `held_back_cause`, which arrived with the #195 fix in one
+/// change, and only on a redacting read: `--raw` turns the mechanism off.
+/// A current daemon's holdback is always one a retry can clear or one
+/// the note already calls permanent, so there it adds nothing.
+#[cfg(unix)]
+fn stopped_short_note(raw: bool, seen: &Drained, tail: Option<usize>) -> Option<String> {
+    let (at, head) = seen.stopped?;
+    let before_195 = !raw
+        && seen
+            .held
+            .as_ref()
+            .is_some_and(|d| d.get("held_back_cause").is_none_or(Value::is_null));
+    let mut note = match tail {
+        Some(n) => format!(
+            "so the lines above are the last {n} before byte {at}, where the read stopped, and \
+             not the last of the {head} bytes this session had printed when it began."
+        ),
+        None if before_195 => format!(
+            "the read stopped at byte {at} of the {head} this session had printed when it began."
+        ),
+        None => return None,
+    };
+    if before_195 {
+        note.push_str(
+            " This daemon predates GH #195 and can also stop there for good, at a key block \
+             that begins and never ends: if reading again stops at the same byte, that is why. \
+             A daemon of this build reads past it and marks what it cannot vouch for \
+             (`holdfast daemon stop` updates it, and ends every session).",
+        );
+    }
+    Some(note)
 }
 
 /// The last `n` lines of `text`, counted the way the daemon's
@@ -1953,11 +2171,13 @@ fn terminal_identity() -> Option<String> {
 /// What the handshake settled on, or why it did not.
 #[cfg(unix)]
 enum Dialled {
-    /// Attached. The stream's two halves, plus the geometry the session
-    /// is currently at.
+    /// Attached. The stream's two halves, and the protocol minor the
+    /// daemon declared in `Attached` — what it can be trusted to do with
+    /// a frame this build sends ([`Requirement`]).
     Ok(
         tokio::net::unix::OwnedReadHalf,
         tokio::net::unix::OwnedWriteHalf,
+        u32,
     ),
     /// The daemon refused, or answered something unusable, and has
     /// already been reported. Carries the exit code.
@@ -2049,7 +2269,7 @@ async fn dial_attach(
                     );
                     return Dialled::Refused(EXIT_FAILED);
                 }
-                return Dialled::Ok(rd, wr);
+                return Dialled::Ok(rd, wr, protocol_minor);
             }
             // §7.5's refusal. `message` is a whole sentence that *begins*
             // with the §18.4b token, so printing it verbatim is what lets
@@ -2307,7 +2527,7 @@ pub async fn attach(session: &str, allow_echo: bool) -> ExitCode {
     use holdfast_core::attach::{AttachMode, AttachRole};
     use std::os::unix::io::AsRawFd;
 
-    let (mut rd, mut wr) = match dial_attach(
+    let (mut rd, mut wr, mut daemon_minor) = match dial_attach(
         session,
         AttachMode::ReadWrite,
         AttachRole::Interactive,
@@ -2315,9 +2535,14 @@ pub async fn attach(session: &str, allow_echo: bool) -> ExitCode {
     )
     .await
     {
-        Dialled::Ok(rd, wr) => (rd, wr),
+        Dialled::Ok(rd, wr, minor) => (rd, wr, minor),
         Dialled::Refused(code) => return ExitCode::from(code),
     };
+    // Said once, here, before the terminal goes raw: a reattach reaches
+    // the same daemon or reports its own refusal.
+    if let Some(note) = older_daemon_note("attach", daemon_minor) {
+        diag!("{note}");
+    }
 
     // **The two signals that would otherwise skip the restore, and they
     // are installed before raw mode is taken.** `TermiosGuard`'s `Drop`
@@ -2408,6 +2633,7 @@ pub async fn attach(session: &str, allow_echo: bool) -> ExitCode {
         match attach_connected(
             session,
             allow_echo,
+            daemon_minor,
             rd,
             wr,
             tty,
@@ -2440,7 +2666,7 @@ pub async fn attach(session: &str, allow_echo: bool) -> ExitCode {
                         )
                         .await
                         {
-                            Dialled::Ok(r, w) => (rd, wr) = (r, w),
+                            Dialled::Ok(r, w, minor) => (rd, wr, daemon_minor) = (r, w, minor),
                             Dialled::Refused(code) => return ExitCode::from(code),
                         }
                     }
@@ -2481,6 +2707,7 @@ enum AttachEnd {
 async fn attach_connected(
     session: &str,
     allow_echo: bool,
+    daemon_minor: u32,
     rd: tokio::net::unix::OwnedReadHalf,
     mut wr: tokio::net::unix::OwnedWriteHalf,
     tty: std::os::unix::io::RawFd,
@@ -2636,6 +2863,21 @@ async fn attach_connected(
     // daemon that can now decline the write makes it a silently discarded
     // credential, which is the defect the decline exists to prevent.
     let mut submitted: Option<String> = None;
+    // `Some` after a request closed while its prompt was still up here and
+    // unanswered: what is typed up to the next Enter is collected, masked,
+    // and thrown away, not sent to the session (GH #262's review).
+    //
+    // **A close does not stop the human typing.** The command that asked
+    // ended, timed out or was interrupted, another client answered, or the
+    // agent cancelled; the person at this keyboard learns that from a line
+    // they are not looking at, mid-password. Handed straight back to the
+    // session, the rest of the value went out as `Input`, which a shell
+    // back at its prompt draws, runs as a command and saves to history,
+    // and which the daemon's shell-prompt check never sees because it is
+    // not a secret (measured: `read -s -t 3` timing out, and an agent's
+    // `interrupt`, on bash 5.2 and zsh 5.9). Swallowing until Enter costs a
+    // human who was about to type a command one line, and says so.
+    let mut discarding: Option<crate::attach_tty::SecretLine> = None;
 
     loop {
         tokio::select! {
@@ -2741,6 +2983,19 @@ async fn attach_connected(
                             render(
                                 secret_prompt_label(&prompt_text, raised_by.as_deref()).as_bytes(),
                             );
+                            // Still collected, masked, when it will not be
+                            // sent: a keyboard handed back to the session
+                            // here would put the secret the human is about
+                            // to type into the very echo this refuses.
+                            if let Some(why) = secret_not_sendable(allow_echo, daemon_minor) {
+                                render(format!("[holdfast] {why}\r\n").as_bytes());
+                            } else if let Some(why) = secret_unguarded_note(daemon_minor) {
+                                render(format!("[holdfast] {why}\r\n").as_bytes());
+                            }
+                            // A new prompt ends a discard: what was typed
+                            // into it is zeroed as it drops, and what is
+                            // typed next is this request's answer.
+                            discarding = None;
                             secret = Some((request_id, crate::attach_tty::SecretLine::default()));
                         }
                     }
@@ -2766,20 +3021,32 @@ async fn attach_connected(
                         let answering = secret.as_ref().is_some_and(|(id, _)| *id == request_id);
                         let mine = answering || submitted.as_deref() == Some(request_id.as_str());
                         if answering {
-                            secret = None;
-                        }
-                        if mine {
+                            // The line keeps collecting, into the discard
+                            // (see `discarding`), rather than handing the
+                            // rest of the password to the session.
+                            discarding = secret.take().map(|(_, line)| line);
                             submitted = None;
-                            // **The one outcome that gets a sentence
-                            // rather than a token** (GH #137). Every other
-                            // word here names something the human already
-                            // knows they did or watched happen; this one
-                            // names a thing Holdfast did *instead of* what
-                            // they asked for, and `secret request
-                            // not_echo_off` does not say that a password
-                            // they typed was thrown away. The token stays
-                            // in the line so it is still greppable and
-                            // still matches the agent's
+                            render(b"\r\n");
+                            diag!(
+                                "holdfast attach: secret request {outcome} before Enter — what you \
+                                 type up to the next Enter is discarded, not sent to the session. \
+                                 Ctrl-C discards it at once."
+                            );
+                        } else if mine {
+                            submitted = None;
+                            // **The two outcomes that get a sentence
+                            // rather than a token** (GH #137, GH #262).
+                            // Every other word here names something the
+                            // human already knows they did or watched
+                            // happen; these two name a thing Holdfast did
+                            // *instead of* what they asked for, and
+                            // `secret request not_echo_off` does not say
+                            // that a password they typed was thrown away.
+                            // `at_shell_prompt` also says that
+                            // `--allow-echo` does not reach it, since the
+                            // other sentence offers that flag. The token
+                            // stays in the line so it is still greppable
+                            // and still matches the agent's
                             // `secret_cancelled.reason`.
                             if outcome == "not_echo_off" {
                                 diag!(
@@ -2788,6 +3055,15 @@ async fn attach_connected(
                                      discarded and nothing was sent to the child. Re-attach \
                                      with `--allow-echo` to send it anyway, accepting that \
                                      the child will echo it into the session's output."
+                                );
+                            } else if outcome == "at_shell_prompt" {
+                                diag!(
+                                    "holdfast attach: secret request at_shell_prompt — the \
+                                     session's shell was back at its prompt, where the value \
+                                     would have been shown, run as a command and saved to \
+                                     history, so it was discarded and nothing was sent. \
+                                     `--allow-echo` does not change this; the command that \
+                                     asks for it has to be run again."
                                 );
                             } else {
                                 diag!("holdfast attach: secret request {outcome}");
@@ -2870,7 +3146,24 @@ async fn attach_connected(
                 // pressed Enter trying to escape. A password prompt is
                 // exactly where a human most needs to be able to leave.
                 let (forward, detached) = detach.feed(&chunk);
-                if !forward.is_empty() {
+                if let Some(line) = discarding.as_mut().filter(|_| !forward.is_empty()) {
+                    // Nothing here reaches the session, `Ctrl-C` included:
+                    // the request it would abandon is already closed, and
+                    // whatever runs now did not ask for it.
+                    let ended = match line.feed(&forward) {
+                        crate::attach_tty::SecretKeys::Pending => false,
+                        crate::attach_tty::SecretKeys::Line(mut bytes) => {
+                            holdfast_core::attach::secret::zero_bytes(&mut bytes);
+                            true
+                        }
+                        crate::attach_tty::SecretKeys::Cancelled(_) => true,
+                    };
+                    if ended {
+                        discarding = None;
+                        render(b"\r\n");
+                        diag!("holdfast attach: discarded; the keyboard is the session's again");
+                    }
+                } else if !forward.is_empty() {
                     match secret.as_mut() {
                         // §9.5: while a prompt is outstanding the bytes
                         // are the *answer* and do not reach the session
@@ -2878,6 +3171,23 @@ async fn attach_connected(
                         // session's echo as well as off this terminal.
                         Some((id, line)) => match line.feed(&forward) {
                             crate::attach_tty::SecretKeys::Pending => {}
+                            crate::attach_tty::SecretKeys::Line(mut bytes)
+                                if secret_not_sendable(allow_echo, daemon_minor).is_some() =>
+                            {
+                                // Refused here, before a byte leaves this
+                                // process — see `secret_not_sendable`. The
+                                // request stays open on the daemon; the
+                                // human can reattach with `--allow-echo`.
+                                holdfast_core::attach::secret::zero_bytes(&mut bytes);
+                                secret = None;
+                                submitted = None;
+                                render(b"\r\n");
+                                diag!(
+                                    "\rholdfast attach: not sent — this daemon speaks protocol \
+                                     {}.{daemon_minor}, which predates the echo check",
+                                    holdfast_core::protocol::PROTOCOL_MAJOR,
+                                );
+                            }
                             crate::attach_tty::SecretKeys::Line(bytes) => {
                                 let mut f = ClientFrame::SecretInput {
                                     request_id: id.clone(),
@@ -3156,7 +3466,12 @@ pub async fn watch(session: &str) -> ExitCode {
 
     let (rd, mut wr) =
         match dial_attach(session, AttachMode::ReadOnly, AttachRole::Observer, "watch").await {
-            Dialled::Ok(rd, wr) => (rd, wr),
+            Dialled::Ok(rd, wr, minor) => {
+                if let Some(note) = older_daemon_note("watch", minor) {
+                    diag!("{note}");
+                }
+                (rd, wr)
+            }
             Dialled::Refused(code) => return ExitCode::from(code),
         };
 
@@ -3922,6 +4237,16 @@ mod tests {
         paths: &RuntimePaths,
         answer: impl Fn(&str, &Value) -> Option<Value> + Send + Sync + 'static,
     ) -> tokio::task::JoinHandle<()> {
+        fake_daemon_at(paths, handshake::PROTOCOL_MINOR, answer)
+    }
+
+    /// [`fake_daemon`], declaring protocol minor `minor` in its handshake —
+    /// an older daemon, as far as anything that reads the minor can tell.
+    fn fake_daemon_at(
+        paths: &RuntimePaths,
+        minor: u32,
+        answer: impl Fn(&str, &Value) -> Option<Value> + Send + Sync + 'static,
+    ) -> tokio::task::JoinHandle<()> {
         let listener = tokio::net::UnixListener::bind(paths.control_sock()).unwrap();
         let answer = Arc::new(answer);
         tokio::spawn(async move {
@@ -3937,7 +4262,7 @@ mod tests {
                                 req.id,
                                 &HandshakeData {
                                     protocol_major: handshake::PROTOCOL_MAJOR,
-                                    protocol_minor: handshake::PROTOCOL_MINOR,
+                                    protocol_minor: minor,
                                     daemon_version: "fake".into(),
                                     build: "fake".into(),
                                     accepted: true,
@@ -4290,6 +4615,11 @@ mod tests {
             3,
             "it asked again after a holdback that made no progress"
         );
+        assert_eq!(
+            seen.stopped,
+            Some((6000, 10_000)),
+            "where it stopped, and the head it was reading to, are kept for the note"
+        );
         let held = seen.held.expect("the holdback page is kept");
         assert_eq!(held["held_back_cause"], "in_flight_secret");
         assert_eq!(
@@ -4297,6 +4627,64 @@ mod tests {
             "the page kept is the one that stopped it"
         );
         daemon.abort();
+    }
+
+    /// **`--tail`'s lines are not passed off as the session's last when
+    /// the drain stopped short** — measured against v0.0.7, whose cursor
+    /// froze at a key block that began and never ended with 300 KB after
+    /// it (GH #195), and whose `--tail 3` then printed three lines from
+    /// the middle and advised reading again, which returned the same.
+    ///
+    /// Paired every way the note is decided: a daemon that sends no
+    /// `held_back_cause` is one from before #195 and is told so, with
+    /// the restart that cures it; a current daemon's holdback is not; a
+    /// `--raw` read is not, since redaction is what freezes; a plain
+    /// `logs` says nothing extra to a current daemon, where the note
+    /// before it already says it all; and a drain that reached the head
+    /// says nothing.
+    #[test]
+    fn a_drain_that_stopped_short_says_where_and_an_old_daemon_says_why() {
+        let seen = |cause: Option<HeldBackCause>| Drained {
+            held: Some(held_page(612, 612, Some(612), cause)),
+            stopped: Some((612, 918_000)),
+            ..Drained::default()
+        };
+        let old = seen(None);
+        let current = seen(Some(HeldBackCause::InFlightSecret));
+
+        let tail = stopped_short_note(false, &old, Some(3)).expect("a tail that stopped short");
+        for needle in [
+            "the last 3 before byte 612",
+            "not the last of the 918000 bytes",
+            "GH #195",
+            "for good",
+            "`holdfast daemon stop`",
+        ] {
+            assert!(tail.contains(needle), "`{needle}` missing: {tail}");
+        }
+        let all = stopped_short_note(false, &old, None).expect("an old daemon is told why");
+        assert!(
+            all.contains("byte 612 of the 918000") && all.contains("GH #195"),
+            "{all}"
+        );
+
+        let tail = stopped_short_note(false, &current, Some(3)).expect("a tail that stopped short");
+        assert!(tail.contains("the last 3 before byte 612"), "{tail}");
+        assert!(
+            !tail.contains("GH #195"),
+            "a current daemon reads past it: {tail}"
+        );
+        assert!(stopped_short_note(false, &current, None).is_none());
+
+        let raw = stopped_short_note(true, &old, Some(3)).expect("a tail that stopped short");
+        assert!(
+            !raw.contains("GH #195"),
+            "`--raw` has no holdback to freeze: {raw}"
+        );
+
+        let reached = Drained::default();
+        assert!(stopped_short_note(false, &reached, Some(3)).is_none());
+        assert!(stopped_short_note(false, &reached, None).is_none());
     }
 
     /// **A holdback that made progress is read past** — the review of GH
@@ -4332,6 +4720,7 @@ mod tests {
             seen.held.is_none(),
             "a holdback the drain read past withheld nothing, and the note would say it did"
         );
+        assert!(seen.stopped.is_none(), "it reached the head");
         daemon.abort();
     }
 
@@ -4384,6 +4773,69 @@ mod tests {
             .expect("a drain that makes no progress must not spin");
         assert!(outcome.is_err(), "no progress is a failure");
         daemon.abort();
+    }
+
+    /// **A daemon that predates `apply_holdback` is never sent a tail
+    /// read.** It would drop the argument and serve §4.1's bypass — a
+    /// real v0.0.7 printed a still-arriving fake token in the clear — so
+    /// `--tail` reads it through the drain, whose cursor reads keep the
+    /// holdback on every daemon.
+    ///
+    /// The daemon here answers a tail read with a marker the drain never
+    /// returns, so the printed lines are not what is asserted: the requests
+    /// are. Paired across the threshold — a daemon of
+    /// `TAIL_HOLDBACK_MINOR` and this build's own are sent the one tail
+    /// read, carrying the argument — or a `logs_tail` that always drained
+    /// would pass.
+    #[tokio::test]
+    async fn a_tail_against_a_daemon_without_apply_holdback_is_read_through_the_holdback() {
+        use holdfast_core::protocol::handshake::TAIL_HOLDBACK_MINOR;
+        for (minor, sends_tail_read) in [
+            (1, false),
+            (TAIL_HOLDBACK_MINOR - 1, false),
+            (TAIL_HOLDBACK_MINOR, true),
+            (handshake::PROTOCOL_MINOR, true),
+        ] {
+            let paths = scratch("oldtail");
+            let _scoped = Scoped(paths.clone());
+            paths.ensure_dir().unwrap();
+            let reads = Arc::new(std::sync::Mutex::new(Vec::<Value>::new()));
+            let seen = Arc::clone(&reads);
+            let daemon = fake_daemon_at(&paths, minor, move |m, p| match m {
+                "tool/status" => Some(json!({ "buffer": { "head": 3000, "tail": 0 } })),
+                "tool/read_output" => {
+                    seen.lock().unwrap().push(p.clone());
+                    if p.get("tail_lines").is_some() {
+                        Some(page(2000, 3000, None, false))
+                    } else {
+                        let c = since(p);
+                        Some(page(c, 3000, None, false))
+                    }
+                }
+                _ => None,
+            });
+            let r = log_reader(&paths).await;
+            tokio::time::timeout(Duration::from_secs(10), logs_tail(&r, 5))
+                .await
+                .expect("bounded")
+                .unwrap_or_else(|_| panic!("1.{minor}: `--tail` was refused"));
+            let reads = reads.lock().unwrap().clone();
+            assert!(!reads.is_empty(), "1.{minor}: nothing was read");
+            if sends_tail_read {
+                assert_eq!(reads.len(), 1, "1.{minor}: {reads:?}");
+                assert_eq!(reads[0]["tail_lines"], 5, "1.{minor}: {reads:?}");
+                assert_eq!(reads[0]["apply_holdback"], true, "1.{minor}: {reads:?}");
+            } else {
+                assert!(
+                    reads
+                        .iter()
+                        .all(|p| p.get("since_cursor").is_some() && p.get("tail_lines").is_none()),
+                    "1.{minor}: a daemon without `apply_holdback` was sent a tail read, which \
+                     it serves raw: {reads:?}"
+                );
+            }
+            daemon.abort();
+        }
     }
 
     /// `--tail`'s fallback keeps the last N lines itself, so it has to
@@ -4863,6 +5315,114 @@ mod tests {
         assert!(secret_prompt_is_new(None, None, "req_1"));
         // A different request is always new, whatever is in hand.
         assert!(secret_prompt_is_new(Some("req_1"), Some("req_1"), "req_2"));
+    }
+
+    /// **A secret goes to a daemon without the echo gate only with
+    /// `--allow-echo`** (1.3's `SecretInput.allow_echo`). Without the
+    /// flag, the frame means *gate it* to a 1.3 daemon and nothing at all
+    /// to v0.0.7's 1.1, which writes the secret into an echoing program
+    /// and so into the session's output. With it, the frame goes, as the
+    /// human's decision; it is not the same write a daemon of this build
+    /// makes, because v0.0.7 also has no shell-prompt check (GH #262), so
+    /// the advice to use the flag says to send only while the command that
+    /// asks is waiting.
+    #[test]
+    fn a_secret_goes_to_a_daemon_without_the_echo_gate_only_with_allow_echo() {
+        use holdfast_core::protocol::handshake::ECHO_GATE_MINOR;
+        let why = secret_not_sendable(false, 1).expect("v0.0.7 has no gate");
+        for needle in [
+            "protocol 1.1",
+            "echo",
+            "will not be sent",
+            "--allow-echo",
+            "holdfast daemon stop",
+            "while the command that asks for it is waiting on screen",
+            "run as a command and saved to history",
+        ] {
+            assert!(why.contains(needle), "`{needle}` missing: {why}");
+        }
+        assert!(secret_not_sendable(false, ECHO_GATE_MINOR - 1).is_some());
+        // The pairings: the flag, and a daemon that has the gate.
+        assert!(secret_not_sendable(true, 1).is_none());
+        assert!(secret_not_sendable(false, ECHO_GATE_MINOR).is_none());
+        assert!(secret_not_sendable(false, holdfast_core::protocol::PROTOCOL_MINOR).is_none());
+    }
+
+    /// **A secret sent to a daemon without the shell-prompt check is sent
+    /// with a warning under its prompt** (GH #262): such a daemon writes
+    /// it into a shell's idle prompt, where it is run and saved to history,
+    /// and only the daemon can refuse that. Keyed to the guard's own
+    /// minor, and silent from it on.
+    #[test]
+    fn a_secret_prompt_warns_when_the_daemon_cannot_refuse_a_shell_prompt() {
+        use holdfast_core::protocol::handshake::SHELL_PROMPT_GUARD_MINOR;
+        let why = secret_unguarded_note(1).expect("v0.0.7 has no shell-prompt check");
+        for needle in [
+            "protocol 1.1",
+            "shell-prompt check (1.5)",
+            "waiting on screen",
+            "run as a command and saved to history",
+        ] {
+            assert!(why.contains(needle), "`{needle}` missing: {why}");
+        }
+        assert!(secret_unguarded_note(SHELL_PROMPT_GUARD_MINOR - 1).is_some());
+        assert!(secret_unguarded_note(SHELL_PROMPT_GUARD_MINOR).is_none());
+        assert!(secret_unguarded_note(holdfast_core::protocol::PROTOCOL_MINOR).is_none());
+    }
+
+    /// **An older daemon's missing frames are said once, on joining**,
+    /// because a view that misses a dropped burst or starts blank looks
+    /// exactly like a quiet session. Each line is keyed to its own minor,
+    /// and a current daemon gets no note at all.
+    #[test]
+    fn joining_an_older_daemon_says_what_the_view_lacks_and_a_current_one_says_nothing() {
+        let attach = older_daemon_note("attach", 1).expect("v0.0.7 is older");
+        for needle in [
+            "holdfast attach: this daemon speaks protocol 1.1",
+            "--allow-echo",
+            "sits at its own prompt",
+            "drops output",
+            "picture of the screen",
+            "`holdfast daemon stop`",
+        ] {
+            assert!(attach.contains(needle), "`{needle}` missing: {attach}");
+        }
+        let watch = older_daemon_note("watch", 1).expect("v0.0.7 is older");
+        assert!(
+            !watch.contains("--allow-echo") && !watch.contains("own prompt"),
+            "`watch` never sends a secret: {watch}"
+        );
+        // One below the shell-prompt check's minor lacks it; the echo gate
+        // it has.
+        let attach_four = older_daemon_note("attach", 4).expect("1.4 is older");
+        assert!(
+            attach_four.contains("sits at its own prompt")
+                && attach_four.contains("saved to history (1.5)"),
+            "1.4 has no shell-prompt check: {attach_four}"
+        );
+        let four = older_daemon_note("watch", 4).expect("1.4 is older");
+        assert!(
+            !four.contains("drops output"),
+            "1.4 has `OutputGap`: {four}"
+        );
+        assert!(four.contains("picture of the screen"), "{four}");
+        // One below each frame's own minor lacks it: a threshold that
+        // drifted down would pass the rows above and not these.
+        let three = older_daemon_note("watch", 3).expect("1.3 is older");
+        assert!(
+            three.contains("drops output under load (1.4)"),
+            "1.3 has no `OutputGap`: {three}"
+        );
+        assert!(
+            three.contains("picture of the screen on joining (1.5)"),
+            "{three}"
+        );
+        let attach_three = older_daemon_note("attach", 3).expect("1.3 is older");
+        assert!(
+            !attach_three.contains("--allow-echo"),
+            "1.3 has the echo gate: {attach_three}"
+        );
+        assert!(older_daemon_note("attach", holdfast_core::protocol::PROTOCOL_MINOR).is_none());
     }
 
     /// **`watch`'s `Ctrl-C` listener is built once, above its loop** (GH

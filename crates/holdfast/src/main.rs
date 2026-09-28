@@ -87,7 +87,11 @@ USAGE:
                                       --allow-echo submits secrets even
                                       when the child has not turned echo
                                       off, which lets it echo them into
-                                      the session's output
+                                      the session's output. It does not
+                                      reach a shell whose markers show it
+                                      at its own prompt: a daemon of this
+                                      release refuses that, and an older
+                                      one does not
     holdfast watch <session>          Follow a session read-only and
                                       redacted (detach with Ctrl+C)
     holdfast version                  Print version information

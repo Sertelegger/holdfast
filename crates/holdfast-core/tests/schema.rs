@@ -3458,11 +3458,39 @@ async fn secret_call_answered_by(
     call.await.expect("the waiting call")
 }
 
+/// A bash session running `read -r x`, not sitting at its prompt.
+///
+/// **Not at the prompt, because of GH #262.** `request_secret_input`
+/// refuses a shell at its own prompt with `at_shell_prompt` before it
+/// raises anything, so a row about a *raised* request's shapes needs a
+/// command in front of the shell. `read -r x` is the smallest one, and the
+/// stand-in client's `\n` ends it.
+///
+/// **The integration's prompt first, then the command.** Until the
+/// snippet's markers arrive an idle shell is not "at its prompt" either,
+/// so a row that called straight after `wait_for("$")` raced the snippet:
+/// it was refused or not depending on which won.
+async fn start_bash_reading(server: &HoldfastServer) -> String {
+    let (id, _) = start_bash(server).await;
+    wait_for_at_prompt(server, &id).await;
+    let session = server.registry.get(&id).expect("the session");
+    session.write_input(b"read -r x\n").expect("write");
+    let deadline = Instant::now() + Duration::from_secs(20);
+    while session.at_shell_prompt() {
+        assert!(
+            Instant::now() < deadline,
+            "bash never started `read -r x`; detection is {:?}",
+            session.detection()
+        );
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    id
+}
+
 #[tokio::test]
 async fn request_secret_input_secret_provided_response_matches_its_schema() {
     let server = HoldfastServer::new();
-    let (id, _) = start_bash(&server).await;
-    wait_for(&server, &id, "$").await;
+    let id = start_bash_reading(&server).await;
 
     let r = secret_call_answered_by(
         &server,
@@ -3510,8 +3538,7 @@ async fn request_secret_input_secret_provided_response_matches_its_schema() {
 #[tokio::test]
 async fn request_secret_input_carries_the_whole_session_state_block() {
     let server = HoldfastServer::new();
-    let (id, _) = start_bash(&server).await;
-    wait_for(&server, &id, "$").await;
+    let id = start_bash_reading(&server).await;
 
     let reference = body(&read_tail(&server, &id).await);
     let r = secret_call_answered_by(
@@ -3548,8 +3575,7 @@ async fn request_secret_input_carries_the_whole_session_state_block() {
 #[tokio::test]
 async fn request_secret_input_secret_cancelled_response_matches_its_schema() {
     let server = HoldfastServer::new();
-    let (id, _) = start_bash(&server).await;
-    wait_for(&server, &id, "$").await;
+    let id = start_bash_reading(&server).await;
 
     let r = server
         .request_secret_input(Parameters(RequestSecretInputArgs {
@@ -3567,6 +3593,33 @@ async fn request_secret_input_secret_cancelled_response_matches_its_schema() {
     // a schema that only ever saw the success path would not have noticed.
     assert_eq!(keys(&payload["data"]), set(&["request_id", "reason"]));
     assert_eq!(payload["data"]["reason"], "timeout");
+    kill(&server, &id).await;
+}
+
+/// GH #262's refusal is the third `data` shape: `secret_cancelled` with a
+/// `reason` and **no `request_id`**, because nothing was raised. The
+/// schema declares `request_id` optional for GH #127's pre-raise cancel,
+/// and this is the second path that relies on it.
+#[tokio::test]
+async fn request_secret_input_at_shell_prompt_response_matches_its_schema() {
+    let server = HoldfastServer::new();
+    let (id, _) = start_bash(&server).await;
+    wait_for_at_prompt(&server, &id).await;
+
+    let r = server
+        .request_secret_input(Parameters(RequestSecretInputArgs {
+            session: id.clone(),
+            prompt_text: "a prompt".into(),
+            timeout_secs: Some(20),
+            ..Default::default()
+        }))
+        .await
+        .expect("request_secret_input");
+
+    let payload = assert_matches_schema("request_secret_input", &r);
+    assert_eq!(payload["status"], "secret_cancelled");
+    assert_eq!(keys(&payload["data"]), set(&["reason"]));
+    assert_eq!(payload["data"]["reason"], "at_shell_prompt");
     kill(&server, &id).await;
 }
 
@@ -4002,13 +4055,17 @@ async fn every_declared_status_is_returned_by_a_real_response() {
     }
 
     // ---- 0.0.7's three.
+    //
+    // The two secret statuses on a shell running a command, because a
+    // shell at its prompt is refused before anything is raised (GH #262).
+    let reading = start_bash_reading(&server).await;
 
     // secret_cancelled: a call with nobody attached to answer it, at the
     // shortest legal window.
     note(&body(
         &server
             .request_secret_input(Parameters(RequestSecretInputArgs {
-                session: id.clone(),
+                session: reading.clone(),
                 prompt_text: "a prompt".into(),
                 timeout_secs: Some(1),
                 ..Default::default()
@@ -4024,7 +4081,7 @@ async fn every_declared_status_is_returned_by_a_real_response() {
     // version, over a real `attach.sock`, is `tests/secrets.rs`.
     {
         let waiting = server.clone();
-        let waiting_id = id.clone();
+        let waiting_id = reading.clone();
         let call = tokio::spawn(async move {
             waiting
                 .request_secret_input(Parameters(RequestSecretInputArgs {
@@ -4039,22 +4096,23 @@ async fn every_declared_status_is_returned_by_a_real_response() {
         let hub = server.attach_hub();
         let deadline = Instant::now() + Duration::from_secs(10);
         let outstanding = loop {
-            if let Some(r) = hub.outstanding_secret(&id) {
+            if let Some(r) = hub.outstanding_secret(&reading) {
                 break r;
             }
             assert!(Instant::now() < deadline, "the call never raised a request");
             tokio::time::sleep(Duration::from_millis(5)).await;
         };
         let raised = hub
-            .close_secret(&id, Some(&outstanding.request_id))
+            .close_secret(&reading, Some(&outstanding.request_id))
             .expect("the slot was ours to take");
-        let session = server.registry.get(&id).expect("the session");
+        let session = server.registry.get(&reading).expect("the session");
         let written = session.write_input(b"\n").expect("write") as u64;
         raised.answer(holdfast_core::secret::Resolution::Provided {
             bytes_written: written,
         });
         note(&body(&call.await.expect("the waiting call")));
     }
+    kill(&server, &reading).await;
 
     // not_supported_on_platform: §3.6's capability, forced. This is the
     // reason `Capabilities` is a value rather than a `#[cfg]` — without
