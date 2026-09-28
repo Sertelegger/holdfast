@@ -177,7 +177,7 @@ session), then restart Claude Code. Until both, each side refuses a
   session starts without it, and zsh saves to the history file the rc names.
 - By default, on bash 4.3 and older (macOS's `/bin/bash`), an rc whose prompt
   runs `history -n; history -w; history -c; history -r`, sourced again, loses
-  your oldest history entry, or every entry if sourced first (SECURITY.md, H1).
+  your oldest history entry, or every entry if sourced first ([#282]).
 
 ## [0.0.7] — 2026-09-01 (Carabiner)
 
@@ -676,3 +676,4 @@ residuals that are known and accepted.
 [#262]: https://github.com/Sertelegger/holdfast/issues/262
 [#274]: https://github.com/Sertelegger/holdfast/issues/274
 [#276]: https://github.com/Sertelegger/holdfast/issues/276
+[#282]: https://github.com/Sertelegger/holdfast/issues/282

@@ -804,7 +804,7 @@ and Python 3.12.
     list itself by reading back `/dev/null`: the operator's oldest entry
     after another command, and every entry as the session's first command
     (measured, bash 3.2.57, macOS's `/bin/bash`; 4.2 and 4.3 by their
-    source);
+    source; GH #282);
   - bash's own save at exit appends, unless the session has run more
     commands than `HISTSIZE` holds, when it rewrites the file from a list
     that holds only the newest of them.
