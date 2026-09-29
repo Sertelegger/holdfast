@@ -23,7 +23,7 @@ use crate::session::SessionRegistry;
 use rmcp::model::{
     CallToolRequestParams, CallToolResponse, Implementation, ListResourceTemplatesResult,
     ListResourcesResult, PaginatedRequestParams, ReadResourceRequestParams, ReadResourceResponse,
-    ServerCapabilities, ServerInfo,
+    ServerCapabilities, ServerConfig,
 };
 use rmcp::service::RequestContext;
 use rmcp::{tool_handler, ErrorData, RoleServer, ServerHandler, ServiceExt};
@@ -793,10 +793,10 @@ impl ServerHandler for HoldfastServer {
         }
     }
 
-    fn get_info(&self) -> ServerInfo {
-        // ServerInfo (= InitializeResult) and Implementation are
+    fn get_info(&self) -> ServerConfig {
+        // ServerConfig (= InitializeResult) and Implementation are
         // #[non_exhaustive]: build from Default, then assign.
-        let mut info = ServerInfo::default();
+        let mut info = ServerConfig::default();
         info.capabilities = server_capabilities();
         info.server_info = Implementation::new("holdfast", env!("CARGO_PKG_VERSION"));
         info.instructions = Some(INSTRUCTIONS.into());
