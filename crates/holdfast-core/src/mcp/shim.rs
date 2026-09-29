@@ -43,7 +43,7 @@ use crate::session::launch::{ClientLaunch, CLIENT_PARAM};
 use rmcp::model::{
     CallToolRequestParams, CallToolResponse, CallToolResult, Implementation,
     ListResourceTemplatesResult, ListResourcesResult, ListToolsResult, PaginatedRequestParams,
-    ReadResourceRequestParams, ReadResourceResponse, ReadResourceResult, ServerInfo,
+    ReadResourceRequestParams, ReadResourceResponse, ReadResourceResult, ServerConfig,
 };
 use rmcp::service::RequestContext;
 use rmcp::{ErrorData, RoleServer, ServerHandler};
@@ -974,8 +974,8 @@ fn lost_in_flight(e: &ClientError, restarted: bool) -> ErrorData {
 }
 
 impl ServerHandler for ShimServer {
-    fn get_info(&self) -> ServerInfo {
-        let mut info = ServerInfo::default();
+    fn get_info(&self) -> ServerConfig {
+        let mut info = ServerConfig::default();
         // **`shim_capabilities`, not `server_capabilities`.** The
         // difference is `resources.listChanged`, which this transport
         // cannot deliver: the forwarder that turns a pulse into an MCP
