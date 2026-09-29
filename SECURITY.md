@@ -2,7 +2,7 @@
 
 ## Supported versions
 
-**Holdfast is pre-release.** `v0.0.5` was the first tag, `v0.0.7` is the
+**Holdfast is pre-release.** `v0.0.5` was the first tag, `v0.0.8` is the
 newest, and the workspace version tracks it. Fixes land on `main` and are not
 backported: a tag here marks a milestone, not a support commitment.
 
@@ -27,10 +27,10 @@ clause each:
   assets are not served from `releases/download/vX.Y.Z/` — so nothing has
   reached anyone, but the *reason* has changed. It is no longer that nothing
   is built; it is that promoting a draft is a human running
-  `gh release edit vX.Y.Z --draft=false`, deliberately, and nobody has. No
-  tag has run that path yet either: `v0.0.7` predates it, which is why the
-  three releases above carry no assets and why there is no draft sitting
-  there to promote.
+  `gh release edit vX.Y.Z --draft=false`, deliberately, and nobody has.
+  `v0.0.8` is the first tag to run that path, and its draft is the one
+  sitting there unpromoted; `v0.0.7` and older predate it, which is why the
+  three releases above carry no assets.
 - **`release.yml` carries a `cargo publish --workspace --locked`** in a
   `crates-io` job (GH #197). It is gated on a `CARGO_REGISTRY_TOKEN` repository
   secret that does not exist, so today it prints why it stopped and exits
@@ -60,7 +60,7 @@ invalidates rather than a merge.
 | Version | Supported |
 | ------- | --------- |
 | `main` (0.0.x, pre-release) | ✅ best effort |
-| `v0.0.5` – `v0.0.7` | none — the fix goes on `main` |
+| `v0.0.5` – `v0.0.8` | none — the fix goes on `main` |
 
 This table becomes a real support statement at the first release anyone is
 expected to install. Until then, "supported" means the fix goes on `main`.
@@ -966,8 +966,8 @@ The channel needs a daemon and an attached client:
 - With nobody attached, it waits out its `timeout_secs` and answers
   `secret_cancelled`.
 
-**Its echo test (G3) is on `main`, and in no tag yet, so a `v0.0.7` install
-does not have it** (GH #137). A `v0.0.7` install writes the value whatever
+**Its echo test (G3) is in `v0.0.8` and later, so a `v0.0.7` install does
+not have it** (GH #137). A `v0.0.7` install writes the value whatever
 the terminal's echo state. An agent that asks before its child reaches a
 password prompt could get a human to type a real credential into an echoing
 terminal.

@@ -1395,9 +1395,10 @@ EOF
   # **The totals are printed, not asserted anywhere.** `mcp-smoke.sh` records
   # that its own "all 38 checks" drifted five times with nothing going red,
   # which is why it prints its total instead; the same applies here, and more
-  # sharply, because three of these cases are derived from `CHANGELOG.md`'s
-  # released-version headings and cutting 0.0.8 adds a fourth. Any comment
-  # naming a fixed number here is stale-by-construction at the next release.
+  # sharply, because one of these cases is derived from each of
+  # `CHANGELOG.md`'s released-version headings, and every release cut adds
+  # one. Any comment naming a fixed number here is stale-by-construction at
+  # the next release.
   echo
   if [ "$fails" -ne 0 ]; then
     echo "release-notes SELF-TEST FAILED ($fails of $((passes + fails)))"

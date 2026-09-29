@@ -380,7 +380,7 @@ jobs:
           else
             echo "publish=false" >> "$GITHUB_OUTPUT"
             echo "No CARGO_REGISTRY_TOKEN secret is configured." >&2
-            echo "The GitHub Release is published; crates.io is skipped." >&2
+            echo "The GitHub Release is created as a draft; crates.io is skipped." >&2
           fi
 
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1

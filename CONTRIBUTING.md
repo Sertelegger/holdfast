@@ -5,9 +5,10 @@ have to pass, and the two testing standards this project actually enforces —
 they are unusual enough that they trip people up, and they are the reason the
 suite is worth anything.
 
-Holdfast is **early**. Releases up to `v0.0.7` are tagged, none of them
-carries a binary — so building from source is the only way to run it — and the
-surface moves. [ROADMAP.md](./ROADMAP.md) shows
+Holdfast is **early**. Releases up to `v0.0.8` are tagged, and none of them
+serves a binary — the published ones carry none, and `v0.0.8`'s sit on a draft
+that has not been promoted — so building from source is the only way to run
+it, and the surface moves. [ROADMAP.md](./ROADMAP.md) shows
 what is being built next; opening an issue before a large change is
 appreciated.
 
@@ -279,7 +280,9 @@ reviewed with the code, and does not survive the repository being recreated.
 
 Cutting one is therefore:
 
-1. Rename `## [Unreleased]` to `## [X.Y.Z] — YYYY-MM-DD`.
+1. Rename `## [Unreleased]` to `## [X.Y.Z] — YYYY-MM-DD (Codename)`, the
+   codename from the register under [Codenames](#codenames); step 6 says why
+   it must be there.
 2. Add the matching link definition at the foot of the file, and repoint
    `[Unreleased]` at the new tag's compare range. **Every version needs a
    definition** — a missing one is why `[0.0.5]` and `[0.0.6]` rendered with
@@ -360,24 +363,32 @@ Cutting one is therefore:
 5. **Update the version references in the prose.** None of these fails a
    check, and each one is read as fact:
 
-   - `SECURITY.md` — "`v0.0.7` is the newest" in the first paragraph, the
-     `` `v0.0.5` – `v0.0.7` `` row of the support table, and the
-     out-of-band-secret bullet saying that echo gating is "on `main`, and in
-     no tag yet, so a `v0.0.7` install does not have it" (that one becomes
-     *wrong*, not merely stale, the moment the tag exists).
-   - `README.md` — the status line near the top. The `## What works today`
+   - `SECURITY.md` — "`vX.Y.Z` is the newest" in the first paragraph, the
+     `` `v0.0.5` – `vX.Y.Z` `` row of the support table, and the sentence in
+     its `release.yml` bullet that names the tag whose draft sits there
+     unpromoted (that one becomes *wrong*, not merely stale, the moment the
+     new tag's draft exists).
+   - `README.md` — the status line near the top, which names the newest tag
+     and says whether its release is promoted. The `## What works today`
      heading below it no longer carries a version: it describes `main`, and
      said `v0.0.7` while doing so.
+   - `ROADMAP.md` — the working-label sentence in the opening paragraph,
+     which names versions not yet cut; the binaries paragraph under "Where it
+     is now"; and the heading of the version's own section, which says
+     whether it is tagged and promoted.
    - `CLAUDE.md` — the "Project Status" paragraph, which pins the newest tag,
-     quotes that version's `CHANGELOG.md` heading verbatim, and states the
-     workspace version; and the paragraph after it, which names
-     `git log vX.Y.Z..main`.
+     quotes that version's `CHANGELOG.md` heading verbatim, states the
+     workspace version and names the newest published release; and the
+     paragraph after it, which names `git log vX.Y.Z..main`.
+   - `CONTRIBUTING.md` — the tagged-releases sentence at the top of this
+     file, and "Assigned so far" under [Codenames](#codenames).
 
-   `grep -rn "0\.0\.7" --include='*.md' .` finds them plus anything added
-   since this list was written, which is the point of running it rather than
-   trusting the list. Most of its hits are in `CHANGELOG.md` and are
-   **history** — a released section names its own version forever. Change
-   only the claims about what is *newest*, *current* or *not yet tagged*.
+   A grep for the previous version — `grep -rn "0\.0\.7" --include='*.md' .`
+   when cutting 0.0.8 — finds them plus anything added since this list was
+   written, which is the point of running it rather than trusting the list.
+   Most of its hits are in `CHANGELOG.md` and are **history** — a released
+   section names its own version forever. Change only the claims about what
+   is *newest*, *current* or *not yet tagged*.
 6. **Run the upgrade-window check by hand first:**
    `scripts/upgrade-skew-check.sh --old-tag <previous tag>`. It builds the
    previous tag in a detached worktree under a temporary directory, drives
@@ -495,10 +506,10 @@ deliberately, and record here when it was decided.
 the codename is the only thing after the number. The tag keeps its `v`
 (`v0.0.7`); the release *name* does not.
 
-Three releases shipped before this was settled and still read
-`holdfast 0.0.5`, `holdfast 0.0.6 — the attach protocol` and
-`holdfast v0.0.7` — three conventions in three releases. Renaming them is
-outstanding.
+Three releases shipped before this was settled, as `holdfast 0.0.5`,
+`holdfast 0.0.6 — the attach protocol` and `holdfast v0.0.7` — three
+conventions in three releases. All three have since been renamed by hand to
+`holdfast X.Y.Z (Codename)`; `gh release list` is the check.
 
 **Nothing types this by hand.** `release.yml` reads the version off the tag
 and the codename off that version's `CHANGELOG.md` heading — the one place it
@@ -523,9 +534,10 @@ than decorating it.
 | U U-bolt | V Vise | W Washer | X — |
 | Y Yoke | Z Zip-tie | | |
 
-Assigned so far: **0.0.5 Anchor**, **0.0.6 Bolt**, **0.0.7 Carabiner**. None of
-the three release objects carries its codename yet; see the renaming note
-above.
+Assigned so far: **0.0.5 Anchor**, **0.0.6 Bolt**, **0.0.7 Carabiner**,
+**0.0.8 Dowel**. 0.0.8 is the first release whose name `release.yml` takes
+from its heading; the three before it were renamed by hand (see the note
+above).
 
 **X is deliberately unfilled.** No fastener or rigging term starts with it,
 and inventing one would break the only rule the list has. It is twenty

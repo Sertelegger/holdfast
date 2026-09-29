@@ -11,6 +11,8 @@ is cut, named and published is in
 
 ## [Unreleased]
 
+## [0.0.8] — 2026-09-28 (Dowel)
+
 **Upgrading:** run `holdfast daemon stop` after installing (it ends every
 session), then restart Claude Code. Until both, each side refuses a
 `start_session` the other would misplace, and says which to restart ([#229]).
@@ -598,7 +600,8 @@ residuals that are known and accepted.
   group plus the terminal's foreground group, so a background job in a third
   group can survive `terminate`.
 
-[Unreleased]: https://github.com/Sertelegger/holdfast/compare/v0.0.7...main
+[Unreleased]: https://github.com/Sertelegger/holdfast/compare/v0.0.8...main
+[0.0.8]: https://github.com/Sertelegger/holdfast/releases/tag/v0.0.8
 [0.0.7]: https://github.com/Sertelegger/holdfast/releases/tag/v0.0.7
 [0.0.6]: https://github.com/Sertelegger/holdfast/releases/tag/v0.0.6
 [0.0.5]: https://github.com/Sertelegger/holdfast/releases/tag/v0.0.5
