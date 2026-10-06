@@ -885,8 +885,14 @@ async fn a_local_resize_reaches_the_child() {
 /// would have come with.** A key typed after joining is an `Input` frame,
 /// and a client sends its startup `Resize` before it reads a key. The
 /// second key is typed after the resize has been delivered, and `Detach`
-/// is the last frame of all.
-async fn frames_of_an_attachment_resized_once(tag: &str, args: &[&str]) -> Vec<ClientFrame> {
+/// is the last frame of all. Where the resize is expected to send a frame
+/// (`sends_size`), that frame is waited for, so a loaded machine slows the
+/// row down rather than failing it.
+async fn frames_of_an_attachment_resized_once(
+    tag: &str,
+    args: &[&str],
+    sends_size: bool,
+) -> Vec<ClientFrame> {
     let stub = StubDaemon::start(
         tag,
         vec![
@@ -914,9 +920,23 @@ async fn frames_of_an_attachment_resized_once(tag: &str, args: &[&str]) -> Vec<C
     wait_frames(&stub, 10, inputs(1));
 
     term.resize(132, 43);
-    // `SIGWINCH` is delivered by the resize itself; this is the time for
-    // the client's loop to take it, which is milliseconds.
-    std::thread::sleep(Duration::from_millis(300));
+    if sends_size {
+        wait_frames(&stub, 10, |f| {
+            f.iter().any(|f| {
+                matches!(
+                    f,
+                    ClientFrame::Resize {
+                        cols: 132,
+                        rows: 43
+                    }
+                )
+            })
+        });
+    } else {
+        // `SIGWINCH` is delivered by the resize itself; this is the time
+        // for the client's loop to take it, which is milliseconds.
+        std::thread::sleep(Duration::from_millis(300));
+    }
     term.type_keys(b"b");
     wait_frames(&stub, 10, inputs(2));
 
@@ -944,9 +964,12 @@ fn resizes(frames: &[ClientFrame]) -> Vec<(u16, u16)> {
 /// `Input`, and `Ctrl-B d` still detaches.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn keep_size_sends_no_resize_on_joining_or_on_a_local_resize() {
-    let sent =
-        frames_of_an_attachment_resized_once("keepsize", &["attach", "--keep-size", "sess_keep01"])
-            .await;
+    let sent = frames_of_an_attachment_resized_once(
+        "keepsize",
+        &["attach", "--keep-size", "sess_keep01"],
+        false,
+    )
+    .await;
     assert_eq!(resizes(&sent), vec![], "{sent:?}");
     assert_eq!(
         sent.iter()
@@ -963,7 +986,7 @@ async fn keep_size_sends_no_resize_on_joining_or_on_a_local_resize() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn without_keep_size_attach_sends_its_size_on_joining_and_on_a_resize() {
     let sent =
-        frames_of_an_attachment_resized_once("keepsizectl", &["attach", "sess_keep01"]).await;
+        frames_of_an_attachment_resized_once("keepsizectl", &["attach", "sess_keep01"], true).await;
     assert_eq!(resizes(&sent), vec![(100, 30), (132, 43)], "{sent:?}");
 }
 
