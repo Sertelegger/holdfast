@@ -17,5 +17,13 @@
     "session",
     "tmux",
     "rust"
-  ]
+  ],
+  "userConfig": {
+    "secret_band": {
+      "type": "boolean",
+      "title": "Secret-request band",
+      "description": "When the agent asks a Holdfast session for a secret, show a toast and a band above the prompt that point you at holdfast attach. Off: the band's mod registers nothing.",
+      "default": true
+    }
+  }
 }
