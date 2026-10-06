@@ -1199,7 +1199,7 @@ mod tests {
             assert!(e.alive && !e.material, "{} at {}: {e:?}", key.name, run - 1);
             // And where a C1 byte follows the cut, and the walk gives up
             // and believes the rest.
-            let mut c1 = pem[..start + run].as_bytes().to_vec();
+            let mut c1 = pem.as_bytes()[..start + run].to_vec();
             c1.push(0x9b);
             let e = extent(&c1, 0);
             assert!(
