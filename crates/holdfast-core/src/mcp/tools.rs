@@ -1965,7 +1965,11 @@ impl HoldfastServer {
         };
         Ok(envelope::ok(
             detection::with_detection(
-                session_record(&session, &self.processor.rules),
+                session_record(
+                    &session,
+                    &self.processor.rules,
+                    holdfast_binary().as_deref(),
+                ),
                 &session,
                 &self.processor,
             ),
@@ -2003,13 +2007,14 @@ impl HoldfastServer {
     /// never sees (GH #219). Both transports reach it through that wrapper
     /// — rmcp's router in-process, `passthrough::call_tool` in the daemon.
     pub async fn list_sessions(&self) -> Result<CallToolResult, ErrorData> {
+        let binary = holdfast_binary();
         let sessions: Vec<serde_json::Value> = self
             .registry
             .all()
             .iter()
             .map(|s| {
                 detection::with_detection(
-                    session_record(s, &self.processor.rules),
+                    session_record(s, &self.processor.rules, binary.as_deref()),
                     s,
                     &self.processor,
                 )
@@ -4489,11 +4494,26 @@ impl HoldfastServer {
 /// `aws --key AKIAIOSFODNN7EXAMPLE` would otherwise hand the credential
 /// back on every `status` call, and `list_sessions` would hand back
 /// every session's.
-fn session_record(session: &Session, rules: &RuleSet) -> serde_json::Value {
+///
+/// `holdfast_binary` is [`holdfast_binary`]'s answer, passed in so
+/// `list_sessions` resolves it once per response rather than once per
+/// session.
+fn session_record(
+    session: &Session,
+    rules: &RuleSet,
+    holdfast_binary: Option<&str>,
+) -> serde_json::Value {
     let state = session.state();
     json!({
         "id": session.id,
         "name": session.name,
+        // The executable serving this record: the daemon's in hybrid mode,
+        // this process's under `--no-daemon`. A client builds a human's
+        // `holdfast attach` command from it, so the command names the build
+        // that serves the session even when `holdfast` is not on `PATH`.
+        // **Not redacted**, for `profile`'s reason below: it is a path on
+        // the operator's filesystem, not text an agent or a child wrote.
+        "holdfast_binary": holdfast_binary,
         "command": redact_str(rules, &session.command),
         // Element-wise, never joined: joining with a space and redacting
         // the result would let a rule match across an argument boundary
@@ -4563,6 +4583,33 @@ fn session_record(session: &Session, rules: &RuleSet) -> serde_json::Value {
         // what REQ-O-012 requires — present and empty, never absent.
         "redaction_stats": session.redaction_stats(),
     })
+}
+
+/// The absolute, canonical path of the executable this process is
+/// running, or `None` when there is no such path to give.
+///
+/// **`None`, not the uncanonicalised path, when canonicalising fails.**
+/// For a running process it fails when the executable is no longer at its
+/// path: replaced or removed by an upgrade, which Linux reports as
+/// `/path/holdfast (deleted)`. A path that does not resolve cannot run
+/// `holdfast attach`, and `None` tells the client to find another binary
+/// rather than hand the human a command that fails. `None` too for a path
+/// that is not UTF-8, which a JSON string cannot carry unchanged.
+///
+/// **Resolved per call and never cached**, so a binary removed while the
+/// daemon runs is reported as gone rather than at the path it used to
+/// have.
+///
+/// On Windows it is `current_exe`'s own path, which is already absolute:
+/// `canonicalize` there returns the `\\?\` verbatim spelling, which names
+/// the same file in a form a human does not type.
+fn holdfast_binary() -> Option<String> {
+    let exe = std::env::current_exe().ok()?;
+    #[cfg(windows)]
+    let path = Some(exe).filter(|p| p.is_absolute() && p.is_file())?;
+    #[cfg(not(windows))]
+    let path = exe.canonicalize().ok()?;
+    path.into_os_string().into_string().ok()
 }
 
 #[derive(Debug, Default, Deserialize, Serialize, schemars::JsonSchema)]
