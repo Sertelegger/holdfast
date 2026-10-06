@@ -292,6 +292,8 @@ The surfaces do not apply the redactor equally:
     records.
   - Matches must be complete.
   - Neither log records session output.
+  - Each session's `session_stats` line carries counts and closed names
+    only: no command, argument, environment value or output.
   - `[security] redaction_enabled = false` is refused at load; it is not a
     switch.
 
@@ -314,8 +316,11 @@ or reveals something about output the redactor masked:
    - It turns off every mask and the in-flight withhold, and returns any
      secret in the text.
    - Each call writes a `redaction_disabled` audit entry naming the session,
-     the tool and the kind of client, with a running count. The entry records
-     no range and no content.
+     the tool and the kind of client, with a running count, whether the read
+     started at a cursor, a tail or the screen, how many bytes it returned,
+     and whether the previous masked read by the same party (the agent, or a
+     human for `cli`) showed an `[REDACTED:unresolved]`. The entry records no
+     offset and no content.
    - The daemon does not start without its audit log. `holdfast mcp
      --no-daemon` starts without one if it cannot open it, and then records
      nothing. On either, a write that fails later is reported once as a

@@ -3788,11 +3788,12 @@ mod tests {
     /// the previous chunk is fully redacted again in the next chunk, with
     /// no leak"*).
     ///
-    /// The unit test in `output` pins the same invariant against a
-    /// hand-built snapshot; the geometry that actually decides whether a
-    /// continuation read can still see `-----BEGIN` is *this* function's
-    /// (`window_start = req_start − lookbehind_bytes`), so it is pinned
-    /// here as well. A 1.6 KB key is three times the 512-byte lookbehind:
+    /// The unit test in `output` pins the same invariant through
+    /// `WindowSnapshot::for_read` over a ring of its own; this row pins it
+    /// on the session's ring, through `read_processed`, where the geometry
+    /// that decides whether a continuation read can still see
+    /// `-----BEGIN` (`window_start = req_start − lookbehind_bytes`) is
+    /// applied. A 1.6 KB key is three times the 512-byte lookbehind:
     /// a cursor left inside it can never be recovered from, and the leak
     /// carries `redactions: {}` and no audit entry, so nothing downstream
     /// can tell it happened.
@@ -3908,15 +3909,15 @@ mod tests {
     /// **GH #195 on the real read path: a continuation read that begins
     /// inside a region a previous read masked must mask it too.**
     ///
-    /// The unit test in `output` pins the same invariant against a
-    /// hand-built snapshot, and it cannot pin *this*: the geometry that
-    /// decides whether the continuation can still see `-----BEGIN` is
-    /// `read_processed`'s `carry_region_start`, which that helper
-    /// supplies for itself. Replacing it with `window_start` — the
-    /// obvious simplification, since the window already has a lookbehind
-    /// — survives every row in `output` and puts a private key body on
-    /// the wire, because `lookbehind_bytes` is 512 and a believed
-    /// candidate reaches `UNVOUCHED_CARRY_BYTES` back.
+    /// The unit test in `output` pins the same invariant through
+    /// `WindowSnapshot::for_read` over a ring of its own; this row pins it
+    /// on the session's own ring, through `read_processed`. The geometry
+    /// that decides whether the continuation can still see `-----BEGIN`
+    /// is `for_read`'s `carry_region_start`. Replacing it with
+    /// `window_start` — the obvious simplification, since the window
+    /// already has a lookbehind — puts a private key body on the wire,
+    /// because `lookbehind_bytes` is 512 and a believed candidate reaches
+    /// `UNVOUCHED_CARRY_BYTES` back.
     ///
     /// The key is **unterminated**, which is the whole subject: a
     /// terminated one matches `private-key-block` as soon as the window
@@ -4264,10 +4265,10 @@ mod tests {
 
     /// REQ-O-008's liveness input comes from the backend, and
     /// `read_processed` is the only place that samples it. Every
-    /// processor unit test builds its own snapshot and passes
-    /// `child_alive` by hand, so hardcoding it here leaves all of them
-    /// green while a real exited session withholds its last bytes for
-    /// ever.
+    /// processor unit test supplies `child_alive` by hand, to
+    /// `WindowSnapshot::for_read` or to a boundary snapshot it builds, so
+    /// hardcoding it here leaves all of them green while a real exited
+    /// session withholds its last bytes for ever.
     #[test]
     fn the_liveness_the_escape_rule_needs_comes_from_the_backend() {
         let (s, pty) = mock_session();
