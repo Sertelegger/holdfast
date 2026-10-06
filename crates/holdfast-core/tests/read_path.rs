@@ -131,6 +131,63 @@ async fn an_oversized_tail_bytes_read_reports_the_front_clip() {
     assert!(fits["next_cursor"].is_null(), "{fits}");
 }
 
+/// **A stale cursor's audit row names the tail the read was moved up to**
+/// (§9.4). The response says `truncated_at_tail`; the row is what tells
+/// an operator how far behind the caller was, and `since_cursor` and
+/// `buffer_tail` are its two ends. The ring is 16 bytes, so the second
+/// chunk evicts the first: the tail is 16 and the head 32, and a row that
+/// reported either the head or the cursor as the tail fails here.
+#[tokio::test]
+async fn a_stale_cursor_is_audited_with_the_tail_the_read_was_moved_up_to() {
+    let dir = tempfile::tempdir().unwrap();
+    let log = dir.path().join("audit.log");
+    let server = HoldfastServer::with_audit_path(Some(log.clone()));
+    let pty = Arc::new(MockPty::new());
+    let session = Session::new(
+        new_session_id(),
+        None,
+        "mock".into(),
+        vec![],
+        Arc::clone(&pty) as Arc<dyn PtyBackend>,
+        SessionConfig::with_buffer_capacity(16),
+    );
+    let id = session.id.clone();
+    server
+        .registry
+        .insert(Arc::clone(&session))
+        .expect("registry insert");
+    feed(&session, &pty, b"0123456789abcdef");
+    feed(&session, &pty, b"GHIJKLMNOPQRSTUV");
+    assert_eq!((session.buffer_tail(), session.buffer_head()), (16, 32));
+
+    let r = read(
+        &server,
+        ReadOutputArgs {
+            session: id.clone(),
+            since_cursor: Some(0),
+            ..Default::default()
+        },
+    )
+    .await;
+    assert_eq!(r["truncated_at_tail"], true, "{r}");
+    assert_eq!(r["output"], "GHIJKLMNOPQRSTUV", "{r}");
+
+    let rows: Vec<Value> = std::fs::read_to_string(&log)
+        .unwrap()
+        .lines()
+        .map(|l| serde_json::from_str::<Value>(l).unwrap())
+        .filter(|row| row["kind"] == "truncated_at_tail")
+        .collect();
+    assert_eq!(rows.len(), 1, "{rows:?}");
+    let row = &rows[0];
+    assert_eq!(row["session_id"], id.as_str(), "{row}");
+    assert_eq!(
+        (row["since_cursor"].as_u64(), row["buffer_tail"].as_u64()),
+        (Some(0), Some(16)),
+        "{row}"
+    );
+}
+
 // ------------------------------------------------ GH #243, #224, #242
 
 /// A throwaway 4096-bit RSA key, stored without its boundaries — see

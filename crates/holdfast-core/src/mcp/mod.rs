@@ -909,7 +909,7 @@ impl ServerHandler for HoldfastServer {
 /// The §9.4 audit trail still fails **open** here, unlike
 /// `run_with_config`, which refuses. That divergence is tracked
 /// separately; it is not this function's to decide quietly.
-pub async fn serve_stdio() -> anyhow::Result<()> {
+pub async fn serve_stdio() -> anyhow::Result<StdioEnd> {
     let config = crate::config::load()?;
     // The audit path is resolved here rather than in `new()` so that only
     // the real server process ever writes to it.
@@ -928,9 +928,98 @@ pub async fn serve_stdio() -> anyhow::Result<()> {
     let audit_path = paths.as_ref().map(|p| p.audit_log());
     let server = HoldfastServer::with_audit_path_and_config(audit_path, &config)
         .with_history_dir(paths.map(|p| p.history_dir()));
-    let service = server.serve(rmcp::transport::stdio()).await?;
-    service.waiting().await?;
-    Ok(())
+    // Before the transport is served, so a stop that lands during
+    // `initialize` is caught too.
+    let stop: std::pin::Pin<Box<dyn std::future::Future<Output = i32> + Send>> =
+        match stop_signals() {
+            Ok(stop) => Box::pin(stop),
+            Err(e) => {
+                crate::diag!(
+                    "holdfast mcp: cannot watch for a stop signal ({e}); a signal ends \
+                     this process without its sessions' session_stats lines"
+                );
+                Box::pin(std::future::pending())
+            }
+        };
+    serve_until(server, rmcp::transport::stdio(), stop).await
+}
+
+/// How [`serve_stdio`] ended.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum StdioEnd {
+    /// The client closed the transport, which is MCP's stdio shutdown.
+    Closed,
+    /// A signal asked this process to stop; the number is the signal's,
+    /// so the conventional exit status is `128 +` it.
+    Signalled(i32),
+}
+
+/// Serve `server` on `transport` until the client closes it or `stop`
+/// resolves with a signal number, then write every session's
+/// `session_stats` line (plan §4.9).
+///
+/// **This process's sessions end with it, and no eviction or daemon stop
+/// will come after**, so the lines are written here, on every way out,
+/// a failed `initialize` included. `Drop` would write most of them as
+/// the server goes, but not for a session something else still holds,
+/// such as a blocking-pool thread parked in a pty write, which the
+/// runtime abandons at exit; and on a signal the server is still inside
+/// the transport's task.
+pub async fn serve_until<T, E, A>(
+    server: HoldfastServer,
+    transport: T,
+    stop: impl std::future::Future<Output = i32>,
+) -> anyhow::Result<StdioEnd>
+where
+    T: rmcp::transport::IntoTransport<rmcp::RoleServer, E, A>,
+    E: std::error::Error + Send + Sync + 'static,
+{
+    let registry = Arc::clone(&server.registry);
+    let served = async {
+        let service = server.serve(transport).await?;
+        service.waiting().await?;
+        anyhow::Ok(StdioEnd::Closed)
+    };
+    let end = tokio::select! {
+        end = served => end,
+        signo = stop => Ok(StdioEnd::Signalled(signo)),
+    };
+    registry.record_remaining_stats();
+    end
+}
+
+/// `SIGTERM`, `SIGHUP` or `SIGINT`: a client stopping its server, a
+/// terminal closing, or `Ctrl-C` where the server runs in one. Without a
+/// handler each kills the process before anything is written.
+#[cfg(unix)]
+fn stop_signals() -> std::io::Result<impl std::future::Future<Output = i32>> {
+    use tokio::signal::unix::{signal, SignalKind};
+    let mut term = signal(SignalKind::terminate())?;
+    let mut hup = signal(SignalKind::hangup())?;
+    let mut int = signal(SignalKind::interrupt())?;
+    Ok(async move {
+        tokio::select! {
+            _ = term.recv() => libc::SIGTERM,
+            _ = hup.recv() => libc::SIGHUP,
+            _ = int.recv() => libc::SIGINT,
+        }
+    })
+}
+
+/// `Ctrl-C`, and the console closing, which Windows gives a handler time
+/// to act on before it ends the process. Reported as `SIGINT` and
+/// `SIGHUP`'s numbers, the nearest meanings.
+#[cfg(windows)]
+fn stop_signals() -> std::io::Result<impl std::future::Future<Output = i32>> {
+    use tokio::signal::windows::{ctrl_c, ctrl_close};
+    let mut int = ctrl_c()?;
+    let mut close = ctrl_close()?;
+    Ok(async move {
+        tokio::select! {
+            _ = int.recv() => 2,
+            _ = close.recv() => 1,
+        }
+    })
 }
 
 #[cfg(test)]
@@ -1118,5 +1207,106 @@ mod tests {
             None,
             "no trail asked for is a choice, not a failure"
         );
+    }
+
+    /// **`--no-daemon`'s sessions die with it, so the way out writes
+    /// their `session_stats` lines (plan §4.9)**: the client closing the
+    /// transport, and a stop signal, which `stop` stands in for here.
+    ///
+    /// The session is also held outside the server, as a blocking-pool
+    /// thread parked in a pty write holds one and as the runtime then
+    /// abandons it, so `Drop` cannot be what writes the line: the line
+    /// must exist while that hold is still live.
+    #[tokio::test]
+    async fn serving_writes_each_sessions_line_when_the_client_closes_and_on_a_signal() {
+        use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+        for signalled in [false, true] {
+            let dir = tempfile::tempdir().unwrap();
+            let log = dir.path().join("audit.log");
+            let server = HoldfastServer::with_audit_path(Some(log.clone()));
+            let held = crate::session::Session::new(
+                crate::session::new_session_id(),
+                None,
+                "bash".into(),
+                vec![],
+                Arc::new(crate::pty::MockPty::new()) as Arc<dyn crate::pty::PtyBackend>,
+                crate::session::SessionConfig {
+                    audit: Some(Arc::clone(&server.processor.audit)),
+                    ..crate::session::SessionConfig::default()
+                },
+            );
+            server.registry.insert(Arc::clone(&held)).unwrap();
+
+            let (server_side, client_side) = tokio::io::duplex(64 * 1024);
+            let (stop_tx, stop_rx) = tokio::sync::oneshot::channel::<i32>();
+            let serving = tokio::spawn(serve_until(server, server_side, async move {
+                match stop_rx.await {
+                    Ok(signo) => signo,
+                    Err(_) => std::future::pending().await,
+                }
+            }));
+
+            // `initialize`, so the transport is being served and not
+            // still being opened when it ends.
+            let (rx, mut tx) = tokio::io::split(client_side);
+            let mut rx = BufReader::new(rx);
+            let initialize = serde_json::json!({
+                "jsonrpc": "2.0",
+                "id": 0,
+                "method": "initialize",
+                "params": {
+                    "protocolVersion": "2025-06-18",
+                    "capabilities": {},
+                    "clientInfo": { "name": "stats-probe", "version": "0.0.0" }
+                }
+            });
+            tx.write_all(format!("{initialize}\n").as_bytes())
+                .await
+                .unwrap();
+            let mut line = String::new();
+            tokio::time::timeout(std::time::Duration::from_secs(10), rx.read_line(&mut line))
+                .await
+                .expect("the server never answered `initialize`")
+                .unwrap();
+            assert!(line.contains("\"result\""), "initialize failed: {line}");
+            tx.write_all(b"{\"jsonrpc\":\"2.0\",\"method\":\"notifications/initialized\"}\n")
+                .await
+                .unwrap();
+
+            if signalled {
+                stop_tx.send(15).unwrap();
+            } else {
+                drop(tx);
+                drop(rx);
+            }
+            let end = tokio::time::timeout(std::time::Duration::from_secs(10), serving)
+                .await
+                .expect("serving did not end")
+                .expect("the serving task")
+                .expect("serve_until");
+            assert_eq!(
+                end,
+                if signalled {
+                    StdioEnd::Signalled(15)
+                } else {
+                    StdioEnd::Closed
+                }
+            );
+
+            let stats_lines = || {
+                std::fs::read_to_string(&log)
+                    .unwrap_or_default()
+                    .lines()
+                    .filter(|l| l.contains("\"session_stats\""))
+                    .count()
+            };
+            assert_eq!(
+                stats_lines(),
+                1,
+                "no line while the session is still held, signalled={signalled}"
+            );
+            drop(held);
+            assert_eq!(stats_lines(), 1, "signalled={signalled}");
+        }
     }
 }

@@ -18,6 +18,14 @@ is cut, named and published is in
   tmux, calling no Holdfast tool. Claude Code 2.1.287+; `secret_band` hides it.
 - `holdfast attach --keep-size` never sends your terminal's size, on joining
   or on a resize, so attaching from a narrower pane does not shrink the session.
+- `audit.log` ends each session with a `session_stats` line of counts, not
+  content. `redaction_disabled` adds the read's `mode`, `start`, size and
+  `prior_unresolved`; `session_start` adds `env_base`, where its env came from.
+
+### Changed
+
+- `holdfast mcp --no-daemon` writes its sessions' audit lines on `SIGTERM`,
+  `SIGHUP` or `SIGINT` too, then exits `128 +` the signal's number.
 
 ### Security
 
@@ -29,6 +37,14 @@ is cut, named and published is in
 
 - The notice a secret request writes into the session's output names only
   `holdfast attach <id>`; it also offered a web UI, which does not exist yet.
+- Uncoloured hex digests and `sha256-`/`sha384-`/`sha512-` integrity strings
+  after a `grep` hit or other line naming a private-key header are no longer
+  `[REDACTED:unresolved]`; base64 blobs there still are ([#260]).
+- When a session's output ends inside a private key's first line, as `head -c`
+  over a key file can, `holdfast watch` masks it at exit; it sent that line raw.
+- After a private-key header nothing closed, a key line inside a longer line is
+  masked when output pauses just after it; `read_output` and `holdfast watch`
+  returned it raw if they read at that moment.
 
 ## [0.0.8] — 2026-09-28 (Dowel)
 
@@ -693,6 +709,7 @@ residuals that are known and accepted.
 [#257]: https://github.com/Sertelegger/holdfast/issues/257
 [#258]: https://github.com/Sertelegger/holdfast/issues/258
 [#259]: https://github.com/Sertelegger/holdfast/issues/259
+[#260]: https://github.com/Sertelegger/holdfast/issues/260
 [#252]: https://github.com/Sertelegger/holdfast/issues/252
 [#270]: https://github.com/Sertelegger/holdfast/issues/270
 [#262]: https://github.com/Sertelegger/holdfast/issues/262

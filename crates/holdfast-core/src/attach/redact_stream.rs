@@ -1138,13 +1138,16 @@ mod tests {
     #[test]
     fn a_key_cut_short_by_the_end_of_the_stream_is_masked_not_flushed() {
         use crate::output::pem::fixtures::KEYS;
+        let shared = processor();
         for key in KEYS {
-            // Four lines: the header and three of body, which is the
-            // whole body of the smallest fixture and leaves it unclosed.
-            let cut: String = key.pem().split_inclusive('\n').take(4).collect();
+            // The header and three lines of key body, after any armour
+            // headers: the whole body of the smallest fixture, unclosed.
+            let pem = key.pem();
+            let third = key.material_lines()[2];
+            let cut = &pem[..pem.find(third).unwrap() + third.len() + 1];
             assert!(!cut.contains("-----END"), "{}", key.name);
             let mut r = redactor();
-            let mut out = r.feed(format!("$ head -n 4 k\n{cut}").as_bytes());
+            let mut out = r.feed(format!("$ head -c {} k\n{cut}", cut.len()).as_bytes());
             assert!(
                 !r.is_withholding(),
                 "{}: the fixture must end in the carry, not in the withhold",
@@ -1158,6 +1161,23 @@ mod tests {
                 "{}: {out:?}",
                 key.name
             );
+            // Cut inside its first body line, sixteen characters or more
+            // into it, with nothing after: the walk is still reading that
+            // line as a possible armour-header name when the stream ends.
+            // `output::pem`'s own test takes every cut; these are its ends
+            // and two between.
+            let first = key.material_lines()[0];
+            let start = pem.find(first).unwrap();
+            let run = crate::output::pem::PEM_MATERIAL_RUN as usize;
+            for n in [run, 24, 40, first.len()] {
+                let cut = &pem[..start + n];
+                let mut r = StreamRedactor::new(Arc::clone(&shared));
+                let mut out = r.feed(format!("$ head -c {} k\n{cut}", cut.len()).as_bytes());
+                out.extend(r.flush());
+                let out = String::from_utf8_lossy(&out).into_owned();
+                assert!(!out.contains(&first[..n]), "{} at {n}: {out:?}", key.name);
+                assert!(out.contains("[REDACTED:unresolved]"), "{} at {n}", key.name);
+            }
         }
         let mut r = redactor();
         assert!(r.feed(b"ghp_abc").is_empty());

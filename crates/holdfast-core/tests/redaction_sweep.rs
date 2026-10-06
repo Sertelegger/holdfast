@@ -60,11 +60,14 @@ use std::sync::Arc;
 
 use base64::Engine as _;
 use holdfast_core::attach::StreamRedactor;
+use holdfast_core::buffer::OutputBuffer;
 use holdfast_core::output::ansi::AnsiMode;
 use holdfast_core::output::encoding::TextEncoding;
 use holdfast_core::output::redact::find_spans;
 use holdfast_core::output::rules::RuleSet;
-use holdfast_core::output::{OutputProcessor, ProcessedRead, ReadOptions, WindowSnapshot};
+use holdfast_core::output::{
+    OutputProcessor, ProcessedRead, ReadOptions, ReadRequest, WindowSnapshot,
+};
 
 // ---------------------------------------------------------------- fixtures
 
@@ -175,45 +178,20 @@ fn paged_prefix() -> String {
 
 // ------------------------------------------------------------- the surfaces
 
-fn snapshot<'a>(
-    processor: &OutputProcessor,
-    buffer: &'a [u8],
-    req_start: u64,
-    max_bytes: usize,
-) -> WindowSnapshot<'a> {
-    let head = buffer.len() as u64;
-    let cap_end = (req_start + max_bytes as u64).min(head);
-    let window_start = req_start.saturating_sub(processor.limits.lookbehind_bytes as u64);
-    let window_end = (cap_end + processor.limits.lookahead_bytes as u64).min(head);
-    let scan_start = head.saturating_sub(processor.limits.partial_secret_scan_bytes as u64);
-    let carry_start = req_start
-        .saturating_sub(holdfast_core::output::UNVOUCHED_CARRY_BYTES as u64)
-        .min(window_start);
-    WindowSnapshot {
-        window: &buffer[window_start as usize..window_end as usize],
-        window_start,
-        carry_region: &buffer[carry_start as usize..window_end as usize],
-        carry_region_start: carry_start,
-        tail_region: &buffer[scan_start as usize..head as usize],
-        tail_region_start: scan_start,
-        req_start,
-        head,
-        cap_end,
-        child_alive: true,
-        bypass_holdback: false,
-        front_clipped: false,
-        truncated_at_tail: false,
-    }
-}
-
+/// A cursor read of `buffer` from `req_start`, through the product's own
+/// read geometry ([`WindowSnapshot::for_read`]) over a ring that holds the
+/// whole buffer.
 fn read(
     processor: &OutputProcessor,
     buffer: &[u8],
     req_start: u64,
     opts: &ReadOptions,
 ) -> ProcessedRead {
-    let w = snapshot(processor, buffer, req_start, 64 * 1024);
-    processor.process(&w, opts)
+    let mut ring = OutputBuffer::new(buffer.len().max(1));
+    ring.push(buffer);
+    let req = ReadRequest::since(req_start, 64 * 1024);
+    let taken = WindowSnapshot::for_read(&ring, &req, processor.limits, true);
+    processor.process(&taken.snapshot(), opts)
 }
 
 /// The bytes the caller ends up holding, after undoing the transport

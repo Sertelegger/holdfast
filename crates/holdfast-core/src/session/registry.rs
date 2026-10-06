@@ -253,9 +253,9 @@ impl SessionRegistry {
     /// against sessions that had already exited.
     pub fn reserve(&self, name: Option<&str>) -> Result<Reservation<'_>> {
         let mut records = self.records.write();
-        let evicted = Self::sweep(&mut records, self.retention);
+        let swept = Self::sweep(&mut records, self.retention);
         // A separate function for the same reason `admit` is one: an
-        // early `return` from this body would drop `evicted` — declared
+        // early `return` from this body would drop `swept` — declared
         // after the guard, so dropped first — with the write lock held.
         let claimed = Self::claim(
             &mut records,
@@ -264,7 +264,7 @@ impl SessionRegistry {
             self.next_reservation.fetch_add(1, Ordering::Relaxed),
         );
         drop(records);
-        drop(evicted);
+        swept.settle();
         claimed.map(|id| Reservation {
             registry: self,
             id,
@@ -375,19 +375,16 @@ impl SessionRegistry {
         // here is what makes the writer thread of the session that just
         // finished go away without waiting for the daemon's 30-second
         // tick. The whole GH #129 shape is exactly this loop.
-        let evicted = Self::sweep(&mut records, self.retention);
+        let swept = Self::sweep(&mut records, self.retention);
         // The checks are a separate function rather than `return`s in
-        // this body, so that the two orderly drops below happen on the
+        // this body, so that the two orderly steps below happen on the
         // refusal paths too: an early `return` from here would drop
-        // `evicted` — declared after the guard, so first — while the
+        // `swept` — declared after the guard, so first — while the
         // write lock is still held.
         let admitted = Self::admit(&mut records, session, self.max_sessions);
         drop(records);
-        // Outside the lock: dropping the last `Arc` of an evicted record
-        // frees a ring buffer, and a registry that held its own write
-        // lock through a megabyte of deallocation would block every
-        // reader for it.
-        drop(evicted);
+        // Outside the lock: see [`Swept::settle`].
+        swept.settle();
         admitted
     }
 
@@ -425,19 +422,28 @@ impl SessionRegistry {
     /// "when does a session stop being live".
     pub fn retire_exited(&self) -> usize {
         let mut records = self.records.write();
-        let before = records.completed.len();
-        let evicted = Self::sweep(&mut records, self.retention);
-        let retired = records.completed.len() + evicted.len() - before;
+        let swept = Self::sweep(&mut records, self.retention);
         drop(records);
-        drop(evicted);
+        let retired = swept.retired;
+        swept.settle();
         retired
+    }
+
+    /// Write the `session_stats` line of every session that has none
+    /// yet, live or retired — the daemon's shutdown and `--no-daemon`'s
+    /// exit, after which no eviction will come. Returns how many it wrote.
+    ///
+    /// Outside the lock, for [`Swept::settle`]'s reason: the list is
+    /// copied out first.
+    pub fn record_remaining_stats(&self) -> usize {
+        self.all().iter().filter(|s| s.record_stats()).count()
     }
 
     /// The body of a sweep, with the lock already held.
     ///
-    /// Returns the evicted records so the caller can drop them outside
-    /// the lock.
-    fn sweep(records: &mut Records, retention: Retention) -> Vec<Arc<Session>> {
+    /// Returns what it retired and what it evicted, so the caller can
+    /// [`Swept::settle`] both outside the lock.
+    fn sweep(records: &mut Records, retention: Retention) -> Swept {
         let mut finished: Vec<Arc<Session>> = records
             .live
             .values()
@@ -451,6 +457,7 @@ impl SessionRegistry {
         // reports as `exited_at_unix_secs` — and creation time to break
         // the ties its one-second granularity leaves.
         finished.sort_by_key(|s| (s.exited_at_secs().unwrap_or(0), s.created_at));
+        let retired = finished.len();
         for session in finished {
             records.live.remove(&session.id);
             // The whole point of the split: a finished session gives up
@@ -473,7 +480,7 @@ impl SessionRegistry {
                 evicted.push(s);
             }
         }
-        evicted
+        Swept { retired, evicted }
     }
 
     /// Recomputed per sweep rather than carried as a running total.
@@ -605,6 +612,36 @@ impl SessionRegistry {
 impl Default for SessionRegistry {
     fn default() -> Self {
         Self::with_defaults()
+    }
+}
+
+/// What one sweep did, held until the registry's lock is released.
+#[must_use = "a sweep's evictions are written and freed by `settle`"]
+struct Swept {
+    /// How many sessions this sweep moved out of the live set.
+    retired: usize,
+    /// Completed records it pushed past the retention bounds.
+    evicted: Vec<Arc<Session>>,
+}
+
+impl Swept {
+    /// The two things a sweep may not do under the registry's write
+    /// lock, which every `get` waits on, both for the records it evicted.
+    ///
+    /// 1. **Write each one's `session_stats` line** — the eviction path
+    ///    of `session::stats`. Not at retire: a retired record is still
+    ///    read, and the read of a finished command's output belongs on
+    ///    the line. Every string on the line goes through the redactor
+    ///    and then to a file, and neither belongs under a lock every
+    ///    reader takes.
+    /// 2. **Drop them.** Dropping the last `Arc` of one frees a ring
+    ///    buffer, and a registry that held its own write lock through a
+    ///    megabyte of deallocation would block every reader for it.
+    fn settle(self) {
+        for session in &self.evicted {
+            session.record_stats();
+        }
+        drop(self.evicted);
     }
 }
 

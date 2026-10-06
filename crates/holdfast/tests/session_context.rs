@@ -971,7 +971,15 @@ impl OldDaemon {
     /// socket and pid files removed.
     fn stop(&mut self) {
         if let Some(rt) = self.rt.take() {
-            rt.shutdown_background();
+            // **Waits for the worker to drop every task**, which is what
+            // closes the listener and each connection. A task the worker
+            // is polling keeps running until it yields, so a runtime shut
+            // down without waiting can still read a request already in a
+            // connection's buffer and answer it, as an exited daemon
+            // cannot: the shim's `daemon/status` probe is answered with
+            // this stand-in's pid, and the refusal the probe exists to
+            // retire stands.
+            rt.shutdown_timeout(Duration::from_secs(5));
             let _ = std::fs::remove_file(&self.pid_file);
         }
         if let Some(mut p) = self.process.lock().unwrap().take() {

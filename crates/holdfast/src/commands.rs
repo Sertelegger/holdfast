@@ -645,7 +645,13 @@ async fn connect(kind: ClientKind) -> Result<ControlClient, ClientError> {
 /// exactly the same code rather than two copies that can drift.
 async fn serve_in_process() -> ExitCode {
     match holdfast_core::mcp::serve_stdio().await {
-        Ok(()) => ExitCode::SUCCESS,
+        Ok(holdfast_core::mcp::StdioEnd::Closed) => ExitCode::SUCCESS,
+        // `128 +` the signal's number, the status a shell reports for a
+        // process that signal killed: the server catches it only to write
+        // its sessions' `session_stats` lines first.
+        Ok(holdfast_core::mcp::StdioEnd::Signalled(signo)) => {
+            ExitCode::from(128u8.saturating_add(u8::try_from(signo).unwrap_or(0)))
+        }
         Err(e) => {
             diag!("holdfast mcp: {e}");
             ExitCode::from(no_daemon_exit_code(&e))
