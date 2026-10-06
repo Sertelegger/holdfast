@@ -6,7 +6,8 @@
 # -- so nothing here may be $.mcp.*, and nothing may be prompt.submit,
 # tool.check, a store write or a model call; scripts/plugin-manifest-check.py
 # refuses a $.mcp line here. The three session-tool hooks only watch the
-# agent's own results pass, for the id that goes with a name.
+# results that pass, the agent's or another mod's, for the id that goes with
+# a name.
 ./register.js hooks: tool.call{tool=mcp__plugin_holdfast_holdfast__request_secret_input}, tool.call{tool=mcp__plugin_holdfast_holdfast__start_session}, tool.call{tool=mcp__plugin_holdfast_holdfast__list_sessions}, tool.call{tool=mcp__plugin_holdfast_holdfast__status}, ui.render{component=AbovePrompt}
 ./register.js gating hook without .catch: tool.call{tool=mcp__plugin_holdfast_holdfast__request_secret_input}
 ./register.js gating hook without .catch: tool.call{tool=mcp__plugin_holdfast_holdfast__start_session}

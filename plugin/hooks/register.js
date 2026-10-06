@@ -3,8 +3,8 @@
 // When the agent calls Holdfast's request_secret_input, the turn blocks until
 // a human types the secret into `holdfast attach`. This module tells the human
 // so: a toast, and a band above the prompt naming the session, what the agent
-// says, the time left, and the attach command, with buttons to open it in a
-// tmux split or copy it when there is a `holdfast` binary to name.
+// says, the least time left, and the attach command, with buttons to open it
+// in a tmux split or copy it when there is a `holdfast` binary to name.
 //
 // What it must never do, and does not:
 //   - take a secret: there is no text field here, and nothing is written to
@@ -14,23 +14,28 @@
 //     untouched, and there is no tool.check hook;
 //   - call Holdfast: a mod's $.mcp.call is permission-checked like the
 //     agent's own, so a read here would put a permission dialog in front of
-//     the agent's secret request. Everything drawn comes from the agent's own
-//     calls as they pass through these hooks;
+//     the agent's secret request. Everything drawn comes from the calls that
+//     pass through these hooks: the agent's, and any other mod's;
 //   - put anything in front of the model: no commands, no prompt submission,
 //     no store.
 // Session names and prompt text are the agent's text, so they are drawn only
-// after control and bidi characters are stripped, labelled, and with the
-// session id beside the name whenever the agent's own calls have shown it.
+// after control and bidi characters are stripped, labelled, with no id-shaped
+// text left in a name, and with the session id beside the name whenever a
+// call that passed through has shown it.
 
 // Measured with this plugin loaded: the server is `plugin:holdfast:holdfast`,
 // so Claude Code names the tools this.
 const TOOL = 'mcp__plugin_holdfast_holdfast__request_secret_input'
-// The agent's own calls whose results pair a session's name with its id.
+// The calls whose results pair a session's name with its id.
 const START_SESSION = 'mcp__plugin_holdfast_holdfast__start_session'
 const LIST_SESSIONS = 'mcp__plugin_holdfast_holdfast__list_sessions'
 const STATUS = 'mcp__plugin_holdfast_holdfast__status'
 // `session/mod.rs` `new_session_id`.
 const SESSION_ID = /^sess_[0-9a-f]{12}$/
+// What reads as an id inside a name the agent chose, in any case and with
+// anything after it up to a space, quote or bracket. A name may be
+// `x sess_<another session's id>`; drawn, the human could type that id.
+const ID_LIKE = /sess_[^\s"'()]*/giu
 // A name `holdfast attach` takes as it stands: it resolves a live session's
 // name as it does an id. Leading with a letter or digit, it is never read as
 // a flag, and nothing in it means anything to a shell.
@@ -65,7 +70,8 @@ const PANE_ENV = ['HOLDFAST_RUNTIME_DIR', 'XDG_RUNTIME_DIR']
 const NOT_ON_PATH_ISSUE = 'https://github.com/Sertelegger/holdfast/issues/280'
 
 // Open requests by tool_use_id, oldest first; the closing lines still on
-// show; and session name -> id, as the agent's own calls reported them.
+// show; and session name -> id, as the calls that passed through reported
+// them.
 // Module state: none of it outlives a reload of this module.
 const pending = new Map()
 let outcomes = []
@@ -125,8 +131,11 @@ export function attachCommand(binary, target) {
 
 // Run by `sh -c` with the binary as $0 and the target as $1, so neither is
 // ever parsed by a shell. On a failure the pane stays open and says so; tmux
-// would otherwise close it at once and take the reason with it.
-const SPLIT_SCRIPT = `"$0" attach --keep-size "$1" || { s=$?; printf '\\nholdfast attach exited %s. Press Enter to close this pane.\\n' "$s"; read -r _; }`
+// would otherwise close it at once and take the reason with it. Exit 64 is
+// holdfast's usage error, which from this argv means a holdfast older than
+// --keep-size; the pane says what to do about it, and does not run attach
+// without the flag, which would resize the agent's session.
+const SPLIT_SCRIPT = `"$0" attach --keep-size "$1" || { s=$?; [ "$s" = 64 ] && printf '\\nThis holdfast predates attach --keep-size: update it, or run attach without the flag, which resizes the session to this pane.\\n'; printf '\\nholdfast attach exited %s. Press Enter to close this pane.\\n' "$s"; read -r _; }`
 
 // The same attach, as the argv of a tmux split, or null when the binary or
 // the target is not what it must be. A command given to tmux as several
@@ -201,10 +210,10 @@ export function outcomeWords(result) {
 
 // ------------------------------------------------------- session identity
 
-// What one of the agent's own start_session, list_sessions or status
-// results says about sessions, kept in `names` as name -> id for the live
-// ones. A session seen exited gives its name up, as the daemon does, since
-// a later session may take it.
+// What one start_session, list_sessions or status result says about
+// sessions, kept in `names` as name -> id for the live ones. A session seen
+// exited gives its name up, as the daemon does, since a later session may
+// take it.
 export function learn(names, env) {
   if (!isEnvelope(env) || env.status !== 'ok' || !env.data || typeof env.data !== 'object') return
   const records = Array.isArray(env.data.sessions) ? env.data.sessions : [env.data]
@@ -225,19 +234,25 @@ export function learn(names, env) {
 }
 
 // Who a request is for, from the agent's `session` argument: `id` when the
-// argument is one or the agent's own calls paired the name with one; `name`
-// to draw; and `target`, what the attach command names -- the id, else a
-// name `holdfast attach` takes as it stands, else nothing.
+// argument is one or a call that passed through paired the name with one;
+// `name` to draw; and `target`, what the attach command names -- the id,
+// else a name `holdfast attach` takes as it stands, else nothing.
 export function identify(names, session) {
   const id = validSessionId(session)
   if (id) {
     let name = ''
     for (const [n, i] of names) if (i === id) name = n
-    return { id, name: clean(name, NAME_MAX), target: id }
+    return { id, name: drawnName(name), target: id }
   }
   const asked = typeof session === 'string' ? session : ''
   const learned = names.get(asked) || null
-  return { id: learned, name: clean(asked, NAME_MAX), target: learned || validTarget(asked) }
+  return { id: learned, name: drawnName(asked), target: learned || validTarget(asked) }
+}
+
+// A name as the band draws it: stripped, capped, and with nothing in it that
+// reads as an id, so the only id the band draws is the real one.
+export function drawnName(name) {
+  return clean(name, NAME_MAX).replace(ID_LIKE, 'sess_\u2026')
 }
 
 function label(req) {
@@ -245,10 +260,15 @@ function label(req) {
   return req.name ? 'session "' + req.name + '"' : 'a session'
 }
 
-function timeLeft(req, now) {
-  const left = Math.ceil((req.startedAt + req.timeoutSecs * 1000 - now) / 1000)
-  if (left <= 0) return 'time is up'
-  return '~' + Math.floor(left / 60) + ':' + String(left % 60).padStart(2, '0') + ' left'
+// The least time the request has left. The clock starts when the call
+// passes this hook, which is before Claude Code's permission dialog for it,
+// if there is one (measured on 2.1.291); the daemon's starts only once the
+// call reaches it. So the true time left is this or more, by as long as the
+// dialog was up, and past zero the request may still be open.
+export function timeLeft(req, now) {
+  const left = Math.floor((req.startedAt + req.timeoutSecs * 1000 - now) / 1000)
+  if (left <= 0) return 'may time out at any moment'
+  return 'at least ' + Math.floor(left / 60) + ':' + String(left % 60).padStart(2, '0') + ' left'
 }
 
 // ------------------------------------------------------------ the binary
@@ -345,10 +365,11 @@ async function onWindows($) {
 
 // The rising edge, with the call already on its way: the band and the toast
 // at once, from the call's own arguments, then the binary and tmux for the
-// buttons. Resolves the request, or null where nothing draws, and never
-// throws. A call that has ended before there was anything to draw
+// buttons. `since` is the clock read as the call went on, where the
+// countdown starts. Resolves the request, or null where nothing draws, and
+// never throws. A call that has ended before there was anything to draw
 // (`call.ended`) gets its closing line and no toast.
-async function open($, e, call, signal) {
+async function open($, e, call, signal, since) {
   try {
     // Under -p, the Agent SDK and the VS Code chat panel nothing draws, so
     // nothing is looked at either.
@@ -363,7 +384,7 @@ async function open($, e, call, signal) {
       ...identify(known, e.session),
       agentSays: clean(e.prompt_text),
       timeoutSecs: Number.isSafeInteger(timeout) && timeout > 0 ? timeout : DEFAULT_TIMEOUT_SECS,
-      startedAt: await $.clock.now(),
+      startedAt: (await since) ?? (await $.clock.now()),
       located: false,
       binary: null,
       tmux: false,
@@ -485,9 +506,9 @@ async function copyCommand($, req, pe) {
   $.ui.toast((copied && copied.isCopied ? 'holdfast: copied ' : 'holdfast: could not copy; run ') + command, { timeoutMs: TOAST_MS })
 }
 
-// The agent's own session calls, watched as they pass: each result is
-// returned untouched, and what it pairs a name with is the id the band shows
-// beside that name and builds the attach command from.
+// The session calls that pass through, the agent's or another mod's: each
+// result is returned untouched, and what it pairs a name with is the id the
+// band shows beside that name and builds the attach command from.
 async function watchSessions($, e, next) {
   const result = await next(e)
   try {
@@ -506,10 +527,11 @@ export function register(on, options) {
 
   on('tool.call', { tool: TOOL }, async ($, e, next) => {
     // The call goes on first, exactly as the agent made it, so nothing the
-    // band does ever waits in front of it.
+    // band does ever waits in front of it; the countdown starts with it.
     const going = next(e)
+    const since = $.clock.now().catch(() => null)
     const call = { ended: false }
-    const opened = open($, e, call, next.signal)
+    const opened = open($, e, call, next.signal, since)
     let words = ''
     try {
       const result = await going
