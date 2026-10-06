@@ -116,9 +116,9 @@ is not measured.
   as the human gate in front of Holdfast relies on something a mod walks past.
 - **Holdfast cannot tell such a call from the agent's.** It arrives through
   the same `holdfast mcp` process, so where the audit log names the kind of
-  client, as a `redaction_disabled` entry does, it names `shim`: the agent's
-  connection. That field is attribution only, and nothing reads it to decide
-  anything.
+  client, as a `redaction_disabled` entry does, it names the one it names for
+  the agent's own calls: `shim` under the daemon. That field is attribution
+  only; it decides no redaction and grants nothing.
 
 Install plugins that carry mods only from marketplaces you trust. `claude
 plugin validate <dir>` lists the mods API calls a plugin's code makes, and
