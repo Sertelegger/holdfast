@@ -1138,6 +1138,7 @@ mod tests {
     #[test]
     fn a_key_cut_short_by_the_end_of_the_stream_is_masked_not_flushed() {
         use crate::output::pem::fixtures::KEYS;
+        let shared = processor();
         for key in KEYS {
             // The header and three lines of key body, after any armour
             // headers: the whole body of the smallest fixture, unclosed.
@@ -1163,11 +1164,14 @@ mod tests {
             // Cut inside its first body line, sixteen characters or more
             // into it, with nothing after: the walk is still reading that
             // line as a possible armour-header name when the stream ends.
+            // `output::pem`'s own test takes every cut; these are its ends
+            // and two between.
             let first = key.material_lines()[0];
             let start = pem.find(first).unwrap();
-            for n in crate::output::pem::PEM_MATERIAL_RUN as usize..=first.len() {
+            let run = crate::output::pem::PEM_MATERIAL_RUN as usize;
+            for n in [run, 24, 40, first.len()] {
                 let cut = &pem[..start + n];
-                let mut r = redactor();
+                let mut r = StreamRedactor::new(Arc::clone(&shared));
                 let mut out = r.feed(format!("$ head -c {} k\n{cut}", cut.len()).as_bytes());
                 out.extend(r.flush());
                 let out = String::from_utf8_lossy(&out).into_owned();
