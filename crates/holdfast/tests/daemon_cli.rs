@@ -639,6 +639,25 @@ impl Shim {
         let _ = self.child.kill();
         let _ = self.child.wait();
     }
+
+    /// End the transport the way an MCP client does when it goes away —
+    /// close stdin — and wait, bounded, for the process to leave. `None`
+    /// if it had to be killed.
+    fn close_and_wait(mut self) -> Option<std::process::ExitStatus> {
+        drop(self.child.stdin.take());
+        let deadline = Instant::now() + CLI_TIMEOUT;
+        loop {
+            if let Some(status) = self.child.try_wait().expect("wait for holdfast") {
+                return Some(status);
+            }
+            if Instant::now() >= deadline {
+                let _ = self.child.kill();
+                let _ = self.child.wait();
+                return None;
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        }
+    }
 }
 
 /// A live session whose buffer holds a secret-shaped value, under the
@@ -2173,6 +2192,68 @@ fn the_no_daemon_server_honours_a_configured_session_cap() {
     );
 
     shim.kill();
+}
+
+/// **Plan §4.9's retire path for `holdfast mcp --no-daemon`.** Its
+/// sessions die with the process, and no sweep comes after the client
+/// leaves, so the exit itself writes each session's one `session_stats`
+/// line — counts only, with the read this test made counted on it.
+#[test]
+fn a_no_daemon_exit_writes_each_sessions_session_stats_line() {
+    let env = TestEnv::new("nodaemonstats");
+    // `$HOME` inside the test directory, for the reason the session-cap
+    // row above gives: this transport's trail must not be the developer's.
+    let mut cmd = env.cmd();
+    cmd.env("HOME", &env.dir);
+    let mut shim = Shim::spawn_cmd(cmd, &["mcp", "--no-daemon"]);
+
+    let started = shim.call_tool(
+        "start_session",
+        json!({ "command": "bash", "args": ["--norc", "--noprofile"], "name": "stats" }),
+    );
+    assert_eq!(
+        started["result"]["structuredContent"]["status"], "ok",
+        "{started}"
+    );
+    let id = started["result"]["structuredContent"]["data"]["session_id"]
+        .as_str()
+        .expect("a session id")
+        .to_string();
+    shim.call_tool(
+        "send_input",
+        json!({ "session": id, "data": "echo STATS_$((6 * 7))" }),
+    );
+    let out = shim.read_until(&id, "STATS_42");
+    assert!(out.contains("STATS_42"), "the session never ran: {out:?}");
+
+    let status = shim.close_and_wait();
+    assert!(
+        status.is_some(),
+        "`holdfast mcp --no-daemon` outlived its client's stdin and was killed"
+    );
+
+    let path = env.dir.join("logs").join("audit.log");
+    let text = std::fs::read_to_string(&path)
+        .unwrap_or_else(|e| panic!("no audit log at {}: {e}", path.display()));
+    let lines: Vec<Value> = text
+        .lines()
+        .filter_map(|l| serde_json::from_str::<Value>(l).ok())
+        .filter(|v| v["kind"] == "session_stats")
+        .collect();
+    assert_eq!(lines.len(), 1, "one line for the one session: {lines:?}");
+    assert_eq!(lines[0]["session_id"], id.as_str());
+    assert_eq!(lines[0]["shell"], "bash");
+    assert!(
+        lines[0]["reads"]["cursor"].as_u64() >= Some(1),
+        "the reads this test made are not on the line: {}",
+        lines[0]
+    );
+    assert!(
+        !text
+            .lines()
+            .any(|l| l.contains("session_stats") && l.contains("STATS_")),
+        "output reached the counts line"
+    );
 }
 
 // ------------------------------------------------ GH #218, #232, #233, #178, #20

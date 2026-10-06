@@ -928,8 +928,14 @@ pub async fn serve_stdio() -> anyhow::Result<()> {
     let audit_path = paths.as_ref().map(|p| p.audit_log());
     let server = HoldfastServer::with_audit_path_and_config(audit_path, &config)
         .with_history_dir(paths.map(|p| p.history_dir()));
+    // Kept past the transport, which owns the server: once it closes,
+    // this process and every session in it are about to end, and no sweep
+    // will come to write their `session_stats` lines (plan §4.9).
+    let registry = Arc::clone(&server.registry);
     let service = server.serve(rmcp::transport::stdio()).await?;
-    service.waiting().await?;
+    let served = service.waiting().await;
+    registry.record_remaining_stats();
+    served?;
     Ok(())
 }
 
