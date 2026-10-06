@@ -119,6 +119,18 @@ This group is what has to be true before that step:
   - A per-session statistics record in the audit log.
 - **Config refusal and scope removals, if decided** (see Pending decisions).
 
+**Also in this group, though promoting does not wait for it: a band in Claude
+Code when an agent asks for a secret.** Today `request_secret_input` blocks the
+agent's turn for its timeout, two minutes by default, while the human may not
+know that a terminal is wanted, for which session, or what to run there. The
+plugin draws a band above Claude Code's prompt naming the session, by name and
+id. One key opens `holdfast attach` in a tmux split, and another copies the
+command. The secret is still typed only in `holdfast attach`: the band has no
+field for it, and it calls no Holdfast tool that writes. It needs Claude Code
+2.1.287 or later, which mods require in a terminal, and it draws nothing in
+the VS Code chat panel, under `claude -p` or in a cloud session. It is the
+first piece of the Session panel below.
+
 ## After that
 
 - **Nothing withheld indefinitely.**
@@ -195,8 +207,9 @@ rather than something the agent can arrange.
 **Nothing of it is built, and it is a candidate for cutting** (Pending
 decisions). The case against it is that Claude Code's own permission prompts
 and `PreToolUse` hooks already see every `start_session` and `send_input`
-call, and a strict mode an agent can satisfy from a second session is not the
-barrier it reads as.
+call the agent makes, and a strict mode an agent can satisfy from a second
+session is not the barrier it reads as. A call from a Claude Code mod skips
+the prompt, which SECURITY.md names.
 
 ## Web UI
 
@@ -231,9 +244,16 @@ agent-authored `command`/`args` and therefore can never receive a credential
 that follows from what holdfast already knows. Some of those rows depend on
 features in the scope decision above.
 
-Surface is undecided and deliberately so: the `attach`/`watch` TUI, the web UI,
-or one model rendered by both. The state is specified and shipped; only the view
-is missing, which is why this is a design question rather than a detection one.
+**The surface is decided: a Claude Code mod first.** A mod is code a Claude
+Code plugin runs inside Claude Code, and it can draw a pane, or a band above
+the prompt, in the terminal the agent is already in. The secret-request band
+in the group above comes first. The panel follows it only if the field week
+(Pending decisions) shows Holdfast in enough use to need one. A `holdfast tui`
+is built only if users outside Claude Code appear. A mod draws only in
+`claude` in a terminal and in the Desktop app's Code tab, so `attach` and
+`watch` stay the view everywhere else. Whatever draws it, the panel shows a
+session's screen masked as the agent reads it, and it never takes a secret:
+that is typed in `holdfast attach`.
 
 ## Windows
 
