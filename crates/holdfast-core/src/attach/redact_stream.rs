@@ -1160,6 +1160,20 @@ mod tests {
                 "{}: {out:?}",
                 key.name
             );
+            // Cut inside its first body line, sixteen characters or more
+            // into it, with nothing after: the walk is still reading that
+            // line as a possible armour-header name when the stream ends.
+            let first = key.material_lines()[0];
+            let start = pem.find(first).unwrap();
+            for n in crate::output::pem::PEM_MATERIAL_RUN as usize..=first.len() {
+                let cut = &pem[..start + n];
+                let mut r = redactor();
+                let mut out = r.feed(format!("$ head -c {} k\n{cut}", cut.len()).as_bytes());
+                out.extend(r.flush());
+                let out = String::from_utf8_lossy(&out).into_owned();
+                assert!(!out.contains(&first[..n]), "{} at {n}: {out:?}", key.name);
+                assert!(out.contains("[REDACTED:unresolved]"), "{} at {n}", key.name);
+            }
         }
         let mut r = redactor();
         assert!(r.feed(b"ghp_abc").is_empty());

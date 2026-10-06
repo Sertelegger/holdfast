@@ -93,21 +93,22 @@ use super::encoding::lossy_printable_keeps;
 ///
 /// **The residual, stated rather than elided.** A key cut *inside the
 /// first sixteen characters of its body* and followed on the same line by
-/// a byte that cannot be PEM text is released. For RSA, PKCS#8 and
-/// OpenSSH those characters are public structure — a DER `SEQUENCE`
-/// header, a version, an algorithm identifier, the `openssh-key-v1`
-/// magic. For a SEC1 EC key the private scalar starts at byte seven, so
-/// such a cut can release up to five bytes of it. It takes `head -c` or a
-/// program that prints a partial first line and then punctuation on the
-/// same line. A run of hex digits is not material (`Run`), and no
-/// unencrypted format's first body line opens with one: each has a
-/// character that is not a hex digit within its first four (`MII`, `MHc`,
-/// `b3Bl`), so the cut is at sixteen for all of them. A legacy encrypted
-/// key's first line is ciphertext, which opens with sixteen hex digits
-/// with probability (22/64)^16, about 4 × 10^-8. Its armour is public —
-/// `Proc-Type`, and a `DEK-Info` IV that is hex — so such a key cut before
-/// sixteen characters of ciphertext is released whole: the armour and less
-/// than one cipher block of ciphertext.
+/// a byte that cannot be PEM text, or by the end of the stream, is
+/// released. For RSA, PKCS#8 and OpenSSH those characters are public
+/// structure — a DER `SEQUENCE` header, a version, an algorithm
+/// identifier, the `openssh-key-v1` magic. For a SEC1 EC key the private
+/// scalar starts at byte seven, so such a cut can release up to five bytes
+/// of it. It takes `head -c`, or a program that prints a partial first
+/// line and then punctuation on the same line or nothing more. A run of
+/// hex digits is not material (`Run`), and no unencrypted format's first
+/// body line opens with one: each has a character that is not a hex digit
+/// within its first four (`MII`, `MHc`, `b3Bl`), so the cut is at sixteen
+/// for all of them. A legacy encrypted key's first line is ciphertext,
+/// which opens with sixteen hex digits with probability (22/64)^16, about
+/// 4 × 10^-8. Its armour is public — `Proc-Type`, and a `DEK-Info` IV that
+/// is hex — so such a key cut before sixteen characters of ciphertext is
+/// released whole: the armour and less than one cipher block of
+/// ciphertext.
 pub const PEM_MATERIAL_RUN: u32 = 16;
 
 /// A line carrying a base64 run this long is a key-body line, wherever on
@@ -259,7 +260,7 @@ pub struct PemExtent {
     pub alive: bool,
     /// Some stream carried a run of [`PEM_MATERIAL_RUN`] base64 characters
     /// that can be key body — not a digest or an integrity string (`Run`)
-    /// — before it died or closed.
+    /// — before it died or closed, or is inside one at the region's end.
     pub material: bool,
     /// Some stream got past the label's closing dashes: the anchor is a
     /// whole encapsulation boundary, not `-----BEGIN` and prose.
@@ -344,7 +345,7 @@ pub fn extent(region: &[u8], at: usize) -> PemExtent {
             return PemExtent {
                 end: region.len(),
                 alive: true,
-                material: lanes.iter().any(|l| l.material),
+                material: lanes.iter().any(Lane::material),
                 header: lanes.iter().any(|l| l.header),
                 closed: false,
             };
@@ -362,7 +363,7 @@ pub fn extent(region: &[u8], at: usize) -> PemExtent {
             lanes.iter().map(Lane::believed_end).max().unwrap_or(start)
         },
         alive,
-        material: lanes.iter().any(|l| l.material),
+        material: lanes.iter().any(Lane::material),
         header: lanes.iter().any(|l| l.header),
         closed: lanes.iter().any(|l| l.phase == Phase::Closed),
     }
@@ -464,6 +465,21 @@ impl Lane {
 
     fn live(&self) -> bool {
         !matches!(self.phase, Phase::Dead | Phase::Closed)
+    }
+
+    /// The body carried material, counting a run still being read as an
+    /// armour-header name. Such a run is credited when a byte that is not
+    /// a name character hands it back as base64, and at the region's end
+    /// none has: a key's first body line opens with a letter (`MII`,
+    /// `MHc`, `b3Bl`), so a key cut inside that line before any `+` or
+    /// `/` — `head -c`, or a session that ends mid-line — is in this phase
+    /// when the region ends, and a stream's end-of-stream flush asks this
+    /// of it. A real header name is shorter than [`PEM_MATERIAL_RUN`] and
+    /// one with a `-` in it is never base64, so neither is counted.
+    fn material(&self) -> bool {
+        self.material
+            || matches!(self.phase, Phase::HeaderName { dash: false, .. })
+                && self.run.key_len() >= PEM_MATERIAL_RUN
     }
 
     /// Where this lane stops believing the candidate. Only meaningful
@@ -1156,6 +1172,50 @@ mod tests {
                 closed: false,
             }
         );
+    }
+
+    /// **A key cut inside its first body line is material at the region's
+    /// end** — which is the end of a stream when `flush` asks, and `flush`
+    /// masks a candidate still believed there only if it carries
+    /// material. That line opens with a letter, so the walk reads it as an
+    /// armour-header name until a byte that is not a name character hands
+    /// it back as base64, and at the region's end nothing has.
+    #[test]
+    fn a_key_cut_inside_its_first_line_is_material_at_the_regions_end() {
+        let run = PEM_MATERIAL_RUN as usize;
+        for key in fixtures::KEYS {
+            let pem = key.pem();
+            let first = key.material_lines()[0];
+            let start = pem.find(first).unwrap();
+            for n in run..=first.len() {
+                let e = walk(&pem[..start + n]);
+                assert!(e.alive && e.material, "{} at {n}: {e:?}", key.name);
+            }
+            let e = walk(&pem[..start + run - 1]);
+            assert!(e.alive && !e.material, "{} at {}: {e:?}", key.name, run - 1);
+            // And where a C1 byte follows the cut, and the walk gives up
+            // and believes the rest.
+            let mut c1 = pem[..start + run].as_bytes().to_vec();
+            c1.push(0x9b);
+            let e = extent(&c1, 0);
+            assert!(
+                e.alive && e.material,
+                "{} before a C1 byte: {e:?}",
+                key.name
+            );
+        }
+        // A header name still arriving is not: a real one is short, and
+        // one with a `-` in it is never base64. Nor is a digest, which
+        // opens with a letter as often as not.
+        for name in [
+            "Proc-Type",
+            "Comment",
+            "DEK-Info-And-More-Than-Sixteen",
+            DIGEST,
+        ] {
+            let e = walk(&format!("{HEADER}\n{name}"));
+            assert!(e.alive && !e.material, "{name}: {e:?}");
+        }
     }
 
     #[test]
