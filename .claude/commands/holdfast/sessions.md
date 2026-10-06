@@ -12,15 +12,17 @@ whose name or id contains `$1` when it is given.
 `interaction_mode`, `detection_tier`, `command_capture`. Only the plain
 `holdfast list` table leaves that out. The CLI is also the read that cannot
 start a daemon: with none running it exits 2 and says why on stderr, which is
-a different fact from "no sessions" and has a different fix.
+a different fact from "no sessions" and has a different fix. When it exits 2,
+report that no daemon is running, with its stderr, and stop. Do not fall back
+to the MCP tool, which would start one.
 
 Find the binary first, because a plugin install puts none on `PATH`:
 - `command -v holdfast`;
 - else `printenv HOLDFAST_BOOTSTRAP_BIN`, and run the path it names;
 - else `./target/debug/holdfast`, a build in this checkout, if it exists.
 
-**Fall back to the MCP `list_sessions` tool only when none of those answers**,
-and say which source you used. Its name depends on how Holdfast was
+**Fall back to the MCP `list_sessions` tool only when none of those finds a
+binary**, and say which source you used. Its name depends on how Holdfast was
 installed, so use whichever this session has:
 - `mcp__plugin_holdfast_holdfast__list_sessions` under the plugin;
 - `mcp__holdfast__list_sessions` under `claude mcp add holdfast`.
