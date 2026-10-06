@@ -990,6 +990,76 @@ async fn without_keep_size_attach_sends_its_size_on_joining_and_on_a_resize() {
     assert_eq!(resizes(&sent), vec![(100, 30), (132, 43)], "{sent:?}");
 }
 
+/// The join notice of a `--keep-size` attach names the session's size,
+/// from the opening screen, and not this terminal's, which never becomes
+/// the session's; from a daemon that sends no opening screen it names no
+/// size at all. Without the flag it names this terminal's, which the
+/// startup `Resize` makes the session's: the controls, on the same frames.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn keep_size_names_the_sessions_size_and_not_this_terminals() {
+    let snapshot = enc(&ServerFrame::ScreenSnapshot {
+        session: "sess_keep02".into(),
+        cols: 120,
+        rows: 40,
+        cursor_row: 0,
+        cursor_col: 2,
+        cursor_visible: true,
+        alt_screen: false,
+        lines: vec!["$ ".into()],
+        held_back: false,
+    });
+    let output = enc(&ServerFrame::Output {
+        session: "sess_keep02".into(),
+        bytes: b"$ ".to_vec(),
+    });
+    for (tag, args, screen, named, not_named) in [
+        (
+            "keepsizenote",
+            &["attach", "--keep-size", "sess_keep02"][..],
+            &snapshot,
+            "sess_keep02 (120x40)",
+            "100x30",
+        ),
+        (
+            "keepsizenotectl",
+            &["attach", "sess_keep02"][..],
+            &snapshot,
+            "sess_keep02 (100x30)",
+            "120x40",
+        ),
+        (
+            "keepsizebar",
+            &["attach", "--keep-size", "sess_keep02"][..],
+            &output,
+            "sess_keep02 \u{2014} Ctrl-B d",
+            "100x30",
+        ),
+        (
+            "keepsizebarctl",
+            &["attach", "sess_keep02"][..],
+            &output,
+            "sess_keep02 (100x30)",
+            "120x40",
+        ),
+    ] {
+        let stub = StubDaemon::start(
+            tag,
+            vec![attached_stub("sess_keep02"), screen.clone()],
+            Duration::from_secs(20),
+        )
+        .await;
+        let mut term = Term::spawn(stub.paths.dir(), args, 100, 30);
+        let seen = term.wait_for(b"Ctrl-B d", 10);
+        assert!(
+            contains(&seen, named.as_bytes()) && !contains(&seen, not_named.as_bytes()),
+            "{tag}: the notice should name {named:?}:\n{}",
+            String::from_utf8_lossy(&seen)
+        );
+        term.type_keys(&[0x02, 0x64]);
+        assert_eq!(term.wait_exit(10), 0);
+    }
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn attach_does_not_redact() {
     // REQ-SEC-008's first half. `holdfast attach` is `role: interactive`

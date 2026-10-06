@@ -111,10 +111,17 @@ pub const EXIT_USAGE: u8 = 64;
 /// a pty nobody sized reports `0x0`, and a bar claiming the session is `0x0`
 /// reads as a defect in the thing added to reassure the reader. Without a
 /// width there is nothing to pad to, so the notice is printed as a sentence.
+///
+/// `names_size` is whether the notice may name `size` as the session's.
+/// It may after the startup `Resize`, which makes it so. Under
+/// `--keep-size` nothing does, and this path has no frame that says what
+/// the session's size is, so the notice names none rather than the wrong
+/// one.
 #[cfg(unix)]
 pub(crate) fn attach_banner(
     session: &str,
     size: Option<(u16, u16)>,
+    names_size: bool,
     stderr_is_terminal: bool,
 ) -> Option<String> {
     // **The policy lives here, not at the call site.** A guard written as a
@@ -129,7 +136,7 @@ pub(crate) fn attach_banner(
         Some((cols, rows)) if cols > 0 && rows > 0 => Some(cols as usize),
         _ => None,
     };
-    let text = attach_notice(session, size);
+    let text = attach_notice(session, size.filter(|_| names_size));
     let body = match cols {
         Some(cols) => fit_to_width(&text, cols),
         None => text,
@@ -2845,6 +2852,7 @@ async fn attach_connected(
     let mut banner = attach_banner(
         session,
         crate::attach_tty::window_size(tty).ok(),
+        !keep_size,
         std::io::IsTerminal::is_terminal(&std::io::stderr()),
     );
     let banner_fallback = tokio::time::sleep(BANNER_AFTER_REPAINT);
@@ -2950,6 +2958,8 @@ async fn attach_connected(
                     // bottom — see `paint_snapshot`. Taken, so the older
                     // path below never prints a second one.
                     ServerFrame::ScreenSnapshot {
+                        cols,
+                        rows,
                         lines,
                         cursor_row,
                         cursor_col,
@@ -2957,7 +2967,12 @@ async fn attach_connected(
                         ..
                     } => {
                         let size = crate::attach_tty::window_size(tty).ok();
-                        let notice = banner.take().map(|_| attach_notice(session, size));
+                        // The size the notice names is the session's. This
+                        // terminal's is about to be, through the startup
+                        // `Resize`; under `--keep-size` it never is, and the
+                        // session's own is the one in this frame.
+                        let shown = if keep_size { Some((cols, rows)) } else { size };
+                        let notice = banner.take().map(|_| attach_notice(session, shown));
                         render(&paint_snapshot(
                             &lines,
                             (cursor_row, cursor_col),
@@ -4022,7 +4037,7 @@ mod tests {
         let (before_row, before_col) = p.screen().cursor_position();
 
         p.process(
-            attach_banner("sess", Some((80, 24)), true)
+            attach_banner("sess", Some((80, 24)), true, true)
                 .unwrap()
                 .as_bytes(),
         );
@@ -4054,11 +4069,24 @@ mod tests {
     /// from a pipe.
     #[test]
     fn a_redirected_stderr_gets_no_escape_sequences() {
-        assert_eq!(attach_banner("sess", Some((80, 24)), false), None);
-        assert_eq!(attach_banner("sess", None, false), None);
+        assert_eq!(attach_banner("sess", Some((80, 24)), true, false), None);
+        assert_eq!(attach_banner("sess", None, true, false), None);
         // And the terminal case still produces one, so the assertion above
         // is not passing because the builder returns `None` for everything.
-        assert!(attach_banner("sess", Some((80, 24)), true).is_some());
+        assert!(attach_banner("sess", Some((80, 24)), true, true).is_some());
+    }
+
+    /// Under `--keep-size` the bar names no size: this terminal's is not
+    /// the session's, and nothing on this path says what the session's
+    /// is. It is still a bar, padded to this terminal's width.
+    #[test]
+    fn a_bar_that_may_not_name_this_terminals_size_names_none() {
+        let named = attach_banner("sess", Some((50, 45)), true, true).unwrap();
+        assert!(named.contains("attached to sess (50x45)"), "{named:?}");
+        let kept = attach_banner("sess", Some((50, 45)), false, true).unwrap();
+        assert!(!kept.contains("50x45"), "{kept:?}");
+        let bar = fit_to_width(" holdfast: attached to sess — Ctrl-B d to detach ", 50);
+        assert!(kept.contains(&bar), "{kept:?}");
     }
 
     /// A name wider than the terminal is truncated, not wrapped.
@@ -4075,7 +4103,7 @@ mod tests {
             let (before_row, _) = p.screen().cursor_position();
 
             p.process(
-                attach_banner(&name, Some((80, 24)), true)
+                attach_banner(&name, Some((80, 24)), true, true)
                     .unwrap()
                     .as_bytes(),
             );
