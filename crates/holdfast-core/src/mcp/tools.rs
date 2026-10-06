@@ -3,6 +3,7 @@
 
 use super::envelope::{self, Status};
 use super::{caller, detection, offload, schema, HoldfastServer};
+use crate::audit::RedactionMode;
 use crate::detect::{
     detect_shell, DetectionConfig, InteractionMode, PatternSet, PromptPattern, Shell,
     DEFAULT_SETTLE_THRESHOLD_MS,
@@ -560,7 +561,11 @@ impl HoldfastServer {
             // Plan §4.9: where this session's one `session_stats` line
             // goes, and the history policy it reports.
             audit: Some(Arc::clone(&self.processor.audit)),
-            history_policy: crate::session::stats::history_policy(history, &launch.env),
+            history_policy: crate::session::stats::history_policy(
+                history,
+                detect_shell(&launch.command, &launch.args),
+                &launch.env,
+            ),
             ..SessionConfig::default()
         };
         // What the typed line needs (`Shell::injection_env`): bash's and
@@ -1288,6 +1293,7 @@ impl HoldfastServer {
         // task-local the blocking pool does not inherit, so it is read on
         // this task; the line waits for the capture because it records
         // how much the grid handed over (`Session::account_screen_read`).
+        // A capture that fails returns nothing, and writes no line.
         let surface = caller::audit_surface("get_screen_state");
 
         // Enabling Tier B costs one buffer re-seed (§4.5); the call
@@ -1303,8 +1309,8 @@ impl HoldfastServer {
         // rendered grid. At `pty::MAX_COLS` by `pty::MAX_ROWS` — 1000 by
         // 1000, which `clamp_geometry` admits — that seed is 4 MiB, and
         // the capture parses it twice. Nothing inside reads a task-local:
-        // the §9.4 obligation for `redact: false` is discharged above,
-        // where the caller is still in scope.
+        // the caller for the §9.4 line is sampled above, while it is
+        // still in scope, and the line is written below.
         //
         // **This one holds `Session::screen`'s lock for the whole
         // capture**, unlike `read_output`, which is outside every lock by
@@ -1320,10 +1326,9 @@ impl HoldfastServer {
         })
         .await?;
         session.account_screen_read(
-            redact,
+            (!redact).then_some(RedactionMode::False),
             &capture,
-            surface.tool,
-            surface.client_kind,
+            surface,
             &self.processor.audit,
         );
         let tracking = session.screen_tracking();
@@ -4284,6 +4289,7 @@ impl HoldfastServer {
             None => Status::Timeout,
         };
         session.account_wait(
+            caller::current().as_str(),
             match status {
                 Status::Ok => WaitResult::Idle,
                 Status::SessionDied => WaitResult::SessionDied,
@@ -4504,6 +4510,7 @@ impl HoldfastServer {
         // and `match.text` are one response, so a marker in either is what
         // the caller saw.
         session.account_wait(
+            context_surface.client_kind,
             match status {
                 Status::Ok => WaitResult::Matched,
                 Status::SessionDied => WaitResult::SessionDied,

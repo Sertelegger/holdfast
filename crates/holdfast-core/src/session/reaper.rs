@@ -539,13 +539,14 @@ mod tests {
 
     /// **Plan §4.9's retire path for a reaped session.** The reaper
     /// signals; the daemon's tick sweeps right after it
-    /// (`daemon::server::reaper_loop`), and the sweep writes the session's
-    /// one `session_stats` line.
+    /// (`daemon::server::reaper_loop`), and the sweep retires the session
+    /// and latches its end. The line is written when the record leaves
+    /// the registry, here at the stop that writes every remaining one.
     ///
     /// On a manual clock, so `duration_ms` is exact: the session lived
     /// from construction to the sweep that first saw it gone, which is the
     /// idle timeout plus the second past it. A clock advanced after that
-    /// moves nothing, because the end was latched and the line is written.
+    /// moves nothing, because the end was latched.
     #[test]
     fn a_reaped_session_gets_one_session_stats_line_timed_on_its_own_clock() {
         let dir = tempfile::tempdir().unwrap();
@@ -585,20 +586,18 @@ mod tests {
             "the reaper signals; it does not retire"
         );
         assert_eq!(reg.retire_exited(), 1);
-        let lines = stats_lines();
-        assert_eq!(lines.len(), 1, "{lines:?}");
-        assert_eq!(lines[0]["session_id"], "sess_reaped");
-        assert_eq!(lines[0]["duration_ms"], 1_801_000);
+        assert!(stats_lines().is_empty(), "a retired record is still read");
 
         clock.advance(Duration::from_secs(60));
         reaper.scan_once();
         assert_eq!(reg.retire_exited(), 0);
-        assert_eq!(
-            s.stats_record().duration_ms,
-            1_801_000,
-            "the end was latched"
-        );
-        assert_eq!(stats_lines().len(), 1, "a later tick wrote a second line");
+        assert_eq!(reg.record_remaining_stats(), 1);
+        let lines = stats_lines();
+        assert_eq!(lines.len(), 1, "{lines:?}");
+        assert_eq!(lines[0]["session_id"], "sess_reaped");
+        assert_eq!(lines[0]["duration_ms"], 1_801_000, "the end was latched");
+        assert_eq!(reg.record_remaining_stats(), 0);
+        assert_eq!(stats_lines().len(), 1, "a second stop wrote a second line");
     }
 
     #[test]

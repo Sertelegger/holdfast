@@ -1213,6 +1213,7 @@ impl Session {
         let reader_clock = clock.clone();
         let reader_backend = Arc::clone(&backend);
         let reader_finished_flag = Arc::clone(&reader_finished);
+        let reader_end = session.stats.end_latch();
         let reader_rules = Arc::clone(&session.rules);
         // §4.5.1's responder is used from the reader thread alone, so it
         // needs no `Mutex` and no `Weak` — it is moved into the closure
@@ -1626,6 +1627,10 @@ impl Session {
                     std::thread::sleep(READER_IDLE_POLL);
                 }
                 if !reader_backend.is_alive() {
+                    // `session_stats.duration_ms` ends at the exit this
+                    // thread saw, rather than at whichever call asks next,
+                    // which under `--no-daemon` may be hours later.
+                    reader_end.latch(reader_clock.now_ms());
                     // **The same derivation `Session::state()` uses**, in
                     // the same order: `backend.exit_code()`, else `-1`.
                     // Two surfaces report this child's end — this frame
@@ -2373,7 +2378,14 @@ impl Session {
     /// thing this must not do.
     ///
     /// Idempotent: a second call swaps one closed sender for another.
+    ///
+    /// **The sweep that calls this has seen the child gone**, so this is
+    /// an observation of the exit and latches its time, which a sweep's
+    /// sort does not reliably do (a sort of one asks for no key).
+    /// `session_stats.duration_ms` ends here at the latest, however long
+    /// the record then stays readable.
     pub fn retire(&self) {
+        self.latch_exit_time();
         // Built here rather than kept as a lazy static: a session is
         // retired once, and a shared closed channel would be a
         // process-wide allocation held for the life of the binary to

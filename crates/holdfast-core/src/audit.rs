@@ -285,9 +285,8 @@ impl AuditLog {
     /// count cannot be told from one a writer forgot.
     pub fn record_session_stats(&self, session_id: &str, stats: &SessionStatsRecord) {
         // `unresolved` is the one kind every line carries, at zero when
-        // no read showed one: it is the numerator the field week divides
-        // by `reads`, and a key that comes and goes is one every reader
-        // has to default by hand.
+        // no read showed one: a key that comes and goes is one every
+        // reader has to default by hand.
         let mut redactions = stats.redactions.clone();
         redactions
             .entry(crate::output::redact::UNRESOLVED_KIND.to_string())
@@ -310,6 +309,8 @@ impl AuditLog {
                 },
                 "reads_held_back": stats.reads_held_back,
                 "max_bytes_withheld": stats.max_bytes_withheld,
+                "reads_unresolved": stats.reads_unresolved,
+                "operator_reads": stats.operator_reads,
                 "redactions": redactions,
                 "raw_reads": {
                     "false": stats.raw_reads.redact_false,
@@ -548,9 +549,12 @@ pub struct RawRead {
     /// `get_screen_state`, the UTF-8 length of the rows and title it
     /// returned, or of the diff, because a grid is not a byte range.
     pub bytes_returned: u64,
-    /// Whether this session's most recent **masked** read — any read,
-    /// screen or wait whose text went through the redactor — returned an
-    /// `[REDACTED:unresolved]` marker. `false` when there was none.
+    /// Whether this session's most recent **masked** read by the same
+    /// party — any read, screen or wait whose text went through the
+    /// redactor — returned an `[REDACTED:unresolved]` marker. `false` when
+    /// there was none. The party is the agent (`shim`, `in_process`) or a
+    /// human (`cli`, `ui-bridge`), so an operator's `holdfast logs` does
+    /// not answer for what the agent saw.
     pub prior_unresolved: bool,
 }
 
@@ -600,9 +604,11 @@ pub enum HistoryPolicy {
     /// the state directory.
     PerSession,
     /// `"caller"`: the call's own `env`, or the profile's, set a variable
-    /// the policy yields to (`HISTFILE`, `HOLDFAST_HISTFILE` or
-    /// `fish_history`), so the shell keeps its history where that said,
-    /// whichever mode is configured.
+    /// the policy yields to and the session's shell reads — `HISTFILE` or
+    /// `HOLDFAST_HISTFILE` for bash and zsh, a non-empty `fish_history`
+    /// for fish, any of those for a command that is not a shell — so the
+    /// shell keeps its history where that said, whichever mode is
+    /// configured (`session::stats::history_policy`).
     Caller,
 }
 
@@ -640,9 +646,9 @@ pub struct RawReadCounts {
     /// `"false"`.
     pub redact_false: u64,
     /// `"complete_only"`. **Zero until the `complete_only` PR (C)**, which
-    /// adds [`RedactionMode`]'s second variant and counts it here; the
-    /// key is on the line now so the field week's reader does not change
-    /// shape when it does.
+    /// adds [`RedactionMode`]'s second variant and counts it here. The
+    /// key is on every line before then, so the field week's reader does
+    /// not change shape when C lands.
     pub complete_only: u64,
 }
 
@@ -664,6 +670,11 @@ pub struct WaitCounts {
 
 /// One `session_stats` line, as plain data. Built by
 /// `Session::stats_record` from the session's counters.
+///
+/// **`reads`, `raw_reads`, `waits`, the held-back figures,
+/// `bytes_returned` and `reads_unresolved` are the agent's**: calls whose
+/// `client_kind` is `shim` or `in_process`. A human's reads (`cli`,
+/// `ui-bridge`) are counted once, in `operator_reads`.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct SessionStatsRecord {
     /// The interactive shell the session runs, when Holdfast recognises
@@ -672,7 +683,9 @@ pub struct SessionStatsRecord {
     pub shell: Option<&'static str>,
     /// From the spawn to the first observation of the child's exit, on
     /// the session's clock; to the record itself for a session still
-    /// running when it was written (daemon shutdown).
+    /// running when it was written (daemon shutdown). The session's
+    /// reader thread observes the exit when the pty closes, so the end
+    /// does not wait for a call to ask.
     pub duration_ms: u64,
     pub history_policy: HistoryPolicy,
     /// How many values the session's known-value matcher holds. **Zero
@@ -682,8 +695,8 @@ pub struct SessionStatsRecord {
     /// Every byte the child wrote: the ring buffer's head.
     pub bytes_produced: u64,
     /// The raw bytes the byte-stream reads (`reads.cursor`, `.tail` and
-    /// `.resource`) handed over, so it divides `bytes_produced`. The grid
-    /// and wait text are not in it.
+    /// `.resource`) handed over. Overlapping reads count each time, so it
+    /// can exceed `bytes_produced`; the grid and wait text are not in it.
     pub bytes_returned: u64,
     pub reads: ReadCounts,
     /// Reads whose response said `held_back: true`, the grid's included.
@@ -691,8 +704,18 @@ pub struct SessionStatsRecord {
     /// The most a held-back byte-stream read left between where it
     /// stopped and the buffer's head at that read.
     pub max_bytes_withheld: u64,
-    /// The session's `status.redaction_stats` tally, by kind. The line
-    /// always carries `unresolved`, at zero if no read showed one.
+    /// Reads in `reads`, every surface, whose response showed at least
+    /// one `[REDACTED:unresolved]`. **The numerator for "how often does
+    /// the agent meet a marker"**, over the same reads as its
+    /// denominator, which `redactions.unresolved` is not.
+    pub reads_unresolved: u64,
+    /// Reads by a human (`holdfast logs`, the web UI), every surface.
+    pub operator_reads: u64,
+    /// The session's `status.redaction_stats` tally, by kind: every
+    /// region masked by every pass through the read pipeline, which
+    /// includes each wait's text (twice for a matched pattern wait) and
+    /// the operator's reads, and excludes the grid. The line always
+    /// carries `unresolved`, at zero if no read showed one.
     pub redactions: std::collections::BTreeMap<String, u64>,
     pub raw_reads: RawReadCounts,
     pub waits: WaitCounts,
@@ -710,8 +733,8 @@ mod tests {
         AuditLog::to_path(dir.join("audit.log"), rules).unwrap()
     }
 
-    /// A `redact: false` cursor read by `tool` for `client_kind`, the
-    /// shape every `redaction_disabled` row before plan §3.4 described.
+    /// A `redact: false` cursor read by `tool` for `client_kind`, with no
+    /// size and no marker before it.
     fn raw_read(tool: &'static str, client_kind: &'static str) -> RawRead {
         RawRead {
             tool,
@@ -1051,6 +1074,8 @@ mod tests {
             },
             reads_held_back: 9,
             max_bytes_withheld: 10,
+            reads_unresolved: 18,
+            operator_reads: 19,
             redactions: [("github".to_string(), 11)].into_iter().collect(),
             raw_reads: RawReadCounts {
                 redact_false: 12,
@@ -1065,7 +1090,9 @@ mod tests {
         }
     }
 
-    /// Plan §4.9's table, field by field, and nothing beyond it.
+    /// Plan §4.9's table, field by field, with the three counts beside
+    /// it (`waits.session_died`, `reads_unresolved`, `operator_reads`),
+    /// and nothing else.
     #[test]
     fn session_stats_lays_out_every_field_of_the_table() {
         let dir = tempfile::tempdir().unwrap();
@@ -1088,6 +1115,8 @@ mod tests {
         );
         assert_eq!(e["reads_held_back"], 9);
         assert_eq!(e["max_bytes_withheld"], 10);
+        assert_eq!(e["reads_unresolved"], 18);
+        assert_eq!(e["operator_reads"], 19);
         assert_eq!(e["raw_reads"], json!({"false": 12, "complete_only": 13}));
         assert_eq!(
             e["waits"],
@@ -1108,9 +1137,11 @@ mod tests {
                 "kind",
                 "known_values_registered",
                 "max_bytes_withheld",
+                "operator_reads",
                 "raw_reads",
                 "reads",
                 "reads_held_back",
+                "reads_unresolved",
                 "redactions",
                 "session_id",
                 "shell",
@@ -1133,6 +1164,8 @@ mod tests {
         assert_eq!(e["history_policy"], "none");
         assert_eq!(e["known_values_registered"], 0);
         assert_eq!(e["raw_reads"]["complete_only"], 0);
+        assert_eq!(e["reads_unresolved"], 0);
+        assert_eq!(e["operator_reads"], 0);
         assert_eq!(e["redactions"], json!({"unresolved": 0}));
     }
 

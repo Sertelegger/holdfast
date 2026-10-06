@@ -645,6 +645,18 @@ impl Shim {
     /// if it had to be killed.
     fn close_and_wait(mut self) -> Option<std::process::ExitStatus> {
         drop(self.child.stdin.take());
+        self.wait_bounded()
+    }
+
+    /// Send `sig`, the other way a client or a terminal ends an MCP
+    /// server, and wait, bounded, for the process to leave. `None` if it
+    /// had to be killed.
+    fn signal_and_wait(mut self, sig: i32) -> Option<std::process::ExitStatus> {
+        assert!(signal(self.child.id(), sig), "could not signal holdfast");
+        self.wait_bounded()
+    }
+
+    fn wait_bounded(&mut self) -> Option<std::process::ExitStatus> {
         let deadline = Instant::now() + CLI_TIMEOUT;
         loop {
             if let Some(status) = self.child.try_wait().expect("wait for holdfast") {
@@ -2194,13 +2206,39 @@ fn the_no_daemon_server_honours_a_configured_session_cap() {
     shim.kill();
 }
 
-/// **Plan §4.9's retire path for `holdfast mcp --no-daemon`.** Its
-/// sessions die with the process, and no sweep comes after the client
-/// leaves, so the exit itself writes each session's one `session_stats`
-/// line — counts only, with the read this test made counted on it.
+/// How [`no_daemon_session_ended_by`]'s server is made to leave.
+#[derive(Debug, Clone, Copy)]
+enum NoDaemonEnd {
+    /// The client closes stdin: MCP's stdio shutdown.
+    Close,
+    /// A signal, as a client that stops its server or a closing terminal
+    /// sends one.
+    Signal(i32),
+}
+
+/// **Plan §4.9's retire path for `holdfast mcp --no-daemon`, by `close`,
+/// `SIGTERM` and `SIGHUP`.** Its sessions die with the process, and no
+/// eviction comes after it, so the way out writes each session's one
+/// `session_stats` line — counts only, with the read this test made
+/// counted on it. A signal ends it with the status a shell reports for a
+/// process the signal killed, `128 +` the signal's number.
 #[test]
 fn a_no_daemon_exit_writes_each_sessions_session_stats_line() {
-    let env = TestEnv::new("nodaemonstats");
+    no_daemon_session_ended_by("nodaemonstats", NoDaemonEnd::Close);
+}
+
+#[test]
+fn a_no_daemon_server_stopped_by_sigterm_writes_each_sessions_line() {
+    no_daemon_session_ended_by("nodaemonterm", NoDaemonEnd::Signal(libc::SIGTERM));
+}
+
+#[test]
+fn a_no_daemon_server_hung_up_on_writes_each_sessions_line() {
+    no_daemon_session_ended_by("nodaemonhup", NoDaemonEnd::Signal(libc::SIGHUP));
+}
+
+fn no_daemon_session_ended_by(label: &str, end: NoDaemonEnd) {
+    let env = TestEnv::new(label);
     // `$HOME` inside the test directory, for the reason the session-cap
     // row above gives: this transport's trail must not be the developer's.
     let mut cmd = env.cmd();
@@ -2226,11 +2264,16 @@ fn a_no_daemon_exit_writes_each_sessions_session_stats_line() {
     let out = shim.read_until(&id, "STATS_42");
     assert!(out.contains("STATS_42"), "the session never ran: {out:?}");
 
-    let status = shim.close_and_wait();
-    assert!(
-        status.is_some(),
-        "`holdfast mcp --no-daemon` outlived its client's stdin and was killed"
-    );
+    let status = match end {
+        NoDaemonEnd::Close => shim.close_and_wait(),
+        NoDaemonEnd::Signal(sig) => shim.signal_and_wait(sig),
+    };
+    let status = status
+        .unwrap_or_else(|| panic!("`holdfast mcp --no-daemon` outlived {end:?} and was killed"));
+    match end {
+        NoDaemonEnd::Close => assert!(status.success(), "{status:?}"),
+        NoDaemonEnd::Signal(sig) => assert_eq!(status.code(), Some(128 + sig), "{status:?}"),
+    }
 
     let path = env.dir.join("logs").join("audit.log");
     let text = std::fs::read_to_string(&path)

@@ -3621,11 +3621,12 @@ mod tests {
 
     /// **Plan §4.9's retire path for a stopping daemon**, both forms.
     ///
-    /// A daemon that stops leaves no sweep behind it, so the stop writes
-    /// the `session_stats` line of every session that has none: the live
-    /// one it is killing, and not the one an earlier tick already retired
-    /// and wrote. `shutdown` runs twice on the real path — the SIGTERM
-    /// handler, then the end of `run` — and the second writes nothing.
+    /// A daemon that stops leaves no eviction behind it, so the stop
+    /// writes the `session_stats` line of every session that has none:
+    /// the live one it is killing, and the one an earlier tick retired,
+    /// whose record was still readable and so had no line. `shutdown`
+    /// runs twice on the real path — the SIGTERM handler, then the end of
+    /// `run` — and the second writes nothing.
     #[tokio::test]
     async fn a_daemon_stop_writes_each_sessions_line_once_whichever_way_it_ended() {
         for graceful in [false, true] {
@@ -3656,7 +3657,7 @@ mod tests {
             assert_eq!(daemon.server.registry.retire_exited(), 1);
 
             let stats_ids = || {
-                let text = std::fs::read_to_string(paths.audit_log()).unwrap();
+                let text = std::fs::read_to_string(paths.audit_log()).unwrap_or_default();
                 let mut ids: Vec<String> = text
                     .lines()
                     .map(|l| serde_json::from_str::<serde_json::Value>(l).unwrap())
@@ -3666,6 +3667,7 @@ mod tests {
                 ids.sort();
                 ids
             };
+            assert!(stats_ids().is_empty(), "graceful={graceful}");
             if graceful {
                 daemon.shutdown_graceful(Duration::from_secs(10)).await;
             } else {
