@@ -105,13 +105,7 @@ impl TestEnv {
     }
 
     fn cmd(&self) -> Command {
-        self.cmd_of(Path::new(BIN))
-    }
-
-    /// [`cmd`](Self::cmd), running the executable at `bin` instead of the
-    /// one Cargo built.
-    fn cmd_of(&self, bin: &Path) -> Command {
-        let mut c = Command::new(bin);
+        let mut c = Command::new(BIN);
         c.env("HOLDFAST_RUNTIME_DIR", &self.dir);
         // §10.1's discovery is `$XDG_CONFIG_HOME/holdfast/config.toml`, and
         // `HOLDFAST_RUNTIME_DIR` deliberately does **not** move it
@@ -1243,110 +1237,6 @@ fn holdfast_list_and_logs_see_sessions_created_through_the_shim() {
 
     shim.call_tool("terminate", json!({ "session": session_id, "force": true }));
     shim.kill();
-}
-
-/// `status.holdfast_binary` names the **daemon's** executable, which is
-/// the one a human's `holdfast attach` has to match, and not the shim's.
-///
-/// The two are the same file in every other test here, so this one starts
-/// the daemon from a hard link with a different path. Then it removes the
-/// link while the daemon runs, which is what an upgrade does to a running
-/// binary, and the field turns `null` rather than naming a path that no
-/// longer runs. `--no-daemon` serves in-process, so there it names the
-/// shim's own executable.
-#[test]
-fn status_names_the_daemons_own_executable_and_null_once_it_is_gone() {
-    use std::os::unix::fs::DirBuilderExt;
-
-    let env = TestEnv::new("hfbin");
-    // `0700`, as `write_config` makes it: the daemon refuses a runtime
-    // directory anyone else can write.
-    std::fs::DirBuilder::new()
-        .recursive(true)
-        .mode(0o700)
-        .create(env.dir.join("bin"))
-        .expect("create the runtime dir and bin/");
-    let link = env.dir.join("bin").join("holdfast-daemon");
-    // A hard link where the filesystem allows one, because a copy of a
-    // debug build is a hundred and more megabytes.
-    if std::fs::hard_link(BIN, &link).is_err() {
-        std::fs::copy(BIN, &link).expect("copy the binary");
-    }
-    let canonical = |p: &Path| p.canonicalize().expect("canonicalize");
-    let daemon_bin = canonical(&link);
-    let shim_bin = canonical(Path::new(BIN));
-    assert_ne!(daemon_bin, shim_bin, "the test needs two distinct paths");
-
-    let started = wait_bounded(
-        env.cmd_of(&link)
-            .args(["daemon", "start"])
-            .stdin(Stdio::null())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .spawn()
-            .expect("run `daemon start` from the link"),
-        CLI_TIMEOUT,
-    )
-    .expect("`daemon start` exited");
-    assert_eq!(started.0, 0, "daemon start: {started:?}");
-
-    // The shim is Cargo's binary; the daemon it reaches is the link's.
-    let mut shim = Shim::start(&env);
-    let session = shim.call_tool(
-        "start_session",
-        json!({ "command": "sleep", "args": ["30"], "name": "hfbin" }),
-    );
-    let id = session["result"]["structuredContent"]["data"]["session_id"]
-        .as_str()
-        .unwrap_or_else(|| panic!("start_session: {session}"))
-        .to_string();
-    let binary_of = |shim: &mut Shim, id: &str| -> (Value, Value) {
-        let status = shim.call_tool("status", json!({ "session": id }));
-        let listed = shim.call_tool("list_sessions", json!({}));
-        (
-            status["result"]["structuredContent"]["data"]["holdfast_binary"].clone(),
-            listed["result"]["structuredContent"]["data"]["sessions"][0]["holdfast_binary"].clone(),
-        )
-    };
-
-    let (status, listed) = binary_of(&mut shim, &id);
-    assert_eq!(
-        status,
-        json!(daemon_bin.to_str().expect("utf-8 path")),
-        "status names the daemon's executable, not the shim's ({})",
-        shim_bin.display()
-    );
-    assert_eq!(listed, status, "list_sessions carries the same value");
-
-    std::fs::remove_file(&link).expect("remove the link");
-    let (status, listed) = binary_of(&mut shim, &id);
-    assert_eq!(
-        status,
-        Value::Null,
-        "a removed executable has no path to attach with"
-    );
-    assert_eq!(listed, Value::Null);
-
-    shim.call_tool("terminate", json!({ "session": id, "force": true }));
-    shim.kill();
-
-    let mut local = Shim::spawn(&env, &["mcp", "--no-daemon"]);
-    let session = local.call_tool(
-        "start_session",
-        json!({ "command": "sleep", "args": ["30"], "name": "hfbin-local" }),
-    );
-    let id = session["result"]["structuredContent"]["data"]["session_id"]
-        .as_str()
-        .unwrap_or_else(|| panic!("start_session: {session}"))
-        .to_string();
-    let (status, _) = binary_of(&mut local, &id);
-    assert_eq!(
-        status,
-        json!(shim_bin.to_str().expect("utf-8 path")),
-        "under --no-daemon the server is the shim itself"
-    );
-    local.call_tool("terminate", json!({ "session": id, "force": true }));
-    local.kill();
 }
 
 #[test]

@@ -409,10 +409,6 @@ fn session_record_keys() -> BTreeSet<String> {
     let mut all = set(&[
         "id",
         "name",
-        // The executable serving the record, for a human's `holdfast
-        // attach`. On the shared record, so `list_sessions` carries it
-        // too: REQ-T-016 makes the two key sets one.
-        "holdfast_binary",
         "command",
         "args",
         // §9.6's session profile, or `null` (GH #46). On the *shared*
@@ -1919,55 +1915,6 @@ async fn status_reports_each_field_from_the_session_it_names() {
     );
     assert_eq!(others["data"]["command"], "mock");
     assert_ne!(others["data"]["id"], id.as_str());
-}
-
-/// `holdfast_binary` names the executable of the process serving the
-/// record. In-process is `holdfast mcp --no-daemon`'s arrangement, so that
-/// is this test binary. The daemon's half, where the shim and the server
-/// are different executables, is `crates/holdfast/tests/daemon_cli.rs`.
-#[tokio::test]
-async fn status_and_list_sessions_name_the_serving_processs_own_executable() {
-    let server = HoldfastServer::new();
-    let pty = Arc::new(MockPty::new());
-    let id = register(
-        &server,
-        Some("bin"),
-        "mycmd",
-        &[],
-        SessionConfig::with_buffer_capacity(4096),
-        &pty,
-    );
-
-    let status = assert_matches_schema(
-        "status",
-        &server
-            .status(Parameters(StatusArgs {
-                session: id.clone(),
-            }))
-            .await
-            .expect("status"),
-    );
-    let listed = assert_matches_schema(
-        "list_sessions",
-        &server.list_sessions().await.expect("list_sessions"),
-    );
-
-    let exe = std::env::current_exe().expect("this test's own path");
-    // Windows reports `current_exe` as it is; elsewhere it is canonical.
-    #[cfg(not(windows))]
-    let exe = exe.canonicalize().expect("canonical");
-    let got = status["data"]["holdfast_binary"]
-        .as_str()
-        .unwrap_or_else(|| panic!("a running binary has a path: {status}"));
-    assert!(
-        std::path::Path::new(got).is_absolute(),
-        "a relative path depends on a working directory the reader does not share: {got}"
-    );
-    assert_eq!(std::path::Path::new(got), exe);
-    assert_eq!(
-        listed["data"]["sessions"][0]["holdfast_binary"], got,
-        "list_sessions carries the same value on the shared record"
-    );
 }
 
 #[tokio::test]

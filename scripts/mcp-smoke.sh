@@ -955,16 +955,6 @@ jcheck "status answers about the named session" \
                 .osc133_source, .command_capture, .command_count]' \
   '[true,"smoke","bash","Running","bash","holdfast","captured",4]'
 
-# The executable serving the session, which a client puts in front of
-# `attach` for a human. This transcript is hybrid mode, so the server is
-# the daemon `$BIN mcp` spawned from its own path: the expected value is
-# `$BIN` canonicalised, as `realpath` and the daemon both do it.
-# `list_sessions` rides the same record (REQ-T-016), so it must agree.
-# `jq -R` makes the path a JSON string, quoting and all.
-jcheck "status and list_sessions name the daemon's own executable" \
-  '[data(8).holdfast_binary, data(13).sessions[0].holdfast_binary]' \
-  "[$(realpath "$BIN" | jq -R -c .),$(realpath "$BIN" | jq -R -c .)]"
-
 check "terminate reports ok" '"already_exited":false'
 
 # --------------------------------------------------- 0.0.6: the attach socket

@@ -601,15 +601,6 @@ pub struct Buffer {
 pub struct SessionRecord {
     pub id: Option<String>,
     pub name: Option<String>,
-    /// Absolute path of the Holdfast executable serving this session, for
-    /// building a human's `holdfast attach` command. **`null` when there
-    /// is no usable path**, such as a binary removed by an upgrade while
-    /// it runs.
-    //
-    // The daemon's own executable in hybrid mode and this process's under
-    // `--no-daemon`, canonicalised. The same value on every record of a
-    // response; it rides the shared record under REQ-T-016.
-    pub holdfast_binary: Option<String>,
     pub command: Option<String>,
     pub args: Option<Vec<String>>,
     /// The `[[security.profiles]]` entry this session was started from,
