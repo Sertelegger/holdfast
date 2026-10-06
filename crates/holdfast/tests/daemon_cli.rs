@@ -639,6 +639,37 @@ impl Shim {
         let _ = self.child.kill();
         let _ = self.child.wait();
     }
+
+    /// End the transport the way an MCP client does when it goes away —
+    /// close stdin — and wait, bounded, for the process to leave. `None`
+    /// if it had to be killed.
+    fn close_and_wait(mut self) -> Option<std::process::ExitStatus> {
+        drop(self.child.stdin.take());
+        self.wait_bounded()
+    }
+
+    /// Send `sig`, the other way a client or a terminal ends an MCP
+    /// server, and wait, bounded, for the process to leave. `None` if it
+    /// had to be killed.
+    fn signal_and_wait(mut self, sig: i32) -> Option<std::process::ExitStatus> {
+        assert!(signal(self.child.id(), sig), "could not signal holdfast");
+        self.wait_bounded()
+    }
+
+    fn wait_bounded(&mut self) -> Option<std::process::ExitStatus> {
+        let deadline = Instant::now() + CLI_TIMEOUT;
+        loop {
+            if let Some(status) = self.child.try_wait().expect("wait for holdfast") {
+                return Some(status);
+            }
+            if Instant::now() >= deadline {
+                let _ = self.child.kill();
+                let _ = self.child.wait();
+                return None;
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        }
+    }
 }
 
 /// A live session whose buffer holds a secret-shaped value, under the
@@ -2173,6 +2204,99 @@ fn the_no_daemon_server_honours_a_configured_session_cap() {
     );
 
     shim.kill();
+}
+
+/// How [`no_daemon_session_ended_by`]'s server is made to leave.
+#[derive(Debug, Clone, Copy)]
+enum NoDaemonEnd {
+    /// The client closes stdin: MCP's stdio shutdown.
+    Close,
+    /// A signal, as a client that stops its server or a closing terminal
+    /// sends one.
+    Signal(i32),
+}
+
+/// **Plan §4.9's retire path for `holdfast mcp --no-daemon`, by `close`,
+/// `SIGTERM` and `SIGHUP`.** Its sessions die with the process, and no
+/// eviction comes after it, so the way out writes each session's one
+/// `session_stats` line — counts only, with the read this test made
+/// counted on it. A signal ends it with the status a shell reports for a
+/// process the signal killed, `128 +` the signal's number.
+#[test]
+fn a_no_daemon_exit_writes_each_sessions_session_stats_line() {
+    no_daemon_session_ended_by("nodaemonstats", NoDaemonEnd::Close);
+}
+
+#[test]
+fn a_no_daemon_server_stopped_by_sigterm_writes_each_sessions_line() {
+    no_daemon_session_ended_by("nodaemonterm", NoDaemonEnd::Signal(libc::SIGTERM));
+}
+
+#[test]
+fn a_no_daemon_server_hung_up_on_writes_each_sessions_line() {
+    no_daemon_session_ended_by("nodaemonhup", NoDaemonEnd::Signal(libc::SIGHUP));
+}
+
+fn no_daemon_session_ended_by(label: &str, end: NoDaemonEnd) {
+    let env = TestEnv::new(label);
+    // `$HOME` inside the test directory, for the reason the session-cap
+    // row above gives: this transport's trail must not be the developer's.
+    let mut cmd = env.cmd();
+    cmd.env("HOME", &env.dir);
+    let mut shim = Shim::spawn_cmd(cmd, &["mcp", "--no-daemon"]);
+
+    let started = shim.call_tool(
+        "start_session",
+        json!({ "command": "bash", "args": ["--norc", "--noprofile"], "name": "stats" }),
+    );
+    assert_eq!(
+        started["result"]["structuredContent"]["status"], "ok",
+        "{started}"
+    );
+    let id = started["result"]["structuredContent"]["data"]["session_id"]
+        .as_str()
+        .expect("a session id")
+        .to_string();
+    shim.call_tool(
+        "send_input",
+        json!({ "session": id, "data": "echo STATS_$((6 * 7))" }),
+    );
+    let out = shim.read_until(&id, "STATS_42");
+    assert!(out.contains("STATS_42"), "the session never ran: {out:?}");
+
+    let status = match end {
+        NoDaemonEnd::Close => shim.close_and_wait(),
+        NoDaemonEnd::Signal(sig) => shim.signal_and_wait(sig),
+    };
+    let status = status
+        .unwrap_or_else(|| panic!("`holdfast mcp --no-daemon` outlived {end:?} and was killed"));
+    match end {
+        NoDaemonEnd::Close => assert!(status.success(), "{status:?}"),
+        NoDaemonEnd::Signal(sig) => assert_eq!(status.code(), Some(128 + sig), "{status:?}"),
+    }
+
+    let path = env.dir.join("logs").join("audit.log");
+    let text = std::fs::read_to_string(&path)
+        .unwrap_or_else(|e| panic!("no audit log at {}: {e}", path.display()));
+    let lines: Vec<Value> = text
+        .lines()
+        .filter_map(|l| serde_json::from_str::<Value>(l).ok())
+        .filter(|v| v["kind"] == "session_stats")
+        .collect();
+    assert_eq!(lines.len(), 1, "one line for the one session: {lines:?}");
+    assert_eq!(lines[0]["session_id"], id.as_str());
+    assert_eq!(lines[0]["shell"], "bash");
+    assert!(
+        lines[0]["reads"]["cursor"].as_u64() >= Some(1),
+        "the reads this test made are not on the line: {}",
+        lines[0]
+    );
+    assert!(
+        !text
+            .lines()
+            .any(|l| l.contains("session_stats") && l.contains("STATS_")),
+        "output reached the counts line"
+    );
 }
 
 // ------------------------------------------------ GH #218, #232, #233, #178, #20
