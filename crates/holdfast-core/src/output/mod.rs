@@ -5334,12 +5334,13 @@ mod tests {
     ///
     /// * After a **complete** key nothing is followed: its candidate
     ///   closed, and the rule's own match is the whole of its mask. A
-    ///   SHA-256 digest on the next line comes back.
+    ///   base64 blob on a later line comes back.
     /// * After a key **cut short**, or a header in **prose**, a git object
-    ///   id (40 hex) and ordinary output come back; a line carrying a run
-    ///   of [`pem::KEY_LINE_RUN`] — here a SHA-256 digest — is masked,
-    ///   which is the stated cost; and past `UNVOUCHED_CARRY_BYTES` from
-    ///   the header even that comes back.
+    ///   id (40 hex), a SHA-256 digest (GH #260) and ordinary output come
+    ///   back; a line carrying a run of [`pem::KEY_LINE_RUN`] that can be
+    ///   key body — here a base64 blob — is masked, which is the stated
+    ///   cost; and past `UNVOUCHED_CARRY_BYTES` from the header even that
+    ///   comes back.
     #[test]
     fn after_a_key_header_only_key_body_lines_are_masked() {
         let p = processor();
@@ -5349,9 +5350,12 @@ mod tests {
         let cut: String = pem.lines().take(9).map(|l| format!("{l}\n")).collect();
         let sha1 = "a81b02d3c4e5f60718293a4b5c6d7e8f90a1b2c3";
         let sha256 = "66786b9abe23920d022a182d1416b1bbc8130dd4872a9553d76985a1708dcd1e";
-        let after =
-            format!("$ git log -1 --format=%H\r\n{sha1}\r\n$ sha256sum f\r\n{sha256}  f\r\n$ ");
-        for (shape, text, digest_masked) in [
+        let blob = "Rj/v7qBgLcYCCmkiP4e6pe8WbKOFqwXwFeR6fQSZx9GwWSrSuHRRZR7i3uoC8KnH";
+        let after = format!(
+            "$ git log -1 --format=%H\r\n{sha1}\r\n$ sha256sum f\r\n{sha256}  f\r\n\
+             $ base64 g\r\n{blob}\r\n$ "
+        );
+        for (shape, text, blob_masked) in [
             ("complete", catted(&pem), false),
             ("head -n 9", catted(&cut), true),
             (
@@ -5366,9 +5370,10 @@ mod tests {
             assert_eq!(key.leaked_in(&r.output), None, "{shape}");
             assert!(r.output.contains(sha1), "{shape}: {:?}", r.output);
             assert!(r.output.contains("$ sha256sum f"), "{shape}: {:?}", r.output);
+            assert!(r.output.contains(sha256), "{shape}: {:?}", r.output);
             assert_eq!(
-                !r.output.contains(sha256),
-                digest_masked,
+                !r.output.contains(blob),
+                blob_masked,
                 "{shape}: {:?}",
                 r.output
             );
@@ -5383,7 +5388,7 @@ mod tests {
             &read_window(&p, buf.as_bytes(), 0, 1 << 20, true, false).snapshot(),
             &o,
         );
-        assert!(r.output.contains(sha256), "the reach is the carry");
+        assert!(r.output.contains(blob), "the reach is the carry");
         assert!(r.redactions.is_empty(), "{:?}", r.redactions);
     }
 
