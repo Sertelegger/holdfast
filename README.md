@@ -409,6 +409,15 @@ unverified. Once a release is promoted, the marketplace listing is pinned to
 it (CONTRIBUTING.md, Releases, step 8), so an install stops following `main`
 onto a version that is still a draft.
 
+**When an agent asks for a secret, the plugin says so above Claude Code's
+prompt.** A band names the session, by name and id, with a key that copies the
+`holdfast attach` command and, inside tmux, one that opens it in a split. Type
+the secret in `holdfast attach`: the band has no field for it, by design. It
+needs Claude Code 2.1.287 or later, which mods require in a terminal, and it
+draws only in `claude` in a terminal and the Desktop app's Code tab. Where it
+does not draw, or mods are turned off, the tools work as before and
+`/holdfast:attach` walks through the same step.
+
 ## Development
 
 ```bash
