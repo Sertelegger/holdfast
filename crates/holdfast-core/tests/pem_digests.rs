@@ -301,6 +301,51 @@ async fn integrity_strings_after_a_header_mention_come_back_on_every_surface() {
     );
 }
 
+/// **A key line inside a longer line is masked on every surface while
+/// that line is still arriving**, when the output so far ends on the byte
+/// after the key: the quote, comma or space that follows one in an HTML
+/// attribute or a JSON array, at the end of what a program has printed so
+/// far. A read at that moment, and the stream it is sent on, judge the line
+/// on what has arrived, which is already a key-body line.
+#[tokio::test]
+async fn a_key_line_inside_a_line_still_arriving_is_masked_on_every_surface() {
+    let line = key_lines()[5];
+    let mut wrong = Vec::new();
+    for (mention, lead) in mentions("cat page.html") {
+        for tail in [" ", "\"", "\","] {
+            let text = format!("{lead}<x src=/l.js data=\"{line}{tail}");
+            for (surface, out, redacted) in surfaces(&text).await {
+                if leaked(&out).is_some() || !out.contains("[REDACTED") || !redacted {
+                    wrong.push(format!("{mention}, {tail:?}, {surface}:\n{out}"));
+                }
+            }
+        }
+    }
+    // And on the stream in pieces of every size up to 120 bytes, so that
+    // some piece ends on each byte after the key.
+    let processor = Arc::new(OutputProcessor::builtin().unwrap());
+    let (_, lead) = &mentions("cat page.html")[0];
+    let text = format!("{lead}<x src=/l.js data={line} crossorigin=anonymous></x>\r\n$ ");
+    for piece in 1..=120 {
+        let mut r = StreamRedactor::new(Arc::clone(&processor));
+        let mut sent = Vec::new();
+        for chunk in text.as_bytes().chunks(piece) {
+            sent.extend(r.feed(chunk));
+        }
+        sent.extend(r.flush());
+        let sent = String::from_utf8_lossy(&sent);
+        if leaked(&sent).is_some() {
+            wrong.push(format!("watch stream, {piece}-byte pieces:\n{sent}"));
+        }
+    }
+    assert!(
+        wrong.is_empty(),
+        "{} surfaces read out a key line:\n{}",
+        wrong.len(),
+        wrong.join("\n")
+    );
+}
+
 /// **The pair: after the same mentions, a key is still masked on every
 /// surface, and so is a base64 blob.**
 ///

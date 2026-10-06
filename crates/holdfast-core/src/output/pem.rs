@@ -771,14 +771,18 @@ pub struct BodyLines {
 /// every body line that arrives after the candidate stopped.
 ///
 /// A last line with no break after it is judged as a line when `end` is
-/// [`RegionEnd::Final`], or when `to` is short of the region's end (the
+/// [`RegionEnd::Final`], when `to` is short of the region's end (the
 /// carry ran out inside it, and the bytes after `to` are not this
-/// candidate's). Otherwise it may still be arriving: it is reported as
-/// [`BodyLines::hold_from`] if it ends inside a base64 run, and masked
-/// already if it follows a body line or has carried [`PEM_MATERIAL_RUN`]
-/// that can be key body — so a read that lands mid-line in a key arriving
-/// under a decoration masks the front of the line, and the next read
-/// masks the rest from the line's own start. A digest still arriving is
+/// candidate's), or when it does not end inside a base64 run: what more
+/// arrives of it can only lengthen its runs, so a line that is a body line
+/// so far is one whole, and a key line in an HTML attribute or a JSON
+/// string is masked when the output so far ends on the quote or the space
+/// after it. Otherwise it may still be arriving: it is reported as
+/// [`BodyLines::hold_from`], and masked already if it follows a body line
+/// or has carried [`PEM_MATERIAL_RUN`] that can be key body — so a read
+/// that lands mid-line in a key arriving under a decoration masks the
+/// front of the line, and the next read masks the rest from the line's own
+/// start. A digest still arriving is
 /// held, as any run is, and not masked, so the front of the first key line
 /// after a stop — the top of a pager's next screenful — is read out for as
 /// long as it is all hex digits: past fifteen characters, with
@@ -842,14 +846,15 @@ pub fn body_lines(region: &[u8], from: usize, to: usize, end: RegionEnd) -> Body
         }
     }
     if seg_start < to {
-        if end == RegionEnd::Arriving && to == region.len() {
-            let arriving = !lanes[3].blank && lanes.iter().any(|l| l.run.len > 0);
-            if arriving {
-                out.hold_from = Some(seg_start);
-                let key = lanes.iter().map(|l| l.max_key_run).max().unwrap_or(0);
-                if prev_body || key >= PEM_MATERIAL_RUN {
-                    open = Some((open.map_or(seg_start, |o| o.0), to));
-                }
+        let arriving = end == RegionEnd::Arriving
+            && to == region.len()
+            && !lanes[3].blank
+            && lanes.iter().any(|l| l.run.len > 0);
+        if arriving {
+            out.hold_from = Some(seg_start);
+            let key = lanes.iter().map(|l| l.max_key_run).max().unwrap_or(0);
+            if prev_body || key >= PEM_MATERIAL_RUN {
+                open = Some((open.map_or(seg_start, |o| o.0), to));
             }
         } else {
             judge(
@@ -1486,6 +1491,32 @@ mod tests {
             RegionEnd::Arriving,
         );
         assert_eq!(got.hold_from, None);
+    }
+
+    /// **A last line still arriving that does not end inside a run is
+    /// judged on what has arrived.** What more arrives can only lengthen
+    /// its runs, so a line that is a body line so far is one whole: a key
+    /// line in an HTML attribute or a JSON array, with the output so far
+    /// ending on the quote, comma or space after it, is masked rather than
+    /// read out, and so is a key's short last line there. A prompt carries
+    /// no such run and is kept, after a body line or not.
+    #[test]
+    fn a_line_still_arriving_is_judged_on_what_has_arrived() {
+        for tail in [" ", "\"", "\",", "\" "] {
+            let text = format!("$ x\r\n<x data=\"{LINE}{tail}");
+            let got = body_lines(text.as_bytes(), 0, text.len(), RegionEnd::Arriving);
+            assert_eq!(got.ranges, vec![(5, text.len())], "{tail:?}");
+            assert_eq!(got.hold_from, None, "{tail:?}: nothing to hold");
+        }
+        let short = format!("  \"{LINE}\",\r\n  \"{}\"", &LINE[..20]);
+        let got = body_lines(short.as_bytes(), 0, short.len(), RegionEnd::Arriving);
+        assert_eq!(got.ranges, vec![(0, short.len())]);
+
+        for prompt in ["user@host:~$ ", "$ "] {
+            let text = format!("{LINE}\r\n{prompt}");
+            let got = body_lines(text.as_bytes(), 0, text.len(), RegionEnd::Arriving);
+            assert_eq!(got.ranges, vec![(0, LINE.len())], "{prompt:?}");
+        }
     }
 
     /// **Only a header that stopped short is followed** — not one that
