@@ -1,11 +1,17 @@
 # `claude plugin validate --strict --json plugin/`: what it reports for the
 # hooks module, pinned exactly by scripts/plugin-mod-tests.sh with the
 # `(via helper)` annotations dropped. A change here is a change to what the
-# mod hooks, calls or reads; review it as one. The mod reads Holdfast only
-# through `status`, and nothing here may be prompt.submit, tool.check, a
-# store write or a model call.
-./register.js hooks: tool.call{tool=mcp__plugin_holdfast_holdfast__request_secret_input}, ui.render{component=AbovePrompt}
+# mod hooks, calls or reads; review it as one. The mod makes no call to
+# Holdfast -- a mod's $.mcp.call is permission-checked like the agent's own
+# -- so nothing here may be $.mcp.*, and nothing may be prompt.submit,
+# tool.check, a store write or a model call; scripts/plugin-manifest-check.py
+# refuses a $.mcp line here. The three session-tool hooks only watch the
+# agent's own results pass, for the id that goes with a name.
+./register.js hooks: tool.call{tool=mcp__plugin_holdfast_holdfast__request_secret_input}, tool.call{tool=mcp__plugin_holdfast_holdfast__start_session}, tool.call{tool=mcp__plugin_holdfast_holdfast__list_sessions}, tool.call{tool=mcp__plugin_holdfast_holdfast__status}, ui.render{component=AbovePrompt}
 ./register.js gating hook without .catch: tool.call{tool=mcp__plugin_holdfast_holdfast__request_secret_input}
-./register.js calls: $.clock.after, $.clock.every, $.clock.now, $.env.get, $.mcp.call, $.mcp.connect, $.process.run, $.session.surfaces, $.ui.copy, $.ui.invalidate, $.ui.resolve, $.ui.toast
+./register.js gating hook without .catch: tool.call{tool=mcp__plugin_holdfast_holdfast__start_session}
+./register.js gating hook without .catch: tool.call{tool=mcp__plugin_holdfast_holdfast__list_sessions}
+./register.js gating hook without .catch: tool.call{tool=mcp__plugin_holdfast_holdfast__status}
+./register.js calls: $.clock.after, $.clock.every, $.clock.now, $.env.get, $.fs.stat, $.process.run, $.session.surfaces, $.ui.copy, $.ui.invalidate, $.ui.resolve, $.ui.toast
 ./register.js env writes: nothing
-./register.js env reads: HOLDFAST_BOOTSTRAP_BIN, HOLDFAST_RUNTIME_DIR, OS, TMUX, TMUX_PANE, XDG_RUNTIME_DIR
+./register.js env reads: HOLDFAST_BOOTSTRAP_BIN, HOLDFAST_RUNTIME_DIR, OS, PATH, TMUX, TMUX_PANE, XDG_RUNTIME_DIR

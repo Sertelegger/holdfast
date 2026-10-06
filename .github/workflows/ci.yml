@@ -932,8 +932,9 @@ jobs:
       # plugin-tests/validate-notes.txt, so a new call is a reviewed diff and
       # not a side effect. Then the mod's own tests under `claude plugin test`.
       # The harness's self-test runs first and plants a prompt submission, a
-      # tool.check hook and a failing test, each of which must go red for the
-      # reason it was planted.
+      # Holdfast `status` read through `$.mcp.call`, a tool.check hook and a
+      # failing test, each of which must go red for the reason it was
+      # planted.
       #
       # **Be clear about what validate does not buy**, because a green
       # official tick is easy to mistake for layout verification: measured, it

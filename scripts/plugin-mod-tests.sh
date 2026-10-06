@@ -4,9 +4,9 @@
 #   1. `claude plugin validate --strict --json plugin/` must pass, and the
 #      hooks, mods API calls and environment reads it reports for the hooks
 #      module must equal plugin-tests/validate-notes.txt line for line. A new
-#      call -- `$.prompt.submit`, `$.store.set`, a `tool.check` hook -- is a
-#      diff against that file, so it is a decision in review rather than a
-#      side effect of an edit.
+#      call -- `$.mcp.call`, `$.prompt.submit`, `$.store.set`, a `tool.check`
+#      hook -- is a diff against that file, so it is a decision in review
+#      rather than a side effect of an edit.
 #   2. `claude plugin test` runs plugin-tests/*.test.ts against the mod.
 #
 # The tests live outside plugin/ so that they do not ship in every install.
@@ -108,20 +108,25 @@ fi
 if [ "${1:-}" = "--self-test" ]; then
   fails=0
   # Each case breaks a scratch copy in one way and must turn a check red.
-  for case in new-call new-hook failing-test; do
+  for case in new-call new-mcp-call new-hook failing-test; do
     rm -rf "$work/plugin"
     cp -R "$root/plugin" "$work/plugin"
     mod="$work/plugin/hooks/register.js"
     case $case in
-      new-call|new-hook)
+      new-call|new-mcp-call|new-hook)
         python3 - "$mod" "$case" <<'PY'
 import sys
 path, case = sys.argv[1], sys.argv[2]
 text = open(path).read()
-if case == "new-call":
+if case in ("new-call", "new-mcp-call"):
     # Inside the tool.call hook, where it would run.
-    anchor = "    if (!(await draws($))) return next(e)\n"
-    planted = anchor + "    await $.prompt.submit({ text: 'planted' })\n"
+    anchor = "    const going = next(e)\n"
+    if case == "new-call":
+        planted = anchor + "    await $.prompt.submit({ text: 'planted' })\n"
+    else:
+        # The status read the band made before a mod's MCP call was
+        # measured to be permission-checked.
+        planted = anchor + "    await $.mcp.call('plugin:holdfast:holdfast', 'status', { session: e.session })\n"
 else:
     anchor = "export function register(on, options) {\n"
     planted = anchor + "  on('tool.check', async ($, e, next) => next(e))\n"
@@ -134,6 +139,7 @@ PY
     # other reason.
     case $case in
       new-call) reason='^  [+]  .*calls: .*[$][.]prompt[.]submit' ;;
+      new-mcp-call) reason='^  [+]  .*calls: .*[$][.]mcp[.]call' ;;
       new-hook) reason='^  [+]  .*hooks: .*tool[.]check' ;;
       failing-test) reason='planted failure' ;;
     esac
@@ -153,7 +159,7 @@ PY
       echo "  ok    caught: $case"
     fi
   done
-  echo "self-test: 3 case(s), $fails not caught"
+  echo "self-test: 4 case(s), $fails not caught"
   [ "$fails" -eq 0 ]
   exit
 fi

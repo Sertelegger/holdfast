@@ -2,40 +2,48 @@
 //
 // When the agent calls Holdfast's request_secret_input, the turn blocks until
 // a human types the secret into `holdfast attach`. This module tells the human
-// so: a toast, and a band above the prompt naming the session, what its
-// terminal shows, what the agent says, the time left, and two buttons -- open
-// `holdfast attach` in a tmux split, or copy that command.
+// so: a toast, and a band above the prompt naming the session, what the agent
+// says, the time left, and the attach command, with buttons to open it in a
+// tmux split or copy it when there is a `holdfast` binary to name.
 //
 // What it must never do, and does not:
 //   - take a secret: there is no text field here, and nothing is written to
 //     any process's standard input. The secret is typed in `holdfast attach`;
-//   - answer, rewrite or approve the call: the tool.call hook awaits next(e)
-//     and returns its result untouched, and there is no tool.check hook;
-//   - call anything but `status` on Holdfast's server, with its default
-//     redaction;
+//   - answer, rewrite, approve or hold up a call: each tool.call hook passes
+//     the call on before it does anything else and returns its result
+//     untouched, and there is no tool.check hook;
+//   - call Holdfast: a mod's $.mcp.call is permission-checked like the
+//     agent's own, so a read here would put a permission dialog in front of
+//     the agent's secret request. Everything drawn comes from the agent's own
+//     calls as they pass through these hooks;
 //   - put anything in front of the model: no commands, no prompt submission,
 //     no store.
-// Session names, prompt text and screen lines are the agent's or the
-// program's text, so they are drawn only after control and bidi characters
-// are stripped, labelled, and with the session id beside the name.
+// Session names and prompt text are the agent's text, so they are drawn only
+// after control and bidi characters are stripped, labelled, and with the
+// session id beside the name whenever the agent's own calls have shown it.
 
 // Measured with this plugin loaded: the server is `plugin:holdfast:holdfast`,
-// so Claude Code names the tool this.
+// so Claude Code names the tools this.
 const TOOL = 'mcp__plugin_holdfast_holdfast__request_secret_input'
-// The server's key in this plugin's .mcp.json, which $.mcp.connect takes.
-const SERVER_KEY = 'holdfast'
-// `session/mod.rs` `new_session_id`: the only shape an attach command is
-// ever built from.
+// The agent's own calls whose results pair a session's name with its id.
+const START_SESSION = 'mcp__plugin_holdfast_holdfast__start_session'
+const LIST_SESSIONS = 'mcp__plugin_holdfast_holdfast__list_sessions'
+const STATUS = 'mcp__plugin_holdfast_holdfast__status'
+// `session/mod.rs` `new_session_id`.
 const SESSION_ID = /^sess_[0-9a-f]{12}$/
+// A name `holdfast attach` takes as it stands: it resolves a live session's
+// name as it does an id. Leading with a letter or digit, it is never read as
+// a flag, and nothing in it means anything to a shell.
+const SAFE_NAME = /^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$/
 const TMUX_PANE = /^%[0-9]{1,9}$/
 // Status and reason words from the daemon are enums; anything else is not
 // drawn as one.
 const WORD = /^[a-z][a-z0-9_]{0,63}$/
 // request_secret_input's own default when the call names none.
 const DEFAULT_TIMEOUT_SECS = 120
-const STATUS_WAIT_MS = 2000
 const OUTCOME_MS = 5000
 const TOAST_MS = 8000
+const CHECK_MS = 2000
 // A request the hook never heard the end of (an abandoned turn) is dropped
 // this long after its own deadline, so the band cannot stay up forever.
 const STALE_AFTER_MS = 300_000
@@ -44,17 +52,25 @@ const TEXT_MAX = 160
 // band the real id after it is never truncated away, whatever the name
 // pretends to be.
 const NAME_MAX = 24
+// How many session names the module keeps an id for, and how many PATH
+// entries it looks in for `holdfast`.
+const KNOWN_MAX = 256
+const PATH_DIRS_MAX = 64
 // What Claude Code's own server resolved its daemon's runtime directory
 // from, besides HOME (holdfast-core `RuntimePaths::discover`). The tmux
 // pane gets them, because a pane is born with the tmux server's
 // environment, not Claude Code's, and would otherwise dial another daemon.
 const PANE_ENV = ['HOLDFAST_RUNTIME_DIR', 'XDG_RUNTIME_DIR']
+// `holdfast` is on PATH only if the user put it there.
+const NOT_ON_PATH_ISSUE = 'https://github.com/Sertelegger/holdfast/issues/280'
 
-// Open requests by tool_use_id, oldest first, and the closing lines still
-// on show. Module state: a request outlives no reload of this module.
+// Open requests by tool_use_id, oldest first; the closing lines still on
+// show; and session name -> id, as the agent's own calls reported them.
+// Module state: none of it outlives a reload of this module.
 const pending = new Map()
 let outcomes = []
 let ticker = null
+const known = new Map()
 
 // ------------------------------------------------------------ pure helpers
 
@@ -79,6 +95,11 @@ export function validSessionId(value) {
   return typeof value === 'string' && SESSION_ID.test(value) ? value : null
 }
 
+// What an attach command may name: an id, or a name in SAFE_NAME.
+export function validTarget(value) {
+  return validSessionId(value) || (typeof value === 'string' && SAFE_NAME.test(value) ? value : null)
+}
+
 function validWord(value) {
   return typeof value === 'string' && WORD.test(value) ? value : null
 }
@@ -94,33 +115,33 @@ export function shellQuote(value) {
   return "'" + value.replaceAll("'", "'\\''") + "'"
 }
 
-// `<binary> attach --keep-size <id>`, both quoted, or null when either is not
-// what it must be. --keep-size because a half-width split must not reflow the
-// agent's session.
-export function attachCommand(binary, id) {
-  if (!validPath(binary) || !validSessionId(id)) return null
-  return shellQuote(binary) + ' attach --keep-size ' + shellQuote(id)
+// `<binary> attach --keep-size <target>`, both quoted, or null when either is
+// not what it must be. --keep-size because a half-width split must not
+// reflow the agent's session.
+export function attachCommand(binary, target) {
+  if (!validPath(binary) || !validTarget(target)) return null
+  return shellQuote(binary) + ' attach --keep-size ' + shellQuote(target)
 }
 
-// Run by `sh -c` with the binary as $0 and the id as $1, so neither is ever
-// parsed by a shell. On a failure the pane stays open and says so; tmux
+// Run by `sh -c` with the binary as $0 and the target as $1, so neither is
+// ever parsed by a shell. On a failure the pane stays open and says so; tmux
 // would otherwise close it at once and take the reason with it.
 const SPLIT_SCRIPT = `"$0" attach --keep-size "$1" || { s=$?; printf '\\nholdfast attach exited %s. Press Enter to close this pane.\\n' "$s"; read -r _; }`
 
 // The same attach, as the argv of a tmux split, or null when the binary or
-// the id is not what it must be. A command given to tmux as several
+// the target is not what it must be. A command given to tmux as several
 // arguments is executed directly (tmux 2.0 and later), not through the
 // user's default-shell, whatever shell that is. `env` hands the pane each
 // of PANE_ENV that Claude Code has as a valid path.
-export function tmuxArgv(binary, id, pane, env = {}) {
+export function tmuxArgv(binary, target, pane, env = {}) {
   const bin = validPath(binary)
-  const sid = validSessionId(id)
-  if (!bin || !sid) return null
-  const target = typeof pane === 'string' && TMUX_PANE.test(pane) ? ['-t', pane] : []
+  const to = validTarget(target)
+  if (!bin || !to) return null
+  const at = typeof pane === 'string' && TMUX_PANE.test(pane) ? ['-t', pane] : []
   const assignments = PANE_ENV.filter((name) => validPath(env[name])).map((name) => name + '=' + env[name])
   // -d keeps the focus in Claude Code's pane, so whatever the human types
   // next still goes to the prompt and never into a waiting password read.
-  return ['tmux', 'split-window', '-d', '-h', ...target, '--', '/usr/bin/env', ...assignments, '/bin/sh', '-c', SPLIT_SCRIPT, bin, sid]
+  return ['tmux', 'split-window', '-d', '-h', ...at, '--', '/usr/bin/env', ...assignments, '/bin/sh', '-c', SPLIT_SCRIPT, bin, to]
 }
 
 function parseJson(text) {
@@ -137,7 +158,7 @@ function isEnvelope(value) {
 
 // Holdfast's `{ status, data, details }` from an MCP result: structured when
 // Claude Code passes it on, else the first text block.
-export function envelopeOfMcp(result) {
+function envelopeOfMcp(result) {
   if (!result || typeof result !== 'object') return null
   if (isEnvelope(result.structuredContent)) return result.structuredContent
   const block = Array.isArray(result.content) ? result.content.find((b) => b && b.type === 'text') : null
@@ -178,14 +199,50 @@ export function outcomeWords(result) {
   return 'not sent: ' + (validWord(data.reason) || status)
 }
 
-function errText(err) {
-  return String(err && err.message ? err.message : err)
+// ------------------------------------------------------- session identity
+
+// What one of the agent's own start_session, list_sessions or status
+// results says about sessions, kept in `names` as name -> id for the live
+// ones. A session seen exited gives its name up, as the daemon does, since
+// a later session may take it.
+export function learn(names, env) {
+  if (!isEnvelope(env) || env.status !== 'ok' || !env.data || typeof env.data !== 'object') return
+  const records = Array.isArray(env.data.sessions) ? env.data.sessions : [env.data]
+  for (const r of records) {
+    if (!r || typeof r !== 'object') continue
+    const id = validSessionId(r.id) || validSessionId(r.session_id)
+    const name = typeof r.name === 'string' && r.name !== '' ? r.name : null
+    if (!id || !name) continue
+    // start_session's result has no state: the session it reports is new.
+    if (r.state === undefined || r.state === 'Starting' || r.state === 'Running') {
+      names.delete(name)
+      names.set(name, id)
+      while (names.size > KNOWN_MAX) names.delete(names.keys().next().value)
+    } else if (names.get(name) === id) {
+      names.delete(name)
+    }
+  }
+}
+
+// Who a request is for, from the agent's `session` argument: `id` when the
+// argument is one or the agent's own calls paired the name with one; `name`
+// to draw; and `target`, what the attach command names -- the id, else a
+// name `holdfast attach` takes as it stands, else nothing.
+export function identify(names, session) {
+  const id = validSessionId(session)
+  if (id) {
+    let name = ''
+    for (const [n, i] of names) if (i === id) name = n
+    return { id, name: clean(name, NAME_MAX), target: id }
+  }
+  const asked = typeof session === 'string' ? session : ''
+  const learned = names.get(asked) || null
+  return { id: learned, name: clean(asked, NAME_MAX), target: learned || validTarget(asked) }
 }
 
 function label(req) {
-  const name = req.name || req.asked
-  if (req.id) return name && name !== req.id ? name + ' (' + req.id + ')' : req.id
-  return name ? 'session "' + name + '"' : 'a session'
+  if (req.id) return req.name && req.name !== req.id ? req.name + ' (' + req.id + ')' : req.id
+  return req.name ? 'session "' + req.name + '"' : 'a session'
 }
 
 function timeLeft(req, now) {
@@ -194,83 +251,48 @@ function timeLeft(req, now) {
   return '~' + Math.floor(left / 60) + ':' + String(left % 60).padStart(2, '0') + ' left'
 }
 
-// ------------------------------------------------------------ the request
+// ------------------------------------------------------------ the binary
 
-// The connection and the one `status` call, as `{ answer }`, or `{ note }`
-// saying why there is none.
-async function askStatus($, session) {
-  const link = await $.mcp.connect(SERVER_KEY)
-  if (!link.isConnected) return { note: 'status unavailable: ' + clean(String(link.reason || 'not connected'), 60) }
-  return { answer: await $.mcp.call(link.server, 'status', { session }) }
-}
-
-async function readStatus($, req, session) {
-  if (typeof session !== 'string' || session === '') {
-    req.note = 'no session named'
-    return
-  }
-  let env
+// A regular file the user may run. $.fs says what kind of file it is; `test
+// -x`, a builtin of every sh, says whether it runs, with the path as an
+// argument no shell parses and nothing looked up on PATH. Where Claude Code
+// has no $.process (the Desktop app), a regular file is taken as it stands.
+async function executable($, path) {
   try {
-    // The agent's call waits for this, so the connection and the call
-    // share one deadline: a wedged daemon or server costs the call two
-    // seconds, not the MCP request timeout.
-    const got = await withinMs($, askStatus($, session), STATUS_WAIT_MS)
-    if (got === TIMED_OUT) {
-      req.note = 'status did not answer in time'
-      return
-    }
-    if (got.note) {
-      req.note = got.note
-      return
-    }
-    env = envelopeOfMcp(got.answer)
-  } catch (err) {
-    req.note = 'status unavailable: ' + clean(errText(err), 60)
-    return
+    if ((await $.fs.stat(path)).kind !== 'file') return false
+  } catch {
+    return false
   }
-  if (!env || env.status !== 'ok' || !env.data || typeof env.data !== 'object') {
-    req.note = 'status: ' + ((env && validWord(env.status)) || 'unreadable')
-    return
+  try {
+    const run = await $.process.run(['/bin/sh', '-c', 'test -x "$1"', 'sh', path], { timeoutMs: CHECK_MS })
+    return run.exitCode === 0
+  } catch {
+    return true
   }
-  const data = env.data
-  req.id = validSessionId(data.id) || req.id
-  req.name = clean(data.name, NAME_MAX)
-  req.terminalShows = clean(data.prompt && data.prompt.last_line)
-  if (typeof data.profile === 'string' && data.profile !== '') {
-    req.startedBy = 'profile ' + clean(data.profile, 48)
-  } else {
-    const argv = [data.command, ...(Array.isArray(data.args) ? data.args : [])].filter((a) => typeof a === 'string')
-    req.startedBy = 'agent' + (argv.length ? ' (' + clean(argv.join(' '), 80) + ')' : '')
-  }
-  req.binary = validPath(data.holdfast_binary)
-  req.note = ''
 }
 
-const TIMED_OUT = Symbol('timed out')
-
-function withinMs($, promise, ms) {
-  return new Promise((resolve, reject) => {
-    const timer = $.clock.after(ms, () => resolve(TIMED_OUT))
-    promise.then(
-      (value) => {
-        timer.cancel()
-        resolve(value)
-      },
-      (err) => {
-        timer.cancel()
-        reject(err)
-      },
-    )
-  })
-}
-
-// The binary the daemon runs, when it says; else the one the user named for
-// the bootstrap; else the bootstrap itself, which finds the pinned release.
-async function attachBinary($, req) {
-  if (req.binary) return req.binary
+// The `holdfast` the attach command names: HOLDFAST_BOOTSTRAP_BIN when it
+// is an absolute path to an executable file, as the plugin's bootstrap
+// would run it; else the first executable `holdfast` in an absolute
+// directory on Claude Code's PATH; else none, and the band says so. Never
+// the plugin's bootstrap: run from here, without the CLAUDE_PLUGIN_DATA of
+// Claude Code's MCP start, it would download a release.
+async function findBinary($) {
   const named = validPath(await $.env.get('HOLDFAST_BOOTSTRAP_BIN'))
-  return named || $.plugin.root + '/bootstrap'
+  if (named && (await executable($, named))) return named
+  const path = await $.env.get('PATH')
+  const dirs = typeof path === 'string' ? path.split(':').slice(0, PATH_DIRS_MAX) : []
+  for (const dir of dirs) {
+    // A relative entry is relative to the session's working directory,
+    // which the agent writes to.
+    if (!validPath(dir)) continue
+    const candidate = dir.replace(/\/+$/, '') + '/holdfast'
+    if (await executable($, candidate)) return candidate
+  }
+  return null
 }
+
+// ------------------------------------------------------------ the request
 
 function startTicker($) {
   if (ticker) return
@@ -294,7 +316,7 @@ function stopTicker() {
 }
 
 function close($, req, words) {
-  if (!pending.delete(req.key)) return
+  pending.delete(req.key)
   if (pending.size === 0) stopTicker()
   if (words) {
     outcomes = [...outcomes.filter((o) => o.key !== req.key), { key: req.key, line: 'holdfast: ' + label(req) + ' - ' + words }]
@@ -303,28 +325,6 @@ function close($, req, words) {
       $.ui.invalidate('ui.render')
     })
   }
-  $.ui.invalidate('ui.render')
-}
-
-// Everything the band needs before the call goes on. It never throws: a
-// refused or failed call leaves that part of the band empty, and the agent's
-// call goes on regardless.
-async function prepare($, req, session) {
-  try {
-    await readStatus($, req, session)
-    req.attachBinary = await attachBinary($, req)
-    req.tmux = Boolean(await $.env.get('TMUX'))
-    if (req.tmux) {
-      req.tmuxPane = (await $.env.get('TMUX_PANE')) || null
-      req.paneEnv = {
-        HOLDFAST_RUNTIME_DIR: await $.env.get('HOLDFAST_RUNTIME_DIR'),
-        XDG_RUNTIME_DIR: await $.env.get('XDG_RUNTIME_DIR'),
-      }
-    }
-  } catch (err) {
-    req.note = req.note || 'unavailable: ' + clean(errText(err), 60)
-  }
-  $.ui.toast('holdfast: ' + label(req) + ' is waiting for a secret. Type it in holdfast attach, not here.', { timeoutMs: TOAST_MS })
   $.ui.invalidate('ui.render')
 }
 
@@ -343,21 +343,75 @@ async function onWindows($) {
   }
 }
 
+// The rising edge, with the call already on its way: the band and the toast
+// at once, from the call's own arguments, then the binary and tmux for the
+// buttons. Resolves the request, or null where nothing draws, and never
+// throws. A call that has ended before there was anything to draw
+// (`call.ended`) gets its closing line and no toast.
+async function open($, e, call, signal) {
+  try {
+    // Under -p, the Agent SDK and the VS Code chat panel nothing draws, so
+    // nothing is looked at either.
+    if (!(await draws($))) return null
+    if (await onWindows($)) {
+      $.ui.toast('holdfast: a secret request needs hybrid mode (Linux, macOS or WSL); on Windows it is refused.', { timeoutMs: TOAST_MS })
+      return null
+    }
+    const timeout = Number(e.timeout_secs)
+    const req = {
+      key: String(e.tool_use_id),
+      ...identify(known, e.session),
+      agentSays: clean(e.prompt_text),
+      timeoutSecs: Number.isSafeInteger(timeout) && timeout > 0 ? timeout : DEFAULT_TIMEOUT_SECS,
+      startedAt: await $.clock.now(),
+      located: false,
+      binary: null,
+      tmux: false,
+      tmuxPane: null,
+      paneEnv: {},
+    }
+    if (call.ended) return req
+    pending.set(req.key, req)
+    startTicker($)
+    $.ui.invalidate('ui.render')
+    if (signal) signal.addEventListener('abort', () => close($, req, ''), { once: true })
+    $.ui.toast('holdfast: ' + label(req) + ' is waiting for a secret. Type it in holdfast attach, not here.', { timeoutMs: TOAST_MS })
+    try {
+      req.binary = await findBinary($)
+      req.tmux = Boolean(await $.env.get('TMUX'))
+      if (req.tmux) {
+        req.tmuxPane = (await $.env.get('TMUX_PANE')) || null
+        req.paneEnv = {
+          HOLDFAST_RUNTIME_DIR: await $.env.get('HOLDFAST_RUNTIME_DIR'),
+          XDG_RUNTIME_DIR: await $.env.get('XDG_RUNTIME_DIR'),
+        }
+      }
+    } catch {
+      // What was found stands; the rest of the band does not need it.
+    }
+    req.located = true
+    $.ui.invalidate('ui.render')
+    return req
+  } catch {
+    return null
+  }
+}
+
 // ------------------------------------------------------------ the band
 
 function requestBox($, e, req, now, more) {
-  const { Box, Text, Button } = $.ui.resolve(e)
+  const { Box, Text, Button, Link } = $.ui.resolve(e)
   const roomy = e.props.maxRows >= 9
   const line = (key, text, extra = {}) => Text({ key, wrap: 'truncate-end', ...extra, children: [text] })
   const rows = [
     line('band-title', 'holdfast: ' + label(req) + ' is waiting for a secret  ' + timeLeft(req, now), { bold: true }),
-    line('band-terminal', 'terminal shows: ' + (req.note ? '(' + req.note + ')' : req.terminalShows ? '"' + req.terminalShows + '"' : '(empty)')),
+    line('band-agent', 'agent says: ' + (req.agentSays ? '"' + req.agentSays + '"' : '(nothing)')),
+    line('band-rule', 'Type it in holdfast attach, not here.', { bold: true }),
   ]
-  if (roomy && req.startedBy) rows.push(line('band-started', 'started by:     ' + req.startedBy))
-  rows.push(line('band-agent', 'agent says:     ' + (req.agentSays ? '"' + req.agentSays + '"' : '(nothing)')))
-  rows.push(line('band-rule', 'Type it in holdfast attach, not here.', { bold: true }))
-  const command = attachCommand(req.attachBinary, req.id)
-  if (command) {
+  const command = attachCommand(req.binary, req.target)
+  if (!req.target) {
+    rows.push(line('band-find', 'Find its id with `holdfast list`, then run `holdfast attach --keep-size <id>`.', { dimColor: true }))
+  } else if (command) {
     const buttons = []
     // $.process exists only where Claude Code runs as the CLI, which is the
     // terminal surface; the Desktop app's Code tab has none.
@@ -382,8 +436,19 @@ function requestBox($, e, req, now, more) {
       }),
     )
     rows.push(Box({ key: 'band-actions', flexDirection: 'row', columnGap: 4, children: buttons }))
-  } else {
-    rows.push(line('band-find', 'Find its id with `holdfast list`, then run `holdfast attach --keep-size <id>`.', { dimColor: true }))
+  } else if (req.located) {
+    rows.push(line('band-command', 'run: holdfast attach --keep-size ' + shellQuote(req.target)))
+    rows.push(
+      Text({
+        key: 'band-no-binary',
+        wrap: 'truncate-end',
+        dimColor: true,
+        children: [
+          "holdfast is not on Claude Code's PATH, and HOLDFAST_BOOTSTRAP_BIN names none: see /holdfast:attach and ",
+          Link({ href: NOT_ON_PATH_ISSUE, label: '#280' }),
+        ],
+      }),
+    )
   }
   if (more.length) {
     rows.push(line('band-more', '+' + more.length + ' more waiting: ' + more.map(label).join(', '), { dimColor: true }))
@@ -395,9 +460,9 @@ function requestBox($, e, req, now, more) {
 
 // Both actions are harmless if a stray digit fires them: the split opens
 // beside Claude Code without taking the focus, and the copy only fills the
-// clipboard. Each rebuilds its command from a re-validated id.
+// clipboard. Each rebuilds its command from a re-validated target.
 async function openSplit($, req) {
-  const argv = tmuxArgv(req.attachBinary, req.id, req.tmuxPane, req.paneEnv)
+  const argv = tmuxArgv(req.binary, req.target, req.tmuxPane, req.paneEnv)
   if (!argv) return
   try {
     const run = await $.process.run(argv, { timeoutMs: 5000 })
@@ -409,15 +474,28 @@ async function openSplit($, req) {
       $.ui.toast('holdfast: tmux split-window failed (exit ' + run.exitCode + '): ' + clean(run.stderr, 80), { timeoutMs: TOAST_MS })
     }
   } catch (err) {
-    $.ui.toast('holdfast: could not run tmux: ' + clean(errText(err), 80), { timeoutMs: TOAST_MS })
+    $.ui.toast('holdfast: could not run tmux: ' + clean(String(err && err.message ? err.message : err), 80), { timeoutMs: TOAST_MS })
   }
 }
 
 async function copyCommand($, req, pe) {
-  const command = attachCommand(req.attachBinary, req.id)
+  const command = attachCommand(req.binary, req.target)
   if (!command) return
   const copied = await $.ui.copy(pe && pe.surface ? { text: command, surface: pe.surface } : { text: command })
   $.ui.toast((copied && copied.isCopied ? 'holdfast: copied ' : 'holdfast: could not copy; run ') + command, { timeoutMs: TOAST_MS })
+}
+
+// The agent's own session calls, watched as they pass: each result is
+// returned untouched, and what it pairs a name with is the id the band shows
+// beside that name and builds the attach command from.
+async function watchSessions($, e, next) {
+  const result = await next(e)
+  try {
+    learn(known, envelopeOfToolResult(result))
+  } catch {
+    // Nothing learned from this one.
+  }
+  return result
 }
 
 // ------------------------------------------------------------ registration
@@ -427,43 +505,14 @@ export function register(on, options) {
   if (options && options.secret_band === false) return
 
   on('tool.call', { tool: TOOL }, async ($, e, next) => {
-    // Under -p, the Agent SDK and the VS Code chat panel nothing draws, so
-    // nothing is read either.
-    if (!(await draws($))) return next(e)
-    if (await onWindows($)) {
-      $.ui.toast('holdfast: a secret request needs hybrid mode (Linux, macOS or WSL); on Windows it is refused.', { timeoutMs: TOAST_MS })
-      return next(e)
-    }
-    const key = String(e.tool_use_id)
-    const timeout = Number(e.timeout_secs)
-    const req = {
-      key,
-      asked: clean(e.session, NAME_MAX),
-      agentSays: clean(e.prompt_text),
-      timeoutSecs: Number.isSafeInteger(timeout) && timeout > 0 ? timeout : DEFAULT_TIMEOUT_SECS,
-      startedAt: await $.clock.now(),
-      id: validSessionId(e.session),
-      name: '',
-      terminalShows: '',
-      startedBy: '',
-      binary: null,
-      attachBinary: null,
-      tmux: false,
-      tmuxPane: null,
-      paneEnv: {},
-      note: 'reading status',
-    }
-    pending.set(key, req)
-    startTicker($)
-    $.ui.invalidate('ui.render')
-    if (next.signal) next.signal.addEventListener('abort', () => close($, req, ''), { once: true })
-
+    // The call goes on first, exactly as the agent made it, so nothing the
+    // band does ever waits in front of it.
+    const going = next(e)
+    const call = { ended: false }
+    const opened = open($, e, call, next.signal)
     let words = ''
     try {
-      // One status read, before the call goes on, so the band does not
-      // depend on Claude Code running two calls to one server at once.
-      await prepare($, req, e.session)
-      const result = await next(e)
+      const result = await going
       try {
         words = outcomeWords(result)
       } catch {
@@ -471,9 +520,16 @@ export function register(on, options) {
       }
       return result
     } finally {
-      close($, req, words)
+      call.ended = true
+      opened.then((req) => {
+        if (req) close($, req, words)
+      })
     }
   })
+
+  on('tool.call', { tool: START_SESSION }, watchSessions)
+  on('tool.call', { tool: LIST_SESSIONS }, watchSessions)
+  on('tool.call', { tool: STATUS }, watchSessions)
 
   on('ui.render', { component: 'AbovePrompt' }, async ($, e, next) => {
     if (e.props.hasSurvey || (pending.size === 0 && outcomes.length === 0)) return next(e)
