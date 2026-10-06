@@ -40,6 +40,19 @@ What is asserted here, and why each one is here rather than assumed:
                      install to whoever owns it. And the pinned release must
                      SERVE its assets: a draft does not, and a pin to one is
                      GH #237 again.
+  the band's mod     plugin/hooks/ holds the secret-request band: hooks.json
+                     names one module, the userConfig switch that turns it
+                     off defaults to on, and the module's source is read for
+                     what it must never do -- an `$.mcp.call` to anything but
+                     the three read tools, `redact`, a `tail_*` read, a
+                     prompt submission, a tool.check hook, an approval, a
+                     text field, stdin, the store or a model. Its source is
+                     ASCII, so no bidi control can make it read otherwise
+                     than it runs. scripts/plugin-mod-tests.sh is the other
+                     half: Claude Code's own report of the module's calls,
+                     pinned, and the module's tests.
+  no tests shipped   The mod's tests live in plugin-tests/, outside the tree
+                     every install copies.
 
 Under CI (`CI` set), a check that could not look -- a tag this clone does not
 have, a release that did not answer -- is a failure, not a skip: CI's
@@ -257,7 +270,93 @@ def check_tree(root):
                 "to the install cache, so anything the bootstrap reads must "
                 "be inside it" % f)
 
+    check_mod(r, root, pl)
     return r
+
+
+# The read tools a Holdfast mod may call through `$.mcp.call`, with their
+# default redaction (design note section 2). Slice 1 needs only `status`.
+MOD_READ_TOOLS = {"status", "list_sessions", "get_screen_state"}
+# Each is something the mod must never do, as it appears in source.
+MOD_FORBIDDEN = [
+    ("redact", "a redaction argument: the mod reads with the default"),
+    ("tail_", "a `tail_*` read, which is a raw path"),
+    ("prompt.submit", "a prompt submission, which reaches the model"),
+    ("tool.check", "a tool.check hook, the one place a mod approves a call"),
+    ("'allow'", "an `allow` decision"),
+    ('"allow"', "an `allow` decision"),
+    ("ApproveBinding", "a binding approval"),
+    ("SecretInput", "a secret sent by the mod"),
+    ("Input(", "a text field, where a secret could be typed"),
+    ("stdin", "standard input handed to a process"),
+    ("$.store", "the store, which the agent's file tools can reach"),
+    ("$.model", "a model call"),
+]
+MOD_CALL = re.compile(r"\$\.mcp\.call\(")
+MOD_CALL_TOOL = re.compile(r"\$\.mcp\.call\(\s*[^,()]+,\s*'([^']*)'")
+
+
+def _code_of(source):
+    """The module without its `//` comments, which name what it must not do."""
+    out = []
+    for line in source.splitlines():
+        m = re.match(r"^(.*?)(?:^|\s)//.*$", line)
+        out.append(m.group(1) if m else line)
+    return "\n".join(out)
+
+
+def check_mod(r, root, pl):
+    hooks_dir = os.path.join(root, "plugin", "hooks")
+    hooks = load_json(r, os.path.join(hooks_dir, "hooks.json"))
+    if hooks is None:
+        return
+    modules = hooks.get("modules")
+    if not r.check(modules == ["./register.js"],
+                   "hooks/hooks.json names one module, ./register.js",
+                   "hooks/hooks.json modules is %r, expected [\"./register.js\"]"
+                   % (modules,)):
+        return
+    cfg = (pl.get("userConfig") or {}).get("secret_band")
+    r.check(isinstance(cfg, dict) and cfg.get("type") == "boolean"
+            and cfg.get("default") is True,
+            "userConfig secret_band is a boolean that defaults to on",
+            "userConfig secret_band is %r; it must be a boolean defaulting to "
+            "true, the switch the module reads to register nothing" % (cfg,))
+    path = os.path.join(hooks_dir, "register.js")
+    try:
+        raw = open(path, "rb").read()
+    except OSError:
+        r.fail("plugin/hooks/register.js does not exist")
+        return
+    r.check(all(b < 0x80 for b in raw),
+            "plugin/hooks/register.js is ASCII",
+            "plugin/hooks/register.js has non-ASCII bytes; write them as "
+            "escapes, so no bidi control can reorder what a reviewer reads")
+    source = raw.decode("utf-8", "replace")
+    r.check("secret_band" in source,
+            "the module reads the secret_band switch",
+            "the module never reads `secret_band`, so the switch does nothing")
+    code = _code_of(source)
+    calls = len(MOD_CALL.findall(code))
+    tools = MOD_CALL_TOOL.findall(code)
+    r.check(calls == len(tools) and set(tools) <= MOD_READ_TOOLS,
+            "every $.mcp.call names a read tool literally: %s"
+            % ", ".join(sorted(set(tools))),
+            "the module makes %d $.mcp.call(s) naming %r; each must name one "
+            "of %s as a literal" % (calls, tools, sorted(MOD_READ_TOOLS)))
+    found = [why for token, why in MOD_FORBIDDEN if token in code]
+    r.check(not found,
+            "the module's code has none of the %d forbidden uses"
+            % len(MOD_FORBIDDEN),
+            "the module's code has %s" % "; ".join(found))
+    shipped = []
+    for d, _, files in os.walk(os.path.join(root, "plugin")):
+        shipped += [os.path.relpath(os.path.join(d, f), root) for f in files
+                    if re.search(r"\.test\.tsx?$", f)]
+    r.check(not shipped,
+            "plugin/ ships no tests (they live in plugin-tests/)",
+            "plugin/ holds test files %s; they belong in plugin-tests/, "
+            "outside what every install copies" % shipped)
 
 
 REPO_GIT_URL = "https://github.com/Sertelegger/holdfast.git"
@@ -425,7 +524,8 @@ def check_git_modes(root, r):
     for path in ("plugin/bootstrap", "scripts/plugin-archive-tests.sh",
                  "scripts/plugin-bootstrap-tests.sh",
                  "scripts/plugin-archive-corpus.py",
-                 "scripts/plugin-manifest-check.py"):
+                 "scripts/plugin-manifest-check.py",
+                 "scripts/plugin-mod-tests.sh"):
         mode = git_mode(root, path)
         if mode is None:
             print("  skip  %s is not tracked yet" % path)
@@ -465,6 +565,34 @@ def self_test(root):
          lambda d: shutil.copy(os.path.join(d, "plugin/commands/attach.md"),
                                os.path.join(d, "plugin/commands/doctor.md"))),
         ("version.txt deleted", lambda d: os.remove(os.path.join(d, "plugin/version.txt"))),
+        ("hooks.json names another module",
+         lambda d: _write(d, "plugin/hooks/hooks.json", '{"modules": ["./other.js"]}')),
+        ("the band switch defaults to off",
+         lambda d: _patch(d, "plugin/.claude-plugin/plugin.json", {"userConfig": {
+             "secret_band": {"type": "boolean", "title": "t", "description": "d",
+                             "default": False}}})),
+        ("the band switch removed",
+         lambda d: _patch(d, "plugin/.claude-plugin/plugin.json", {"userConfig": {}})),
+        ("a write tool through $.mcp.call",
+         lambda d: _mod_append(d, "export const x = ($) => $.mcp.call(s, 'send_input', {})")),
+        ("$.mcp.call with a computed tool name",
+         lambda d: _mod_append(d, "export const x = ($, t) => $.mcp.call(s, t, {})")),
+        ("a raw read", lambda d: _mod_append(
+            d, "export const x = ($) => $.mcp.call(s, 'status', { redact: false })")),
+        ("a prompt submission",
+         lambda d: _mod_append(d, "export const x = ($) => $.prompt.submit({ text: 'x' })")),
+        ("an allow decision", lambda d: _mod_append(d, "export const x = { decision: 'allow' }")),
+        ("a text field", lambda d: _mod_append(d, "export const x = (I) => I.Input({ key: 'pw' })")),
+        ("stdin to a process",
+         lambda d: _mod_append(d, "export const x = ($) => $.process.run(['a'], { stdin: 's' })")),
+        ("the store", lambda d: _mod_append(d, "export const x = ($) => $.store.set('k', 1)")),
+        ("a bidi control in the module",
+         lambda d: _mod_append(d, "// " + chr(0x202E) + " reads backwards")),
+        ("the switch no longer read",
+         lambda d: _write(d, "plugin/hooks/register.js", open(os.path.join(
+             d, "plugin/hooks/register.js")).read().replace("secret_band", "band"))),
+        ("a test file shipped in plugin/",
+         lambda d: _write(d, "plugin/hooks/band.test.ts", "// planted\n")),
         ("pin without a sha", lambda d: _pin(d, sha=None)),
         ("pin to a branch", lambda d: _pin(d, ref="main")),
         ("pin to another repository",
@@ -729,6 +857,11 @@ def _nested_in_clone(d):
 
 def _write(d, rel, text):
     open(os.path.join(d, rel), "w").write(text)
+
+
+def _mod_append(d, line):
+    with open(os.path.join(d, "plugin/hooks/register.js"), "a") as f:
+        f.write(line + "\n")
 
 
 class _Sink:

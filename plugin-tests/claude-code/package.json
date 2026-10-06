@@ -1,0 +1,8 @@
+{
+  "name": "holdfast-plugin-tests-claude-code",
+  "private": true,
+  "description": "The Claude Code CI runs the plugin's mod checks with, pinned with its integrity hashes. Installed with `npm ci --ignore-scripts`; nothing here ships.",
+  "dependencies": {
+    "@anthropic-ai/claude-code": "2.1.291"
+  }
+}
