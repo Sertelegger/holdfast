@@ -39,6 +39,9 @@
 #                                       fetched. TWO digests, one per platform:
 #                                       the `linux` tarball in `test`, the `mac`
 #                                       one in `macos-native`)
+#   Claude Code                 2.1.291 (npm, by plugin-tests/claude-code's
+#                                       lockfile and its integrity hashes;
+#                                       the `plugin` job)
 
 name: CI
 
@@ -921,16 +924,45 @@ jobs:
       # not -- and under CI a release that does not answer is a failure.
       - run: ./scripts/plugin-manifest-check.py
 
-      # `claude plugin validate --strict` is the OFFICIAL check and it is
-      # deliberately not run here: it needs the Claude Code CLI, which is not
-      # a pinned input this pipeline has. Run it by hand before a release
-      # (`dev/workflows/verify.md`).
+      # --- the band's mod, checked by Claude Code itself ---------------------
       #
-      # **Be clear about what it would and would not buy**, because a green
+      # `claude plugin validate --strict` is the OFFICIAL check, and here it
+      # runs with what it reports for the hooks module -- its hooks, its mods
+      # API calls, the variables it reads -- pinned exactly by
+      # plugin-tests/validate-notes.txt, so a new call is a reviewed diff and
+      # not a side effect. Then the mod's own tests under `claude plugin test`.
+      # The harness's self-test runs first and plants a prompt submission, a
+      # tool.check hook and a failing test, each of which must go red for the
+      # reason it was planted.
+      #
+      # **Be clear about what validate does not buy**, because a green
       # official tick is easy to mistake for layout verification: measured, it
       # prints "Validation passed" for a plugin whose commands sit in a
       # subdirectory and are therefore silently never loaded. The flat-layout
       # rule above is the one that catches that, and only that rule does.
+      #
+      # Claude Code is a pinned input: plugin-tests/claude-code's lockfile
+      # names 2.1.291 with an integrity hash for every package, `npm ci`
+      # refuses anything that does not match, and `--ignore-scripts` keeps the
+      # wrapper's postinstall from running -- the native binary is run where
+      # it lands. The runs get a scratch HOME and CLAUDE_CONFIG_DIR and need
+      # no network (measured under `unshare -rn`); under CI the harness fails
+      # if the binary is not the pinned version.
+      - name: Install the pinned Claude Code from its lockfile
+        run: |
+          set -eux
+          mkdir -p "$RUNNER_TEMP/claude-code"
+          cp plugin-tests/claude-code/package.json plugin-tests/claude-code/package-lock.json \
+             "$RUNNER_TEMP/claude-code/"
+          npm ci --ignore-scripts --no-audit --no-fund --prefix "$RUNNER_TEMP/claude-code"
+          "$RUNNER_TEMP/claude-code/node_modules/@anthropic-ai/claude-code-linux-x64/claude" --version
+      - name: The mod's pinned validate report and its tests
+        env:
+          CLAUDE: ${{ runner.temp }}/claude-code/node_modules/@anthropic-ai/claude-code-linux-x64/claude
+        run: |
+          set -eux
+          ./scripts/plugin-mod-tests.sh --self-test
+          ./scripts/plugin-mod-tests.sh
 
       - name: shellcheck must exist, or the shell gate below is a no-op
         run: shellcheck --version
@@ -939,12 +971,14 @@ jobs:
         run: |
           set -eux
           shellcheck -s sh -x plugin/bootstrap plugin/lib-safe-extract.sh
-          shellcheck -s sh -x scripts/plugin-archive-tests.sh scripts/plugin-bootstrap-tests.sh
+          shellcheck -s sh -x scripts/plugin-archive-tests.sh scripts/plugin-bootstrap-tests.sh \
+                     scripts/plugin-mod-tests.sh
           # Both interpreters the plugin promises to run under. `sh` is dash
           # on Ubuntu, so the second is not a duplicate of the first on any
           # box where /bin/sh is bash.
           for f in plugin/bootstrap plugin/lib-safe-extract.sh \
-                   scripts/plugin-archive-tests.sh scripts/plugin-bootstrap-tests.sh; do
+                   scripts/plugin-archive-tests.sh scripts/plugin-bootstrap-tests.sh \
+                   scripts/plugin-mod-tests.sh; do
             dash -n "$f"
             sh -n "$f"
           done
