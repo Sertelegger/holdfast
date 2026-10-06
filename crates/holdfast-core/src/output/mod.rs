@@ -439,8 +439,8 @@ impl WindowSnapshot<'_> {
     /// **`Session::read_processed` calls it under the buffer lock, and a
     /// test that judges a read without a session calls it over an
     /// [`OutputBuffer`] of its own**, so the two judge one geometry. A
-    /// transcription of it in a test falls behind a change such as
-    /// GH #241's start snap, and nothing goes red.
+    /// transcription of it in a test falls behind the first change to it,
+    /// such as the UTF-8 start snap below, and nothing goes red.
     ///
     /// The regions are copies, so the caller can drop the lock before any
     /// of the processing runs (§4.3). `child_alive` is the caller's to
@@ -466,26 +466,26 @@ impl WindowSnapshot<'_> {
         // the cursor still lands past `buffer.head`. Capping forward
         // instead would return the oldest slice and hand back a cursor
         // far behind `head`, which re-delivers the same bytes on every
-        // subsequent cursor read (0.0.1's documented contract, REQ-T-006).
+        // subsequent cursor read (REQ-T-006).
         //
         // **`is_tail()`, not the holdback.** This clip is a fact about
         // where the read is anchored; the holdback is a fact about
-        // whether the caller opted in. They were one predicate until
-        // GH #169, which is how `holdfast logs --tail` acquired a
-        // bypass §4.1 names it as a non-member of.
+        // whether the caller opted in. `holdfast logs --tail` sends a
+        // tail read inside the holdback (§4.1), and it is clipped from
+        // the front like any other.
         let (req_start, front_clipped) = if req.start.is_tail() {
             let clipped = head
                 .saturating_sub(req.max_bytes as u64)
                 .max(requested_start);
-            // **A tail read starts on a character, not inside one
-            // (GH #241).** `tail_bytes` and a front clip are both
-            // byte counts back from `head`, so either can land on the
-            // second byte of a character and open the page with
-            // U+FFFD. The continuation bytes of a character whose
-            // lead is behind the start are not text the caller can
-            // use; skipping at most three of them is. A cursor read
-            // is not snapped: its start is the caller's, and the
-            // paging loop no longer produces one inside a character.
+            // **A tail read starts on a character, not inside one.**
+            // `tail_bytes` and a front clip are both byte counts back
+            // from `head`, so either can land on the second byte of a
+            // character and open the page with U+FFFD. The
+            // continuation bytes of a character whose lead is behind
+            // the start are not text the caller can use; skipping at
+            // most three of them is. A cursor read is not snapped: its
+            // start is the caller's, and the cursor a read hands back
+            // is past any character the page would otherwise split.
             let snapped = (0..3u64)
                 .map(|k| clipped + k)
                 .find(|off| {
@@ -507,7 +507,7 @@ impl WindowSnapshot<'_> {
         let scan_start = head
             .saturating_sub(limits.partial_secret_scan_bytes as u64)
             .max(tail);
-        // The unvouched scan's own lookbehind (GH #195). It reaches
+        // The unvouched scan's own lookbehind. It reaches
         // `UNVOUCHED_CARRY_BYTES` rather than `lookbehind_bytes`
         // because a read that begins inside a region a previous read
         // masked has to see the anchor that produced the mask, and
@@ -3133,10 +3133,10 @@ mod tests {
     /// not among the bytes `process` holds. `WindowSnapshot::carry_region`
     /// is the extra lookbehind that makes it visible.
     ///
-    /// Two mutations survived every other row in this file before this
-    /// one existed — `carry_region` swapped back to `window` here, and
-    /// `session/mod.rs` handing `window_start` as `carry_region_start` —
-    /// and both of them are a private key body on the wire.
+    /// It fails on two mutations, each a private key body on the wire:
+    /// `carry_region` swapped back to `window` in `process`, and
+    /// `WindowSnapshot::for_read` handing `window_start` as
+    /// `carry_region_start`.
     ///
     /// The paging step is deliberately small (512 B), because the
     /// property is about a cursor landing *strictly between* the anchor
