@@ -59,3 +59,10 @@ __pycache__/
 # points at nothing anyone else can fetch. Ignored so a careless `-A`
 # cannot publish one, which it did once.
 .claude/worktrees/
+
+# Written into a plugin directory by a Claude Code session that loads it with
+# `--plugin-dir` (measured on 2.1.291, under `claude -p` too), beside the
+# self-ignoring `.claude-plugin/types/` it extends. The manual check in
+# plugin/README.md starts exactly such a session on this checkout, and a
+# tracked copy extends a file no install has.
+/plugin/tsconfig.json

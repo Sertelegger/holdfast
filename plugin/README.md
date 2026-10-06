@@ -84,6 +84,133 @@ Once the listing is pinned to a promoted release ([Releasing](#releasing)), a
 local-directory marketplace installs *that* release, and `--plugin-dir` is the
 in-place route.
 
+## The secret-request band
+
+When the agent calls `request_secret_input`, its turn blocks until a human
+types the secret into `holdfast attach`. The plugin's mod (`hooks/`) says so
+where you are looking: a toast, and a band above the prompt.
+
+```
+ holdfast: deploy (sess_4f2c91aa07de) is waiting for a secret  at least 1:52 left
+ agent says: "sudo password for deploy"
+ Type it in holdfast attach, not here.
+ 1: open attach in tmux split (right)    2: copy attach command
+```
+
+- **The session** by name, and by id once a `start_session`,
+  `list_sessions` or `status` result passing through Claude Code has paired
+  that name with one; a session such a result shows exited gives its name
+  up. Without an id the band says `session "deploy"`. The name is the
+  agent's choice, so it is cut to 24 characters, which keeps the id on a
+  narrow band, and anything in it that reads as an id is drawn as `sess_…`,
+  so the only id on the band is the real one. "agent says" is the agent's
+  `prompt_text`. Both are the agent's text, so they are drawn stripped of
+  control, escape, bidi and invisible characters and labelled for what they
+  are.
+- **The time** is the least the request has left. The countdown starts as
+  the agent's call reaches the mod, which is before Claude Code's own
+  permission dialog for that call, if it asks; Holdfast's timeout starts
+  only once you approve. So the request has the time shown and as long
+  again as the dialog was up, and past zero the band says it *may time out
+  at any moment*, not that it has: the band closes when the call does.
+- **1** opens `holdfast attach --keep-size <id>` in a tmux pane to the right,
+  without moving the focus out of Claude Code. It is drawn only in the
+  terminal and only inside tmux. **2** copies the same command. Each runs only
+  when pressed, which includes a `1` or `2` typed alone into an empty prompt,
+  and both are harmless if that happens by accident.
+- **The tmux pane** starts with the tmux server's environment, not Claude
+  Code's, so the split hands it Claude Code's `HOLDFAST_RUNTIME_DIR` and
+  `XDG_RUNTIME_DIR`, which choose the daemon that attach dials. The binary
+  and the session reach tmux as separate arguments, so no shell parses them;
+  that takes tmux 2.0 or later. If attach fails, the pane stays open showing
+  why until you press Enter; if it failed because that `holdfast` predates
+  `--keep-size` (exit 64), the pane says so. A copied command runs with the
+  environment of the shell you paste it into.
+- **When the call ends**, the band shows the outcome word for five seconds,
+  as the daemon gave it: `secret_provided, 8 bytes written`, or
+  `not sent: timeout`.
+
+**The secret is never typed into the band.** It has no field, by design: a
+mod's text field is not masked, and every other installed mod sees each key
+typed into it. The band points you at `holdfast attach`, which is where the
+secret goes.
+
+**It makes no Holdfast call, so it asks no permission.** A mod's
+`$.mcp.call` is checked against the session's permission mode like the
+agent's own (measured on Claude Code 2.1.291): in default mode it raises a
+dialog naming the plugin, and under `claude -p` it is refused. A band that
+read the session first would put that dialog in front of the very request
+it announces. So the hook passes the agent's call on before anything else,
+draws from the call's own arguments, and watches the `start_session`,
+`list_sessions` and `status` results that pass for the id that goes with a
+name, returning every result untouched. A call another installed mod makes
+passes the same hooks as the agent's, so it can raise the band or pair a
+name with an id too; a mod is already trusted with more than that
+([SECURITY.md](../SECURITY.md)). What it does call —
+`$.env.get`, `$.fs.stat`, `$.process.run` — was measured under `claude -p`
+in default mode, where `$.mcp.call` is refused, and none of them was. It
+puts nothing in front of the model and never answers or approves the call.
+"terminal shows" and "started by", which need a read, are left to the
+session panel ([ROADMAP.md](../ROADMAP.md#session-panel)).
+
+**The command names `HOLDFAST_BOOTSTRAP_BIN`** when it is an absolute path to
+an executable file, as the bootstrap would run it; **else the first
+executable `holdfast` in an absolute directory on Claude Code's `PATH`**.
+Executable is `test -x`, run as a builtin of `/bin/sh` with the path as an
+argument, so nothing is looked up on `PATH` to check it; the Desktop app has
+no `$.process`, and there a regular file is taken as it stands. **With
+neither, there are no buttons**: the band shows
+`holdfast attach --keep-size '<id>'` and says `holdfast` is not on Claude
+Code's `PATH`, pointing at `/holdfast:attach` and
+[#280](https://github.com/Sertelegger/holdfast/issues/280). It never names
+this plugin's `bootstrap`: run from a mod, without the `CLAUDE_PLUGIN_DATA`
+of Claude Code's MCP start, that would download a release. With no id, the
+command names the session by its name when `holdfast attach` can take it as
+it stands — a letter or digit, then letters, digits, `.`, `_` or `-`, which
+attach resolves as it resolves an id — and otherwise the band asks you to
+find the id with `holdfast list`. `--keep-size` keeps the half-width split
+from resizing the agent's session, and **it needs a `holdfast` from this
+release or later**: an older one refuses the flag with exit 64, in a pasted
+command and in the split alike. The split's pane then says to update
+`holdfast`, or to run attach without the flag, which resizes the session to
+that pane; it never does that by itself.
+
+**It needs Claude Code 2.1.287 or later**, which is when mods arrived; it is
+measured with 2.1.291. The plugin manifest has no field that declares a
+minimum Claude Code version, so this sentence is the declaration. An older
+Claude Code still loads the plugin and connects its MCP server, and runs no
+mod, so the tools work and there is no band: measured on 2.1.285, where
+`claude plugin validate` passes, `plugin:holdfast:holdfast` connects, and a
+command a mod registers is not there (on 2.1.291 the same one runs).
+
+Its tests live in `plugin-tests/`, outside what every install copies, and
+`scripts/plugin-mod-tests.sh` runs them under `claude plugin test`, after
+checking that what `claude plugin validate` reports the module hooks, calls
+and reads still matches `plugin-tests/validate-notes.txt`, a pin that
+`scripts/plugin-manifest-check.py` refuses if it lists any MCP call. A real
+session is [the manual check below](#manual-check-the-band-in-a-real-session).
+
+**To turn it off**, run `/plugin configure holdfast@holdfast`, or use its
+row in `/config`, or set it in `settings.json`:
+
+```json
+{ "pluginConfigs": { "holdfast@holdfast": { "options": { "secret_band": false } } } }
+```
+
+Off, the mod registers nothing at all; it takes effect at the next session
+start. Installing the plugin prints *1 userConfig option not yet set*: that
+is this switch, and unset it is on.
+
+**Where it does not draw:** `claude -p`, the Agent SDK and the VS Code chat
+panel, where nothing draws and so nothing is looked up either; cloud
+sessions; the Desktop app's WSL sessions, which get no plugins. In the
+Desktop app's Code tab it draws without the tmux button, which needs a
+terminal. On Windows native there is no daemon to attach to, and
+`request_secret_input` is refused at once, so instead of the band a toast
+says the request needs hybrid mode. An organisation's `disableAllHooks` or
+`allowManagedModsOnly` removes the mod and keeps the MCP server, so
+Holdfast's own text never promises the band.
+
 ## What the bootstrap does
 
 `.mcp.json` registers one stdio server whose command is
@@ -266,6 +393,104 @@ CI step:
 If PATHEXT does not resolve, the fallback is two MCP server entries with the
 wrong-platform one failing closed. That is ugly enough to be worth recording
 here rather than discovering twice.
+
+## MANUAL CHECK: the band in a real session
+
+CI drives the band through Claude Code's test kit. A real terminal drove
+the rest once, on 2026-10-06 with Claude Code 2.1.291 in default permission
+mode, with no login: a second plugin's command stood in for the agent and
+made its `list_sessions` and `request_secret_input` calls, allowed by rule.
+The band and the toast drew with the id beside the name, `1` alone in the
+empty prompt opened attach in a split without taking the focus, the secret
+typed there answered the call, `2` copied the command, and a timeout closed
+with `not sent: timeout`. The session kept its own size, and the band raised
+no permission dialog. A second run left `request_secret_input` unallowed:
+Claude Code's dialog for it came up with the band's toast already drawn, the
+band itself appeared only once the dialog was answered, reading the timeout
+less the time the dialog had been up, and a `1` pressed while the dialog was
+up answered the dialog. What neither run could have is a model turn, so this
+check has one. It is the owner's to run for each Claude Code release the
+band is claimed to work with. It needs a `holdfast` built with
+`attach --keep-size`, tmux, and a Claude Code login.
+
+1. **Isolate the daemon, Claude Code and tmux.** In a terminal at least 110
+   columns wide, from the checkout's root:
+
+   ```bash
+   cargo build --release --locked -p holdfast
+   CHECKOUT=$PWD
+   HF="$CHECKOUT/target/release/holdfast"   # or under your CARGO_TARGET_DIR
+   ISO=$(mktemp -d)
+   mkdir -p -m 700 "$ISO/home" "$ISO/run" "$ISO/rt" "$ISO/xdg" "$ISO/claude"
+   export HOME="$ISO/home" XDG_RUNTIME_DIR="$ISO/run" HOLDFAST_RUNTIME_DIR="$ISO/rt" \
+          XDG_CONFIG_HOME="$ISO/xdg/config" XDG_DATA_HOME="$ISO/xdg/data" \
+          XDG_STATE_HOME="$ISO/xdg/state" CLAUDE_CONFIG_DIR="$ISO/claude" \
+          HOLDFAST_BOOTSTRAP_BIN="$HF"
+   env -u TMUX tmux -L hf-band -f /dev/null new-session \
+     claude --plugin-dir "$CHECKOUT/plugin" --permission-mode default
+   ```
+
+   The private tmux server starts with these exports, so every pane it opens
+   has them; a pane of your usual tmux server would not, and its attach
+   would dial your real daemon. If that terminal is itself a tmux pane, this
+   one runs nested inside it: press the prefix twice to reach the inner one.
+   The first time, `/login` inside that session: the config directory is a
+   new installation.
+
+2. **Ask for a secret.** Send:
+
+   > Using only the holdfast tools: start a session named deploy running
+   > bash, and in it run `read -r -s -p 'Password: ' pw; echo; echo got
+   > ${#pw} bytes`. Wait until its interaction_mode is AwaitingSecret, then
+   > call request_secret_input for it with prompt_text "test password for
+   > deploy" and timeout_secs 120. Never send input to the session yourself.
+
+3. **The band and the toast.** When the `request_secret_input` row appears
+   you should see the toast *holdfast: deploy (sess_...) is waiting for a
+   secret. Type it in holdfast attach, not here.* and, above the prompt, the
+   band: the name with the id (the agent's own `start_session` gave it),
+   "agent says" with the prompt text, *at least M:SS left* counting down, and
+   the two buttons. **No permission dialog names the holdfast plugin**, at
+   this step or any other: the only dialogs are Claude Code's for the agent's
+   own calls, and none if you allowed them. If Claude Code asks you to
+   approve the agent's `request_secret_input`, the toast is expected while
+   its dialog is up and the band only after it, as in the run above: note
+   whether that holds, wait about ten seconds, and approve with Enter on
+   *Yes*. The band should then read about ten seconds less than the timeout,
+   and the call should still be open for the whole timeout after you
+   approved.
+
+4. **Button 1, from an empty prompt.** With nothing typed, press `1` and
+   pause. A pane opens on the right, and the cursor stays in Claude Code.
+   The pane must show attach's own banner, *holdfast: attached to sess_...*;
+   if it shows *holdfast attach exited N* instead, attach did not reach the
+   daemon, and that line and the one above it are the report. Switch to the
+   pane (`Ctrl-B o`), type any password and Enter. Within a second the call
+   returns, and the band reads *holdfast: deploy (sess_...) - secret_provided,
+   N bytes written* for about five seconds, then is gone.
+
+5. **Button 2.** Ask the agent to run the `read` again and request another
+   secret. Press `2` in the empty prompt: the toast shows the copied command.
+   Paste it into a shell with the same exports; it attaches, and the secret
+   typed there answers the call.
+
+6. **A timeout.** Request once more with timeout_secs 20 and answer nothing:
+   the closing line reads `not sent: timeout`.
+
+7. **The switch.** Quit, add
+   `"pluginConfigs": { "holdfast@inline": { "options": { "secret_band": false } } }`
+   to `$ISO/claude/settings.json` (`holdfast@inline` is the plugin's id under
+   `--plugin-dir`), start the private tmux again as in step 1 and repeat
+   step 2: no toast, no band, and the call still waits for `holdfast attach`.
+
+**Report**, for each step, whether it happened as written, the terminal
+width, what step 3 saw while the permission dialog was up and what the band
+read after it, any permission
+dialog that names the holdfast plugin (there must be none), and any
+transcript line naming the plugin, such as `ui.render (AbovePrompt) refused:
+...` (a drawing Claude Code rejected and replaced with its own) or
+`tool.call hook skipped: ...`. Then clean up with the same exports:
+`"$HF" daemon stop`, `tmux -L hf-band kill-server`, and `rm -rf "$ISO"`.
 
 ## Releasing
 

@@ -1,0 +1,4 @@
+{
+  "description": "Holdfast's mod: the secret-request band above the prompt",
+  "modules": ["./register.js"]
+}

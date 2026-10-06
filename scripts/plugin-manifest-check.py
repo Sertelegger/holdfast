@@ -40,6 +40,24 @@ What is asserted here, and why each one is here rather than assumed:
                      install to whoever owns it. And the pinned release must
                      SERVE its assets: a draft does not, and a pin to one is
                      GH #237 again.
+  the band's mod     plugin/hooks/ holds the secret-request band: hooks.json
+                     names one module, the userConfig switch that turns it
+                     off defaults to on, and the module's source is read for
+                     what it must never do -- any MCP call or connection (a
+                     mod's `$.mcp.call` is permission-checked like the
+                     agent's own, so the band would put a dialog in front of
+                     the request it is announcing), the plugin's bootstrap
+                     (which downloads when run from a mod), a prompt
+                     submission, a tool.check hook, an approval, a text
+                     field, stdin, the store or a model. Its source is ASCII,
+                     so no bidi control can make it read otherwise than it
+                     runs. scripts/plugin-mod-tests.sh is the other half:
+                     Claude Code's own report of the module's calls, pinned
+                     by plugin-tests/validate-notes.txt -- which this check
+                     refuses if it lists an MCP call -- and the module's
+                     tests.
+  no tests shipped   The mod's tests live in plugin-tests/, outside the tree
+                     every install copies.
 
 Under CI (`CI` set), a check that could not look -- a tag this clone does not
 have, a release that did not answer -- is a failure, not a skip: CI's
@@ -257,7 +275,137 @@ def check_tree(root):
                 "to the install cache, so anything the bootstrap reads must "
                 "be inside it" % f)
 
+    check_mod(r, root, pl)
     return r
+
+
+# Each is something the mod must never do, as it appears in source.
+MOD_FORBIDDEN = [
+    ("bootstrap", "the plugin's bootstrap, which downloads a release when run "
+                  "without the CLAUDE_PLUGIN_DATA of Claude Code's MCP start"),
+    ("prompt.submit", "a prompt submission, which reaches the model"),
+    ("tool.check", "a tool.check hook, the one place a mod approves a call"),
+    ("'allow'", "an `allow` decision"),
+    ('"allow"', "an `allow` decision"),
+    ("ApproveBinding", "a binding approval"),
+    ("SecretInput", "a secret sent by the mod"),
+    ("Input(", "a text field, where a secret could be typed"),
+    ("stdin", "standard input handed to a process"),
+    ("$.store", "the store, which the agent's file tools can reach"),
+    ("$.model", "a model call"),
+]
+# **No MCP**, in the spellings a reading of the source can see: `$.mcp.call`,
+# `$.mcp.connect`, `$ . mcp`, or `mcp.call(` off a destructured `$`. A mod's
+# MCP call is checked against the session's permission mode like the agent's
+# own, so in default mode it asks the user (measured, Claude Code 2.1.291),
+# and the band exists to point at the request, not to stand in front of it.
+#
+# This is a first line, not the authority. Source can name `mcp` in ways no
+# pattern here follows, so a `$` reached other than by a plain name
+# (`$['mcp']`, `$?.mcp`) is refused outright, as `claude plugin validate
+# --strict` refuses it. The authority is the validate pin below: what Claude
+# Code itself reports the module calls, which may list no `$.mcp` call.
+MOD_MCP = [
+    re.compile(r"\$\s*\.\s*mcp\b"),
+    re.compile(r"\bmcp\s*\.\s*(?:call|connect)\b"),
+    re.compile(r"\{[^}]*\bmcp\b[^}]*\}\s*=\s*\$"),
+]
+MOD_OPAQUE = re.compile(r"\$\s*(?:\[|\?\s*\.)")
+MOD_PIN = os.path.join("plugin-tests", "validate-notes.txt")
+
+
+def _code_of(source):
+    """The module without its `//` comments, which name what it must not do.
+
+    A `//` is a comment only where it starts the line or follows a space with
+    every quote before it closed, so `'x //'; $.mcp.call(...)` keeps its call.
+    A line this misreads keeps its comment, which can only refuse more.
+    """
+    out = []
+    for line in source.splitlines():
+        code = line
+        for m in re.finditer(r"(?:^|\s)//", line):
+            before = line[:m.start()]
+            if all(before.count(q) % 2 == 0 for q in "'\"`"):
+                code = before
+                break
+        out.append(code)
+    return "\n".join(out)
+
+
+def check_mod(r, root, pl):
+    hooks_dir = os.path.join(root, "plugin", "hooks")
+    hooks = load_json(r, os.path.join(hooks_dir, "hooks.json"))
+    if hooks is None:
+        return
+    modules = hooks.get("modules")
+    if not r.check(modules == ["./register.js"],
+                   "hooks/hooks.json names one module, ./register.js",
+                   "hooks/hooks.json modules is %r, expected [\"./register.js\"]"
+                   % (modules,)):
+        return
+    cfg = (pl.get("userConfig") or {}).get("secret_band")
+    r.check(isinstance(cfg, dict) and cfg.get("type") == "boolean"
+            and cfg.get("default") is True,
+            "userConfig secret_band is a boolean that defaults to on",
+            "userConfig secret_band is %r; it must be a boolean defaulting to "
+            "true, the switch the module reads to register nothing" % (cfg,))
+    path = os.path.join(hooks_dir, "register.js")
+    try:
+        raw = open(path, "rb").read()
+    except OSError:
+        r.fail("plugin/hooks/register.js does not exist")
+        return
+    r.check(all(b < 0x80 for b in raw),
+            "plugin/hooks/register.js is ASCII",
+            "plugin/hooks/register.js has non-ASCII bytes; write them as "
+            "escapes, so no bidi control can reorder what a reviewer reads")
+    source = raw.decode("utf-8", "replace")
+    r.check("secret_band" in source,
+            "the module reads the secret_band switch",
+            "the module never reads `secret_band`, so the switch does nothing")
+    code = _code_of(source)
+    mcp = [m.group(0) for rx in MOD_MCP for m in rx.finditer(code)]
+    r.check(not mcp,
+            "the module makes no MCP call or connection",
+            "the module's code reaches an MCP server (%s); a mod's MCP call is "
+            "permission-checked like the agent's own, so the band makes none"
+            % ", ".join(sorted(set(mcp))))
+    opaque = sorted(set(m.group(0) for m in MOD_OPAQUE.finditer(code)))
+    r.check(not opaque,
+            "the module reaches `$` only by plain names",
+            "the module reaches `$` by a computed or optional member (%s), "
+            "which no reading of the source can follow to what it calls"
+            % ", ".join(opaque))
+    # The other half's pin: Claude Code's own list of what the module calls.
+    # A pin that admits an MCP call would let one through that review.
+    pin = os.path.join(root, MOD_PIN)
+    try:
+        pinned = [l for l in open(pin).read().splitlines()
+                  if l and not l.startswith("#")]
+    except OSError:
+        pinned = None
+    if pinned is None:
+        r.fail("%s does not exist" % MOD_PIN)
+    else:
+        calls = [l for l in pinned if " calls: " in l]
+        r.check(len(calls) == 1 and not any("$.mcp" in l for l in pinned),
+                "%s pins one calls line, with no MCP call in it" % MOD_PIN,
+                "%s must pin exactly one calls line and no `$.mcp` call; it "
+                "has %d calls line(s): %s" % (MOD_PIN, len(calls), calls))
+    found = [why for token, why in MOD_FORBIDDEN if token in code]
+    r.check(not found,
+            "the module's code has none of the %d forbidden uses"
+            % len(MOD_FORBIDDEN),
+            "the module's code has %s" % "; ".join(found))
+    shipped = []
+    for d, _, files in os.walk(os.path.join(root, "plugin")):
+        shipped += [os.path.relpath(os.path.join(d, f), root) for f in files
+                    if re.search(r"\.test\.tsx?$", f)]
+    r.check(not shipped,
+            "plugin/ ships no tests (they live in plugin-tests/)",
+            "plugin/ holds test files %s; they belong in plugin-tests/, "
+            "outside what every install copies" % shipped)
 
 
 REPO_GIT_URL = "https://github.com/Sertelegger/holdfast.git"
@@ -425,7 +573,8 @@ def check_git_modes(root, r):
     for path in ("plugin/bootstrap", "scripts/plugin-archive-tests.sh",
                  "scripts/plugin-bootstrap-tests.sh",
                  "scripts/plugin-archive-corpus.py",
-                 "scripts/plugin-manifest-check.py"):
+                 "scripts/plugin-manifest-check.py",
+                 "scripts/plugin-mod-tests.sh"):
         mode = git_mode(root, path)
         if mode is None:
             print("  skip  %s is not tracked yet" % path)
@@ -465,6 +614,49 @@ def self_test(root):
          lambda d: shutil.copy(os.path.join(d, "plugin/commands/attach.md"),
                                os.path.join(d, "plugin/commands/doctor.md"))),
         ("version.txt deleted", lambda d: os.remove(os.path.join(d, "plugin/version.txt"))),
+        ("hooks.json names another module",
+         lambda d: _write(d, "plugin/hooks/hooks.json", '{"modules": ["./other.js"]}')),
+        ("the band switch defaults to off",
+         lambda d: _patch(d, "plugin/.claude-plugin/plugin.json", {"userConfig": {
+             "secret_band": {"type": "boolean", "title": "t", "description": "d",
+                             "default": False}}})),
+        ("the band switch removed",
+         lambda d: _patch(d, "plugin/.claude-plugin/plugin.json", {"userConfig": {}})),
+        # The read the band made before 2.1.291 was measured: one `status`.
+        ("a status read through $.mcp.call",
+         lambda d: _mod_append(d, "export const x = ($, s) => $.mcp.call(s, 'status', {})")),
+        ("an MCP connection",
+         lambda d: _mod_append(d, "export const x = ($) => $.mcp.connect('holdfast')")),
+        ("an MCP call off a destructured $",
+         lambda d: _mod_append(d, "export const x = ({ mcp }) => mcp.call(s, 'status', {})")),
+        ("$.mcp spelled with spaces",
+         lambda d: _mod_append(d, "export const x = ($) => $ . mcp . call(s, 'status', {})")),
+        ("$.mcp after a string holding //",
+         lambda d: _mod_append(d, "const u = 'x //'; export const x = ($) => $.mcp.call(s, 'status', {})")),
+        ("$ reached by a computed member",
+         lambda d: _mod_append(d, "export const x = ($) => $['mcp'].call(s, 'status', {})")),
+        ("$ reached by an optional member",
+         lambda d: _mod_append(d, "export const x = ($) => $?.env.get('PATH')")),
+        ("the validate pin admits an MCP call",
+         lambda d: _write(d, MOD_PIN, open(os.path.join(d, MOD_PIN)).read().replace(
+             "$.fs.stat,", "$.fs.stat, $.mcp.call,"))),
+        ("the validate pin deleted", lambda d: os.remove(os.path.join(d, MOD_PIN))),
+        ("the plugin's bootstrap named in the mod",
+         lambda d: _mod_append(d, "export const x = ($) => $.plugin.root + '/bootstrap'")),
+        ("a prompt submission",
+         lambda d: _mod_append(d, "export const x = ($) => $.prompt.submit({ text: 'x' })")),
+        ("an allow decision", lambda d: _mod_append(d, "export const x = { decision: 'allow' }")),
+        ("a text field", lambda d: _mod_append(d, "export const x = (I) => I.Input({ key: 'pw' })")),
+        ("stdin to a process",
+         lambda d: _mod_append(d, "export const x = ($) => $.process.run(['a'], { stdin: 's' })")),
+        ("the store", lambda d: _mod_append(d, "export const x = ($) => $.store.set('k', 1)")),
+        ("a bidi control in the module",
+         lambda d: _mod_append(d, "// " + chr(0x202E) + " reads backwards")),
+        ("the switch no longer read",
+         lambda d: _write(d, "plugin/hooks/register.js", open(os.path.join(
+             d, "plugin/hooks/register.js")).read().replace("secret_band", "band"))),
+        ("a test file shipped in plugin/",
+         lambda d: _write(d, "plugin/hooks/band.test.ts", "// planted\n")),
         ("pin without a sha", lambda d: _pin(d, sha=None)),
         ("pin to a branch", lambda d: _pin(d, ref="main")),
         ("pin to another repository",
@@ -615,7 +807,7 @@ def _release_server():
 
 def _fixture(root):
     d = tempfile.mkdtemp(prefix="hf-manifest-")
-    for item in (".claude-plugin", "plugin", "Cargo.toml", ".claude"):
+    for item in (".claude-plugin", "plugin", "plugin-tests", "Cargo.toml", ".claude"):
         s = os.path.join(root, item)
         t = os.path.join(d, item)
         if os.path.isdir(s):
@@ -729,6 +921,11 @@ def _nested_in_clone(d):
 
 def _write(d, rel, text):
     open(os.path.join(d, rel), "w").write(text)
+
+
+def _mod_append(d, line):
+    with open(os.path.join(d, "plugin/hooks/register.js"), "a") as f:
+        f.write(line + "\n")
 
 
 class _Sink:

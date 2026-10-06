@@ -51,12 +51,14 @@ use crate::attach::secret::SecretRequest;
 /// the name is optional and the notice has to work for a session that has
 /// none. Terminated with `\r\n`, because it lands in a raw PTY byte
 /// stream that attached terminals render without translation.
+///
+/// **It names one way to answer, the one that exists.** `holdfast attach`
+/// is the only client that can submit a secret; a notice offering a web
+/// UI that is not built sends a human looking for it while the request
+/// times out.
 pub fn buffer_notice(session_id: &str) -> Vec<u8> {
-    format!(
-        "[holdfast] awaiting secret input — run 'holdfast attach {session_id}' \
-         or open the web UI\r\n"
-    )
-    .into_bytes()
+    format!("[holdfast] awaiting secret input — run 'holdfast attach {session_id}'\r\n")
+        .into_bytes()
 }
 
 /// How the request a call is bound to came into existence (§9.4).
@@ -1465,8 +1467,7 @@ mod tests {
         let text = String::from_utf8(notice.clone()).expect("utf-8");
         assert_eq!(
             text,
-            "[holdfast] awaiting secret input — run 'holdfast attach sess_abc123' \
-             or open the web UI\r\n"
+            "[holdfast] awaiting secret input — run 'holdfast attach sess_abc123'\r\n"
         );
         assert!(
             !text.contains("<id>"),
@@ -1484,14 +1485,12 @@ mod tests {
         assert!(text.ends_with("\r\n"), "a raw PTY stream needs the CR");
 
         // **The template's own size, measured rather than remembered.**
-        // The 0.0.7 plan states 74 characters and 76 bytes for this line;
-        // both are wrong, and the numbers below are what `buffer_notice`
-        // actually produces. Pinned here so a later edit to the string
-        // has to say so.
+        // The numbers below are what `buffer_notice` actually produces,
+        // pinned so a later edit to the string has to say so.
         let template = String::from_utf8(buffer_notice("<id>")).expect("utf-8");
         let line = template.strip_suffix("\r\n").expect("CRLF");
-        assert_eq!(line.chars().count(), 80, "characters, before <id> grows");
-        assert_eq!(line.len(), 82, "bytes — two more, and both are the em dash");
+        assert_eq!(line.chars().count(), 61, "characters, before <id> grows");
+        assert_eq!(line.len(), 63, "bytes — two more, and both are the em dash");
         assert_eq!(
             line.bytes().filter(|b| *b >= 0x80).count(),
             3,

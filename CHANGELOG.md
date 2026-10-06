@@ -11,6 +11,25 @@ is cut, named and published is in
 
 ## [Unreleased]
 
+### Added
+
+- While the agent waits in `request_secret_input`, a band above Claude Code's
+  prompt offers this release's `holdfast attach --keep-size` to copy or run in
+  tmux, calling no Holdfast tool. Claude Code 2.1.287+; `secret_band` hides it.
+- `holdfast attach --keep-size` never sends your terminal's size, on joining
+  or on a resize, so attaching from a narrower pane does not shrink the session.
+
+### Security
+
+- `SECURITY.md` says a Claude Code mod from any installed plugin can call
+  Holdfast's tools with every grant the session holds and approve the agent's
+  own calls, and that the audit log attributes a mod's call to the agent's shim.
+
+### Fixed
+
+- The notice a secret request writes into the session's output names only
+  `holdfast attach <id>`; it also offered a web UI, which does not exist yet.
+
 ## [0.0.8] — 2026-09-28 (Dowel)
 
 **Upgrading:** run `holdfast daemon stop` after installing (it ends every
