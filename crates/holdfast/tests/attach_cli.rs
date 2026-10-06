@@ -877,6 +877,96 @@ async fn a_local_resize_reaches_the_child() {
     let _ = s.signal(holdfast_core::pty::Signal::Kill);
 }
 
+/// One attachment's frames as the stub records them, from joining through
+/// a local resize to `Ctrl-B d`: `args` are `attach`'s, and the client
+/// joins on a 100x30 terminal that is then made 132x43.
+///
+/// **Each wait has a witness, so an absence is read after the frame it
+/// would have come with.** A key typed after joining is an `Input` frame,
+/// and a client sends its startup `Resize` before it reads a key. The
+/// second key is typed after the resize has been delivered, and `Detach`
+/// is the last frame of all.
+async fn frames_of_an_attachment_resized_once(tag: &str, args: &[&str]) -> Vec<ClientFrame> {
+    let stub = StubDaemon::start(
+        tag,
+        vec![
+            attached_stub("sess_keep01"),
+            enc(&ServerFrame::Output {
+                session: "sess_keep01".into(),
+                bytes: b"JOINED\r\n".to_vec(),
+            }),
+        ],
+        Duration::from_secs(20),
+    )
+    .await;
+    let mut term = Term::spawn(stub.paths.dir(), args, 100, 30);
+    term.wait_for(b"JOINED", 10);
+
+    let inputs = |n: usize| {
+        move |f: &[ClientFrame]| {
+            f.iter()
+                .filter(|f| matches!(f, ClientFrame::Input { .. }))
+                .count()
+                >= n
+        }
+    };
+    term.type_keys(b"a");
+    wait_frames(&stub, 10, inputs(1));
+
+    term.resize(132, 43);
+    // `SIGWINCH` is delivered by the resize itself; this is the time for
+    // the client's loop to take it, which is milliseconds.
+    std::thread::sleep(Duration::from_millis(300));
+    term.type_keys(b"b");
+    wait_frames(&stub, 10, inputs(2));
+
+    term.type_keys(&[0x02, 0x64]);
+    assert_eq!(term.wait_exit(10), 0);
+    wait_frames(&stub, 10, |f| {
+        f.iter().any(|f| matches!(f, ClientFrame::Detach))
+    })
+}
+
+fn resizes(frames: &[ClientFrame]) -> Vec<(u16, u16)> {
+    frames
+        .iter()
+        .filter_map(|f| match f {
+            ClientFrame::Resize { cols, rows } => Some((*cols, *rows)),
+            _ => None,
+        })
+        .collect()
+}
+
+/// `attach --keep-size` puts no `Resize` on the wire: not on joining and
+/// not when this terminal is resized. It is the secret-request band's
+/// split pane, which is narrower than the agent's session and must not
+/// reflow it. Everything else is an attachment: keys still arrive as
+/// `Input`, and `Ctrl-B d` still detaches.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn keep_size_sends_no_resize_on_joining_or_on_a_local_resize() {
+    let sent =
+        frames_of_an_attachment_resized_once("keepsize", &["attach", "--keep-size", "sess_keep01"])
+            .await;
+    assert_eq!(resizes(&sent), vec![], "{sent:?}");
+    assert_eq!(
+        sent.iter()
+            .filter(|f| matches!(f, ClientFrame::Input { .. }))
+            .count(),
+        2,
+        "both keys reached the session as input: {sent:?}"
+    );
+}
+
+/// The control for the row above, on the same harness: without the flag
+/// the client sends its size on joining and again after the resize, so the
+/// harness can see a `Resize` when one is sent.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn without_keep_size_attach_sends_its_size_on_joining_and_on_a_resize() {
+    let sent =
+        frames_of_an_attachment_resized_once("keepsizectl", &["attach", "sess_keep01"]).await;
+    assert_eq!(resizes(&sent), vec![(100, 30), (132, 43)], "{sent:?}");
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn attach_does_not_redact() {
     // REQ-SEC-008's first half. `holdfast attach` is `role: interactive`

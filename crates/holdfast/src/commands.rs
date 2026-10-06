@@ -2522,8 +2522,15 @@ fn render(bytes: &[u8]) {
 /// `ServerFrame::BindingApprovalRequired`'s arm declines to do below and
 /// for the same reason. So the decision is declared for the attachment,
 /// up front, by the person who knows which child they are attaching to.
+///
+/// `keep_size` is `--keep-size`: this attachment sends **no `Resize`**,
+/// neither the one on joining nor one on a local resize, so the session
+/// keeps the size its other clients gave it. It is for joining from a
+/// smaller pane, such as a tmux split opened beside the agent's, where the
+/// startup `Resize` would reflow the agent's session to half its width.
+/// The view wraps or clips instead.
 #[cfg(unix)]
-pub async fn attach(session: &str, allow_echo: bool) -> ExitCode {
+pub async fn attach(session: &str, allow_echo: bool, keep_size: bool) -> ExitCode {
     use holdfast_core::attach::{AttachMode, AttachRole};
     use std::os::unix::io::AsRawFd;
 
@@ -2633,6 +2640,7 @@ pub async fn attach(session: &str, allow_echo: bool) -> ExitCode {
         match attach_connected(
             session,
             allow_echo,
+            keep_size,
             daemon_minor,
             rd,
             wr,
@@ -2707,6 +2715,7 @@ enum AttachEnd {
 async fn attach_connected(
     session: &str,
     allow_echo: bool,
+    keep_size: bool,
     daemon_minor: u32,
     rd: tokio::net::unix::OwnedReadHalf,
     mut wr: tokio::net::unix::OwnedWriteHalf,
@@ -2750,8 +2759,13 @@ async fn attach_connected(
     // daemon that is genuinely gone — a write half broken by a dead peer
     // is a read half that EOFs at once — so this cannot wait on a peer
     // that will never answer.
-    if let Ok((cols, rows)) = crate::attach_tty::window_size(tty) {
-        let _ = frame::write_frame(&mut wr, &ClientFrame::Resize { cols, rows }).await;
+    //
+    // Not under `--keep-size`, whose whole promise is that this terminal's
+    // size reaches nothing.
+    if !keep_size {
+        if let Ok((cols, rows)) = crate::attach_tty::window_size(tty) {
+            let _ = frame::write_frame(&mut wr, &ClientFrame::Resize { cols, rows }).await;
+        }
     }
 
     // **Say that the attach worked, but not yet.** Nothing else here
@@ -3294,7 +3308,12 @@ async fn attach_connected(
                     diag!("holdfast attach: the session is now {cols}x{rows}");
                 }
             }
+            // Still received under `--keep-size`, so the signal is
+            // consumed rather than left pending, and nothing is sent.
             _ = winch.recv() => {
+                if keep_size {
+                    continue;
+                }
                 if let Ok((cols, rows)) = crate::attach_tty::window_size(tty) {
                     if frame::write_frame(&mut wr, &ClientFrame::Resize { cols, rows })
                         .await
@@ -3690,7 +3709,7 @@ pub async fn watch(_session: &str) -> ExitCode {
 /// rewording either copy left every job in the workflow green. There is now
 /// exactly one place in this crate that prints the sentence.
 #[cfg(windows)]
-pub async fn attach(_session: &str, _allow_echo: bool) -> ExitCode {
+pub async fn attach(_session: &str, _allow_echo: bool, _keep_size: bool) -> ExitCode {
     unsupported("attach", Remedy::Wsl)
 }
 

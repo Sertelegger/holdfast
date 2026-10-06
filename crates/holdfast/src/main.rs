@@ -81,7 +81,7 @@ USAGE:
                                       buffer still holds. --tail N prints
                                       only the last N lines; --raw turns
                                       redaction off, and is audited
-    holdfast attach <session> [--allow-echo]
+    holdfast attach <session> [--allow-echo] [--keep-size]
                                       Take over the session's terminal
                                       (detach with Ctrl-B then d).
                                       --allow-echo submits secrets even
@@ -91,7 +91,12 @@ USAGE:
                                       reach a shell whose markers show it
                                       at its own prompt: a daemon of this
                                       release refuses that, and an older
-                                      one does not
+                                      one does not.
+                                      --keep-size leaves the session at
+                                      its own size: this terminal's size
+                                      is not sent on joining or when it
+                                      changes, so joining from a smaller
+                                      pane does not reflow the session
     holdfast watch <session>          Follow a session read-only and
                                       redacted (detach with Ctrl+C)
     holdfast version                  Print version information
@@ -966,6 +971,7 @@ enum Cmd {
     Attach {
         session: String,
         allow_echo: bool,
+        keep_size: bool,
     },
     Watch {
         session: String,
@@ -1003,6 +1009,7 @@ fn plan(path: &[&str], a: &Args) -> Result<Cmd, String> {
         ["attach"] => Cmd::Attach {
             session: a.positional(0),
             allow_echo: a.switch("--allow-echo"),
+            keep_size: a.switch("--keep-size"),
         },
         ["watch"] => Cmd::Watch {
             session: a.positional(0),
@@ -1031,7 +1038,8 @@ async fn execute(cmd: Cmd) -> ExitCode {
         Cmd::Attach {
             session,
             allow_echo,
-        } => commands::attach(&session, allow_echo).await,
+            keep_size,
+        } => commands::attach(&session, allow_echo, keep_size).await,
         Cmd::Watch { session } => commands::watch(&session).await,
         Cmd::Version => commands::version(),
     }
@@ -1195,7 +1203,7 @@ mod tests {
             ),
             (
                 "attach".into(),
-                vec!["--allow-echo"],
+                vec!["--allow-echo", "--keep-size"],
                 vec![],
                 vec!["<session>"],
             ),
@@ -1281,6 +1289,47 @@ mod tests {
         }
         assert!(decide(&["logs"], &["big", "--tail", "1", "--tail", "2"]).is_err());
         assert!(decide(&["logs"], &["big", "--raw=yes"]).is_err());
+    }
+
+    /// `--keep-size` is a switch of `attach` alone, parsed like the others:
+    /// in any position, never with a value, and never on `watch`, which
+    /// sends no size at all.
+    #[test]
+    fn keep_size_is_an_attach_switch_and_nothing_else() {
+        let attach = |allow_echo, keep_size| Cmd::Attach {
+            session: "s".into(),
+            allow_echo,
+            keep_size,
+        };
+        assert_eq!(decide(&["attach"], &["s"]), Ok(attach(false, false)));
+        for rest in [
+            &["s", "--keep-size"][..],
+            &["--keep-size", "s"][..],
+            &["--keep-size", "--", "s"][..],
+        ] {
+            assert_eq!(
+                decide(&["attach"], rest),
+                Ok(attach(false, true)),
+                "{rest:?}"
+            );
+        }
+        assert_eq!(
+            decide(&["attach"], &["--allow-echo", "s", "--keep-size"]),
+            Ok(attach(true, true))
+        );
+        for (path, rest) in [
+            (&["attach"][..], &["s", "--keep-size=yes"][..]),
+            (&["attach"][..], &["s", "--keep-sise"][..]),
+            (&["watch"][..], &["s", "--keep-size"][..]),
+        ] {
+            let err = decide(path, rest).expect_err("refused");
+            assert!(err.contains("--keep-si"), "{path:?} {rest:?}: {err}");
+        }
+        let help = help_text(&["attach"]).expect("attach");
+        assert!(
+            help.contains("[--keep-size]") && help.contains("--keep-size leaves the session"),
+            "{help}"
+        );
     }
 
     #[test]
