@@ -122,7 +122,9 @@ is not measured.
 
 Install plugins that carry mods only from marketplaces you trust. `claude
 plugin validate <dir>` lists the mods API calls a plugin's code makes, and
-`$.mcp.call` in that list is this reach.
+`$.mcp.call` in that list is this reach. The `holdfast` plugin's own mod uses
+it only to read session status, and it never accepts a secret: it points you
+at `holdfast attach`, where the secret is typed.
 
 ## In scope
 
