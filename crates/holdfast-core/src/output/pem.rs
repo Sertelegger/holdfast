@@ -782,11 +782,10 @@ pub struct BodyLines {
 /// or has carried [`PEM_MATERIAL_RUN`] that can be key body — so a read
 /// that lands mid-line in a key arriving under a decoration masks the
 /// front of the line, and the next read masks the rest from the line's own
-/// start. A digest still arriving is
-/// held, as any run is, and not masked, so the front of the first key line
-/// after a stop — the top of a pager's next screenful — is read out for as
-/// long as it is all hex digits: past fifteen characters, with
-/// probability (22/64)^16, about 4 × 10^-8.
+/// start. A digest still arriving is held, as any run is, and not masked,
+/// so the front of the first key line after a stop — the top of a pager's
+/// next screenful — is read out for as long as it is all hex digits: past
+/// fifteen characters, with probability (22/64)^16, about 4 × 10^-8.
 pub fn body_lines(region: &[u8], from: usize, to: usize, end: RegionEnd) -> BodyLines {
     let to = to.min(region.len());
     let mut out = BodyLines::default();
