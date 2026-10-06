@@ -294,25 +294,42 @@ MOD_FORBIDDEN = [
     ("$.store", "the store, which the agent's file tools can reach"),
     ("$.model", "a model call"),
 ]
-# **No MCP at all**, however it is spelled: `$.mcp.call`, `$.mcp.connect`,
-# `$ . mcp`, or `mcp.call(` off a destructured `$`. A mod's MCP call is
-# checked against the session's permission mode like the agent's own, so
-# in default mode it asks the user (measured, Claude Code 2.1.291), and the
-# band exists to point at the request, not to stand in front of it.
+# **No MCP**, in the spellings a reading of the source can see: `$.mcp.call`,
+# `$.mcp.connect`, `$ . mcp`, or `mcp.call(` off a destructured `$`. A mod's
+# MCP call is checked against the session's permission mode like the agent's
+# own, so in default mode it asks the user (measured, Claude Code 2.1.291),
+# and the band exists to point at the request, not to stand in front of it.
+#
+# This is a first line, not the authority. Source can name `mcp` in ways no
+# pattern here follows, so a `$` reached other than by a plain name
+# (`$['mcp']`, `$?.mcp`) is refused outright, as `claude plugin validate
+# --strict` refuses it. The authority is the validate pin below: what Claude
+# Code itself reports the module calls, which may list no `$.mcp` call.
 MOD_MCP = [
     re.compile(r"\$\s*\.\s*mcp\b"),
     re.compile(r"\bmcp\s*\.\s*(?:call|connect)\b"),
     re.compile(r"\{[^}]*\bmcp\b[^}]*\}\s*=\s*\$"),
 ]
+MOD_OPAQUE = re.compile(r"\$\s*(?:\[|\?\s*\.)")
 MOD_PIN = os.path.join("plugin-tests", "validate-notes.txt")
 
 
 def _code_of(source):
-    """The module without its `//` comments, which name what it must not do."""
+    """The module without its `//` comments, which name what it must not do.
+
+    A `//` is a comment only where it starts the line or follows a space with
+    every quote before it closed, so `'x //'; $.mcp.call(...)` keeps its call.
+    A line this misreads keeps its comment, which can only refuse more.
+    """
     out = []
     for line in source.splitlines():
-        m = re.match(r"^(.*?)(?:^|\s)//.*$", line)
-        out.append(m.group(1) if m else line)
+        code = line
+        for m in re.finditer(r"(?:^|\s)//", line):
+            before = line[:m.start()]
+            if all(before.count(q) % 2 == 0 for q in "'\"`"):
+                code = before
+                break
+        out.append(code)
     return "\n".join(out)
 
 
@@ -354,6 +371,12 @@ def check_mod(r, root, pl):
             "the module's code reaches an MCP server (%s); a mod's MCP call is "
             "permission-checked like the agent's own, so the band makes none"
             % ", ".join(sorted(set(mcp))))
+    opaque = sorted(set(m.group(0) for m in MOD_OPAQUE.finditer(code)))
+    r.check(not opaque,
+            "the module reaches `$` only by plain names",
+            "the module reaches `$` by a computed or optional member (%s), "
+            "which no reading of the source can follow to what it calls"
+            % ", ".join(opaque))
     # The other half's pin: Claude Code's own list of what the module calls.
     # A pin that admits an MCP call would let one through that review.
     pin = os.path.join(root, MOD_PIN)
@@ -608,6 +631,12 @@ def self_test(root):
          lambda d: _mod_append(d, "export const x = ({ mcp }) => mcp.call(s, 'status', {})")),
         ("$.mcp spelled with spaces",
          lambda d: _mod_append(d, "export const x = ($) => $ . mcp . call(s, 'status', {})")),
+        ("$.mcp after a string holding //",
+         lambda d: _mod_append(d, "const u = 'x //'; export const x = ($) => $.mcp.call(s, 'status', {})")),
+        ("$ reached by a computed member",
+         lambda d: _mod_append(d, "export const x = ($) => $['mcp'].call(s, 'status', {})")),
+        ("$ reached by an optional member",
+         lambda d: _mod_append(d, "export const x = ($) => $?.env.get('PATH')")),
         ("the validate pin admits an MCP call",
          lambda d: _write(d, MOD_PIN, open(os.path.join(d, MOD_PIN)).read().replace(
              "$.fs.stat,", "$.fs.stat, $.mcp.call,"))),
