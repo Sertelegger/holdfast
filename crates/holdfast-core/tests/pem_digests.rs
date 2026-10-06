@@ -4,11 +4,11 @@
 //! A line that names a whole `-----BEGIN … PRIVATE KEY-----` header
 //! without being a key — a `grep` hit, a code literal — opens a candidate
 //! that stops short, and `pem::body_lines` follows it for 16 KiB, masking
-//! every line that carries a run of 48 base64 characters. A SHA-256 digest
-//! is 64 hex digits, and the base64 of a `sha384-` or `sha512-` integrity
-//! string is 64 or 88 characters, so on `main` at `98c07d0` the rows below
-//! came back as `[REDACTED:unresolved]`: every digest and integrity string
-//! on the reads and the grid, and all but at most three on `watch`.
+//! every line that carries a run of 48 base64 characters that can be key
+//! body. A SHA-256 digest is 64 hex digits, and the base64 of a `sha384-`
+//! or `sha512-` integrity string is 64 or 88 characters: long enough, and
+//! refused for what they are (`pem::Run`), so each row below asserts that
+//! every surface shows them and reports nothing redacted.
 //!
 //! Driven through `HoldfastServer` over a `MockPty`, as `read_path.rs` is,
 //! so each surface is the one an agent calls: a cursor read at the default
@@ -212,11 +212,8 @@ fn mentions(command: &str) -> Vec<(&'static str, String)> {
 }
 
 /// **R19's reproduction: a `grep` hit naming a header, then `sha256sum`
-/// over twelve files.** On `main` at `98c07d0` all twelve digest lines
-/// were masked on the cursor read, on 1 KiB pages and on the grid, for
-/// each of these mentions, and on `watch` all twelve fed whole and nine to
-/// eleven fed in pieces. Every surface shows all twelve and reports
-/// nothing redacted.
+/// over twelve files.** Every surface shows all twelve digest lines, after
+/// each of the four mentions, and reports nothing redacted.
 #[tokio::test]
 async fn sha256sum_after_a_header_mention_comes_back_on_every_surface() {
     let digests: Vec<String> = (0..12).map(|i| hex(&bytes(i, 32))).collect();
@@ -245,10 +242,10 @@ async fn sha256sum_after_a_header_mention_comes_back_on_every_surface() {
 
 /// **`package-lock.json`, `yarn.lock` and an HTML `<script>` tag after the
 /// same mention: the integrity strings come back.** The base64 after
-/// `sha512-` is 88 characters and after `sha384-` 64, so each was a
-/// key-body line to the line test. `sha256-` (44) is shorter than that
-/// and was masked only for following one; it is here so that all three
-/// prefixes are exercised.
+/// `sha512-` is 88 characters and after `sha384-` 64, long enough for the
+/// line test. `sha256-` (44) is not, and follows a line that is already
+/// released here; it is in the row so that all three prefixes reach every
+/// surface, and `pem.rs`'s own tests pin its refusal.
 #[tokio::test]
 async fn integrity_strings_after_a_header_mention_come_back_on_every_surface() {
     let sri =

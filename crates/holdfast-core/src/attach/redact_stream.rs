@@ -1146,7 +1146,7 @@ mod tests {
             let cut = &pem[..pem.find(third).unwrap() + third.len() + 1];
             assert!(!cut.contains("-----END"), "{}", key.name);
             let mut r = redactor();
-            let mut out = r.feed(format!("$ head -n 4 k\n{cut}").as_bytes());
+            let mut out = r.feed(format!("$ head -c {} k\n{cut}", cut.len()).as_bytes());
             assert!(
                 !r.is_withholding(),
                 "{}: the fixture must end in the carry, not in the withhold",

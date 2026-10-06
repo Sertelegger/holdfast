@@ -87,9 +87,9 @@ use super::encoding::lossy_printable_keeps;
 /// against both sides.** Every body line a real key is printed with is
 /// 64 characters (70 for OpenSSH), so any key cut after its first line
 /// clears it by a factor of four. Prose rarely does: sixteen consecutive
-/// letters or digits with no space or punctuation is a hash, a long path,
-/// or `internationalization` — and the whole cost of one is that the line
-/// it sits on is masked.
+/// letters or digits with no space or punctuation is a base64 hash, a
+/// long path, or `internationalization` — and the whole cost of one is
+/// that the line it sits on is masked. A hex digest is not one (`Run`).
 ///
 /// **The residual, stated rather than elided.** A key cut *inside the
 /// first sixteen characters of its body* and followed on the same line by
@@ -99,11 +99,15 @@ use super::encoding::lossy_printable_keeps;
 /// magic. For a SEC1 EC key the private scalar starts at byte seven, so
 /// such a cut can release up to five bytes of it. It takes `head -c` or a
 /// program that prints a partial first line and then punctuation on the
-/// same line. A run of hex digits is not material (`Run`). That moves the
-/// cut for no unencrypted format, whose first body line has a character
-/// that is not a hex digit within its first four (`MII`, `MHc`, `b3Bl`).
-/// A legacy encrypted key's first line is ciphertext, and opens with
-/// sixteen hex digits with probability (22/64)^16, about 4 × 10^-8.
+/// same line. A run of hex digits is not material (`Run`), and no
+/// unencrypted format's first body line opens with one: each has a
+/// character that is not a hex digit within its first four (`MII`, `MHc`,
+/// `b3Bl`), so the cut is at sixteen for all of them. A legacy encrypted
+/// key's first line is ciphertext, which opens with sixteen hex digits
+/// with probability (22/64)^16, about 4 × 10^-8. Its armour is public —
+/// `Proc-Type`, and a `DEK-Info` IV that is hex — so such a key cut before
+/// sixteen characters of ciphertext is released whole: the armour and less
+/// than one cipher block of ciphertext.
 pub const PEM_MATERIAL_RUN: u32 = 16;
 
 /// A line carrying a base64 run this long is a key-body line, wherever on
@@ -152,14 +156,27 @@ const SRI_ALGORITHMS: [&[u8; 6]; 3] = [b"sha256", b"sha384", b"sha512"];
 ///   be all hex by chance: about 4 × 10^-8 at sixteen characters, and
 ///   only when no `=` pads it. [`body_lines`] masks a refused run on the
 ///   line after a body line for that reason, and the walk keeps a line
-///   that a key's mask already reaches.
+///   that a key's mask already reaches. Hex is refused whatever it
+///   encodes: a hex secret (`openssl rand -hex`) or a hex dump of a key
+///   (`xxd -p`) is not PEM text, and comes back after a header as it does
+///   where no header was mentioned — Tier 2's secret with no recognisable
+///   shape.
 /// * **Directly after `sha256-`, `sha384-` or `sha512-`: an integrity
 ///   string**, as `package-lock.json`, `yarn.lock`, pnpm, Nix and an HTML
 ///   `<script integrity>` print one. Base64 has no `-`, so no key line
 ///   carries the prefix inside a run. Only the run directly after the `-`
 ///   is refused: any other byte and every line break clear it, so text
 ///   that ends in `sha256-` cannot refuse a key printed after it, and
-///   `xsha256-` is not the prefix.
+///   `xsha256-` is not the prefix. Only the lower-case spelling is, which
+///   is the one those tools print; `SHA512-` is masked. A key line with the
+///   prefix written in front of it is released, and that takes rewriting
+///   the key's text on purpose, which Tier 2 does not claim to catch.
+///
+/// **Each stream counts its own runs**, so a colour change that touches a
+/// run — `rg` and `grep --color` paint a match — puts the escape's
+/// parameters into the raw and printable streams' run (`31m` and then the
+/// digest), which is neither hex nor after the prefix there, and the line
+/// is masked as any other run of its length is.
 #[derive(Debug, Clone, Copy)]
 struct Run {
     len: u32,
@@ -240,8 +257,9 @@ pub struct PemExtent {
     pub end: usize,
     /// Some stream can still be PEM text at the region's end.
     pub alive: bool,
-    /// Some stream carried [`PEM_MATERIAL_RUN`] base64 characters before
-    /// it died or closed.
+    /// Some stream carried a run of [`PEM_MATERIAL_RUN`] base64 characters
+    /// that can be key body — not a digest or an integrity string (`Run`)
+    /// — before it died or closed.
     pub material: bool,
     /// Some stream got past the label's closing dashes: the anchor is a
     /// whole encapsulation boundary, not `-----BEGIN` and prose.
@@ -414,7 +432,7 @@ struct Lane {
     material: bool,
     /// Region index just past the most recent line break, and whether
     /// that line has carried a run of [`PEM_MATERIAL_RUN`] of any kind. A
-    /// digest's counts here: a line the mask of a key already reaches is
+    /// digest counts here: a line the mask of a key already reaches is
     /// kept in it, because a key's last line can be all hex digits.
     line_start: usize,
     line_material: bool,
@@ -721,9 +739,13 @@ pub struct BodyLines {
 /// for neither, except on the line after a body line: there it is masked
 /// as a key's last line may be, and ends the run of body lines, so a list
 /// of digests printed after a key costs its first line and no more. A
-/// blank line — nothing but whitespace once escapes are gone — neither
-/// ends a run of body lines nor starts one. Everything else is kept: a
-/// prompt, a command, a pager's `:`, the `-----END` line itself.
+/// line shorter than [`KEY_LINE_RUN`] after it is not reached, so a key
+/// rewrapped to lines that short loses the rest of its run of body lines
+/// at a line that happens to be all hex digits: (22/64)^n for a line of n
+/// characters, about 4 × 10^-8 at sixteen. A blank line — nothing but
+/// whitespace once escapes are gone — neither ends a run of body lines
+/// nor starts one. Everything else is kept: a prompt, a command, a pager's
+/// `:`, the `-----END` line itself.
 ///
 /// **Why not the whole carry, as before GH #242.** That is the
 /// alternative the review offered, and it is the one that undoes the
@@ -741,11 +763,10 @@ pub struct BodyLines {
 /// that can be key body — so a read that lands mid-line in a key arriving
 /// under a decoration masks the front of the line, and the next read
 /// masks the rest from the line's own start. A digest still arriving is
-/// held, as any run is, and not masked. So the front of the first key line
-/// after a stop — the top of a pager's next screenful — is read out this
-/// way for as long as it is all hex digits, where it was for its first
-/// fifteen characters: past sixteen, with probability (22/64)^16, about
-/// 4 × 10^-8.
+/// held, as any run is, and not masked, so the front of the first key line
+/// after a stop — the top of a pager's next screenful — is read out for as
+/// long as it is all hex digits: past fifteen characters, with
+/// probability (22/64)^16, about 4 × 10^-8.
 pub fn body_lines(region: &[u8], from: usize, to: usize, end: RegionEnd) -> BodyLines {
     let to = to.min(region.len());
     let mut out = BodyLines::default();
@@ -1457,6 +1478,10 @@ mod tests {
     const SRI512: &str = "sha512-aPHDxaLSeT7L+t+1t4Mzoi9kLG1Oe0jjJNPn4gehlmWOthNVLYvXR5FyBm7Sk+trevdwUPNEStIxCopBRW1KCg==";
     /// A `sha384-` integrity string, whose base64 is 64 characters.
     const SRI384: &str = "sha384-SrpsZDxVFyEgP6pohNcOq1aI+48FVepYM3iOroCp6u/k8XE+LoRE6nYZK7iapn+0";
+    /// A `sha256-` integrity string, whose base64 is 44 characters: under
+    /// [`KEY_LINE_RUN`], so only the walk's material test and the line
+    /// after a body line can tell that it is refused.
+    const SRI256: &str = "sha256-gjKy6NK7JobqmMZgEIxwdAEpGqGStDM2rS8e6/qL3xU=";
 
     fn masked(text: &str, end: RegionEnd) -> Vec<&str> {
         body_lines(text.as_bytes(), 0, text.len(), end)
@@ -1486,6 +1511,10 @@ mod tests {
                 "pnpm",
                 format!("    resolution: {{integrity: {SRI512}}}\r\n"),
             ),
+            (
+                "pnpm sha256",
+                format!("    resolution: {{integrity: {SRI256}}}\r\n"),
+            ),
             ("sha384", format!("Integrity: {SRI384}\r\n")),
         ] {
             let text = format!("{HEADER}\r\n{after}$ ");
@@ -1496,6 +1525,20 @@ mod tests {
         // The pair: the same walk with key body in it is material.
         let key = walk(&format!("{HEADER}\r\n{DIGEST}  a\r\n{LINE}\r\n$ "));
         assert!(key.material, "{key:?}");
+
+        // A refused run still opens the body, as any run of sixteen does,
+        // so no armour header opens after it: the walk dies on the `:` of
+        // `Comment:` with nothing material behind it, and the key line
+        // after that is `body_lines`' to mask.
+        let text = format!("{HEADER}\n{DIGEST}\nComment: x\n{LINE}\n$ ");
+        let e = walk(&text);
+        assert!(!e.alive && !e.material && e.stopped_short(), "{e:?}");
+        assert_eq!(&text[e.end..], &text[text.find("Comment").unwrap()..]);
+        assert_eq!(
+            masked(&text[e.end..], RegionEnd::Final),
+            vec![LINE],
+            "the key line is a body line"
+        );
 
         // A legacy encrypted key's armour alone carries none either: its
         // DEK-Info IV is hex. Its body is material from the first line.
@@ -1547,6 +1590,28 @@ mod tests {
             masked(&after_blob, RegionEnd::Final),
             vec![&after_blob[..after_blob.find("  f").unwrap() + 3]]
         );
+        // The same for a `sha256-` string, which is too short to be a body
+        // line on its own: after a blob it is masked and ends the run.
+        let sri256 = format!("{blob}\r\n{SRI256}\r\n{SRI256}\r\n");
+        assert_eq!(
+            masked(&sri256, RegionEnd::Final),
+            vec![&sri256[..blob.len() + 2 + SRI256.len()]]
+        );
+        // And what is not refused: an integrity string in capitals, which
+        // no tool prints, and a digest or an integrity string a colour
+        // change touches, as `grep --color` and `rg` paint a match. Each
+        // stream counts its own runs, and the raw one carries the escape's
+        // parameters into the run.
+        let upper = format!("SHA512-{}", &SRI512["sha512-".len()..]);
+        let painted = format!("\x1b[33m{DIGEST}\x1b[m  b.tgz");
+        let rg = format!(
+            "\"integrity\": \"\x1b[0m\x1b[1m\x1b[31msha512\x1b[0m-{}\",",
+            &SRI512["sha512-".len()..]
+        );
+        for line in [upper, painted, rg] {
+            let text = format!("$ x\r\n{line}\r\n$ ");
+            assert_eq!(masked(&text, RegionEnd::Final), vec![&line[..]], "{line:?}");
+        }
 
         // A digest still arriving is held on a stream, as any run is, and
         // not masked: its first sixteen digits are not material.
@@ -1625,11 +1690,13 @@ mod tests {
     }
 
     /// **No fixture key starts a body line with sixteen hex digits**, so
-    /// the hex refusal moves `PEM_MATERIAL_RUN`'s residual for none of
-    /// them: each first body line has a character that is not a hex digit
-    /// in its first four (`MII`, `MHc`, `b3Bl`, and the legacy encrypted
-    /// key's ciphertext), and a key cut after it, with a prompt on the same
-    /// line, is material and masked to the prompt.
+    /// `PEM_MATERIAL_RUN`'s residual is the first fifteen characters for
+    /// every one of them: each first body line has a character that is not
+    /// a hex digit in its first four (`MII`, `MHc`, `b3Bl`, and the legacy
+    /// encrypted key's ciphertext). A key cut sixteen characters or more
+    /// into that line, with a prompt on the same line, is material and
+    /// masked to the prompt; cut at fifteen it is not, and the line is
+    /// released from its start.
     #[test]
     fn every_fixture_key_is_material_by_its_first_line() {
         for key in fixtures::KEYS {
@@ -1643,11 +1710,23 @@ mod tests {
             }
             let pem = key.pem();
             let first = key.material_lines()[0];
-            let at = pem.find(first).unwrap() + first.len();
-            let cut = format!("{}$ ", &pem[..at]);
+            let start = pem.find(first).unwrap();
+            let run = PEM_MATERIAL_RUN as usize;
+            for n in [run, KEY_LINE_RUN as usize - 1, first.len()] {
+                let cut = format!("{}$ ", &pem[..start + n]);
+                let e = walk(&cut);
+                assert!(!e.alive && e.material, "{} at {n}: {e:?}", key.name);
+                assert_eq!(&cut[e.end..], "$ ", "{} at {n}", key.name);
+            }
+            let cut = format!("{}$ ", &pem[..start + run - 1]);
             let e = walk(&cut);
-            assert!(!e.alive && e.material, "{}: {e:?}", key.name);
-            assert_eq!(&cut[e.end..], "$ ", "{}", key.name);
+            assert!(
+                !e.alive && !e.material,
+                "{} at {}: {e:?}",
+                key.name,
+                run - 1
+            );
+            assert_eq!(e.end, start, "{}: released from the line's start", key.name);
         }
     }
 }
