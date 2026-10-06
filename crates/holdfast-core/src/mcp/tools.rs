@@ -18,6 +18,7 @@ use crate::screen::{ScreenCapture, ScreenConfig, ScreenTracking};
 use crate::secret::binding::{Autofill, Resolved};
 use crate::secret::{CancelReason, RaisedBy, Resolution, SlotSnapshot, SlotTake};
 use crate::session::launch::History;
+use crate::session::stats::{shows_unresolved, WaitResult};
 use crate::session::SecretWrite;
 use crate::session::{new_session_id, wait, Session, SessionConfig, WriteRequest};
 use rmcp::handler::server::wrapper::Parameters;
@@ -556,6 +557,10 @@ impl HoldfastServer {
             rules: Some(Arc::clone(&self.processor.rules)),
             // §4.2's `output_broadcast_capacity`, live since GH #210.
             output_broadcast_capacity: self.config.limits.output_broadcast_capacity,
+            // Plan §4.9: where this session's one `session_stats` line
+            // goes, and the history policy it reports.
+            audit: Some(Arc::clone(&self.processor.audit)),
+            history_policy: crate::session::stats::history_policy(history, &launch.env),
             ..SessionConfig::default()
         };
         // What the typed line needs (`Shell::injection_env`): bash's and
@@ -817,6 +822,13 @@ impl HoldfastServer {
                 "redaction_rules_active": self.processor.rules.len(),
                 "redaction_rules_disabled": self.processor.rules.disabled_builtin_rules(),
                 "pid": session.pid(),
+                // Where the child's environment started from, before the
+                // defaults and the call's own `env` (plan §3.1, E4): the
+                // arm `base_env` above took, named by the function that
+                // mirrors it. `env_keys` cannot say this, because it lists
+                // only the call's own keys. The known-values PR (#253)
+                // adds `known_env_names` beside it, names only.
+                "env_base": host.env_base(profiled).as_str(),
             }),
         );
 
@@ -1271,14 +1283,12 @@ impl HoldfastServer {
         // `client_kind` is derived by `mcp::caller` from the uid-checked
         // handshake the daemon scoped this call to (REQ-SEC-018). The
         // same pair 0.0.3's `read_processed` passes, for the same reasons.
-        if !redact {
-            let surface = caller::audit_surface("get_screen_state");
-            self.processor.audit.record_redaction_disabled(
-                Some(&session.id),
-                surface.tool,
-                surface.client_kind,
-            );
-        }
+        //
+        // **Sampled here, written after the capture.** The pair is a
+        // task-local the blocking pool does not inherit, so it is read on
+        // this task; the line waits for the capture because it records
+        // how much the grid handed over (`Session::account_screen_read`).
+        let surface = caller::audit_surface("get_screen_state");
 
         // Enabling Tier B costs one buffer re-seed (§4.5); the call
         // succeeds either way, so this is never an error path — which is
@@ -1309,6 +1319,13 @@ impl HoldfastServer {
             capture_session.screen_state(diff_from, redact, &capture_processor)
         })
         .await?;
+        session.account_screen_read(
+            redact,
+            &capture,
+            surface.tool,
+            surface.client_kind,
+            &self.processor.audit,
+        );
         let tracking = session.screen_tracking();
 
         let (mut data, details) = match capture {
@@ -4266,6 +4283,14 @@ impl HoldfastServer {
             Some(_) => Status::Ok,
             None => Status::Timeout,
         };
+        session.account_wait(
+            match status {
+                Status::Ok => WaitResult::Idle,
+                Status::SessionDied => WaitResult::SessionDied,
+                _ => WaitResult::Timeout,
+            },
+            None,
+        );
         (status, fields)
     }
 
@@ -4363,6 +4388,9 @@ impl HoldfastServer {
             }
             _ => None,
         };
+
+        let text_unresolved =
+            shows_unresolved(&context) || match_text.as_ref().is_some_and(shows_unresolved);
 
         let mut fields = serde_json::Map::new();
         fields.insert("matched".into(), json!(outcome.found.is_some()));
@@ -4472,6 +4500,17 @@ impl HoldfastServer {
         if status == Status::SessionDied {
             fields.insert("exit_code".into(), json!(session.exit_code()));
         }
+        // One wait, however many reads its text took: `output_since_start`
+        // and `match.text` are one response, so a marker in either is what
+        // the caller saw.
+        session.account_wait(
+            match status {
+                Status::Ok => WaitResult::Matched,
+                Status::SessionDied => WaitResult::SessionDied,
+                _ => WaitResult::Timeout,
+            },
+            Some(text_unresolved),
+        );
         (status, fields)
     }
 }

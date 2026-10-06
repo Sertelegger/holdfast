@@ -267,6 +267,24 @@ impl Host {
         }
     }
 
+    /// Which of [`Host::base_env`]'s three arms a session takes, as
+    /// `session_start.env_base` records it (plan §3.1, E4).
+    ///
+    /// The same match as `base_env`'s, arm for arm;
+    /// `env_base_names_the_arm_base_env_takes` holds the two together
+    /// over every host shape, so a change to one that skips the other
+    /// fails there rather than in an operator's reading of the trail.
+    pub fn env_base(&self, profile: bool) -> crate::audit::EnvBase {
+        use crate::audit::EnvBase;
+        match self {
+            Self::InProcess => EnvBase::InProcess,
+            Self::Daemon {
+                client: Some(ClientLaunch { env: Some(_), .. }),
+            } if !profile => EnvBase::Client,
+            Self::Daemon { .. } => EnvBase::Daemon,
+        }
+    }
+
     /// The environment a session's child starts from, before the
     /// defaults and the call's own `env`.
     ///
@@ -645,6 +663,71 @@ mod tests {
         // is inherited untouched — `CLAUDE_PROJECT_DIR` included, because
         // there it is right.
         assert_eq!(Host::InProcess.base_env(false, spawner()), None);
+    }
+
+    /// `session_start.env_base` names the arm `base_env` took, for every
+    /// host shape `base_env` distinguishes — the two are separate matches,
+    /// and this is what keeps them one decision. Each shape is checked
+    /// against what `base_env` actually returned, not against a second
+    /// copy of the rule.
+    #[test]
+    fn env_base_names_the_arm_base_env_takes() {
+        use crate::audit::EnvBase;
+        let with_env = client("/b", &[("PATH", "/b/bin")]);
+        let cwd_only = ClientLaunch {
+            cwd: Some("/b".into()),
+            env: None,
+        };
+        let shapes = [
+            (Host::InProcess, false),
+            (Host::InProcess, true),
+            (
+                Host::Daemon {
+                    client: Some(with_env.clone()),
+                },
+                false,
+            ),
+            (
+                Host::Daemon {
+                    client: Some(with_env),
+                },
+                true,
+            ),
+            (
+                Host::Daemon {
+                    client: Some(cwd_only),
+                },
+                false,
+            ),
+            (Host::Daemon { client: None }, false),
+            (Host::Daemon { client: None }, true),
+        ];
+        let daemon_own: Vec<(OsString, OsString)> = spawner()
+            .into_iter()
+            .filter(|(k, _)| !k.to_str().is_some_and(names_the_spawning_client))
+            .collect();
+        let mut seen = Vec::new();
+        for (host, profile) in shapes {
+            let base = host.base_env(profile, spawner());
+            let named = host.env_base(profile);
+            let arm = match &base {
+                None => EnvBase::InProcess,
+                Some(env) if *env == daemon_own => EnvBase::Daemon,
+                Some(_) => EnvBase::Client,
+            };
+            assert_eq!(
+                named, arm,
+                "{host:?} profile={profile}: the record names another arm"
+            );
+            seen.push(named);
+        }
+        for each in EnvBase::ALL {
+            assert!(
+                seen.contains(&each),
+                "no host shape reaches `{}`",
+                each.as_str()
+            );
+        }
     }
 
     #[test]

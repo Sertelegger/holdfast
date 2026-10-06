@@ -3,9 +3,11 @@
 pub mod launch;
 pub mod reaper;
 pub mod registry;
+pub mod stats;
 pub mod wait;
 pub use reaper::Reaper;
 pub use registry::{Retention, SessionRegistry};
+pub use stats::SessionStats;
 
 use crate::attach::secret::SecretBytes;
 use crate::buffer::{BufferRead, OutputBuffer};
@@ -371,6 +373,14 @@ pub struct SessionConfig {
     /// both from the file; the clamp is for the callers that build a
     /// `SessionConfig` by hand.
     pub output_broadcast_capacity: usize,
+    /// The audit log this session's `session_stats` line goes to
+    /// (`stats`), or `None` for a session that writes none.
+    /// `start_session` passes the server's; a session built by hand keeps
+    /// the default and leaves no line in anybody's trail.
+    pub audit: Option<Arc<crate::audit::AuditLog>>,
+    /// GH #252's history policy as `session_stats` reports it, decided by
+    /// `start_session` (`stats::history_policy`).
+    pub history_policy: crate::audit::HistoryPolicy,
 }
 
 impl Default for SessionConfig {
@@ -393,6 +403,8 @@ impl Default for SessionConfig {
             // default is every rule.
             rules: None,
             output_broadcast_capacity: OUTPUT_BROADCAST_FRAMES,
+            audit: None,
+            history_policy: crate::audit::HistoryPolicy::default(),
         }
     }
 }
@@ -476,6 +488,9 @@ pub struct Session {
     /// each response reporting 1 while this reaches 2, and that
     /// difference is the contract.
     redaction_stats: Mutex<BTreeMap<String, u64>>,
+    /// Plan §4.9's per-session counters, and the one `session_stats` line
+    /// they become. See [`stats`].
+    stats: SessionStats,
     /// §9.6's `max_uses` budget, `{binding name: resolutions}` — 0.0.7.
     ///
     /// **The counter lives with the session and not with the binding**,
@@ -1162,6 +1177,7 @@ impl Session {
             shell_integration: config.shell_integration,
             state: Mutex::new(SessionState::Running),
             redaction_stats: Mutex::new(BTreeMap::new()),
+            stats: SessionStats::new(config.audit.clone(), config.history_policy, started_ms),
             binding_uses: Mutex::new(BTreeMap::new()),
             output_tx: output_tx.clone(),
             output_broadcast_capacity,
@@ -1974,6 +1990,9 @@ impl Session {
             Ordering::Relaxed,
             Ordering::Relaxed,
         );
+        // `session_stats.duration_ms` ends here, on the session's own
+        // clock rather than this wall-clock second.
+        self.stats.latch_end(self.clock.now_ms());
     }
 
     /// Unix seconds at which this session's exit was first observed
@@ -2689,11 +2708,7 @@ impl Session {
 
         // Both of these are audit obligations of the *read*, so they live
         // here rather than in each transport that calls it (§9.2, §9.4).
-        if !req.options.redact {
-            processor
-                .audit
-                .record_redaction_disabled(Some(&self.id), req.tool, req.client_kind);
-        }
+        self.account_read(req, &read, snapshot.head, processor);
         if truncated_at_tail {
             if let ReadStart::Cursor(c) = req.start {
                 processor
@@ -5023,6 +5038,9 @@ mod tests {
                 // detection knobs, and a usize beside two usizes above is
                 // named rather than defaulted for the same reason.
                 output_broadcast_capacity: OUTPUT_BROADCAST_FRAMES,
+                // No `session_stats` line: this row has no trail to read.
+                audit: None,
+                history_policy: crate::audit::HistoryPolicy::Discard,
             },
         );
         pty.queue_output(&bytes);

@@ -537,6 +537,70 @@ mod tests {
         assert!(!reaper.has_pending_escalation());
     }
 
+    /// **Plan §4.9's retire path for a reaped session.** The reaper
+    /// signals; the daemon's tick sweeps right after it
+    /// (`daemon::server::reaper_loop`), and the sweep writes the session's
+    /// one `session_stats` line.
+    ///
+    /// On a manual clock, so `duration_ms` is exact: the session lived
+    /// from construction to the sweep that first saw it gone, which is the
+    /// idle timeout plus the second past it. A clock advanced after that
+    /// moves nothing, because the end was latched and the line is written.
+    #[test]
+    fn a_reaped_session_gets_one_session_stats_line_timed_on_its_own_clock() {
+        let dir = tempfile::tempdir().unwrap();
+        let log_path = dir.path().join("audit.log");
+        let rules = Arc::new(crate::output::rules::RuleSet::builtin().unwrap());
+        let audit = Arc::new(crate::audit::AuditLog::to_path(&log_path, rules).unwrap());
+        let reg = registry();
+        let clock = Clock::manual(Instant::now());
+        let s = Session::new(
+            "sess_reaped".into(),
+            None,
+            "bash".into(),
+            vec![],
+            Arc::new(MockPty::new()),
+            SessionConfig {
+                idle_timeout_secs: 1800,
+                clock: clock.clone(),
+                audit: Some(audit),
+                ..SessionConfig::default()
+            },
+        );
+        reg.insert(Arc::clone(&s)).unwrap();
+        let reaper = Reaper::new(Arc::clone(&reg), clock.clone());
+        let stats_lines = || -> Vec<serde_json::Value> {
+            std::fs::read_to_string(&log_path)
+                .unwrap_or_default()
+                .lines()
+                .map(|l| serde_json::from_str::<serde_json::Value>(l).unwrap())
+                .filter(|e| e["kind"] == "session_stats")
+                .collect()
+        };
+
+        clock.advance(Duration::from_secs(1801));
+        assert_eq!(reaper.scan_once(), 1);
+        assert!(
+            stats_lines().is_empty(),
+            "the reaper signals; it does not retire"
+        );
+        assert_eq!(reg.retire_exited(), 1);
+        let lines = stats_lines();
+        assert_eq!(lines.len(), 1, "{lines:?}");
+        assert_eq!(lines[0]["session_id"], "sess_reaped");
+        assert_eq!(lines[0]["duration_ms"], 1_801_000);
+
+        clock.advance(Duration::from_secs(60));
+        reaper.scan_once();
+        assert_eq!(reg.retire_exited(), 0);
+        assert_eq!(
+            s.stats_record().duration_ms,
+            1_801_000,
+            "the end was latched"
+        );
+        assert_eq!(stats_lines().len(), 1, "a later tick wrote a second line");
+    }
+
     #[test]
     fn the_scan_interval_and_the_grace_are_the_two_the_spec_names() {
         // Pinned as literals, not against each other: the reaper's 5 s is
