@@ -97,34 +97,49 @@ What *is* in scope is everything Holdfast claims to do about that execution:
 whether the agent is told the truth about what a session is doing, whether a
 `terminate` really terminates, and whether the redactor holds.
 
-**Claude Code's permission prompt does not see every Holdfast call made from
-inside Claude Code.** A Claude Code *mod*, the code a plugin runs inside Claude
-Code, can call any tool on any MCP server the session has connected, through
-`$.mcp.call`. Claude Code's mod API documents that such a call raises no
-permission prompt: the plugin's call is the grant. A mod in one plugin was
-measured reading another plugin's Holdfast sessions that way under `claude -p`,
-with no rule allowing it. So a mod from any installed plugin can call any
-Holdfast tool, `send_input`, `terminate` and `read_output(redact: false)`
-included, and no human is asked. Claude Code's admin guide says the call runs
-under the session's permission rules, so a `deny` rule may still stop it; that
-is not measured.
+**A Claude Code mod can call Holdfast with every permission the session has
+granted.** A *mod* is code a plugin runs inside Claude Code. Through
+`$.mcp.call` it can call any tool on any MCP server the session has connected,
+another plugin's included. Claude Code 2.1.291 was measured checking such a
+call as it checks the agent's: in default permission mode it asks, naming the
+plugin, and under `claude -p`, where nobody can be asked, it refuses the call;
+`deny` and `ask` rules apply. What a mod inherits is every standing grant. A
+Holdfast tool you have always allowed, or any Holdfast tool under auto mode,
+can be called by any installed plugin's mod with nobody asked. That was
+measured from a second plugin's mod: an allowed `list_sessions` in default
+mode, and `send_input` and `read_output(redact: false)` in auto mode.
 
+- **A mod can also approve the agent's own calls.** A `tool.check` hook
+  answers before the permission prompt appears. Claude Code's admin guide
+  documents that its approval overrides an `ask` rule and, in auto mode, the
+  classifier, and that a `deny` rule still holds where Claude Code's built-in
+  guard loads (managed settings, or a Team or Enterprise sign-in). This is not
+  measured here.
 - **It is no new capability.** A process running as your user can already
   connect to the daemon's `control.sock`, which admits any process with the
   daemon's uid. That puts it under the same-user rule in Out of scope.
-- **It is a hole in an assumption.** Treating Claude Code's permission prompt
-  as the human gate in front of Holdfast relies on something a mod walks past.
+- **It is a hole in an assumption.** An always-allow you give the agent for a
+  Holdfast tool is given to every installed plugin's mod too. Claude Code's
+  permission prompt is the human gate in front of Holdfast only as far as you
+  trust those plugins.
 - **Holdfast cannot tell such a call from the agent's.** It arrives through
   the same `holdfast mcp` process, so where the audit log names the kind of
-  client, as a `redaction_disabled` entry does, it names the one it names for
-  the agent's own calls: `shim` under the daemon. That field is attribution
-  only; it decides no redaction and grants nothing.
+  client, it names the one it names for the agent's own calls: `shim` under
+  the daemon. A mod's `read_output(redact: false)` was measured landing in a
+  `redaction_disabled` entry that way. That field is attribution only; it
+  decides no redaction and grants nothing.
+- **What was not measured.** The auto-mode run had no model access, so
+  whether auto mode's classifier reviews a mod's call is unknown. The mod
+  API's own types say such a call raises no prompt at all; 2.1.291 does not
+  behave that way, and a later version may.
 
 Install plugins that carry mods only from marketplaces you trust. `claude
-plugin validate <dir>` lists the mods API calls a plugin's code makes, and
-`$.mcp.call` in that list is this reach. The `holdfast` plugin's own mod uses
-it only to read session status, and it never accepts a secret: it points you
-at `holdfast attach`, where the secret is typed.
+plugin validate <dir>` shows both reaches before you install: `$.mcp.call` on
+its `calls:` line, and `tool.check` on its `hooks:` line.
+
+The `holdfast` plugin's own mod uses `$.mcp.call` only to read session status,
+and it never accepts a secret: it points you at `holdfast attach`, where the
+secret is typed.
 
 ## In scope
 

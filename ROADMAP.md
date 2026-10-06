@@ -208,8 +208,9 @@ rather than something the agent can arrange.
 decisions). The case against it is that Claude Code's own permission prompts
 and `PreToolUse` hooks already see every `start_session` and `send_input`
 call the agent makes, and a strict mode an agent can satisfy from a second
-session is not the barrier it reads as. A call from a Claude Code mod skips
-the prompt, which SECURITY.md names.
+session is not the barrier it reads as. A Claude Code mod's own calls pass
+the same rules but inherit every standing grant, and a mod can approve the
+agent's calls itself, which SECURITY.md names.
 
 ## Web UI
 
