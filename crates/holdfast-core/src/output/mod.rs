@@ -1989,10 +1989,17 @@ mod tests {
         OutputProcessor::builtin().unwrap()
     }
 
-    /// A cursor read's window over a whole in-memory buffer, taken by the
+    /// A read's window over a whole in-memory buffer, taken by the
     /// product's own [`WindowSnapshot::for_read`] from a ring that holds
     /// all of it: `head == buffer.len()` and nothing evicted.
-    fn for_read(
+    ///
+    /// Without `bypass_holdback` it is a cursor read at `req_start`. With
+    /// it, it is the request `read_output` grants the bypass to (§4.1): a
+    /// `tail_bytes` read reaching back to `req_start`, front-clipped to
+    /// `max_bytes` as that read is. No caller sends a cursor read with the
+    /// bypass, so a row built on one would judge a request that never
+    /// reaches the processor.
+    fn read_window(
         proc: &OutputProcessor,
         buffer: &[u8],
         req_start: u64,
@@ -2002,32 +2009,33 @@ mod tests {
     ) -> ReadWindow {
         let mut ring = OutputBuffer::new(buffer.len().max(1));
         ring.push(buffer);
-        let req = ReadRequest {
-            holdback: if bypass_holdback {
-                Holdback::BypassedByCallerOptIn
-            } else {
-                Holdback::Applies
-            },
-            ..ReadRequest::since(req_start, max_bytes)
+        let req = if bypass_holdback {
+            ReadRequest {
+                start: ReadStart::TailBytes(buffer.len().saturating_sub(req_start as usize)),
+                holdback: Holdback::BypassedByCallerOptIn,
+                ..ReadRequest::since(0, max_bytes)
+            }
+        } else {
+            ReadRequest::since(req_start, max_bytes)
         };
         WindowSnapshot::for_read(&ring, &req, proc.limits, child_alive)
     }
 
     fn read(buffer: &[u8], req_start: u64, max_bytes: usize) -> ProcessedRead {
         let p = processor();
-        let taken = for_read(&p, buffer, req_start, max_bytes, true, false);
+        let taken = read_window(&p, buffer, req_start, max_bytes, true, false);
         let w = taken.snapshot();
         p.process(&w, &ReadOptions::default())
     }
 
     /// **Every region of a read, from a ring that has evicted.** The
-    /// helper above never evicts and never reads a `tail_*` shape, so this
-    /// is where `for_read` is pinned on the inputs only a ring can give
-    /// it: a stale cursor is moved up to the tail, flagged, and reports
-    /// that tail; a live one sees each region where §4.2's limits put it.
-    /// The three regions are told apart by their offsets, so a snapshot
-    /// that lent one region's bytes as another's fails here and not only
-    /// on a fixture large enough to separate them.
+    /// helper above never evicts, so this is where `for_read` is pinned
+    /// on the inputs only a ring can give it: a stale cursor is moved up
+    /// to the tail, flagged, and reports that tail; a live one sees each
+    /// region where §4.2's limits put it. The three regions are told apart
+    /// by their offsets, so a snapshot that lent one region's bytes as
+    /// another's fails here and not only on a fixture large enough to
+    /// separate them.
     #[test]
     fn for_read_takes_every_region_of_a_read_from_the_ring_it_is_given() {
         let p = processor();
@@ -2049,14 +2057,10 @@ mod tests {
         assert_eq!(w.carry_region_start, tail);
 
         let at = 30 * 1024u64;
-        let req = ReadRequest {
-            holdback: Holdback::BypassedByCallerOptIn,
-            ..ReadRequest::since(at, 1024)
-        };
-        let live = WindowSnapshot::for_read(&ring, &req, l, false);
+        let live = WindowSnapshot::for_read(&ring, &ReadRequest::since(at, 1024), l, false);
         let w = live.snapshot();
         assert!(!w.truncated_at_tail && !w.front_clipped && !w.child_alive);
-        assert!(w.bypass_holdback);
+        assert!(!w.bypass_holdback);
         assert_eq!((w.req_start, w.head, w.cap_end), (at, head, at + 1024));
         let window_end = at + 1024 + l.lookahead_bytes as u64;
         let window_start = at - l.lookbehind_bytes as u64;
@@ -2070,32 +2074,114 @@ mod tests {
         assert_eq!(w.tail_region, region(scan_start, head));
     }
 
+    /// **Each region stays inside the ring, and the carry region holds
+    /// the whole window**, on the two inputs that push a region against
+    /// its bound: a ring smaller than `partial_secret_scan_bytes`, and a
+    /// `lookbehind_bytes` wider than [`UNVOUCHED_CARRY_BYTES`] (an operator
+    /// can set one; `Config::validate` puts no ceiling on it). The offsets
+    /// are what `process` places holdbacks and spans by, so a region whose
+    /// bytes are right and whose start is not still misplaces them.
+    #[test]
+    fn for_read_floors_each_region_at_the_tail_and_starts_the_carry_by_the_window() {
+        let p = processor();
+        let l = p.limits;
+        let bytes: Vec<u8> = (0..48 * 1024u32).map(|i| b'a' + (i % 23) as u8).collect();
+        let region = |start: u64, end: u64| &bytes[start as usize..end as usize];
+
+        let mut small = OutputBuffer::new(64);
+        small.push(&bytes[..100]);
+        assert_eq!((small.tail(), small.head()), (36, 100));
+        let taken = WindowSnapshot::for_read(&small, &ReadRequest::since(90, 4), l, true);
+        let w = taken.snapshot();
+        assert_eq!(w.tail_region_start, 36);
+        assert_eq!(w.tail_region, region(36, 100));
+        assert_eq!((w.window_start, w.carry_region_start), (36, 36));
+
+        let wide = ProcessingLimits {
+            lookbehind_bytes: 2 * UNVOUCHED_CARRY_BYTES,
+            ..l
+        };
+        let mut ring = OutputBuffer::new(40 * 1024);
+        ring.push(&bytes);
+        let at = 44 * 1024u64;
+        let taken = WindowSnapshot::for_read(&ring, &ReadRequest::since(at, 1024), wide, true);
+        let w = taken.snapshot();
+        let window_start = at - wide.lookbehind_bytes as u64;
+        assert!(window_start > ring.tail(), "the window is not floored here");
+        assert_eq!(w.window_start, window_start);
+        assert_eq!(w.carry_region_start, window_start);
+        assert_eq!(w.carry_region, region(window_start, ring.head()));
+    }
+
     /// **A `tail_*` read opens on a character, and a cursor read opens
     /// where the caller put it** (GH #241), at the geometry rather than
-    /// through a session. Characters are two bytes at even offsets here,
-    /// so every odd start is a continuation byte.
+    /// through a session. In the first ring characters are two bytes at
+    /// even offsets, so every odd start is a continuation byte. The second
+    /// holds `Āÿ` (`C4 80 C3 BF`), the two ends of the continuation range.
     #[test]
     fn for_read_opens_a_tail_read_on_a_character_and_leaves_a_cursor_where_it_is() {
         let p = processor();
-        let text = "é".repeat(100);
-        let mut ring = OutputBuffer::new(text.len());
-        ring.push(text.as_bytes());
+        let ring_of = |text: &str| {
+            let mut ring = OutputBuffer::new(text.len());
+            ring.push(text.as_bytes());
+            ring
+        };
         let tail_read = |tail_bytes: usize, max_bytes: usize| ReadRequest {
             start: ReadStart::TailBytes(tail_bytes),
             holdback: Holdback::BypassedByCallerOptIn,
             ..ReadRequest::since(0, max_bytes)
         };
-        let geometry = |req: &ReadRequest| {
-            let w = WindowSnapshot::for_read(&ring, req, p.limits, true);
+        let geometry = |ring: &OutputBuffer, req: &ReadRequest| {
+            let w = WindowSnapshot::for_read(ring, req, p.limits, true);
             let w = w.snapshot();
             (w.req_start, w.front_clipped)
         };
 
-        assert_eq!(geometry(&tail_read(3, 32 * 1024)), (198, false));
-        assert_eq!(geometry(&tail_read(4, 32 * 1024)), (196, false));
+        let e = ring_of(&"é".repeat(100));
+        assert_eq!(geometry(&e, &tail_read(3, 32 * 1024)), (198, false));
+        assert_eq!(geometry(&e, &tail_read(4, 32 * 1024)), (196, false));
         // Clipped to `max_bytes` from the front: 195, then snapped.
-        assert_eq!(geometry(&tail_read(200, 5)), (196, true));
-        assert_eq!(geometry(&ReadRequest::since(197, 32 * 1024)), (197, false));
+        assert_eq!(geometry(&e, &tail_read(200, 5)), (196, true));
+        assert_eq!(
+            geometry(&e, &ReadRequest::since(197, 32 * 1024)),
+            (197, false)
+        );
+
+        let ends = ring_of(&"Āÿ".repeat(50));
+        // 195 is `BF`, 197 is `80`; each is skipped to the lead after it.
+        assert_eq!(geometry(&ends, &tail_read(5, 32 * 1024)), (196, false));
+        assert_eq!(geometry(&ends, &tail_read(3, 32 * 1024)), (198, false));
+    }
+
+    /// **The holdback bypass follows the caller's opt-in, not the read's
+    /// shape** (§4.1). `holdfast logs --tail` sends a `tail_*` read with
+    /// `apply_holdback: true`, and that read stays inside the holdback.
+    #[test]
+    fn for_read_bypasses_the_holdback_only_when_the_caller_opted_out() {
+        let p = processor();
+        let mut ring = OutputBuffer::new(64);
+        ring.push(b"line one\nghp_abcdef");
+        let bypassed = |start: ReadStart, holdback: Holdback| {
+            let req = ReadRequest {
+                start,
+                holdback,
+                ..ReadRequest::since(0, 32 * 1024)
+            };
+            let taken = WindowSnapshot::for_read(&ring, &req, p.limits, true);
+            let w = taken.snapshot();
+            w.bypass_holdback
+        };
+        assert!(bypassed(
+            ReadStart::TailBytes(8),
+            Holdback::BypassedByCallerOptIn
+        ));
+        assert!(bypassed(
+            ReadStart::TailLines(1),
+            Holdback::BypassedByCallerOptIn
+        ));
+        assert!(!bypassed(ReadStart::TailBytes(8), Holdback::Applies));
+        assert!(!bypassed(ReadStart::TailLines(1), Holdback::Applies));
+        assert!(!bypassed(ReadStart::Cursor(0), Holdback::Applies));
     }
 
     /// **The two boundaries compose by `min`, and `read_output` keeps the
@@ -2119,7 +2205,7 @@ mod tests {
         let ordinary = b"   Compiling holdfast-core v0.0.1\n".to_vec();
 
         for buf in [spliced.to_vec(), arriving, ordinary] {
-            let taken = for_read(&p, &buf, 0, 32 * 1024, true, false);
+            let taken = read_window(&p, &buf, 0, 32 * 1024, true, false);
             let w = taken.snapshot();
             assert!(
                 p.unvouched_boundary(&w, &o) <= p.holdback_boundary(&w, &o),
@@ -2128,7 +2214,7 @@ mod tests {
         }
 
         // Strictly earlier on the fixture, and §4.1 finds nothing at all.
-        let taken = for_read(&p, spliced, 0, 32 * 1024, true, false);
+        let taken = read_window(&p, spliced, 0, 32 * 1024, true, false);
         let w = taken.snapshot();
         assert_eq!(p.holdback_boundary(&w, &o), w.head);
         assert!(p.unvouched_boundary(&w, &o) < w.head);
@@ -2148,8 +2234,7 @@ mod tests {
         let p = processor();
         let spliced = b"line one\nghp_0123456789a\x1b[0mbcdefghijABCDEFGHIJ01234";
 
-        let taken = for_read(&p, spliced, 0, 32 * 1024, true, false);
-
+        let taken = read_window(&p, spliced, 0, 32 * 1024, true, false);
         let w = taken.snapshot();
         let no_redact = ReadOptions {
             redact: false,
@@ -2157,8 +2242,7 @@ mod tests {
         };
         assert_eq!(p.unvouched_boundary(&w, &no_redact), w.head);
 
-        let taken = for_read(&p, spliced, 0, 32 * 1024, true, true);
-
+        let taken = read_window(&p, spliced, 0, 32 * 1024, true, true);
         let bypass = taken.snapshot();
         assert_eq!(
             p.unvouched_boundary(&bypass, &ReadOptions::default()),
@@ -2201,7 +2285,7 @@ mod tests {
         assert_eq!(read(buf, 0, 4096).output, "ok done");
 
         let p = processor();
-        let taken = for_read(&p, buf, 0, 4096, true, false);
+        let taken = read_window(&p, buf, 0, 4096, true, false);
         let w = taken.snapshot();
         let raw = p.process(
             &w,
@@ -2511,14 +2595,14 @@ mod tests {
         let p = processor();
 
         // Child has exited: still withheld. Quiescence is not a release.
-        let taken = for_read(&p, &buf, 0, 32 * 1024, false, false);
+        let taken = read_window(&p, &buf, 0, 32 * 1024, false, false);
         let w = taken.snapshot();
         let r = p.process(&w, &ReadOptions::default());
         assert!(r.held_back);
         assert_eq!(r.output, "line one\n");
 
         // The escape hatch returns it.
-        let taken = for_read(&p, &buf, 0, 32 * 1024, false, false);
+        let taken = read_window(&p, &buf, 0, 32 * 1024, false, false);
         let w = taken.snapshot();
         let raw = p.process(
             &w,
@@ -2536,7 +2620,7 @@ mod tests {
     fn tail_reads_bypass_the_holdback() {
         let buf = b"line one\nghp_abcdef".to_vec();
         let p = processor();
-        let taken = for_read(&p, &buf, 9, 32 * 1024, true, true);
+        let taken = read_window(&p, &buf, 9, 32 * 1024, true, true);
         let w = taken.snapshot();
         let r = p.process(&w, &ReadOptions::default());
         assert!(!r.held_back);
@@ -2564,7 +2648,7 @@ mod tests {
             for line in lines {
                 buf.extend_from_slice(line.as_bytes());
             }
-            let taken = for_read(&p, &buf, cursor, 32 * 1024, true, false);
+            let taken = read_window(&p, &buf, cursor, 32 * 1024, true, false);
             let w = taken.snapshot();
             let r = p.process(&w, &ReadOptions::default());
             assert!(
@@ -2686,7 +2770,7 @@ mod tests {
         // names are unique and each one names its own line.
         let lines = short_body.len() / 65 + 1;
         for cap in [4096usize, 32 * 1024, 256 * 1024, 4 * 1024 * 1024] {
-            let taken = for_read(&p, &short, 0, cap, true, false);
+            let taken = read_window(&p, &short, 0, cap, true, false);
             let w = taken.snapshot();
             let r = p.process(&w, &ReadOptions::default());
             for i in 0..lines {
@@ -2722,8 +2806,7 @@ mod tests {
             "the fixture must actually truncate the window, or it pins nothing"
         );
 
-        let taken = for_read(&p, &buf, 0, CAP, true, false);
-
+        let taken = read_window(&p, &buf, 0, CAP, true, false);
         let w = taken.snapshot();
         let r = p.process(&w, &ReadOptions::default());
 
@@ -2874,7 +2957,7 @@ mod tests {
             while cursor < buf.len() as u64 {
                 reads += 1;
                 assert!(reads <= 32, "the read loop did not terminate");
-                let taken = for_read(&p, buf, cursor, 32 * 1024, true, false);
+                let taken = read_window(&p, buf, cursor, 32 * 1024, true, false);
                 let w = taken.snapshot();
                 let r = p.process(&w, &o);
                 assert!(
@@ -2990,7 +3073,7 @@ mod tests {
         // loop crosses the truncated/at-head boundary; 256 KiB is
         // `read_output`'s ceiling and 4 MiB is `resources/read`'s.
         for cap in [4096usize, 32 * 1024, 256 * 1024, 4 * 1024 * 1024] {
-            let taken = for_read(&p, &buf, 0, cap, true, false);
+            let taken = read_window(&p, &buf, 0, cap, true, false);
             let w = taken.snapshot();
             let r = p.process(&w, &ReadOptions::default());
             for i in 0..lines {
@@ -3011,7 +3094,7 @@ mod tests {
 
         // The audited hatch is unchanged: it is the recourse, and a mask
         // that survived it would be a hole in the recourse.
-        let taken = for_read(&p, &buf, 0, 32 * 1024, true, false);
+        let taken = read_window(&p, &buf, 0, 32 * 1024, true, false);
         let w = taken.snapshot();
         let raw = p.process(
             &w,
@@ -3028,7 +3111,7 @@ mod tests {
         // And §4.1's in-flight partial still reaches a `tail_*` read: the
         // carry scan stops where `holdback_boundary`'s region begins.
         let arriving = b"line one\nghp_abcdef".to_vec();
-        let taken = for_read(&p, &arriving, 9, 32 * 1024, true, true);
+        let taken = read_window(&p, &arriving, 9, 32 * 1024, true, true);
         let w = taken.snapshot();
         let r = p.process(&w, &ReadOptions::default());
         assert_eq!(
@@ -3157,7 +3240,8 @@ mod tests {
                     for max_bytes in [1usize, 8, 64, 65, 512, 8192, 32 * 1024] {
                         for alive in [true, false] {
                             for bypass in [true, false] {
-                                let taken = for_read(&p, &buf, req_start, max_bytes, alive, bypass);
+                                let taken =
+                                    read_window(&p, &buf, req_start, max_bytes, alive, bypass);
                                 let w = taken.snapshot();
                                 let r = p.process(&w, &o);
                                 swept += 1;
@@ -3231,8 +3315,7 @@ mod tests {
             "the anchor must sit inside `holdback_boundary`'s region"
         );
 
-        let taken = for_read(&p, &buf, 0, 32 * 1024, true, true);
-
+        let taken = read_window(&p, &buf, 0, 32 * 1024, true, true);
         let w = taken.snapshot();
         let window_end = w.window_start + w.window.len() as u64;
         // The scan really does find it — without this the assertion below
@@ -3326,8 +3409,7 @@ mod tests {
             "the anchor must stay unterminated, which is what makes it a mask"
         );
 
-        let taken = for_read(&p, &buf, 0, 32 * 1024, true, false);
-
+        let taken = read_window(&p, &buf, 0, 32 * 1024, true, false);
         let w = taken.snapshot();
         assert_eq!(
             p.all_spans(w.window, w.window_start).len(),
@@ -3366,7 +3448,7 @@ mod tests {
             4 * p.limits.partial_secret_scan_bytes,
         ));
         buf.extend_from_slice(b"\n");
-        let taken = for_read(&p, &buf, 0, 32 * 1024, true, false);
+        let taken = read_window(&p, &buf, 0, 32 * 1024, true, false);
         let w = taken.snapshot();
         let real = p.all_spans(w.window, w.window_start);
         assert_eq!(real.len(), 1, "one real match: {real:?}");
@@ -3429,8 +3511,7 @@ mod tests {
         buf.extend(std::iter::repeat_n(b'A', 40 * 1024));
         buf.extend_from_slice(b"\n");
 
-        let taken = for_read(&p, &buf, 0, CAP, true, false);
-
+        let taken = read_window(&p, &buf, 0, CAP, true, false);
         let w = taken.snapshot();
         // The arrangement really is the one described, or the row is a
         // restatement of the ordinary case.
@@ -3485,8 +3566,7 @@ mod tests {
         buf.extend(std::iter::repeat_n(b'A', 40 * 1024));
         buf.extend_from_slice(b"\n");
 
-        let taken = for_read(&p, &buf, 0, CAP, true, false);
-
+        let taken = read_window(&p, &buf, 0, CAP, true, false);
         let w = taken.snapshot();
         assert_eq!(anchor, w.cap_end, "the fixture must sit exactly on the tie");
         assert_eq!(
@@ -3911,8 +3991,7 @@ mod tests {
             "the fixture must actually truncate the window, or it pins nothing"
         );
 
-        let taken = for_read(&p, &buf, 0, CAP, true, false);
-
+        let taken = read_window(&p, &buf, 0, CAP, true, false);
         let w = taken.snapshot();
         let r = p.process(&w, &ReadOptions::default());
         // THE HARM: the value's bytes, in a response §4.1 says is
@@ -3973,7 +4052,7 @@ mod tests {
         // it to the rule that matched and names that rule's kind, so the
         // withhold is a consequence of the missing evidence and not of the
         // rule being unindexed.
-        let taken = for_read(&p, &buf, 0, 256 * 1024, true, false);
+        let taken = read_window(&p, &buf, 0, 256 * 1024, true, false);
         let w = taken.snapshot();
         let r = p.process(&w, &ReadOptions::default());
         assert!(!r.held_back);
@@ -4014,7 +4093,7 @@ mod tests {
         let buf = format!("{prologue}{blob}\n").into_bytes();
 
         const CAP: usize = 32 * 1024;
-        let taken = for_read(&p, &buf, 0, CAP, true, false);
+        let taken = read_window(&p, &buf, 0, CAP, true, false);
         let w = taken.snapshot();
         let r = p.process(&w, &ReadOptions::default());
         assert!(!r.output.contains("GREEDYSECRETBODY"), "the value leaked");
@@ -4080,7 +4159,7 @@ mod tests {
     fn an_unfinished_trailing_escape_is_dropped_once_the_child_has_exited() {
         let buf = b"done\x1b[3".to_vec();
         let p = processor();
-        let taken = for_read(&p, &buf, 0, 4096, false, false);
+        let taken = read_window(&p, &buf, 0, 4096, false, false);
         let w = taken.snapshot();
         let r = p.process(&w, &ReadOptions::default());
         assert!(!r.held_back, "a dead child will never finish it");
@@ -4106,7 +4185,7 @@ mod tests {
     fn raw_mode_bypasses_the_escape_boundary_rule() {
         let buf = b"done\x1b[3".to_vec();
         let p = processor();
-        let taken = for_read(&p, &buf, 0, 4096, true, false);
+        let taken = read_window(&p, &buf, 0, 4096, true, false);
         let w = taken.snapshot();
         let r = p.process(
             &w,
@@ -4126,7 +4205,7 @@ mod tests {
         use base64::Engine as _;
         let buf = format!("t={GITHUB}\n").into_bytes();
         let p = processor();
-        let taken = for_read(&p, &buf, 0, 4096, true, false);
+        let taken = read_window(&p, &buf, 0, 4096, true, false);
         let w = taken.snapshot();
         let r = p.process(
             &w,
@@ -4153,7 +4232,7 @@ mod tests {
         use base64::Engine as _;
         let buf: Vec<u8> = vec![0xff, 0x00, 0x80, b'h', b'i'];
         let p = processor();
-        let taken = for_read(&p, &buf, 0, 4096, true, false);
+        let taken = read_window(&p, &buf, 0, 4096, true, false);
         let w = taken.snapshot();
         let r = p.process(
             &w,
@@ -4174,7 +4253,7 @@ mod tests {
         // ansi: raw must not disable redaction (§5.2).
         let buf = format!("\x1b[31mt={GITHUB}\x1b[0m").into_bytes();
         let p = processor();
-        let taken = for_read(&p, &buf, 0, 4096, true, false);
+        let taken = read_window(&p, &buf, 0, 4096, true, false);
         let w = taken.snapshot();
         let r = p.process(
             &w,
@@ -4191,7 +4270,7 @@ mod tests {
     fn disabling_redaction_returns_the_secret_verbatim() {
         let buf = format!("t={GITHUB}\n").into_bytes();
         let p = processor();
-        let taken = for_read(&p, &buf, 0, 4096, true, false);
+        let taken = read_window(&p, &buf, 0, 4096, true, false);
         let w = taken.snapshot();
         let r = p.process(
             &w,
@@ -4224,7 +4303,7 @@ mod tests {
         buf.extend_from_slice(b"\nbuild finished\n");
 
         let p = processor();
-        let taken = for_read(&p, &buf, req_start, 4096, true, false);
+        let taken = read_window(&p, &buf, req_start, 4096, true, false);
         let w = taken.snapshot();
         assert!(
             p.all_spans(w.window, w.window_start).is_empty(),
@@ -4255,7 +4334,7 @@ mod tests {
         buf.extend_from_slice(b"\nbuild finished\n");
 
         let p = processor();
-        let taken = for_read(&p, &buf, req_start, 4096, true, false);
+        let taken = read_window(&p, &buf, req_start, 4096, true, false);
         let w = taken.snapshot();
         let redacted = p.process(&w, &ReadOptions::default());
         // `redact: false` takes the same path with no span set at all,
@@ -4379,7 +4458,7 @@ mod tests {
             TextEncoding::Base64,
             TextEncoding::LossyPrintable,
         ] {
-            let taken = for_read(&p, &buf, 0, 32 * 1024, true, false);
+            let taken = read_window(&p, &buf, 0, 32 * 1024, true, false);
             let w = taken.snapshot();
             let r = p.process(
                 &w,
@@ -4426,7 +4505,7 @@ mod tests {
     fn raw_mode_redacts_the_credential_a_terminal_would_reassemble() {
         let buf = painted(GITHUB, "\n");
         let p = processor();
-        let taken = for_read(&p, &buf, 0, 32 * 1024, true, false);
+        let taken = read_window(&p, &buf, 0, 32 * 1024, true, false);
         let w = taken.snapshot();
         let r = p.process(
             &w,
@@ -4475,8 +4554,7 @@ mod tests {
                 "{planted:?} survives the stripper; only the encoder drops it"
             );
 
-            let taken = for_read(&p, &buf, 0, 32 * 1024, true, false);
-
+            let taken = read_window(&p, &buf, 0, 32 * 1024, true, false);
             let w = taken.snapshot();
             let r = p.process(
                 &w,
@@ -4703,7 +4781,7 @@ mod tests {
                 TextEncoding::Base64,
                 TextEncoding::LossyPrintable,
             ] {
-                let taken = for_read(&p, &buf, 0, 32 * 1024, true, false);
+                let taken = read_window(&p, &buf, 0, 32 * 1024, true, false);
                 let w = taken.snapshot();
                 let r = p.process(
                     &w,
@@ -4740,7 +4818,7 @@ mod tests {
     fn the_raw_lossy_printable_stream_is_redacted_on_its_own_account() {
         let buf = format!("deploy {}\u{8}{}\n", &GITHUB[..15], &GITHUB[15..]).into_bytes();
         let p = processor();
-        let taken = for_read(&p, &buf, 0, 32 * 1024, true, false);
+        let taken = read_window(&p, &buf, 0, 32 * 1024, true, false);
         let w = taken.snapshot();
         let r = p.process(
             &w,
@@ -4813,7 +4891,7 @@ mod tests {
     fn the_audited_opt_out_still_returns_the_planted_bytes_verbatim() {
         let buf = painted(GITHUB, "\n");
         let p = processor();
-        let taken = for_read(&p, &buf, 0, 32 * 1024, true, false);
+        let taken = read_window(&p, &buf, 0, 32 * 1024, true, false);
         let w = taken.snapshot();
         let r = p.process(
             &w,
@@ -4852,7 +4930,7 @@ mod tests {
             !ansi::strip(&buf).windows(4).any(|w| w == b"ghp_"),
             "the stripped view really does not carry it"
         );
-        let taken = for_read(&p, &buf, 0, 32 * 1024, true, false);
+        let taken = read_window(&p, &buf, 0, 32 * 1024, true, false);
         let w = taken.snapshot();
         let r = p.process(
             &w,
@@ -4913,7 +4991,7 @@ mod tests {
                     reads <= buf.len() + 1,
                     "max_bytes {max_bytes}: no termination"
                 );
-                let taken = for_read(&p, buf, cursor, max_bytes, true, false);
+                let taken = read_window(&p, buf, cursor, max_bytes, true, false);
                 let w = taken.snapshot();
                 // The fixture really does put a raw page end inside a
                 // character at this size, or the row is vacuous for it.
@@ -4956,7 +5034,7 @@ mod tests {
 
         // Pulled back: a page ending one byte into the character stops
         // before it and returns what it can.
-        let taken = for_read(&p, buf, 0, 3, true, false);
+        let taken = read_window(&p, buf, 0, 3, true, false);
         let w = taken.snapshot();
         let r = p.process(&w, &ReadOptions::default());
         assert_eq!(r.output, "ab");
@@ -4966,7 +5044,7 @@ mod tests {
 
         // Pushed forward: a page that *is* the front of the character
         // would return nothing if pulled back, so it finishes it.
-        let taken = for_read(&p, buf, 2, 1, true, false);
+        let taken = read_window(&p, buf, 2, 1, true, false);
         let w = taken.snapshot();
         let r = p.process(&w, &ReadOptions::default());
         assert_eq!(r.output, "日");
@@ -4976,7 +5054,7 @@ mod tests {
         // At `head`, with the child alive: the rest has not arrived, so
         // the page stops before it and `cursor` says where to resume.
         let partial = &buf[..4];
-        let taken = for_read(&p, partial, 0, 4096, true, false);
+        let taken = read_window(&p, partial, 0, 4096, true, false);
         let w = taken.snapshot();
         let r = p.process(&w, &ReadOptions::default());
         assert_eq!(r.output, "ab");
@@ -4985,7 +5063,7 @@ mod tests {
 
         // …and with the child gone it never will arrive, so the bytes go
         // out as what they are rather than being stranded.
-        let taken = for_read(&p, partial, 0, 4096, false, false);
+        let taken = read_window(&p, partial, 0, 4096, false, false);
         let w = taken.snapshot();
         let r = p.process(&w, &ReadOptions::default());
         assert_eq!(r.cursor, 4, "a dead child's partial character is not held");
@@ -4994,7 +5072,7 @@ mod tests {
         // A read that is *only* an unfinished character at `head` is left
         // alone even while the child lives, for the reason the escape
         // rule gives: withholding it would return the caller nothing.
-        let taken = for_read(&p, partial, 2, 4096, true, false);
+        let taken = read_window(&p, partial, 2, 4096, true, false);
         let w = taken.snapshot();
         let r = p.process(&w, &ReadOptions::default());
         assert_eq!(r.cursor, 4, "no zero-byte read at head");
@@ -5066,7 +5144,10 @@ mod tests {
                 let head = buf.len() as u64;
                 // Control: the whole-buffer read masks it, so a leak below
                 // is the read shape's and not the fixture's.
-                let whole = p.process(&for_read(&p, buf, 0, 1 << 20, true, false).snapshot(), &o);
+                let whole = p.process(
+                    &read_window(&p, buf, 0, 1 << 20, true, false).snapshot(),
+                    &o,
+                );
                 assert_eq!(key.leaked_in(&whole.output), None, "{} {name}", key.name);
                 for kept in &shape.kept {
                     assert!(
@@ -5083,7 +5164,7 @@ mod tests {
                     for (max_bytes, bypass) in [(32 * 1024, true), (32 * 1024, false), (256, false)]
                     {
                         reads += 1;
-                        let taken = for_read(&p, buf, start, max_bytes, true, bypass);
+                        let taken = read_window(&p, buf, start, max_bytes, true, bypass);
                         let w = taken.snapshot();
                         let r = p.process(&w, &o);
                         assert_eq!(
@@ -5146,7 +5227,7 @@ mod tests {
                 let buf = text.as_bytes();
                 for start in (0..buf.len() as u64).step_by(97) {
                     let r = p.process(
-                        &for_read(&p, buf, start, 32 * 1024, true, false).snapshot(),
+                        &read_window(&p, buf, start, 32 * 1024, true, false).snapshot(),
                         &o,
                     );
                     assert!(
@@ -5213,7 +5294,7 @@ mod tests {
                 // A read that starts at the next command sees it verbatim,
                 // though the key is well inside its carry region.
                 let r = p.process(
-                    &for_read(&p, buf, done, 32 * 1024, true, false).snapshot(),
+                    &read_window(&p, buf, done, 32 * 1024, true, false).snapshot(),
                     &o,
                 );
                 assert_eq!(
@@ -5228,7 +5309,10 @@ mod tests {
                     r.redactions
                 );
                 // And the whole-buffer read masks the key and nothing else.
-                let r = p.process(&for_read(&p, buf, 0, 1 << 20, true, false).snapshot(), &o);
+                let r = p.process(
+                    &read_window(&p, buf, 0, 1 << 20, true, false).snapshot(),
+                    &o,
+                );
                 assert!(
                     r.output.starts_with("$ cat id_key\r\n[REDACTED:"),
                     "{}",
@@ -5278,7 +5362,7 @@ mod tests {
             ),
         ] {
             let buf = format!("{text}{after}");
-            let r = p.process(&for_read(&p, buf.as_bytes(), 0, 1 << 20, true, false).snapshot(), &o);
+            let r = p.process(&read_window(&p, buf.as_bytes(), 0, 1 << 20, true, false).snapshot(), &o);
             assert_eq!(key.leaked_in(&r.output), None, "{shape}");
             assert!(r.output.contains(sha1), "{shape}: {:?}", r.output);
             assert!(r.output.contains("$ sha256sum f"), "{shape}: {:?}", r.output);
@@ -5296,7 +5380,7 @@ mod tests {
             .collect();
         let buf = format!("12: `-----BEGIN RSA PRIVATE KEY-----` as prose\r\n{pad}{after}");
         let r = p.process(
-            &for_read(&p, buf.as_bytes(), 0, 1 << 20, true, false).snapshot(),
+            &read_window(&p, buf.as_bytes(), 0, 1 << 20, true, false).snapshot(),
             &o,
         );
         assert!(r.output.contains(sha256), "the reach is the carry");
@@ -5364,7 +5448,7 @@ mod tests {
         let (text, shown) = cargo_progress(&["proc-macro2", "quote", "syn", "serde", "regex"]);
         let buf = text.as_bytes();
         let r = p.process_at_width(
-            &for_read(&p, buf, 0, 1 << 20, true, false).snapshot(),
+            &read_window(&p, buf, 0, 1 << 20, true, false).snapshot(),
             &ReadOptions::default(),
             Some(WIDE),
         );
@@ -5384,7 +5468,7 @@ mod tests {
             ));
         }
         let r = p.process_at_width(
-            &for_read(&p, bar.as_bytes(), 0, 1 << 20, true, false).snapshot(),
+            &read_window(&p, bar.as_bytes(), 0, 1 << 20, true, false).snapshot(),
             &ReadOptions::default(),
             Some(WIDE),
         );
@@ -5398,7 +5482,7 @@ mod tests {
         // The second spelling: a redraw from column 0 that ends in an
         // erase-to-end, with no erase in front of it.
         let r = p.process_at_width(
-            &for_read(
+            &read_window(
                 &p,
                 b"a much longer old line\rnew\x1b[K\r\n",
                 0,
@@ -5414,7 +5498,7 @@ mod tests {
 
         // `ansi: raw` promises the bytes, and gets them.
         let raw = p.process_at_width(
-            &for_read(&p, buf, 0, 1 << 20, true, false).snapshot(),
+            &read_window(&p, buf, 0, 1 << 20, true, false).snapshot(),
             &ReadOptions {
                 ansi: AnsiMode::Raw,
                 ..ReadOptions::default()
@@ -5459,7 +5543,7 @@ mod tests {
             "$ ls\r\n\x1b[?2004l\rCargo.toml\r\n",
         ] {
             let r = p.process_at_width(
-                &for_read(&p, text.as_bytes(), 0, 1 << 20, true, false).snapshot(),
+                &read_window(&p, text.as_bytes(), 0, 1 << 20, true, false).snapshot(),
                 &ReadOptions::default(),
                 Some(WIDE),
             );
@@ -5485,7 +5569,7 @@ mod tests {
         let p = processor();
         let read = |text: &str, cols: u16| {
             p.process_at_width(
-                &for_read(&p, text.as_bytes(), 0, 1 << 20, true, false).snapshot(),
+                &read_window(&p, text.as_bytes(), 0, 1 << 20, true, false).snapshot(),
                 &ReadOptions::default(),
                 Some(cols),
             )
@@ -5514,7 +5598,7 @@ mod tests {
         let mut long = "x".repeat(4000);
         long.push_str("\r\x1b[Kdone\r\n");
         let r = p.process_at_width(
-            &for_read(&p, long.as_bytes(), 2000, 1 << 20, true, false).snapshot(),
+            &read_window(&p, long.as_bytes(), 2000, 1 << 20, true, false).snapshot(),
             &ReadOptions::default(),
             Some(u16::MAX),
         );
@@ -5524,7 +5608,7 @@ mod tests {
         known.push_str("\r\nbar 1/9\r\x1b[Kdone\r\n");
         let at = known.find("bar").unwrap() as u64;
         let r = p.process_at_width(
-            &for_read(&p, known.as_bytes(), at, 1 << 20, true, false).snapshot(),
+            &read_window(&p, known.as_bytes(), at, 1 << 20, true, false).snapshot(),
             &ReadOptions::default(),
             Some(80),
         );
@@ -5534,7 +5618,7 @@ mod tests {
         // that cannot say.
         let bar = "bar 1/9\r\x1b[Kdone\r\n";
         let r = p.process(
-            &for_read(&p, bar.as_bytes(), 0, 1 << 20, true, false).snapshot(),
+            &read_window(&p, bar.as_bytes(), 0, 1 << 20, true, false).snapshot(),
             &ReadOptions::default(),
         );
         assert_eq!(r.output, strip(bar));
@@ -5651,7 +5735,7 @@ mod tests {
                     }
                 };
                 let buf = text.as_bytes();
-                let taken = for_read(&p, buf, 0, 1 << 20, true, false);
+                let taken = read_window(&p, buf, 0, 1 << 20, true, false);
                 let w = taken.snapshot();
                 let erased = erased_redraws(&w, &[], buf.len() as u64, cols);
                 if erased.is_empty() {
@@ -5698,7 +5782,7 @@ mod tests {
         let p = processor();
         let text = format!("progress {GITHUB}\r\x1b[Kdone\n");
         let r = p.process_at_width(
-            &for_read(&p, text.as_bytes(), 0, 1 << 20, true, false).snapshot(),
+            &read_window(&p, text.as_bytes(), 0, 1 << 20, true, false).snapshot(),
             &ReadOptions::default(),
             Some(WIDE),
         );
@@ -5722,7 +5806,7 @@ mod tests {
         let value = "hunter2hunter2hunter2";
         let text = format!("PASSWORD=\n x\r\x1b[K    {value}\n");
         let uncollapsed = p.process_at_width(
-            &for_read(&p, text.as_bytes(), 0, 1 << 20, true, false).snapshot(),
+            &read_window(&p, text.as_bytes(), 0, 1 << 20, true, false).snapshot(),
             &ReadOptions {
                 ansi: AnsiMode::Raw,
                 ..ReadOptions::default()
@@ -5735,7 +5819,7 @@ mod tests {
             uncollapsed.redactions
         );
         let r = p.process_at_width(
-            &for_read(&p, text.as_bytes(), 0, 1 << 20, true, false).snapshot(),
+            &read_window(&p, text.as_bytes(), 0, 1 << 20, true, false).snapshot(),
             &ReadOptions::default(),
             Some(WIDE),
         );
