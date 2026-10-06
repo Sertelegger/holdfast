@@ -63,12 +63,16 @@ this heading while describing `main`, which is a claim about `v0.0.7` that
 - `holdfast daemon start|stop|status|run` — manage the background daemon
 - `holdfast list` / `holdfast logs <session> [--tail N] [--raw]` — inspect
   sessions from any terminal
-- `holdfast attach <session> [--allow-echo]` — your terminal *becomes* the
-  session. Full colour, full TUIs, full keyboard. Detach with **Ctrl-B then
-  d**; the session keeps running. That works at a password prompt too, and
-  **Ctrl+C** there abandons the prompt rather than answering it.
+- `holdfast attach <session> [--allow-echo] [--keep-size]` — your terminal
+  *becomes* the session. Full colour, full TUIs, full keyboard. Detach with
+  **Ctrl-B then d**; the session keeps running. That works at a password
+  prompt too, and **Ctrl+C** there abandons the prompt rather than answering
+  it.
   `--allow-echo` submits secrets even to a program that has not turned
   terminal echo off — see the password note below for what that costs.
+  `--keep-size` never sends your terminal's size, so attaching from a
+  smaller pane, such as a tmux split beside the agent, does not shrink the
+  session for everyone else; long lines wrap in your view instead.
 - `holdfast watch <session>` — the same view, read-only and **redacted**.
   Detach with Ctrl+C.
 
@@ -78,7 +82,9 @@ session, though** — a second `holdfast attach` from a terminal that already ha
 one is refused with `terminal_busy`, because two processes reading one keyboard
 are handed alternate keystrokes by the kernel and neither reliably sees a
 detach. Attach from another window instead. The session's size is the smallest
-attached writer's, so another client's window can narrow what a program sees. When a program asks for a password, every attached
+attached writer's, so another client's window can narrow what a program sees,
+unless that client attached with `--keep-size`, which makes no claim on it.
+When a program asks for a password, every attached
 client is told and any of them can answer — without the value ever reaching the
 agent, **provided the program turned terminal echo off**, as `sudo`, `ssh` and
 `gpg` do. If it did not, the terminal echoes what it is given straight into the
@@ -410,13 +416,17 @@ it (CONTRIBUTING.md, Releases, step 8), so an install stops following `main`
 onto a version that is still a draft.
 
 **When an agent asks for a secret, the plugin says so above Claude Code's
-prompt.** A band names the session, by name and id, with a key that copies the
-`holdfast attach` command and, inside tmux, one that opens it in a split. Type
-the secret in `holdfast attach`: the band has no field for it, by design. It
-needs Claude Code 2.1.287 or later, which mods require in a terminal, and it
-draws only in `claude` in a terminal and the Desktop app's Code tab. Where it
-does not draw, or mods are turned off, the tools work as before and
-`/holdfast:attach` walks through the same step.
+prompt.** A band names the session, with its id once the agent's own calls have
+shown it, and the `holdfast attach` command to run. When Claude Code can find
+`holdfast`, through `HOLDFAST_BOOTSTRAP_BIN` or its `PATH`, one key copies the
+command and, inside tmux, another opens it in a split. Type the secret in
+`holdfast attach`: the band has no field for it, by design. It draws from the
+agent's own calls and makes none to Holdfast, so it raises no permission prompt
+of its own. It needs Claude Code 2.1.287 or later, which mods require in a
+terminal, and it draws only in `claude` in a terminal and the Desktop app's
+Code tab. Where it does not draw, or mods or the plugin's `secret_band` option
+are off, the tools work as before and `/holdfast:attach` walks through the same
+step.
 
 ## Development
 
@@ -445,7 +455,7 @@ request runs:
 | `windows-cross` | The same clippy invocation against `x86_64-pc-windows-gnu`, on a Linux runner. A **cross-compilation check, not a test run** — it proves Holdfast still *compiles* for Windows, against the GNU ABI, in about two minutes. It was red on `main` from before 0.0.6 until #19 |
 | `windows-native` | `windows-2022`. Native **MSVC** clippy over `--all-targets` (the ABI a Windows user actually installs, which `windows-cross` does not check), `tests/source_guards.rs`, a **filtered `--lib`**, and the `#[cfg(windows)]` CLI arms executed: the daemon-backed subcommands must exit 64 and name the reason, `daemon stop` must exit 0 (§3.2 is idempotent). The `--lib` filter names only the modules whose Windows arm differs from its Unix one, and it is load-bearing: it is the only gate anywhere that kills the `.append(true)` → `.truncate(true)` mutation, which would zero the §9.4 audit trail on every start. This row said "`--lib` is not run" — read that as the **full** `--lib`, which is not: 55 of its tests spawn a real shell — measured 721 passed / 55 failed natively — and gating those is 0.0.11's |
 | `macos-native` | `macos-14` — **the third platform, and the one this project develops on.** The full suite on a BSD kernel under `cargo-nextest` at a pinned digest, plus the shells the detection rows spawn and a check that the GH #96 exclusion is still earning its place. It exists because the defects it catches are runtime and kernel-shaped — pty buffering, accept ordering, line discipline — and a cross-compile cannot see any of them: a `#[cfg]` split that deleted the arm for every BSD compiled cleanly on both platforms anyone had tested. Free while this repository is public, and the first job to revisit if it ever is not |
-| `plugin` | The plugin and marketplace layer: `scripts/plugin-manifest-check.py` and its self-test, which breaks the real tree one rule at a time and also requires the one pin shape the release procedure writes to pass — on a checkout with the tags, so a pin is checked against its tag and not skipped — shellcheck plus `dash -n`/`sh -n` over every shell file the plugin ships, and the bootstrap's safe-extraction rules against a generated corpus of 19 hostile tar archives and 12 hostile zips. **Four cells here and a fifth on `macos-native`**: dash + GNU tar unprivileged; bash with GNU tar and again with bsdtar, which together are what macOS `/bin/sh` and macOS `tar` are; busybox ash + busybox tar as root in a digest-pinned Alpine container; and the PowerShell extractor under `pwsh`. The cells are not repeats of each other — the bash cells exist because a bomb cap written in `ulimit -f` blocks is twice as large under bash as under dash, and every Linux cell used to be dash or busybox. Each check is deleted in turn and the corpus must go red; the post-extraction check is invisible outside the busybox-as-root cell, and every rejection is matched against the message of the check the case was written to provoke rather than against a non-zero status alone — which is itself what makes the mode check load-bearing in the busybox cell, where a bare exit-status assertion let a later check cover for its deletion. Then the download path itself, against a fabricated release served over loopback HTTP, because `release.yml` attaches its binaries to a *draft* and a draft's assets are not served from `releases/download/` — so there is no real release to point this at, and there will not be one until a human promotes a draft. The same harness runs `bootstrap.ps1`'s `HOLDFAST_BOOTSTRAP_BIN` arm, its 404-versus-unreachable split and its answer to `initialize` under `pwsh`, the only place anything executes that file, and runs the download under GNU wget and busybox wget on a `$PATH` with no curl, since each reports a 404 differently |
+| `plugin` | The plugin and marketplace layer: `scripts/plugin-manifest-check.py` and its self-test, which breaks the real tree one rule at a time and also requires the one pin shape the release procedure writes to pass — on a checkout with the tags, so a pin is checked against its tag and not skipped — shellcheck plus `dash -n`/`sh -n` over every shell file the plugin ships, and the bootstrap's safe-extraction rules against a generated corpus of 19 hostile tar archives and 12 hostile zips. **Four cells here and a fifth on `macos-native`**: dash + GNU tar unprivileged; bash with GNU tar and again with bsdtar, which together are what macOS `/bin/sh` and macOS `tar` are; busybox ash + busybox tar as root in a digest-pinned Alpine container; and the PowerShell extractor under `pwsh`. The cells are not repeats of each other — the bash cells exist because a bomb cap written in `ulimit -f` blocks is twice as large under bash as under dash, and every Linux cell used to be dash or busybox. Each check is deleted in turn and the corpus must go red; the post-extraction check is invisible outside the busybox-as-root cell, and every rejection is matched against the message of the check the case was written to provoke rather than against a non-zero status alone — which is itself what makes the mode check load-bearing in the busybox cell, where a bare exit-status assertion let a later check cover for its deletion. Then the download path itself, against a fabricated release served over loopback HTTP, because `release.yml` attaches its binaries to a *draft* and a draft's assets are not served from `releases/download/` — so there is no real release to point this at, and there will not be one until a human promotes a draft. The same harness runs `bootstrap.ps1`'s `HOLDFAST_BOOTSTRAP_BIN` arm, its 404-versus-unreachable split and its answer to `initialize` under `pwsh`, the only place anything executes that file, and runs the download under GNU wget and busybox wget on a `$PATH` with no curl, since each reports a 404 differently. Then Claude Code's own checks of the band's mod, run by `scripts/plugin-mod-tests.sh` after its self-test: `claude plugin validate --strict --json` with what it reports the module hooks, calls and reads pinned exactly by `plugin-tests/validate-notes.txt`, a pin the manifest check refuses if it lists any MCP call, and the mod's tests under `claude plugin test`, against Claude Code 2.1.291 installed with `npm ci --ignore-scripts` from a lockfile of integrity hashes |
 | `probe` | `scripts/ci-probe.sh` — toolchain version, pseudoterminal allocation, and every shell and interpreter the suite spawns by name. Host-dependent rows of `tests/detection.rs` skip *and report as passing* when their program is absent, so this gate is part of what makes the test job's green mean something. The exact set is pinned by `scripts/ci-skip-census.sh` rather than counted here (GH #74) |
 | `test` | `scripts/ci-skip-census.sh --self-test` (the census's own gates, deleted one at a time against fixtures), then `cargo nextest run --workspace --locked --no-fail-fast -j 4 --success-output immediate --no-output-indent`, then `cargo test --workspace --locked --doc` because nextest runs no doctests, then `scripts/ci-skip-census.sh` over the captured log — which fails on any skipped row the pipeline has not agreed to, on any *assertion* gated off inside a row that ran without an agreed entry, **and on an agreed one of either kind that stopped happening** |
 | `fish-req-ts-008` | `ubuntu-24.04` with fish 4.x from `ppa:fish-shell/release-4`, running REQ-TS-008's three-arm row and nothing else — the measurement §4.5.1's decision to write unsolicited bytes into a child's stdin rests on, which had executed nowhere in this pipeline until 0.0.4. It gets its own job because installing fish in `test` takes `tests/detection.rs`'s fish row red for a defect that is not the pipeline's; the `detection` binary is never invoked here, so that row's agreed skip is untouched. Not gated on `probe` — fish is deliberately not among the shells the probe asserts |

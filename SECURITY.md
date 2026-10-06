@@ -137,9 +137,14 @@ Install plugins that carry mods only from marketplaces you trust. `claude
 plugin validate <dir>` shows both reaches before you install: `$.mcp.call` on
 its `calls:` line, and `tool.check` on its `hooks:` line.
 
-The `holdfast` plugin's own mod uses `$.mcp.call` only to read session status,
-and it never accepts a secret: it points you at `holdfast attach`, where the
-secret is typed.
+The `holdfast` plugin's own mod makes no Holdfast calls and never accepts a
+secret. It draws its band from the agent's own `request_secret_input` call as
+that passes, takes the id that goes with a session's name from the agent's own
+`start_session`, `list_sessions` and `status` results, and points you at
+`holdfast attach`, where the secret is typed. It keeps nothing beyond the
+running module's memory. `scripts/plugin-manifest-check.py` fails the build if
+the mod's source, or the pinned report of what it calls, reaches an MCP
+server.
 
 ## In scope
 

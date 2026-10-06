@@ -124,10 +124,13 @@ Code when an agent asks for a secret.** Today `request_secret_input` blocks the
 agent's turn for up to its timeout, two minutes by default, while the human
 may not know that a terminal is wanted, for which session, or what to run
 there. The plugin draws a band above Claude Code's prompt naming the session,
-by name and id. One key copies the `holdfast attach` command and, inside
-tmux, another opens it in a split. The secret is still typed only in `holdfast
-attach`: the band has no field for it, and it calls no Holdfast tool that
-writes. It needs Claude Code 2.1.287 or later, which mods require in a
+with its id once the agent's own calls have shown it, and the `holdfast
+attach` command. When Claude Code can find `holdfast`, one key copies that
+command and, inside tmux, another opens it in a split. The secret is still
+typed only in `holdfast attach`: the band has no field for it. It draws from
+the agent's own calls and makes none to Holdfast, because a mod's call is
+permission-checked like the agent's and would put a prompt in front of the
+request. It needs Claude Code 2.1.287 or later, which mods require in a
 terminal, and it draws nothing in the VS Code chat panel, under `claude -p` or
 in a cloud session. It is the first piece of the Session panel below.
 
@@ -254,7 +257,11 @@ is built only if users outside Claude Code appear. A mod draws only in
 `claude` in a terminal and in the Desktop app's Code tab, so `attach` and
 `watch` stay the view everywhere else. Whatever draws it, the panel shows a
 session's screen masked as the agent reads it, and it never takes a secret:
-that is typed in `holdfast attach`.
+that is typed in `holdfast attach`. Unlike the band, the panel has to read
+Holdfast, and Claude Code checks a mod's reads as it checks the agent's
+calls: in default mode the first one asks, and allowing the read tools for
+good is a grant every installed mod shares (SECURITY.md). It brings back
+what the band leaves out: the session's last line and who started it.
 
 ## Windows
 
