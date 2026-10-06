@@ -1139,9 +1139,11 @@ mod tests {
     fn a_key_cut_short_by_the_end_of_the_stream_is_masked_not_flushed() {
         use crate::output::pem::fixtures::KEYS;
         for key in KEYS {
-            // Four lines: the header and three of body, which is the
-            // whole body of the smallest fixture and leaves it unclosed.
-            let cut: String = key.pem().split_inclusive('\n').take(4).collect();
+            // The header and three lines of key body, after any armour
+            // headers: the whole body of the smallest fixture, unclosed.
+            let pem = key.pem();
+            let third = key.material_lines()[2];
+            let cut = &pem[..pem.find(third).unwrap() + third.len() + 1];
             assert!(!cut.contains("-----END"), "{}", key.name);
             let mut r = redactor();
             let mut out = r.feed(format!("$ head -n 4 k\n{cut}").as_bytes());

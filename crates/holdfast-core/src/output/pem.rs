@@ -35,8 +35,9 @@
 //! a prompt — is still a key body nobody will close, and it is masked from
 //! its header to the byte that killed it. A candidate that dies with none
 //! — prose — is not masked at all. "Material" is a run of
-//! [`PEM_MATERIAL_RUN`] base64 characters; see that constant for why the
-//! number is sixteen and what it costs.
+//! [`PEM_MATERIAL_RUN`] base64 characters that is neither a digest nor an
+//! integrity string; see that constant for why the number is sixteen and
+//! what it costs, and `Run` for the two refusals (GH #260).
 //!
 //! **Judged over every stream a read can emit, not over the raw bytes
 //! alone**, for the reason `normalise` gives: a view may add a marker,
@@ -98,7 +99,11 @@ use super::encoding::lossy_printable_keeps;
 /// magic. For a SEC1 EC key the private scalar starts at byte seven, so
 /// such a cut can release up to five bytes of it. It takes `head -c` or a
 /// program that prints a partial first line and then punctuation on the
-/// same line.
+/// same line. A run of hex digits is not material (`Run`). That moves the
+/// cut for no unencrypted format, whose first body line has a character
+/// that is not a hex digit within its first four (`MII`, `MHc`, `b3Bl`).
+/// A legacy encrypted key's first line is ciphertext, and opens with
+/// sixteen hex digits with probability (22/64)^16, about 4 × 10^-8.
 pub const PEM_MATERIAL_RUN: u32 = 16;
 
 /// A line carrying a base64 run this long is a key-body line, wherever on
@@ -111,11 +116,14 @@ pub const PEM_MATERIAL_RUN: u32 = 16;
 /// whatever decoration sits in front of it: a timestamp, a `bat` gutter,
 /// a diff's `-`, `grep -n`'s `12:`. It is above forty so a git object id
 /// is never one, which matters because `git log` is the likeliest output
-/// to follow a key header in prose. A SHA-256 digest (64) is one, and
-/// that is the cost: inside the carry behind a private-key header, a
-/// digest on its own line is masked. The last, short line of a key is
-/// reached by the second arm of [`body_lines`] — a run of
-/// [`PEM_MATERIAL_RUN`] on the line after a body line.
+/// to follow a key header in prose. A SHA-256 digest (64) and the base64
+/// of a `sha384-` or `sha512-` integrity string (64, 88) are long enough,
+/// and are refused by what they are rather than by length: see `Run`.
+/// What is left of the cost is a base64 blob, which has key body's
+/// alphabet: inside the carry behind a private-key header, a line of one
+/// is masked (GH #260). The last, short line of a key is reached by the
+/// second arm of [`body_lines`] — a run of [`PEM_MATERIAL_RUN`] on the
+/// line after a body line.
 ///
 /// Measured on this repository's own `CHANGELOG.md`, `README.md` and
 /// `ROADMAP.md`: no line within [`UNVOUCHED_CARRY_BYTES`] behind any
@@ -125,6 +133,78 @@ pub const PEM_MATERIAL_RUN: u32 = 16;
 ///
 /// [`UNVOUCHED_CARRY_BYTES`]: super::UNVOUCHED_CARRY_BYTES
 pub const KEY_LINE_RUN: u32 = 48;
+
+/// The Subresource Integrity algorithms, each followed by `-` and the
+/// digest in base64 in an integrity string (W3C SRI).
+const SRI_ALGORITHMS: [&[u8; 6]; 3] = [b"sha256", b"sha384", b"sha512"];
+
+/// One run of base64 characters, as both walks count it, and whether it
+/// is one of the two shapes that have base64's alphabet and are never key
+/// body (GH #260). Neither is [`PEM_MATERIAL_RUN`] for the walk, nor
+/// [`KEY_LINE_RUN`] for [`body_lines`].
+///
+/// * **Hex digits only: a digest**, as `sha256sum`, `docker images
+///   --digests` and `Get-FileHash` print one. A PEM line is the base64 of
+///   DER, and 22 of base64's 64 characters are hex digits, so a uniformly
+///   drawn 64-character line is all hex with probability (22/64)^64,
+///   about 2 × 10^-30; no line of any key in `fixtures` opens with more
+///   than five. A key's last line is the one that can be short enough to
+///   be all hex by chance: about 4 × 10^-8 at sixteen characters, and
+///   only when no `=` pads it. [`body_lines`] masks a refused run on the
+///   line after a body line for that reason, and the walk keeps a line
+///   that a key's mask already reaches.
+/// * **Directly after `sha256-`, `sha384-` or `sha512-`: an integrity
+///   string**, as `package-lock.json`, `yarn.lock`, pnpm, Nix and an HTML
+///   `<script integrity>` print one. Base64 has no `-`, so no key line
+///   carries the prefix inside a run. Only the run directly after the `-`
+///   is refused: any other byte and every line break clear it, so text
+///   that ends in `sha256-` cannot refuse a key printed after it, and
+///   `xsha256-` is not the prefix.
+#[derive(Debug, Clone, Copy)]
+struct Run {
+    len: u32,
+    /// Every character so far is a hex digit.
+    hex: bool,
+    /// The run opened directly after an SRI algorithm and its `-`.
+    sri: bool,
+    /// The first six characters, enough to recognise an SRI algorithm
+    /// when the `-` after it arrives.
+    head: [u8; 6],
+}
+
+impl Run {
+    const EMPTY: Self = Self {
+        len: 0,
+        hex: true,
+        sri: false,
+        head: [0; 6],
+    };
+
+    fn push(&mut self, b: u8) {
+        if let Some(slot) = self.head.get_mut(self.len as usize) {
+            *slot = b;
+        }
+        self.len += 1;
+        self.hex &= b.is_ascii_hexdigit();
+    }
+
+    /// The run ends on `by`, which is not base64. The next run is an
+    /// integrity string when `by` is the `-` after an SRI algorithm.
+    fn end(&mut self, by: u8) {
+        let sri = by == b'-' && self.len == 6 && SRI_ALGORITHMS.contains(&&self.head);
+        *self = Self { sri, ..Self::EMPTY };
+    }
+
+    /// The run's length if it can be key body, and zero if it is a digest
+    /// or an integrity string.
+    fn key_len(&self) -> u32 {
+        if self.hex || self.sri {
+            0
+        } else {
+            self.len
+        }
+    }
+}
 
 /// Whether the text a caller judges ends where it will end, or where more
 /// of it can still arrive — which decides what [`body_lines`] makes of a
@@ -328,10 +408,14 @@ struct Lane {
     /// open. A shorter run does not count: `cat -n` puts a line number in
     /// front of `Proc-Type:`, and that is not the body starting.
     seen_body: bool,
-    run: u32,
+    run: Run,
+    /// The body has carried a run of [`PEM_MATERIAL_RUN`] that can be key
+    /// body ([`Run::key_len`]).
     material: bool,
     /// Region index just past the most recent line break, and whether
-    /// that line has carried material yet.
+    /// that line has carried a run of [`PEM_MATERIAL_RUN`] of any kind. A
+    /// digest's counts here: a line the mask of a key already reaches is
+    /// kept in it, because a key's last line can be all hex digits.
     line_start: usize,
     line_material: bool,
     /// Where the body began: headers and body both start after the
@@ -350,7 +434,7 @@ impl Lane {
             stripper: AnsiStripper::new(),
             phase: Phase::Label { len: 0, dashes: 0 },
             seen_body: false,
-            run: 0,
+            run: Run::EMPTY,
             material: false,
             line_start: start,
             line_material: false,
@@ -402,25 +486,33 @@ impl Lane {
     }
 
     fn line_break(&mut self, at: usize) {
-        self.run = 0;
+        self.run = Run::EMPTY;
         self.line_start = at + 1;
         self.line_material = false;
         self.phase = Phase::LineStart;
     }
 
-    fn base64(&mut self) {
-        self.base64_in_value();
-        self.seen_body |= self.run >= PEM_MATERIAL_RUN;
+    fn base64(&mut self, b: u8) {
+        self.run.push(b);
+        self.credit(true);
     }
 
     /// A base64 character that does not open the body — one inside an
     /// armour header's value.
-    fn base64_in_value(&mut self) {
-        self.run += 1;
-        if self.run >= PEM_MATERIAL_RUN {
-            self.material = true;
+    fn base64_in_value(&mut self, b: u8) {
+        self.run.push(b);
+        self.credit(false);
+    }
+
+    /// Count the run as it stands. A run of [`PEM_MATERIAL_RUN`] of any
+    /// kind marks its line and, in the body, opens it; only one that can
+    /// be key body is material.
+    fn credit(&mut self, body: bool) {
+        if self.run.len >= PEM_MATERIAL_RUN {
             self.line_material = true;
+            self.seen_body |= body;
         }
+        self.material |= self.run.key_len() >= PEM_MATERIAL_RUN;
     }
 
     fn step(&mut self, at: usize, b: u8) {
@@ -457,7 +549,7 @@ impl Lane {
             },
             Phase::HeaderName { len, dash } => match b {
                 b':' => {
-                    self.run = 0;
+                    self.run.end(b);
                     self.phase = Phase::HeaderValue { end_seen: 0 };
                 }
                 b'-' => {
@@ -467,7 +559,7 @@ impl Lane {
                     }
                 }
                 _ if b.is_ascii_alphanumeric() && len < MAX_LABEL => {
-                    self.run += 1;
+                    self.run.push(b);
                     self.phase = Phase::HeaderName { len: len + 1, dash };
                 }
                 // Not a header after all. A name with a dash in it is not
@@ -475,11 +567,7 @@ impl Lane {
                 // line, and the byte that ended it is judged as body.
                 _ if dash => self.kill(at),
                 _ => {
-                    let run = self.run;
-                    self.run = 0;
-                    for _ in 0..run {
-                        self.base64();
-                    }
+                    self.credit(true);
                     self.phase = Phase::Body;
                     self.step(at, b);
                 }
@@ -502,13 +590,14 @@ impl Lane {
                     };
                     return;
                 }
-                // The value's own base64 counts as material: a DEK-Info
-                // IV is public, but in the flattened spelling the body
-                // itself runs on inside the last header's value.
+                // The value's own base64 counts as material, because in
+                // the flattened spelling the body itself runs on inside
+                // the last header's value. A DEK-Info IV is hex, and
+                // public, and does not.
                 if b.is_ascii_alphanumeric() || matches!(b, b'+' | b'/' | b'=') {
-                    self.base64_in_value();
+                    self.base64_in_value(b);
                 } else {
-                    self.run = 0;
+                    self.run.end(b);
                 }
                 match b {
                     b'\n' => self.line_break(at),
@@ -528,7 +617,7 @@ impl Lane {
                     }
                 }
                 b'/' if !in_value => {
-                    self.base64();
+                    self.base64(b);
                     self.phase = Phase::Body;
                 }
                 0x20..=0x7e if in_value => self.phase = Phase::HeaderValue { end_seen: 0 },
@@ -539,22 +628,22 @@ impl Lane {
                 // at a line start or — unquoted `echo $KEY` — after the
                 // whitespace that replaced one. A name that turns out not
                 // to be one is handed back as base64 by `HeaderName`.
-                _ if !self.seen_body && self.run == 0 && b.is_ascii_alphabetic() => {
+                _ if !self.seen_body && self.run.len == 0 && b.is_ascii_alphabetic() => {
                     self.phase = Phase::HeaderName {
                         len: 1,
                         dash: false,
                     };
-                    self.run = 1;
+                    self.run.push(b);
                 }
-                b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'+' | b'/' | b'=' => self.base64(),
-                b' ' | b'\t' | b'\r' => self.run = 0,
+                b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'+' | b'/' | b'=' => self.base64(b),
+                b' ' | b'\t' | b'\r' => self.run.end(b),
                 b'\n' => self.line_break(at),
                 b'\\' => {
-                    self.run = 0;
+                    self.run.end(b);
                     self.phase = Phase::Backslash { in_value: false };
                 }
                 b'-' => {
-                    self.run = 0;
+                    self.run.end(b);
                     self.phase = Phase::End {
                         seen: 1,
                         label: 0,
@@ -628,9 +717,13 @@ pub struct BodyLines {
 /// of it — raw, stripped, printable or stripped-printable, the four
 /// [`extent`] walks — carries a base64 run of [`KEY_LINE_RUN`], or of
 /// [`PEM_MATERIAL_RUN`] on the line after a body line (a key's last, short
-/// line). A blank line — nothing but whitespace once escapes are gone —
-/// neither ends a run of body lines nor starts one. Everything else is
-/// kept: a prompt, a command, a pager's `:`, the `-----END` line itself.
+/// line). A run that is a digest or an integrity string (`Run`) counts
+/// for neither, except on the line after a body line: there it is masked
+/// as a key's last line may be, and ends the run of body lines, so a list
+/// of digests printed after a key costs its first line and no more. A
+/// blank line — nothing but whitespace once escapes are gone — neither
+/// ends a run of body lines nor starts one. Everything else is kept: a
+/// prompt, a command, a pager's `:`, the `-----END` line itself.
 ///
 /// **Why not the whole carry, as before GH #242.** That is the
 /// alternative the review offered, and it is the one that undoes the
@@ -645,9 +738,14 @@ pub struct BodyLines {
 /// candidate's). Otherwise it may still be arriving: it is reported as
 /// [`BodyLines::hold_from`] if it ends inside a base64 run, and masked
 /// already if it follows a body line or has carried [`PEM_MATERIAL_RUN`]
-/// — so a read that lands mid-line in a key arriving under a decoration
-/// masks the front of the line, and the next read masks the rest from the
-/// line's own start.
+/// that can be key body — so a read that lands mid-line in a key arriving
+/// under a decoration masks the front of the line, and the next read
+/// masks the rest from the line's own start. A digest still arriving is
+/// held, as any run is, and not masked. So the front of the first key line
+/// after a stop — the top of a pager's next screenful — is read out this
+/// way for as long as it is all hex digits, where it was for its first
+/// fifteen characters: past sixteen, with probability (22/64)^16, about
+/// 4 × 10^-8.
 pub fn body_lines(region: &[u8], from: usize, to: usize, end: RegionEnd) -> BodyLines {
     let to = to.min(region.len());
     let mut out = BodyLines::default();
@@ -676,10 +774,12 @@ pub fn body_lines(region: &[u8], from: usize, to: usize, end: RegionEnd) -> Body
         if lanes[3].blank {
             return;
         }
-        let run = lanes.iter().map(|l| l.max_run).max().unwrap_or(0);
-        if run >= KEY_LINE_RUN || (*prev_body && run >= PEM_MATERIAL_RUN) {
+        let key = lanes.iter().map(|l| l.max_key_run).max().unwrap_or(0);
+        let any = lanes.iter().map(|l| l.max_run).max().unwrap_or(0);
+        let body = key >= KEY_LINE_RUN || (*prev_body && key >= PEM_MATERIAL_RUN);
+        if body || (*prev_body && any >= PEM_MATERIAL_RUN) {
             *open = Some((open.map_or(seg_start, |o| o.0), seg_end));
-            *prev_body = true;
+            *prev_body = body;
         } else {
             ranges.extend(open.take());
             *prev_body = false;
@@ -706,11 +806,11 @@ pub fn body_lines(region: &[u8], from: usize, to: usize, end: RegionEnd) -> Body
     }
     if seg_start < to {
         if end == RegionEnd::Arriving && to == region.len() {
-            let arriving = !lanes[3].blank && lanes.iter().any(|l| l.run > 0);
+            let arriving = !lanes[3].blank && lanes.iter().any(|l| l.run.len > 0);
             if arriving {
                 out.hold_from = Some(seg_start);
-                let run = lanes.iter().map(|l| l.max_run).max().unwrap_or(0);
-                if prev_body || run >= PEM_MATERIAL_RUN {
+                let key = lanes.iter().map(|l| l.max_key_run).max().unwrap_or(0);
+                if prev_body || key >= PEM_MATERIAL_RUN {
                     open = Some((open.map_or(seg_start, |o| o.0), to));
                 }
             }
@@ -735,9 +835,11 @@ pub fn body_lines(region: &[u8], from: usize, to: usize, end: RegionEnd) -> Body
 struct SegLane {
     filter: Filter,
     stripper: AnsiStripper,
-    /// The base64 run the line currently ends in, and its longest.
-    run: u32,
+    /// The base64 run the line currently ends in; the line's longest run,
+    /// and its longest that can be key body ([`Run::key_len`]).
+    run: Run,
     max_run: u32,
+    max_key_run: u32,
     /// Nothing but spaces and tabs emitted on this line so far.
     blank: bool,
 }
@@ -747,15 +849,17 @@ impl SegLane {
         Self {
             filter,
             stripper: AnsiStripper::new(),
-            run: 0,
+            run: Run::EMPTY,
             max_run: 0,
+            max_key_run: 0,
             blank: true,
         }
     }
 
     fn next_line(&mut self) {
-        self.run = 0;
+        self.run = Run::EMPTY;
         self.max_run = 0;
+        self.max_key_run = 0;
         self.blank = true;
     }
 
@@ -774,10 +878,11 @@ impl SegLane {
             return;
         }
         if b.is_ascii_alphanumeric() || matches!(b, b'+' | b'/' | b'=') {
-            self.run += 1;
-            self.max_run = self.max_run.max(self.run);
+            self.run.push(b);
+            self.max_run = self.max_run.max(self.run.len);
+            self.max_key_run = self.max_key_run.max(self.run.key_len());
         } else {
-            self.run = 0;
+            self.run.end(b);
         }
         self.blank &= matches!(b, b' ' | b'\t');
     }
@@ -1207,6 +1312,13 @@ mod tests {
         let e = walk(&late);
         assert!(!e.alive && e.material);
         assert_eq!(&late[e.end..], "Note: this is prose\n");
+        // The same with a body line of letters and digits alone, which the
+        // walk reads as a header name until the line break hands it back.
+        let alnum = LINE.replace(['+', '/'], "x");
+        let late = format!("{HEADER}\n{alnum}\nNote: this is prose\n");
+        let e = walk(&late);
+        assert!(!e.alive && e.material, "{e:?}");
+        assert_eq!(&late[e.end..], "Note: this is prose\n");
     }
 
     /// **A glyph in a window title does not keep a dead candidate alive.**
@@ -1335,5 +1447,207 @@ mod tests {
         let mut dead = format!("{HEADER}` prose").into_bytes();
         dead.push(0x9b);
         assert!(!extent(&dead, 0).alive, "every stream died on the backtick");
+    }
+
+    // ------------------------------------- GH #260: digests and SRI strings
+
+    /// A SHA-256 digest: 64 hex digits.
+    const DIGEST: &str = "f0706ee90e320bb78d77c1dc331330e49445fb405d6d765be20625d9569b195a";
+    /// A `sha512-` integrity string, whose base64 is 88 characters.
+    const SRI512: &str = "sha512-aPHDxaLSeT7L+t+1t4Mzoi9kLG1Oe0jjJNPn4gehlmWOthNVLYvXR5FyBm7Sk+trevdwUPNEStIxCopBRW1KCg==";
+    /// A `sha384-` integrity string, whose base64 is 64 characters.
+    const SRI384: &str = "sha384-SrpsZDxVFyEgP6pohNcOq1aI+48FVepYM3iOroCp6u/k8XE+LoRE6nYZK7iapn+0";
+
+    fn masked(text: &str, end: RegionEnd) -> Vec<&str> {
+        body_lines(text.as_bytes(), 0, text.len(), end)
+            .ranges
+            .iter()
+            .map(|&(s, e)| &text[s..e])
+            .collect()
+    }
+
+    /// **A digest or an integrity string straight after a header is not
+    /// key material** — the shape where no prompt comes between them, so
+    /// the candidate's own walk reaches it: `grep …; sha256sum *` on one
+    /// command line, bare digests (`cut -c1-64`, upper-case from
+    /// `Get-FileHash`), and pnpm's `resolution:` line, which the walk reads
+    /// as an armour header whose value counts toward material.
+    #[test]
+    fn a_digest_or_an_integrity_string_after_a_header_is_not_material() {
+        let upper = DIGEST.to_ascii_uppercase();
+        for (name, after) in [
+            (
+                "sha256sum",
+                format!("{DIGEST}  dist/a.tar.gz\r\n").repeat(3),
+            ),
+            ("bare", format!("{DIGEST}\r\n").repeat(3)),
+            ("upper", format!("{upper}  a.zip\r\n")),
+            (
+                "pnpm",
+                format!("    resolution: {{integrity: {SRI512}}}\r\n"),
+            ),
+            ("sha384", format!("Integrity: {SRI384}\r\n")),
+        ] {
+            let text = format!("{HEADER}\r\n{after}$ ");
+            let e = walk(&text);
+            assert!(!e.alive && !e.material, "{name}: {e:?}");
+            assert!(e.stopped_short(), "{name}: still followed: {e:?}");
+        }
+        // The pair: the same walk with key body in it is material.
+        let key = walk(&format!("{HEADER}\r\n{DIGEST}  a\r\n{LINE}\r\n$ "));
+        assert!(key.material, "{key:?}");
+
+        // A legacy encrypted key's armour alone carries none either: its
+        // DEK-Info IV is hex. Its body is material from the first line.
+        let legacy = fixtures::KEYS
+            .iter()
+            .find(|k| k.name == "rsa-legacy-encrypted")
+            .unwrap();
+        let pem = legacy.pem();
+        let first = legacy.material_lines()[0];
+        let armour = format!("{}$ ", &pem[..pem.find(first).unwrap()]);
+        assert!(armour.contains("DEK-Info: "), "{armour}");
+        let e = walk(&armour);
+        assert!(!e.alive && !e.material, "{e:?}");
+    }
+
+    /// **`body_lines` releases a digest and an integrity string, and still
+    /// masks key body beside them** (R19's reproduction, in miniature).
+    #[test]
+    fn body_lines_releases_digests_and_integrity_strings() {
+        let text = format!(
+            "$ sha256sum *\r\n{DIGEST}  a.tgz\r\n{DIGEST}  b.tgz\r\n\
+             $ docker images --digests\r\napp  sha256:{DIGEST}\r\n\
+             $ cat package-lock.json\r\n      \"integrity\": \"{SRI512}\"\r\n\
+             yarn.lock:  integrity {SRI512}\r\n\
+             <script src=\"/l.js\" integrity=\"{SRI384}\"></script>\r\n$ "
+        );
+        assert_eq!(masked(&text, RegionEnd::Final), Vec::<&str>::new());
+        assert_eq!(
+            body_lines(text.as_bytes(), 0, text.len(), RegionEnd::Arriving).hold_from,
+            None
+        );
+
+        // The pair: a key line among them is masked, alone.
+        let with_key = text.replace("$ docker", &format!("{LINE}\r\n$ docker"));
+        assert_eq!(masked(&with_key, RegionEnd::Final), vec![LINE]);
+
+        // What R19 keeps: a base64 blob, and a digest inside a longer run,
+        // such as a URL path, which `/` and the letters make base64.
+        let blob = &SRI384["sha384-".len()..];
+        let kept = format!("$ base64 f\r\n{blob}\r\n$ curl\r\nhttps://x.org/sha256/{DIGEST}\r\n$ ");
+        assert_eq!(
+            masked(&kept, RegionEnd::Final),
+            vec![blob, &format!("https://x.org/sha256/{DIGEST}")[..]]
+        );
+        // And the digest on the line after a blob, which after key body
+        // could be the key's last line; the one after that comes back.
+        let after_blob = format!("{blob}\r\n{DIGEST}  f\r\n{DIGEST}  g\r\n");
+        assert_eq!(
+            masked(&after_blob, RegionEnd::Final),
+            vec![&after_blob[..after_blob.find("  f").unwrap() + 3]]
+        );
+
+        // A digest still arriving is held on a stream, as any run is, and
+        // not masked: its first sixteen digits are not material.
+        let arriving = format!("$ sha256sum a\r\n{}", &DIGEST[..40]);
+        let got = body_lines(arriving.as_bytes(), 0, arriving.len(), RegionEnd::Arriving);
+        let line = arriving.find(&DIGEST[..40]).unwrap();
+        assert_eq!((got.hold_from, got.ranges.len()), (Some(line), 0));
+    }
+
+    /// **A key whose last line happens to be all hex digits is masked to
+    /// its end** — the case a hex refusal could leak.
+    ///
+    /// A key's last line is short, and unpadded when its DER length is a
+    /// multiple of three; then it is all hex with probability (22/64)^n
+    /// for its n characters, about 4 × 10^-8 at sixteen. Such a line
+    /// follows a body line, so `body_lines` masks a refused run there as it
+    /// masks a short one — and ends the run of body lines with it, because
+    /// no key line comes after the last one, so a list of digests behind a
+    /// key costs one line rather than all of them. The walk keeps the line its
+    /// candidate died on whenever that line carried a run of any kind, so
+    /// a prompt printed straight after the hex line does not release it.
+    #[test]
+    fn a_key_whose_last_line_is_all_hex_is_masked_to_its_end() {
+        let last = &DIGEST[..24];
+        let text = format!("{LINE}\r\n{LINE}\r\n{last}\r\n$ ");
+        assert_eq!(
+            masked(&text, RegionEnd::Final),
+            vec![&text[..text.find("\r\n$").unwrap()]]
+        );
+
+        let then = format!("{LINE}\r\n{last}\r\n{DIGEST}  a.tgz\r\n{DIGEST}  b.tgz\r\n");
+        assert_eq!(
+            masked(&then, RegionEnd::Final),
+            vec![&then[..LINE.len() + 2 + last.len()]],
+            "the digests after the last line are released"
+        );
+
+        // Still arriving, after a body line: masked already.
+        let arriving = format!("{LINE}\r\n{}", &last[..18]);
+        let got = body_lines(arriving.as_bytes(), 0, arriving.len(), RegionEnd::Arriving);
+        assert_eq!(got.ranges, vec![(0, arriving.len())]);
+
+        let cut = format!("{HEADER}\n{LINE}\n{last}$ echo\n");
+        let e = walk(&cut);
+        assert!(!e.alive && e.material, "{e:?}");
+        assert_eq!(&cut[e.end..], "$ echo\n", "masked through the hex line");
+    }
+
+    /// **Text that names an integrity prefix does not refuse a key after
+    /// it.** The prefix refuses only the run directly after its `-`, on
+    /// the same line: a line break, a pager's `\r`, a space or any other
+    /// byte clears it. The name followed by anything but `-` is not the
+    /// prefix (`sha256:`), and nor is a longer word that ends or begins
+    /// with it (`xsha256-`, `sha256sum-`).
+    #[test]
+    fn an_integrity_prefix_refuses_only_the_run_directly_after_it() {
+        for lead in [
+            "sha256-\r\n",
+            "see sha512-\r",
+            "sha384- ",
+            "sha512-\"",
+            "xsha256-",
+            "sha256sum-",
+            "sha256:",
+            "sha512 ",
+        ] {
+            let text = format!("{lead}{LINE}\r\n$ ");
+            let got = masked(&text, RegionEnd::Final);
+            assert!(
+                got.len() == 1 && got[0].ends_with(LINE),
+                "{lead:?}: {got:?}"
+            );
+        }
+        let header = format!("{HEADER}\nComment: sha256-\n{LINE}\n$ ");
+        assert!(walk(&header).material, "an armour header naming the prefix");
+    }
+
+    /// **No fixture key starts a body line with sixteen hex digits**, so
+    /// the hex refusal moves `PEM_MATERIAL_RUN`'s residual for none of
+    /// them: each first body line has a character that is not a hex digit
+    /// in its first four (`MII`, `MHc`, `b3Bl`, and the legacy encrypted
+    /// key's ciphertext), and a key cut after it, with a prompt on the same
+    /// line, is material and masked to the prompt.
+    #[test]
+    fn every_fixture_key_is_material_by_its_first_line() {
+        for key in fixtures::KEYS {
+            for line in key.material_lines() {
+                let lead = line.bytes().take_while(u8::is_ascii_hexdigit).count();
+                assert!(
+                    lead < PEM_MATERIAL_RUN as usize,
+                    "{}: {line} opens with {lead} hex digits",
+                    key.name
+                );
+            }
+            let pem = key.pem();
+            let first = key.material_lines()[0];
+            let at = pem.find(first).unwrap() + first.len();
+            let cut = format!("{}$ ", &pem[..at]);
+            let e = walk(&cut);
+            assert!(!e.alive && e.material, "{}: {e:?}", key.name);
+            assert_eq!(&cut[e.end..], "$ ", "{}", key.name);
+        }
     }
 }
