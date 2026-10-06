@@ -138,13 +138,16 @@ plugin validate <dir>` shows both reaches before you install: `$.mcp.call` on
 its `calls:` line, and `tool.check` on its `hooks:` line.
 
 The `holdfast` plugin's own mod makes no Holdfast calls and never accepts a
-secret. It draws its band from the agent's own `request_secret_input` call as
-that passes, takes the id that goes with a session's name from the agent's own
-`start_session`, `list_sessions` and `status` results, and points you at
-`holdfast attach`, where the secret is typed. It keeps nothing beyond the
-running module's memory. `scripts/plugin-manifest-check.py` fails the build if
-the mod's source, or the pinned report of what it calls, reaches an MCP
-server.
+secret. It draws its band from each `request_secret_input` call as that passes
+through Claude Code, takes the id that goes with a session's name from the
+`start_session`, `list_sessions` and `status` results that pass the same way,
+and points you at `holdfast attach`, where the secret is typed. Those are the
+agent's calls and any other installed mod's, since a mod's calls pass the same
+hooks, so another mod can raise the band or pair a name with an id; it can
+already do more than that, as above. It keeps nothing beyond the running
+module's memory. `scripts/plugin-manifest-check.py` fails the build if the
+mod's source, or the pinned report of what it calls, reaches an MCP server;
+the pin, which is Claude Code's own report, is the authority.
 
 ## In scope
 

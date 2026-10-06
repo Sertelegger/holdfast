@@ -14,8 +14,8 @@ is cut, named and published is in
 ### Added
 
 - While the agent waits in `request_secret_input`, a band above Claude Code's
-  prompt offers `holdfast attach` to copy or open in tmux, and calls no Holdfast
-  tool to do it. Needs Claude Code 2.1.287+; the `secret_band` option hides it.
+  prompt offers this release's `holdfast attach --keep-size` to copy or run in
+  tmux, calling no Holdfast tool. Claude Code 2.1.287+; `secret_band` hides it.
 - `holdfast attach --keep-size` never sends your terminal's size, on joining
   or on a resize, so attaching from a narrower pane does not shrink the session.
 

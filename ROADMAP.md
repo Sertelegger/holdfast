@@ -124,13 +124,13 @@ Code when an agent asks for a secret.** Today `request_secret_input` blocks the
 agent's turn for up to its timeout, two minutes by default, while the human
 may not know that a terminal is wanted, for which session, or what to run
 there. The plugin draws a band above Claude Code's prompt naming the session,
-with its id once the agent's own calls have shown it, and the `holdfast
-attach` command. When Claude Code can find `holdfast`, one key copies that
-command and, inside tmux, another opens it in a split. The secret is still
+with its id once a call passing through Claude Code has shown it, and the
+`holdfast attach` command. When Claude Code can find `holdfast`, one key copies
+that command and, inside tmux, another opens it in a split. The secret is still
 typed only in `holdfast attach`: the band has no field for it. It draws from
-the agent's own calls and makes none to Holdfast, because a mod's call is
-permission-checked like the agent's and would put a prompt in front of the
-request. It needs Claude Code 2.1.287 or later, which mods require in a
+the calls that pass through Claude Code and makes none to Holdfast, because a
+mod's call is permission-checked like the agent's and would put a prompt in
+front of the request. It needs Claude Code 2.1.287 or later, which mods require in a
 terminal, and it draws nothing in the VS Code chat panel, under `claude -p` or
 in a cloud session. It is the first piece of the Session panel below.
 

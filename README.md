@@ -416,13 +416,15 @@ it (CONTRIBUTING.md, Releases, step 8), so an install stops following `main`
 onto a version that is still a draft.
 
 **When an agent asks for a secret, the plugin says so above Claude Code's
-prompt.** A band names the session, with its id once the agent's own calls have
-shown it, and the `holdfast attach` command to run. When Claude Code can find
-`holdfast`, through `HOLDFAST_BOOTSTRAP_BIN` or its `PATH`, one key copies the
-command and, inside tmux, another opens it in a split. Type the secret in
-`holdfast attach`: the band has no field for it, by design. It draws from the
-agent's own calls and makes none to Holdfast, so it raises no permission prompt
-of its own. It needs Claude Code 2.1.287 or later, which mods require in a
+prompt.** A band names the session, with its id once a call passing through
+Claude Code has shown it, and the `holdfast attach` command to run. When Claude
+Code can find `holdfast`, through `HOLDFAST_BOOTSTRAP_BIN` or its `PATH`, one
+key copies the command and, inside tmux, another opens it in a split; both run
+`attach --keep-size`, so they need a `holdfast` from this release or later.
+Type the secret in `holdfast attach`: the band has no field for it, by design.
+It draws from the calls that pass through Claude Code, the agent's and any
+other mod's, and makes none to Holdfast, so it raises no permission prompt of
+its own. It needs Claude Code 2.1.287 or later, which mods require in a
 terminal, and it draws only in `claude` in a terminal and the Desktop app's
 Code tab. Where it does not draw, or mods or the plugin's `secret_band` option
 are off, the tools work as before and `/holdfast:attach` walks through the same

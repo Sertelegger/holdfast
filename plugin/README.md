@@ -91,20 +91,28 @@ types the secret into `holdfast attach`. The plugin's mod (`hooks/`) says so
 where you are looking: a toast, and a band above the prompt.
 
 ```
- holdfast: deploy (sess_4f2c91aa07de) is waiting for a secret  ~1:52 left
+ holdfast: deploy (sess_4f2c91aa07de) is waiting for a secret  at least 1:52 left
  agent says: "sudo password for deploy"
  Type it in holdfast attach, not here.
  1: open attach in tmux split (right)    2: copy attach command
 ```
 
-- **The session** by name, and by id once the agent's own `start_session`,
-  `list_sessions` or `status` results have paired that name with one; a
-  session they show exited gives its name up. Without an id the band says
-  `session "deploy"`. The name is the agent's choice, so it is cut to 24
-  characters, which keeps the id on a narrow band. "agent says" is the
-  agent's `prompt_text`. Both are the agent's text, so they are drawn
-  stripped of control, escape, bidi and invisible characters and labelled
-  for what they are.
+- **The session** by name, and by id once a `start_session`,
+  `list_sessions` or `status` result passing through Claude Code has paired
+  that name with one; a session such a result shows exited gives its name
+  up. Without an id the band says `session "deploy"`. The name is the
+  agent's choice, so it is cut to 24 characters, which keeps the id on a
+  narrow band, and anything in it that reads as an id is drawn as `sess_…`,
+  so the only id on the band is the real one. "agent says" is the agent's
+  `prompt_text`. Both are the agent's text, so they are drawn stripped of
+  control, escape, bidi and invisible characters and labelled for what they
+  are.
+- **The time** is the least the request has left. The countdown starts as
+  the agent's call reaches the mod, which is before Claude Code's own
+  permission dialog for that call, if it asks; Holdfast's timeout starts
+  only once you approve. So the request has the time shown and as long
+  again as the dialog was up, and past zero the band says it *may time out
+  at any moment*, not that it has: the band closes when the call does.
 - **1** opens `holdfast attach --keep-size <id>` in a tmux pane to the right,
   without moving the focus out of Claude Code. It is drawn only in the
   terminal and only inside tmux. **2** copies the same command. Each runs only
@@ -115,8 +123,9 @@ where you are looking: a toast, and a band above the prompt.
   `XDG_RUNTIME_DIR`, which choose the daemon that attach dials. The binary
   and the session reach tmux as separate arguments, so no shell parses them;
   that takes tmux 2.0 or later. If attach fails, the pane stays open showing
-  why until you press Enter. A copied command runs with the environment of
-  the shell you paste it into.
+  why until you press Enter; if it failed because that `holdfast` predates
+  `--keep-size` (exit 64), the pane says so. A copied command runs with the
+  environment of the shell you paste it into.
 - **When the call ends**, the band shows the outcome word for five seconds,
   as the daemon gave it: `secret_provided, 8 bytes written`, or
   `not sent: timeout`.
@@ -132,9 +141,12 @@ agent's own (measured on Claude Code 2.1.291): in default mode it raises a
 dialog naming the plugin, and under `claude -p` it is refused. A band that
 read the session first would put that dialog in front of the very request
 it announces. So the hook passes the agent's call on before anything else,
-draws from the call's own arguments, and watches the agent's
-`start_session`, `list_sessions` and `status` results pass for the id that
-goes with a name, returning every result untouched. What it does call —
+draws from the call's own arguments, and watches the `start_session`,
+`list_sessions` and `status` results that pass for the id that goes with a
+name, returning every result untouched. A call another installed mod makes
+passes the same hooks as the agent's, so it can raise the band or pair a
+name with an id too; a mod is already trusted with more than that
+([SECURITY.md](../SECURITY.md)). What it does call —
 `$.env.get`, `$.fs.stat`, `$.process.run` — was measured under `claude -p`
 in default mode, where `$.mcp.call` is refused, and none of them was. It
 puts nothing in front of the model and never answers or approves the call.
@@ -157,13 +169,19 @@ command names the session by its name when `holdfast attach` can take it as
 it stands — a letter or digit, then letters, digits, `.`, `_` or `-`, which
 attach resolves as it resolves an id — and otherwise the band asks you to
 find the id with `holdfast list`. `--keep-size` keeps the half-width split
-from resizing the agent's session; it needs a `holdfast` that has the flag.
+from resizing the agent's session, and **it needs a `holdfast` from this
+release or later**: an older one refuses the flag with exit 64, in a pasted
+command and in the split alike. The split's pane then says to update
+`holdfast`, or to run attach without the flag, which resizes the session to
+that pane; it never does that by itself.
 
 **It needs Claude Code 2.1.287 or later**, which is when mods arrived; it is
 measured with 2.1.291. The plugin manifest has no field that declares a
-minimum Claude Code version, so this sentence is the declaration. Whether an
-older Claude Code still loads the plugin's MCP server beside a `hooks.json`
-it does not understand has not been checked.
+minimum Claude Code version, so this sentence is the declaration. An older
+Claude Code still loads the plugin and connects its MCP server, and runs no
+mod, so the tools work and there is no band: measured on 2.1.285, where
+`claude plugin validate` passes, `plugin:holdfast:holdfast` connects, and a
+command a mod registers is not there (on 2.1.291 the same one runs).
 
 Its tests live in `plugin-tests/`, outside what every install copies, and
 `scripts/plugin-mod-tests.sh` runs them under `claude plugin test`, after
@@ -386,7 +404,11 @@ The band and the toast drew with the id beside the name, `1` alone in the
 empty prompt opened attach in a split without taking the focus, the secret
 typed there answered the call, `2` copied the command, and a timeout closed
 with `not sent: timeout`. The session kept its own size, and the band raised
-no permission dialog. What that run could not have is a model turn, so this
+no permission dialog. A second run left `request_secret_input` unallowed:
+Claude Code's dialog for it came up with the band's toast already drawn, the
+band itself appeared only once the dialog was answered, reading the timeout
+less the time the dialog had been up, and a `1` pressed while the dialog was
+up answered the dialog. What neither run could have is a model turn, so this
 check has one. It is the owner's to run for each Claude Code release the
 band is claimed to work with. It needs a `holdfast` built with
 `attach --keep-size`, tmux, and a Claude Code login.
@@ -427,15 +449,16 @@ band is claimed to work with. It needs a `holdfast` built with
    you should see the toast *holdfast: deploy (sess_...) is waiting for a
    secret. Type it in holdfast attach, not here.* and, above the prompt, the
    band: the name with the id (the agent's own `start_session` gave it),
-   "agent says" with the prompt text, a countdown that moves, and the two
-   buttons. **No permission dialog names the holdfast plugin**, at this step
-   or any other: the only dialogs are Claude Code's for the agent's own
-   calls, and none if you allowed them. If Claude Code asks you to approve
-   the agent's `request_secret_input`, note whether the band is drawn while
-   the dialog is up. Then press `2` once, with the dialog still up, and note
-   which happened: the band's copy toast, or the dialog's *Yes, and don't
-   ask again*. Either is harmless in this isolated config; if the dialog is
-   still there, approve it with Enter on *Yes*.
+   "agent says" with the prompt text, *at least M:SS left* counting down, and
+   the two buttons. **No permission dialog names the holdfast plugin**, at
+   this step or any other: the only dialogs are Claude Code's for the agent's
+   own calls, and none if you allowed them. If Claude Code asks you to
+   approve the agent's `request_secret_input`, the toast is expected while
+   its dialog is up and the band only after it, as in the run above: note
+   whether that holds, wait about ten seconds, and approve with Enter on
+   *Yes*. The band should then read about ten seconds less than the timeout,
+   and the call should still be open for the whole timeout after you
+   approved.
 
 4. **Button 1, from an empty prompt.** With nothing typed, press `1` and
    pause. A pane opens on the right, and the cursor stays in Claude Code.
@@ -461,7 +484,8 @@ band is claimed to work with. It needs a `holdfast` built with
    step 2: no toast, no band, and the call still waits for `holdfast attach`.
 
 **Report**, for each step, whether it happened as written, the terminal
-width, what step 3 saw while the permission dialog was up, any permission
+width, what step 3 saw while the permission dialog was up and what the band
+read after it, any permission
 dialog that names the holdfast plugin (there must be none), and any
 transcript line naming the plugin, such as `ui.render (AbovePrompt) refused:
 ...` (a drawing Claude Code rejected and replaced with its own) or
