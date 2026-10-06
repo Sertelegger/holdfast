@@ -97,6 +97,33 @@ What *is* in scope is everything Holdfast claims to do about that execution:
 whether the agent is told the truth about what a session is doing, whether a
 `terminate` really terminates, and whether the redactor holds.
 
+**Claude Code's permission prompt does not see every Holdfast call made from
+inside Claude Code.** A Claude Code *mod*, the code a plugin runs inside Claude
+Code, can call any tool on any MCP server the session has connected, through
+`$.mcp.call`. Claude Code's mod API documents that such a call raises no
+permission prompt: the plugin's call is the grant. A mod in one plugin was
+measured reading another plugin's Holdfast sessions that way under `claude -p`,
+with no rule allowing it. So a mod from any installed plugin can call any
+Holdfast tool, `send_input`, `terminate` and `read_output(redact: false)`
+included, and no human is asked. Claude Code's admin guide says the call runs
+under the session's permission rules, so a `deny` rule may still stop it; that
+is not measured.
+
+- **It is no new capability.** A process running as your user can already
+  connect to the daemon's `control.sock`, which admits any process with the
+  daemon's uid. That puts it under the same-user rule in Out of scope.
+- **It is a hole in an assumption.** Treating Claude Code's permission prompt
+  as the human gate in front of Holdfast relies on something a mod walks past.
+- **Holdfast cannot tell such a call from the agent's.** It arrives through
+  the same `holdfast mcp` process, so where the audit log names the kind of
+  client, as a `redaction_disabled` entry does, it names `shim`: the agent's
+  connection. That field is attribution only, and nothing reads it to decide
+  anything.
+
+Install plugins that carry mods only from marketplaces you trust. `claude
+plugin validate <dir>` lists the mods API calls a plugin's code makes, and
+`$.mcp.call` in that list is this reach.
+
 ## In scope
 
 ### Secrets and output redaction
