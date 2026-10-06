@@ -40,6 +40,15 @@ const TOAST_MS = 8000
 // this long after its own deadline, so the band cannot stay up forever.
 const STALE_AFTER_MS = 300_000
 const TEXT_MAX = 160
+// A name is the agent's to choose. Capped short, so that in an 80-column
+// band the real id after it is never truncated away, whatever the name
+// pretends to be.
+const NAME_MAX = 24
+// What Claude Code's own server resolved its daemon's runtime directory
+// from, besides HOME (holdfast-core `RuntimePaths::discover`). The tmux
+// pane gets them, because a pane is born with the tmux server's
+// environment, not Claude Code's, and would otherwise dial another daemon.
+const PANE_ENV = ['HOLDFAST_RUNTIME_DIR', 'XDG_RUNTIME_DIR']
 
 // Open requests by tool_use_id, oldest first, and the closing lines still
 // on show. Module state: a request outlives no reload of this module.
@@ -51,10 +60,13 @@ let ticker = null
 
 // CSI, OSC and two-byte escapes; then line breaks and tabs, which become a
 // space; then every remaining C0/C1 control, DEL, bidi mark, override or
-// isolate, and byte order mark, which are dropped.
+// isolate, byte order mark, and invisible character (soft hyphen, zero
+// widths, joiners, invisible operators, tags), which are dropped: an
+// invisible character lets one name draw exactly like another.
 const ESCAPES = /\x1b\[[0-?]*[ -/]*[@-~]|\x1b\][^\x07\x1b]*(?:\x07|\x1b\\)?|\x1b[@-_]/g
 const BREAKS = /[\t\n\v\f\r\u0085\u2028\u2029]/g
-const UNSAFE = /[\u0000-\u001f\u007f-\u009f\u061c\u200e\u200f\u2028\u2029\u202a-\u202e\u2066-\u2069\ufeff]/g
+const UNSAFE =
+  /[\u0000-\u001f\u007f-\u009f\u00ad\u061c\u180e\u200b-\u200f\u2028\u2029\u202a-\u202e\u2060-\u2069\ufeff\ufff9-\ufffb\u{e0000}-\u{e007f}]/gu
 
 export function clean(value, max = TEXT_MAX) {
   if (typeof value !== 'string') return ''
@@ -73,7 +85,7 @@ function validWord(value) {
 
 // An absolute path with nothing in it that a terminal or a shell would read
 // as anything but a path.
-function validBinary(value) {
+function validPath(value) {
   if (typeof value !== 'string' || !value.startsWith('/') || value.length > 4096) return null
   return value.replace(UNSAFE, '') === value ? value : null
 }
@@ -86,15 +98,29 @@ export function shellQuote(value) {
 // what it must be. --keep-size because a half-width split must not reflow the
 // agent's session.
 export function attachCommand(binary, id) {
-  if (!validBinary(binary) || !validSessionId(id)) return null
+  if (!validPath(binary) || !validSessionId(id)) return null
   return shellQuote(binary) + ' attach --keep-size ' + shellQuote(id)
 }
 
-export function tmuxArgv(command, pane) {
+// Run by `sh -c` with the binary as $0 and the id as $1, so neither is ever
+// parsed by a shell. On a failure the pane stays open and says so; tmux
+// would otherwise close it at once and take the reason with it.
+const SPLIT_SCRIPT = `"$0" attach --keep-size "$1" || { s=$?; printf '\\nholdfast attach exited %s. Press Enter to close this pane.\\n' "$s"; read -r _; }`
+
+// The same attach, as the argv of a tmux split, or null when the binary or
+// the id is not what it must be. A command given to tmux as several
+// arguments is executed directly (tmux 2.0 and later), not through the
+// user's default-shell, whatever shell that is. `env` hands the pane each
+// of PANE_ENV that Claude Code has as a valid path.
+export function tmuxArgv(binary, id, pane, env = {}) {
+  const bin = validPath(binary)
+  const sid = validSessionId(id)
+  if (!bin || !sid) return null
   const target = typeof pane === 'string' && TMUX_PANE.test(pane) ? ['-t', pane] : []
+  const assignments = PANE_ENV.filter((name) => validPath(env[name])).map((name) => name + '=' + env[name])
   // -d keeps the focus in Claude Code's pane, so whatever the human types
   // next still goes to the prompt and never into a waiting password read.
-  return ['tmux', 'split-window', '-d', '-h', ...target, '--', command]
+  return ['tmux', 'split-window', '-d', '-h', ...target, '--', '/usr/bin/env', ...assignments, '/bin/sh', '-c', SPLIT_SCRIPT, bin, sid]
 }
 
 function parseJson(text) {
@@ -170,6 +196,14 @@ function timeLeft(req, now) {
 
 // ------------------------------------------------------------ the request
 
+// The connection and the one `status` call, as `{ answer }`, or `{ note }`
+// saying why there is none.
+async function askStatus($, session) {
+  const link = await $.mcp.connect(SERVER_KEY)
+  if (!link.isConnected) return { note: 'status unavailable: ' + clean(String(link.reason || 'not connected'), 60) }
+  return { answer: await $.mcp.call(link.server, 'status', { session }) }
+}
+
 async function readStatus($, req, session) {
   if (typeof session !== 'string' || session === '') {
     req.note = 'no session named'
@@ -177,17 +211,19 @@ async function readStatus($, req, session) {
   }
   let env
   try {
-    const link = await $.mcp.connect(SERVER_KEY)
-    if (!link.isConnected) {
-      req.note = 'status unavailable: ' + clean(String(link.reason || 'not connected'), 60)
-      return
-    }
-    const answer = await withinMs($, $.mcp.call(link.server, 'status', { session }), STATUS_WAIT_MS)
-    if (answer === TIMED_OUT) {
+    // The agent's call waits for this, so the connection and the call
+    // share one deadline: a wedged daemon or server costs the call two
+    // seconds, not the MCP request timeout.
+    const got = await withinMs($, askStatus($, session), STATUS_WAIT_MS)
+    if (got === TIMED_OUT) {
       req.note = 'status did not answer in time'
       return
     }
-    env = envelopeOfMcp(answer)
+    if (got.note) {
+      req.note = got.note
+      return
+    }
+    env = envelopeOfMcp(got.answer)
   } catch (err) {
     req.note = 'status unavailable: ' + clean(errText(err), 60)
     return
@@ -198,7 +234,7 @@ async function readStatus($, req, session) {
   }
   const data = env.data
   req.id = validSessionId(data.id) || req.id
-  req.name = clean(data.name, 48)
+  req.name = clean(data.name, NAME_MAX)
   req.terminalShows = clean(data.prompt && data.prompt.last_line)
   if (typeof data.profile === 'string' && data.profile !== '') {
     req.startedBy = 'profile ' + clean(data.profile, 48)
@@ -206,7 +242,7 @@ async function readStatus($, req, session) {
     const argv = [data.command, ...(Array.isArray(data.args) ? data.args : [])].filter((a) => typeof a === 'string')
     req.startedBy = 'agent' + (argv.length ? ' (' + clean(argv.join(' '), 80) + ')' : '')
   }
-  req.binary = validBinary(data.holdfast_binary)
+  req.binary = validPath(data.holdfast_binary)
   req.note = ''
 }
 
@@ -232,7 +268,7 @@ function withinMs($, promise, ms) {
 // the bootstrap; else the bootstrap itself, which finds the pinned release.
 async function attachBinary($, req) {
   if (req.binary) return req.binary
-  const named = validBinary(await $.env.get('HOLDFAST_BOOTSTRAP_BIN'))
+  const named = validPath(await $.env.get('HOLDFAST_BOOTSTRAP_BIN'))
   return named || $.plugin.root + '/bootstrap'
 }
 
@@ -278,7 +314,13 @@ async function prepare($, req, session) {
     await readStatus($, req, session)
     req.attachBinary = await attachBinary($, req)
     req.tmux = Boolean(await $.env.get('TMUX'))
-    req.tmuxPane = (await $.env.get('TMUX_PANE')) || null
+    if (req.tmux) {
+      req.tmuxPane = (await $.env.get('TMUX_PANE')) || null
+      req.paneEnv = {
+        HOLDFAST_RUNTIME_DIR: await $.env.get('HOLDFAST_RUNTIME_DIR'),
+        XDG_RUNTIME_DIR: await $.env.get('XDG_RUNTIME_DIR'),
+      }
+    }
   } catch (err) {
     req.note = req.note || 'unavailable: ' + clean(errText(err), 60)
   }
@@ -289,6 +331,16 @@ async function prepare($, req, session) {
 async function draws($) {
   const surfaces = await $.session.surfaces()
   return surfaces.some((s) => s === 'terminal' || s === 'desktop')
+}
+
+// Windows native runs Holdfast without a daemon, so there is no attach to
+// point at and the daemon refuses the request at once.
+async function onWindows($) {
+  try {
+    return (await $.env.get('OS')) === 'Windows_NT'
+  } catch {
+    return false
+  }
 }
 
 // ------------------------------------------------------------ the band
@@ -345,12 +397,14 @@ function requestBox($, e, req, now, more) {
 // beside Claude Code without taking the focus, and the copy only fills the
 // clipboard. Each rebuilds its command from a re-validated id.
 async function openSplit($, req) {
-  const command = attachCommand(req.attachBinary, req.id)
-  if (!command) return
+  const argv = tmuxArgv(req.attachBinary, req.id, req.tmuxPane, req.paneEnv)
+  if (!argv) return
   try {
-    const run = await $.process.run(tmuxArgv(command, req.tmuxPane), { timeoutMs: 5000 })
+    const run = await $.process.run(argv, { timeoutMs: 5000 })
     if (run.exitCode === 0) {
-      $.ui.toast('holdfast: attach opened in the tmux pane to the right. Switch to it to type.', { timeoutMs: TOAST_MS })
+      $.ui.toast('holdfast: attach is in the tmux pane to the right; switch to it to type. If it cannot attach, that pane says why.', {
+        timeoutMs: TOAST_MS,
+      })
     } else {
       $.ui.toast('holdfast: tmux split-window failed (exit ' + run.exitCode + '): ' + clean(run.stderr, 80), { timeoutMs: TOAST_MS })
     }
@@ -376,11 +430,15 @@ export function register(on, options) {
     // Under -p, the Agent SDK and the VS Code chat panel nothing draws, so
     // nothing is read either.
     if (!(await draws($))) return next(e)
+    if (await onWindows($)) {
+      $.ui.toast('holdfast: a secret request needs hybrid mode (Linux, macOS or WSL); on Windows it is refused.', { timeoutMs: TOAST_MS })
+      return next(e)
+    }
     const key = String(e.tool_use_id)
     const timeout = Number(e.timeout_secs)
     const req = {
       key,
-      asked: clean(e.session, 48),
+      asked: clean(e.session, NAME_MAX),
       agentSays: clean(e.prompt_text),
       timeoutSecs: Number.isSafeInteger(timeout) && timeout > 0 ? timeout : DEFAULT_TIMEOUT_SECS,
       startedAt: await $.clock.now(),
@@ -392,6 +450,7 @@ export function register(on, options) {
       attachBinary: null,
       tmux: false,
       tmuxPane: null,
+      paneEnv: {},
       note: 'reading status',
     }
     pending.set(key, req)

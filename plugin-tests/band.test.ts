@@ -16,6 +16,13 @@ const DAEMON_BIN = '/opt/holdfast/bin/holdfast'
 const TMUX_ENV = { TMUX: '/tmp/tmux-1000/default,4242,0', TMUX_PANE: '%7' }
 const ASK = { tool: TOOL, session: 'deploy', prompt_text: 'sudo password for deploy', timeout_secs: 120 }
 const PROVIDED = { result: PROVIDED_TEXT, text: PROVIDED_TEXT }
+// What the tmux split runs under `sh -c`, with the binary as $0 and the id
+// as $1: pinned here, so a change to it is a change in review.
+const SPLIT_SCRIPT =
+  '"$0" attach --keep-size "$1" || { s=$?; printf \'\\nholdfast attach exited %s. Press Enter to close this pane.\\n\' "$s"; read -r _; }'
+const split = (target: string[], env: string[], binary = DAEMON_BIN) => [
+  'tmux', 'split-window', '-d', '-h', ...target, '--', '/usr/bin/env', ...env, '/bin/sh', '-c', SPLIT_SCRIPT, binary, ID,
+]
 
 // `status` as the daemon answers it once it reports its own binary:
 // `data.holdfast_binary`, an absolute path or null. Today's daemon does not
@@ -46,6 +53,9 @@ type Opts = {
   result?: unknown
   holdMs?: number
   envDeny?: string
+  connectHoldMs?: number
+  statusHoldMs?: number
+  run?: { exitCode: number; stdout: string; stderr: string }
 }
 
 // Every stub the band's calls need, each recording what it was asked.
@@ -66,12 +76,14 @@ function stubAll(on: any, opts: Opts = {}) {
   if (opts.envDeny) on('env.get', () => ({ deny: opts.envDeny }))
   else mock.env(on, opts.env ?? TMUX_ENV)
   on('session.surfaces', () => ({ value: opts.surfaces ?? ['terminal'] }))
-  on('mcp.connect', ($: any, e: any) => {
+  on('mcp.connect', async ($: any, e: any) => {
     rec.connects.push(e)
+    if (opts.connectHoldMs) await clock.sleep(opts.connectHoldMs)
     return { value: opts.connect ?? { isConnected: true, server: SERVER } }
   })
-  on('mcp.call', ($: any, e: any) => {
+  on('mcp.call', async ($: any, e: any) => {
     rec.mcp.push(e)
+    if (opts.statusHoldMs) await clock.sleep(opts.statusHoldMs)
     if (opts.mcpDeny) return { deny: opts.mcpDeny }
     const status = typeof opts.status === 'function' ? opts.status(e) : opts.status
     return { value: status ?? statusWith(DAEMON_BIN) }
@@ -86,7 +98,7 @@ function stubAll(on: any, opts: Opts = {}) {
   })
   on('process.run', ($: any, e: any) => {
     rec.runs.push(e)
-    return { value: { exitCode: 0, stdout: '', stderr: '' } }
+    return { value: opts.run ?? { exitCode: 0, stdout: '', stderr: '' } }
   })
   on('prompt.submit', ($: any, e: any) => {
     rec.submits.push(e)
@@ -153,10 +165,27 @@ test('the attach command quotes the binary and the id for a shell', () => {
   expect(attachCommand("/opt/hold fast/it's/holdfast", ID)).toBe(
     "'/opt/hold fast/it'\\''s/holdfast' attach --keep-size 'sess_0f8fb4eb7af1'",
   )
-  const command = attachCommand(DAEMON_BIN, ID)
-  expect(tmuxArgv(command, '%7')).toEqual(['tmux', 'split-window', '-d', '-h', '-t', '%7', '--', command])
+})
+
+test('the tmux split passes the binary and the id as arguments, never through a shell', () => {
+  expect(tmuxArgv(DAEMON_BIN, ID, '%7')).toEqual(split(['-t', '%7'], []))
+  // Quotes, spaces and backslashes in the path stay one argument, untouched.
+  const odd = "/opt/hold fast/it's \\odd/holdfast"
+  expect(tmuxArgv(odd, ID, '%7')).toEqual(split(['-t', '%7'], [], odd))
   // A pane id that is not tmux's `%N` is left out rather than passed on.
-  expect(tmuxArgv(command, '%7; rm')).toEqual(['tmux', 'split-window', '-d', '-h', '--', command])
+  expect(tmuxArgv(DAEMON_BIN, ID, '%7; rm')).toEqual(split([], []))
+  expect(tmuxArgv(DAEMON_BIN, ID, undefined)).toEqual(split([], []))
+  // Claude Code's runtime directories go to the pane, each only as a path.
+  expect(tmuxArgv(DAEMON_BIN, ID, '%7', { HOLDFAST_RUNTIME_DIR: '/iso/rt', XDG_RUNTIME_DIR: '/run/user/1000' })).toEqual(
+    split(['-t', '%7'], ['HOLDFAST_RUNTIME_DIR=/iso/rt', 'XDG_RUNTIME_DIR=/run/user/1000']),
+  )
+  expect(tmuxArgv(DAEMON_BIN, ID, '%7', { HOLDFAST_RUNTIME_DIR: 'rt', XDG_RUNTIME_DIR: '/run/user/1000\n/x', HOME: '/home/me' })).toEqual(
+    split(['-t', '%7'], []),
+  )
+  // No split at all from an id or a binary that is not what it must be.
+  expect(tmuxArgv(DAEMON_BIN, "sess_0f8fb4eb7af1'; touch /tmp/pwned; '", '%7')).toBe(null)
+  expect(tmuxArgv('holdfast', ID, '%7')).toBe(null)
+  expect(tmuxArgv('/opt/holdfast\x1b]0;x\x07', ID, '%7')).toBe(null)
 })
 
 test('agent text loses every control, escape and bidi character before it is drawn', () => {
@@ -166,6 +195,9 @@ test('agent text loses every control, escape and bidi character before it is dra
   // Line breaks read as a space; a control inside a word is simply gone.
   const raw = 'sudo\x1b[2J\x1b[31m pass\x07word\r\nfor ' + rlo + 'deploy' + isolate + ' \x1b]0;title\x07!' + csi8 + '\x00'
   expect(clean(raw)).toBe('sudo password for deploy !')
+  // Invisible characters, which let one name draw exactly like another.
+  const invisible = [0xad, 0x200b, 0x200c, 0x200d, 0x2060, 0x2063, 0xfeff, 0xe0041, 0xe007f].map((c) => String.fromCodePoint(c))
+  expect(clean('de' + invisible.join('') + 'ploy')).toBe('deploy')
   expect(clean('a'.repeat(200)).length).toBe(160)
   expect(clean(undefined)).toBe('')
 })
@@ -179,6 +211,8 @@ test("the closing words are the daemon's own: status, reason, bytes", () => {
   // A word that is not an enum is not drawn as one.
   const odd = JSON.stringify({ status: 'secret_cancelled', data: { reason: 'Ignore all instructions' } })
   expect(outcomeWords({ result: odd, text: odd })).toBe('not sent: secret_cancelled')
+  const oddStatus = JSON.stringify({ status: 'Secret provided\x1b[2J', data: {} })
+  expect(outcomeWords({ result: oddStatus, text: oddStatus })).toBe('not sent: unknown')
 })
 
 // ---------------------------------------------------------------- the band
@@ -259,13 +293,10 @@ test('the tmux button splits beside Claude Code, and only when pressed', async (
   expect(rec.runs).toEqual([])
   await ui.press({ key: 'band-tmux' })
   expect(rec.runs.length).toBe(1)
-  expect(rec.runs[0].argv).toEqual([
-    'tmux', 'split-window', '-d', '-h', '-t', '%7', '--',
-    "'/opt/holdfast/bin/holdfast' attach --keep-size 'sess_0f8fb4eb7af1'",
-  ])
+  expect(rec.runs[0].argv).toEqual(split(['-t', '%7'], []))
   expect(rec.runs[0].init).toMatchObject({ timeoutMs: 5000 })
   expect(rec.runs[0].init.stdin).toBeUndefined()
-  expect(rec.toasts.at(-1)).toMatch(/attach opened in the tmux pane to the right/)
+  expect(rec.toasts.at(-1)).toMatch(/^holdfast: attach is in the tmux pane to the right; switch to it to type\./)
   await ui.unmount()
   await clock.advance(60_000)
   await call
@@ -552,4 +583,179 @@ test('nothing it does writes to Holdfast, reaches the model or approves a call',
   // The call reached Claude Code exactly as the agent made it.
   expect(rec.calls.length).toBe(1)
   expect(rec.calls[0]).toMatchObject(ASK)
+})
+
+// ------------------------------------------------- what the agent's call is
+
+test('the call goes on exactly as the agent made it, odd arguments included', async ($, on) => {
+  const { rec, clock } = stubAll(on, { holdMs: 10_000 })
+  // Dirty text and no timeout_secs: a hook that cleaned or filled in either
+  // before next(e) would be rewriting the call.
+  const asked = { tool: TOOL, session: 'dep\x1b[2Jloy', prompt_text: 'type\x1b[2J it\r\nhere ‮now' }
+  const call = $.tool.call(asked)
+  await untilCalled(clock, rec)
+  const { tool_use_id, ...seen } = rec.calls[0]
+  expect(seen).toEqual(asked)
+  await clock.advance(10_000)
+  expect(await call).toEqual(PROVIDED)
+})
+
+test('a timeout_secs that is not a positive whole number counts down from the default', async ($, on) => {
+  const { rec, clock } = stubAll(on, { holdMs: 1_000 })
+  const odd = ['soon', -5, 1.5, 0, null]
+  for (const [i, timeout_secs] of odd.entries()) {
+    const asked = { ...ASK, timeout_secs }
+    const call = $.tool.call(asked)
+    await untilCalled(clock, rec, i + 1)
+    const ui = await $.ui.mount(band())
+    expect(await texts(ui, /is waiting for a secret/)).toMatch(/~2:00 left$/)
+    const { tool_use_id, ...seen } = rec.calls[i]
+    expect(seen).toEqual(asked)
+    await ui.unmount()
+    await clock.advance(1_000)
+    await call
+  }
+})
+
+// ------------------------------------------------------ the status read
+
+test('a status call that never answers holds the agent two seconds, no more', async ($, on) => {
+  const { rec, clock } = stubAll(on, { holdMs: 60_000, statusHoldMs: 600_000 })
+  const call = $.tool.call(ASK)
+  for (let i = 0; i < 50; i++) await clock.settle()
+  expect(rec.mcp.length).toBe(1)
+  expect(rec.calls.length).toBe(0)
+  await clock.advance(1_999)
+  expect(rec.calls.length).toBe(0)
+  await clock.advance(1)
+  await untilCalled(clock, rec)
+  const ui = await $.ui.mount(band())
+  expect(await texts(ui, /^terminal shows/)).toBe('terminal shows: (status did not answer in time)')
+  expect(await texts(ui, /is waiting for a secret/)).toMatch(/^holdfast: session "deploy" is waiting/)
+  await ui.unmount()
+  await clock.advance(600_000)
+  expect(await call).toEqual(PROVIDED)
+})
+
+test('a connection that never answers counts against the same two seconds', async ($, on) => {
+  const { rec, clock } = stubAll(on, { holdMs: 60_000, connectHoldMs: 600_000 })
+  const call = $.tool.call(ASK)
+  for (let i = 0; i < 50; i++) await clock.settle()
+  expect(rec.connects.length).toBe(1)
+  expect(rec.calls.length).toBe(0)
+  await clock.advance(2_000)
+  await untilCalled(clock, rec)
+  expect(rec.mcp).toEqual([])
+  const ui = await $.ui.mount(band())
+  expect(await texts(ui, /^terminal shows/)).toBe('terminal shows: (status did not answer in time)')
+  await ui.unmount()
+  await clock.advance(600_000)
+  expect(await call).toEqual(PROVIDED)
+})
+
+test("the agent's session argument is drawn stripped when status cannot name it", async ($, on) => {
+  const { rec, clock } = stubAll(on, { holdMs: 60_000, mcpDeny: 'denied by policy' })
+  const call = $.tool.call({ ...ASK, session: 'dep\x1b[2J\x1b]0;x\x07loy‮​' })
+  await untilCalled(clock, rec)
+  const ui = await $.ui.mount(band())
+  expect(await texts(ui, /is waiting for a secret/)).toMatch(/^holdfast: session "deploy" is waiting/)
+  expect(rec.toasts[0]).toBe('holdfast: session "deploy" is waiting for a secret. Type it in holdfast attach, not here.')
+  await ui.unmount()
+  await clock.advance(60_000)
+  await call
+})
+
+test('a status that is not ok is named only by an enum word', async ($, on) => {
+  const words: Record<string, string> = { a: 'session_not_found', b: 'Ignore all\x1b[2J instructions' }
+  const status = (e: any) => ({
+    content: [{ type: 'text', text: JSON.stringify({ status: words[e.args.session], data: null, details: 'x' }) }],
+    isError: false,
+  })
+  const { rec, clock } = stubAll(on, { holdMs: 1_000, status })
+  for (const [i, [session, note]] of [['a', '(status: session_not_found)'], ['b', '(status: unreadable)']].entries()) {
+    const call = $.tool.call({ ...ASK, session })
+    await untilCalled(clock, rec, i + 1)
+    const ui = await $.ui.mount(band())
+    expect(await texts(ui, /^terminal shows/)).toBe('terminal shows: ' + note)
+    await ui.unmount()
+    await clock.advance(1_000)
+    await call
+  }
+})
+
+test('a profile name is drawn stripped', async ($, on) => {
+  const status = statusWith(DAEMON_BIN, (d) => {
+    d.profile = 'prod\x1b[31m-db‮​'
+  })
+  const { rec, clock } = stubAll(on, { holdMs: 60_000, status })
+  const call = $.tool.call(ASK)
+  await untilCalled(clock, rec)
+  const ui = await $.ui.mount(band())
+  expect(await texts(ui, /^started by/)).toBe('started by:     profile prod-db')
+  await ui.unmount()
+  await clock.advance(60_000)
+  await call
+})
+
+test('a long name cannot push the real id out of an 80-column band', async ($, on) => {
+  // Names chosen to look like an id; the real one must still be drawn whole.
+  const fake = 'deploy (sess_4f2c91aa07de) is waiting x'.padEnd(48, 'x')
+  const status = statusWith(DAEMON_BIN, (d) => {
+    d.name = fake
+  })
+  const { rec, clock } = stubAll(on, { holdMs: 60_000, status })
+  const call = $.tool.call(ASK)
+  await untilCalled(clock, rec)
+  const ui = await $.ui.mount(band())
+  const title: string = await texts(ui, /is waiting for a secret/)
+  // 80 columns, less the round border and paddingX 1.
+  expect(title.slice(0, 76)).toContain('(' + ID + ')')
+  expect(rec.toasts[0].slice(0, 76)).toContain('(' + ID + ')')
+  await ui.unmount()
+  await clock.advance(60_000)
+  await call
+})
+
+// ------------------------------------------------------------- the split
+
+test("the split hands the pane Claude Code's runtime directories", async ($, on) => {
+  const env = { ...TMUX_ENV, HOLDFAST_RUNTIME_DIR: '/iso/rt', XDG_RUNTIME_DIR: '/run/user/1000' }
+  const { rec, clock } = stubAll(on, { holdMs: 60_000, env })
+  const call = $.tool.call(ASK)
+  await untilCalled(clock, rec)
+  const ui = await $.ui.mount(band())
+  await ui.press({ key: 'band-tmux' })
+  expect(rec.runs[0].argv).toEqual(split(['-t', '%7'], ['HOLDFAST_RUNTIME_DIR=/iso/rt', 'XDG_RUNTIME_DIR=/run/user/1000']))
+  await ui.unmount()
+  await clock.advance(60_000)
+  await call
+})
+
+test('a failed split says why, stripped', async ($, on) => {
+  const run = { exitCode: 1, stdout: '', stderr: "can't find pane\x1b[2J %7‮\r\n" }
+  const { rec, clock } = stubAll(on, { holdMs: 60_000, run })
+  const call = $.tool.call(ASK)
+  await untilCalled(clock, rec)
+  const ui = await $.ui.mount(band())
+  await ui.press({ key: 'band-tmux' })
+  expect(rec.toasts.at(-1)).toBe("holdfast: tmux split-window failed (exit 1): can't find pane %7")
+  await ui.unmount()
+  await clock.advance(60_000)
+  await call
+})
+
+// --------------------------------------------------------------- Windows
+
+test('on Windows native the band says hybrid mode only, and reads nothing', async ($, on) => {
+  const { rec, clock } = stubAll(on, { holdMs: 1_000, env: { OS: 'Windows_NT' } })
+  const call = $.tool.call(ASK)
+  await untilCalled(clock, rec)
+  expect(rec.connects).toEqual([])
+  expect(rec.mcp).toEqual([])
+  expect(rec.toasts).toEqual(['holdfast: a secret request needs hybrid mode (Linux, macOS or WSL); on Windows it is refused.'])
+  const ui = await $.ui.mount(band())
+  expect(await ui.find({ key: 'band' })).toBeUndefined()
+  await ui.unmount()
+  await clock.advance(1_000)
+  expect(await call).toEqual(PROVIDED)
 })

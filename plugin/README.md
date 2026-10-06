@@ -99,16 +99,25 @@ where you are looking: a toast, and a band above the prompt.
  1: open attach in tmux split (right)    2: copy attach command
 ```
 
-- **The session** by name and always by id. "terminal shows" is the
-  session's last line as the daemon reports it, redacted, and may be empty.
-  "agent says" is the agent's `prompt_text`. Both are the agent's or the
-  program's text, so they are drawn stripped of control, escape and bidi
-  characters and labelled for what they are.
+- **The session** by name and always by id. The name is the agent's choice,
+  so it is cut to 24 characters, which keeps the id on a narrow band.
+  "terminal shows" is the session's last line as the daemon reports it,
+  redacted, and may be empty. "agent says" is the agent's `prompt_text`. All
+  three are the agent's or the program's text, so they are drawn stripped of
+  control, escape, bidi and invisible characters and labelled for what they
+  are.
 - **1** opens `holdfast attach --keep-size <id>` in a tmux pane to the right,
   without moving the focus out of Claude Code. It is drawn only in the
   terminal and only inside tmux. **2** copies the same command. Each runs only
   when pressed, which includes a `1` or `2` typed alone into an empty prompt,
   and both are harmless if that happens by accident.
+- **The tmux pane** starts with the tmux server's environment, not Claude
+  Code's, so the split hands it Claude Code's `HOLDFAST_RUNTIME_DIR` and
+  `XDG_RUNTIME_DIR`, which choose the daemon that attach dials. The binary
+  and the id reach tmux as separate arguments, so no shell parses them; that
+  takes tmux 2.0 or later. If attach fails, the pane stays open showing why
+  until you press Enter. A copied command runs with the environment of the
+  shell you paste it into.
 - **When the call ends**, the band shows the outcome word for five seconds,
   as the daemon gave it: `secret_provided, 8 bytes written`, or
   `not sent: timeout`.
@@ -152,7 +161,8 @@ panel, where nothing draws and so nothing is read either; cloud sessions; the
 Desktop app's WSL sessions, which get no plugins. In the Desktop app's Code
 tab it draws without the tmux button, which needs a terminal. On Windows
 native there is no daemon to attach to, and `request_secret_input` is refused
-at once. An organisation's `disableAllHooks` or `allowManagedModsOnly`
+at once, so instead of the band a toast says the request needs hybrid mode.
+An organisation's `disableAllHooks` or `allowManagedModsOnly`
 removes the mod and keeps the MCP server, so Holdfast's own text never
 promises the band.
 
@@ -348,7 +358,7 @@ release the band is claimed to work with. It needs a `holdfast` built with
 `attach --keep-size` and `status`'s `holdfast_binary`, tmux, and a Claude
 Code login.
 
-1. **Isolate the daemon and Claude Code.** In a tmux pane at least 110
+1. **Isolate the daemon, Claude Code and tmux.** In a terminal at least 110
    columns wide, from the checkout's root:
 
    ```bash
@@ -361,9 +371,14 @@ Code login.
           XDG_CONFIG_HOME="$ISO/xdg/config" XDG_DATA_HOME="$ISO/xdg/data" \
           XDG_STATE_HOME="$ISO/xdg/state" CLAUDE_CONFIG_DIR="$ISO/claude" \
           HOLDFAST_BOOTSTRAP_BIN="$HF"
-   claude --plugin-dir "$CHECKOUT/plugin"
+   env -u TMUX tmux -L hf-band -f /dev/null new-session \
+     claude --plugin-dir "$CHECKOUT/plugin"
    ```
 
+   The private tmux server starts with these exports, so every pane it opens
+   has them; a pane of your usual tmux server would not, and its attach
+   would dial your real daemon. If that terminal is itself a tmux pane, this
+   one runs nested inside it: press the prefix twice to reach the inner one.
    The first time, `/login` inside that session: the config directory is a
    new installation.
 
@@ -381,14 +396,20 @@ Code login.
    band: the name with the id, "terminal shows" (`"Password:"`, or `(empty)`),
    "started by: agent (bash)", "agent says" with the prompt text, a countdown
    that moves, and the two buttons. If Claude Code asks you to approve the
-   call, the band is already up beside the dialog; approve it.
+   call, note whether the band is drawn while the dialog is up. Then press
+   `2` once, with the dialog still up, and note which happened: the band's
+   copy toast, or the dialog's *Yes, and don't ask again*. Either is
+   harmless in this isolated config; if the dialog is still there, approve it
+   with Enter on *Yes*.
 
 4. **Button 1, from an empty prompt.** With nothing typed, press `1` and
-   pause. A pane opens on the right running `holdfast attach --keep-size
-   sess_...`, and the cursor stays in Claude Code. Switch to that pane, type
-   any password and Enter. Within a second the call returns, and the band
-   reads *holdfast: deploy (sess_...) - secret_provided, N bytes written* for
-   about five seconds, then is gone.
+   pause. A pane opens on the right, and the cursor stays in Claude Code.
+   The pane must show attach's own banner, *holdfast: attached to sess_...*;
+   if it shows *holdfast attach exited N* instead, attach did not reach the
+   daemon, and that line and the one above it are the report. Switch to the
+   pane (`Ctrl-B o`), type any password and Enter. Within a second the call
+   returns, and the band reads *holdfast: deploy (sess_...) - secret_provided,
+   N bytes written* for about five seconds, then is gone.
 
 5. **Button 2.** Ask the agent to run the `read` again and request another
    secret. Press `2` in the empty prompt: the toast shows the copied command.
@@ -401,14 +422,15 @@ Code login.
 7. **The switch.** Quit, add
    `"pluginConfigs": { "holdfast@inline": { "options": { "secret_band": false } } }`
    to `$ISO/claude/settings.json` (`holdfast@inline` is the plugin's id under
-   `--plugin-dir`), start again and repeat step 2: no toast, no band, and the
-   call still waits for `holdfast attach`.
+   `--plugin-dir`), start the private tmux again as in step 1 and repeat
+   step 2: no toast, no band, and the call still waits for `holdfast attach`.
 
 **Report**, for each step, whether it happened as written, the terminal
-width, and any transcript line naming the plugin, such as `ui.render
-(AbovePrompt) refused: ...` (a drawing Claude Code rejected and replaced with
-its own) or `tool.call hook skipped: ...`. Then clean up with the same
-exports: `"$HF" daemon stop`, close the attach pane, and `rm -rf "$ISO"`.
+width, what step 3 saw while the permission dialog was up, and any
+transcript line naming the plugin, such as `ui.render (AbovePrompt) refused:
+...` (a drawing Claude Code rejected and replaced with its own) or
+`tool.call hook skipped: ...`. Then clean up with the same exports:
+`"$HF" daemon stop`, `tmux -L hf-band kill-server`, and `rm -rf "$ISO"`.
 
 ## Releasing
 
