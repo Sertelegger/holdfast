@@ -5748,31 +5748,48 @@ async fn start_shell(d: &TestDaemon, command: &str, args: &[&str]) -> Arc<Sessio
 
 /// Poll until the shell is idle at its prompt **as the agent sees it**:
 /// `AtPrompt` at the `semantic` tier, the state GH #262's dogfood run was
-/// in. And then assert the precondition that makes the row mean anything:
-/// the line editor has `ECHO` off, so the echo test alone would admit a
-/// write here.
+/// in, with the precondition that makes the row mean anything: the line
+/// editor has `ECHO` off, so the echo test alone would admit a write here.
+///
+/// **All three are polled together, not the last one asserted once the
+/// first two hold** (GH #289). Detection reads the marker stream, and a
+/// stream with no `C` in it still says `AtPrompt` while the shell runs a
+/// line it has read, with the terminal cooked and `ECHO` on.
 async fn await_idle_prompt(s: &Session) {
     let deadline = tokio::time::Instant::now() + Duration::from_secs(20);
     loop {
         let det = s.detection();
+        let at_prompt = s.at_shell_prompt();
+        let echo = s.line_discipline().echo;
         if det.interaction_mode == InteractionMode::AtPrompt
             && det.detection_tier == DetectionTier::Semantic
-            && s.at_shell_prompt()
+            && at_prompt
+            && echo == Some(false)
         {
-            break;
+            return;
         }
         assert!(
             tokio::time::Instant::now() < deadline,
-            "the shell never sat at its prompt at the semantic tier; detection is {det:?}"
+            "the shell never sat at its prompt at the semantic tier with the line \
+             editor's ECHO off, so this row cannot show that the echo test admits an \
+             idle prompt; detection is {det:?}, at_shell_prompt {at_prompt}, ECHO {echo:?}"
         );
         tokio::time::sleep(Duration::from_millis(20)).await;
     }
-    assert_eq!(
-        s.line_discipline().echo,
-        Some(false),
-        "the line editor has ECHO on here, so this row cannot show that the echo \
-         test admits an idle prompt"
-    );
+}
+
+/// [`await_idle_prompt`] for a shell that has just started, **after a
+/// fence**. Holdfast types its integration line into bash and zsh as they
+/// start, and until that line has run the prompt the poll sees can be the
+/// one the line is about to leave (GH #289). Once the fence's output is
+/// back, every line typed before it has been read and run.
+///
+/// Its own needle, not [`fence`]'s: a row that fences later searches the
+/// whole buffer, and would find this one.
+async fn await_started_and_idle(d: &TestDaemon, s: &Session) {
+    type_line(d, s, "echo HOLDFAST''_STARTED").await;
+    await_output(s, b"HOLDFAST_STARTED").await;
+    await_idle_prompt(s).await;
 }
 
 /// `send_input`, and the answer it gave.
@@ -5806,7 +5823,7 @@ async fn an_idle_prompt_is_refused_and_a_read_s_is_not(
 ) {
     let d = TestDaemon::start(tag).await;
     let s = start_shell(&d, command, args).await;
-    await_idle_prompt(&s).await;
+    await_started_and_idle(&d, &s).await;
     let mut c = attach_ok(&d, &s.id, AttachMode::ReadWrite).await;
 
     let refused = d.call(secret_args(&s.id, 20)).await;
@@ -5916,7 +5933,7 @@ async fn zsh_at_its_idle_prompt_is_not_asked_for_a_secret() {
 async fn a_request_answered_after_the_shell_prompt_returned_is_not_written() {
     let d = TestDaemon::start("promptlate").await;
     let s = start_shell(&d, "bash", &["--norc", "--noprofile"]).await;
-    await_idle_prompt(&s).await;
+    await_started_and_idle(&d, &s).await;
     let mut c = attach_ok(&d, &s.id, AttachMode::ReadWrite).await;
 
     for allow_echo in [false, true] {
@@ -5982,7 +5999,7 @@ async fn a_request_answered_after_the_shell_prompt_returned_is_not_written() {
 async fn a_program_reading_with_echo_off_is_still_answered() {
     let d = TestDaemon::start("promptraw").await;
     let s = start_shell(&d, "bash", &["--norc", "--noprofile"]).await;
-    await_idle_prompt(&s).await;
+    await_started_and_idle(&d, &s).await;
     let mut c = attach_ok(&d, &s.id, AttachMode::ReadWrite).await;
 
     type_line(
@@ -6064,7 +6081,7 @@ async fn a_read_s_is_answered_where_the_markers_never_say_a_command_started() {
         std::fs::write(&rc, format!("{ps1}\n")).expect("write the rc file");
         let d = TestDaemon::start("promptnoc").await;
         let s = start_shell(&d, "bash", &["--rcfile", rc.to_str().expect("utf-8")]).await;
-        await_idle_prompt(&s).await;
+        await_started_and_idle(&d, &s).await;
         let mut c = attach_ok(&d, &s.id, AttachMode::ReadWrite).await;
 
         let refused = body(&d.call(secret_args(&s.id, 20)).await);
