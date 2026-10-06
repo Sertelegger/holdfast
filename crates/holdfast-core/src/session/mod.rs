@@ -16,7 +16,7 @@ use crate::detect::{
 };
 use crate::output::rules::RuleSet;
 use crate::output::{
-    Holdback, OutputProcessor, ProcessedRead, ReadOptions, ReadRequest, ReadStart, WindowSnapshot,
+    OutputProcessor, ProcessedRead, ReadOptions, ReadRequest, ReadStart, WindowSnapshot,
 };
 use crate::pty::{clamp_geometry, PtyBackend, Signal};
 use crate::screen::{
@@ -2565,117 +2565,11 @@ impl Session {
         // Liveness decides whether an unfinished escape can still be
         // completed; read it before taking the lock (§4.1).
         let child_alive = self.backend.is_alive();
-        let limits = processor.limits;
-
-        let (
-            window,
-            window_start,
-            carry_region,
-            carry_region_start,
-            tail_region,
-            scan_start,
-            req_start,
-            head,
-            tail,
-            cap_end,
-            front_clipped,
-        ) = {
-            let buffer = self.buffer.lock();
-            let head = buffer.head();
-            let tail = buffer.tail();
-            let requested_start = match req.start {
-                ReadStart::Cursor(c) => c.clamp(tail, head),
-                ReadStart::TailBytes(n) => buffer.tail_bytes_start(n),
-                ReadStart::TailLines(n) => buffer.tail_lines_start(n),
-            };
-            // A `tail_*` read asks for the *newest* bytes, so when its
-            // extent exceeds `max_bytes` the OLDEST bytes are dropped and
-            // the cursor still lands past `buffer.head`. Capping forward
-            // instead would return the oldest slice and hand back a cursor
-            // far behind `head`, which re-delivers the same bytes on every
-            // subsequent cursor read (0.0.1's documented contract, REQ-T-006).
-            //
-            // **`is_tail()`, not the holdback.** This clip is a fact about
-            // where the read is anchored; the holdback is a fact about
-            // whether the caller opted in. They were one predicate until
-            // GH #169, which is how `holdfast logs --tail` acquired a
-            // bypass §4.1 names it as a non-member of.
-            let (req_start, front_clipped) = if req.start.is_tail() {
-                let clipped = head
-                    .saturating_sub(req.max_bytes as u64)
-                    .max(requested_start);
-                // **A tail read starts on a character, not inside one
-                // (GH #241).** `tail_bytes` and a front clip are both
-                // byte counts back from `head`, so either can land on the
-                // second byte of a character and open the page with
-                // U+FFFD. The continuation bytes of a character whose
-                // lead is behind the start are not text the caller can
-                // use; skipping at most three of them is. A cursor read
-                // is not snapped: its start is the caller's, and the
-                // paging loop no longer produces one inside a character.
-                let snapped = (0..3u64)
-                    .map(|k| clipped + k)
-                    .find(|off| {
-                        *off >= head || !(0x80..=0xbfu8).contains(&buffer.slice(*off, *off + 1)[0])
-                    })
-                    .unwrap_or(clipped + 3)
-                    .min(head);
-                (snapped, clipped > requested_start)
-            } else {
-                (requested_start, false)
-            };
-            let cap_end = req_start.saturating_add(req.max_bytes as u64).min(head);
-            let window_start = req_start
-                .saturating_sub(limits.lookbehind_bytes as u64)
-                .max(tail);
-            let window_end = cap_end
-                .saturating_add(limits.lookahead_bytes as u64)
-                .min(head);
-            let scan_start = head
-                .saturating_sub(limits.partial_secret_scan_bytes as u64)
-                .max(tail);
-            // The unvouched scan's own lookbehind (GH #195). It reaches
-            // `UNVOUCHED_CARRY_BYTES` rather than `lookbehind_bytes`
-            // because a read that begins inside a region a previous read
-            // masked has to see the anchor that produced the mask, and
-            // that anchor can be the whole carry behind `req_start`.
-            // Never later than `window_start`, so the region contains the
-            // window and one slice answers for both.
-            let carry_region_start = req_start
-                .saturating_sub(crate::output::UNVOUCHED_CARRY_BYTES as u64)
-                .max(tail)
-                .min(window_start);
-            (
-                buffer.slice(window_start, window_end),
-                window_start,
-                buffer.slice(carry_region_start, window_end),
-                carry_region_start,
-                buffer.slice(scan_start, head),
-                scan_start,
-                req_start,
-                head,
-                tail,
-                cap_end,
-                front_clipped,
-            )
-        };
-
-        let truncated_at_tail = matches!(req.start, ReadStart::Cursor(c) if c < tail);
-        let snapshot = WindowSnapshot {
-            window: &window,
-            window_start,
-            carry_region: &carry_region,
-            carry_region_start,
-            tail_region: &tail_region,
-            tail_region_start: scan_start,
-            req_start,
-            head,
-            cap_end,
-            child_alive,
-            bypass_holdback: req.holdback == Holdback::BypassedByCallerOptIn,
-            front_clipped,
-            truncated_at_tail,
-        };
+        // The guard is a temporary of this statement, so the lock is
+        // released as soon as `for_read` has copied the regions.
+        let taken =
+            WindowSnapshot::for_read(&self.buffer.lock(), req, processor.limits, child_alive);
+        let snapshot = taken.snapshot();
         // The width is the session's now: GH #247's collapse drops a
         // redraw only when the line in front of it cannot have wrapped.
         let read = processor.process_at_width(&snapshot, &req.options, Some(self.size().0));
@@ -2694,11 +2588,14 @@ impl Session {
                 .audit
                 .record_redaction_disabled(Some(&self.id), req.tool, req.client_kind);
         }
-        if truncated_at_tail {
+        if snapshot.truncated_at_tail {
             if let ReadStart::Cursor(c) = req.start {
-                processor
-                    .audit
-                    .record_truncated_at_tail(&self.id, req.tool, c, tail);
+                processor.audit.record_truncated_at_tail(
+                    &self.id,
+                    req.tool,
+                    c,
+                    taken.buffer_tail(),
+                );
             }
         }
         read
@@ -3762,7 +3659,7 @@ mod tests {
     // Re-importing any of them is `error[E0252]`.
     use crate::audit::AuditLog;
     use crate::output::rules::RuleSet;
-    use crate::output::{ProcessingLimits, ReadRequest, ReadStart};
+    use crate::output::{Holdback, ProcessingLimits, ReadRequest, ReadStart};
 
     const GITHUB: &str = "ghp_0123456789abcdefghijABCDEFGHIJ012345";
 
