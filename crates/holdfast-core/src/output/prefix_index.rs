@@ -490,8 +490,10 @@ pub struct Unterminated {
     /// returned because they carry key material.
     pub in_flight: bool,
     /// Its body carried a run of `pem::PEM_MATERIAL_RUN` base64
-    /// characters — always true of one that is not `in_flight`, and what
-    /// the stream's end-of-stream flush asks of one that is.
+    /// characters that can be key body (not a digest or an integrity
+    /// string: `pem::Run`), or is inside one at the region's end — always
+    /// true of one that is not `in_flight`, and what the stream's
+    /// end-of-stream flush asks of one that is.
     pub material: bool,
     /// Not a candidate but key-body lines *after* one that stopped short
     /// of its closing boundary (`pem::body_lines`): a pager's next
