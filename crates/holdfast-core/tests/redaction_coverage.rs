@@ -22,9 +22,12 @@
 //!   everything" does not pass either.
 //! * `not_vacuous` floors both tables.
 
+use holdfast_core::buffer::OutputBuffer;
 use holdfast_core::output::redact::{find_spans, redact_str};
 use holdfast_core::output::rules::RuleSet;
-use holdfast_core::output::{OutputProcessor, ProcessedRead, ReadOptions, WindowSnapshot};
+use holdfast_core::output::{
+    OutputProcessor, ProcessedRead, ReadOptions, ReadRequest, WindowSnapshot,
+};
 
 /// One spelling, and the bytes of it that are the credential.
 struct Row {
@@ -356,24 +359,22 @@ fn the_neighbouring_ordinary_text_is_untouched() {
 
 const TAIL: &str = "\nbuild finished in 13.72s\n";
 
+/// `read_output` from cursor 0 with its default `max_bytes`, through the
+/// product's own read geometry ([`WindowSnapshot::for_read`]) over a ring
+/// that holds the whole buffer.
 fn read(processor: &OutputProcessor, buffer: &[u8]) -> ProcessedRead {
-    let head = buffer.len() as u64;
-    let scan_start = head.saturating_sub(processor.limits.partial_secret_scan_bytes as u64);
-    let w = WindowSnapshot {
-        window: buffer,
-        window_start: 0,
-        carry_region: buffer,
-        carry_region_start: 0,
-        tail_region: &buffer[scan_start as usize..],
-        tail_region_start: scan_start,
-        req_start: 0,
-        head,
-        cap_end: head,
-        child_alive: true,
-        bypass_holdback: false,
-        front_clipped: false,
-        truncated_at_tail: false,
-    };
+    let mut ring = OutputBuffer::new(buffer.len().max(1));
+    ring.push(buffer);
+    let taken = WindowSnapshot::for_read(
+        &ring,
+        &ReadRequest::since(0, 32 * 1024),
+        processor.limits,
+        true,
+    );
+    let w = taken.snapshot();
+    // Every arm here means one read of the whole fixture; a fixture that
+    // outgrows the cap would be judged on its first page alone.
+    assert_eq!(w.cap_end, w.head, "the fixture must fit one read");
     processor.process(&w, &ReadOptions::default())
 }
 

@@ -269,15 +269,15 @@ const EFFECTIVE: &[(&str, &str)] = &[
     ),
     (
         "limits.redaction_lookbehind_bytes",
-        "Renamed at the seam: crates/holdfast-core/src/config.rs:1730 maps it to ProcessingLimits::lookbehind_bytes, read on the live path at crates/holdfast-core/src/output/mod.rs:564 and crates/holdfast-core/src/session/mod.rs:1986.",
+        "Renamed at the seam: crates/holdfast-core/src/config.rs:1834 maps it to ProcessingLimits::lookbehind_bytes, read on the live path by WindowSnapshot::for_read at crates/holdfast-core/src/output/mod.rs:502, which Session::read_processed calls for every read.",
     ),
     (
         "limits.redaction_lookahead_bytes",
-        "Renamed at the seam: crates/holdfast-core/src/config.rs:1731 maps it to ProcessingLimits::lookahead_bytes, read at crates/holdfast-core/src/output/mod.rs:565 and crates/holdfast-core/src/session/mod.rs:1989.",
+        "Renamed at the seam: crates/holdfast-core/src/config.rs:1835 maps it to ProcessingLimits::lookahead_bytes, read by WindowSnapshot::for_read at crates/holdfast-core/src/output/mod.rs:505.",
     ),
     (
         "limits.partial_secret_scan_bytes",
-        "crates/holdfast-core/src/config.rs:1732 maps it onto ProcessingLimits; read at crates/holdfast-core/src/output/mod.rs:566 and crates/holdfast-core/src/session/mod.rs:1992.",
+        "crates/holdfast-core/src/config.rs:1836 maps it onto ProcessingLimits; read by WindowSnapshot::for_read at crates/holdfast-core/src/output/mod.rs:508 and by Session::boundary_snapshot at crates/holdfast-core/src/session/mod.rs:2490.",
     ),
     (
         "limits.ansi_incomplete_max_bytes",

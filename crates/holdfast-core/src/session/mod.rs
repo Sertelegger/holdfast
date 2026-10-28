@@ -3,9 +3,11 @@
 pub mod launch;
 pub mod reaper;
 pub mod registry;
+pub mod stats;
 pub mod wait;
 pub use reaper::Reaper;
 pub use registry::{Retention, SessionRegistry};
+pub use stats::SessionStats;
 
 use crate::attach::secret::SecretBytes;
 use crate::buffer::{BufferRead, OutputBuffer};
@@ -16,7 +18,7 @@ use crate::detect::{
 };
 use crate::output::rules::RuleSet;
 use crate::output::{
-    Holdback, OutputProcessor, ProcessedRead, ReadOptions, ReadRequest, ReadStart, WindowSnapshot,
+    OutputProcessor, ProcessedRead, ReadOptions, ReadRequest, ReadStart, WindowSnapshot,
 };
 use crate::pty::{clamp_geometry, PtyBackend, Signal};
 use crate::screen::{
@@ -371,6 +373,14 @@ pub struct SessionConfig {
     /// both from the file; the clamp is for the callers that build a
     /// `SessionConfig` by hand.
     pub output_broadcast_capacity: usize,
+    /// The audit log this session's `session_stats` line goes to
+    /// (`stats`), or `None` for a session that writes none.
+    /// `start_session` passes the server's; a session built by hand keeps
+    /// the default and leaves no line in anybody's trail.
+    pub audit: Option<Arc<crate::audit::AuditLog>>,
+    /// GH #252's history policy as `session_stats` reports it, decided by
+    /// `start_session` (`stats::history_policy`).
+    pub history_policy: crate::audit::HistoryPolicy,
 }
 
 impl Default for SessionConfig {
@@ -393,6 +403,8 @@ impl Default for SessionConfig {
             // default is every rule.
             rules: None,
             output_broadcast_capacity: OUTPUT_BROADCAST_FRAMES,
+            audit: None,
+            history_policy: crate::audit::HistoryPolicy::default(),
         }
     }
 }
@@ -476,6 +488,9 @@ pub struct Session {
     /// each response reporting 1 while this reaches 2, and that
     /// difference is the contract.
     redaction_stats: Mutex<BTreeMap<String, u64>>,
+    /// Plan §4.9's per-session counters, and the one `session_stats` line
+    /// they become. See [`stats`].
+    stats: SessionStats,
     /// §9.6's `max_uses` budget, `{binding name: resolutions}` — 0.0.7.
     ///
     /// **The counter lives with the session and not with the binding**,
@@ -1162,6 +1177,7 @@ impl Session {
             shell_integration: config.shell_integration,
             state: Mutex::new(SessionState::Running),
             redaction_stats: Mutex::new(BTreeMap::new()),
+            stats: SessionStats::new(config.audit.clone(), config.history_policy, started_ms),
             binding_uses: Mutex::new(BTreeMap::new()),
             output_tx: output_tx.clone(),
             output_broadcast_capacity,
@@ -1197,6 +1213,7 @@ impl Session {
         let reader_clock = clock.clone();
         let reader_backend = Arc::clone(&backend);
         let reader_finished_flag = Arc::clone(&reader_finished);
+        let reader_end = session.stats.end_latch();
         let reader_rules = Arc::clone(&session.rules);
         // §4.5.1's responder is used from the reader thread alone, so it
         // needs no `Mutex` and no `Weak` — it is moved into the closure
@@ -1610,6 +1627,10 @@ impl Session {
                     std::thread::sleep(READER_IDLE_POLL);
                 }
                 if !reader_backend.is_alive() {
+                    // `session_stats.duration_ms` ends at the exit this
+                    // thread saw, rather than at whichever call asks next,
+                    // which under `--no-daemon` may be hours later.
+                    reader_end.latch(reader_clock.now_ms());
                     // **The same derivation `Session::state()` uses**, in
                     // the same order: `backend.exit_code()`, else `-1`.
                     // Two surfaces report this child's end — this frame
@@ -1974,6 +1995,9 @@ impl Session {
             Ordering::Relaxed,
             Ordering::Relaxed,
         );
+        // `session_stats.duration_ms` ends here, on the session's own
+        // clock rather than this wall-clock second.
+        self.stats.latch_end(self.clock.now_ms());
     }
 
     /// Unix seconds at which this session's exit was first observed
@@ -2354,7 +2378,14 @@ impl Session {
     /// thing this must not do.
     ///
     /// Idempotent: a second call swaps one closed sender for another.
+    ///
+    /// **The sweep that calls this has seen the child gone**, so this is
+    /// an observation of the exit and latches its time, which a sweep's
+    /// sort does not reliably do (a sort of one asks for no key).
+    /// `session_stats.duration_ms` ends here at the latest, however long
+    /// the record then stays readable.
     pub fn retire(&self) {
+        self.latch_exit_time();
         // Built here rather than kept as a lazy static: a session is
         // retired once, and a shared closed channel would be a
         // process-wide allocation held for the life of the binary to
@@ -2565,117 +2596,11 @@ impl Session {
         // Liveness decides whether an unfinished escape can still be
         // completed; read it before taking the lock (§4.1).
         let child_alive = self.backend.is_alive();
-        let limits = processor.limits;
-
-        let (
-            window,
-            window_start,
-            carry_region,
-            carry_region_start,
-            tail_region,
-            scan_start,
-            req_start,
-            head,
-            tail,
-            cap_end,
-            front_clipped,
-        ) = {
-            let buffer = self.buffer.lock();
-            let head = buffer.head();
-            let tail = buffer.tail();
-            let requested_start = match req.start {
-                ReadStart::Cursor(c) => c.clamp(tail, head),
-                ReadStart::TailBytes(n) => buffer.tail_bytes_start(n),
-                ReadStart::TailLines(n) => buffer.tail_lines_start(n),
-            };
-            // A `tail_*` read asks for the *newest* bytes, so when its
-            // extent exceeds `max_bytes` the OLDEST bytes are dropped and
-            // the cursor still lands past `buffer.head`. Capping forward
-            // instead would return the oldest slice and hand back a cursor
-            // far behind `head`, which re-delivers the same bytes on every
-            // subsequent cursor read (0.0.1's documented contract, REQ-T-006).
-            //
-            // **`is_tail()`, not the holdback.** This clip is a fact about
-            // where the read is anchored; the holdback is a fact about
-            // whether the caller opted in. They were one predicate until
-            // GH #169, which is how `holdfast logs --tail` acquired a
-            // bypass §4.1 names it as a non-member of.
-            let (req_start, front_clipped) = if req.start.is_tail() {
-                let clipped = head
-                    .saturating_sub(req.max_bytes as u64)
-                    .max(requested_start);
-                // **A tail read starts on a character, not inside one
-                // (GH #241).** `tail_bytes` and a front clip are both
-                // byte counts back from `head`, so either can land on the
-                // second byte of a character and open the page with
-                // U+FFFD. The continuation bytes of a character whose
-                // lead is behind the start are not text the caller can
-                // use; skipping at most three of them is. A cursor read
-                // is not snapped: its start is the caller's, and the
-                // paging loop no longer produces one inside a character.
-                let snapped = (0..3u64)
-                    .map(|k| clipped + k)
-                    .find(|off| {
-                        *off >= head || !(0x80..=0xbfu8).contains(&buffer.slice(*off, *off + 1)[0])
-                    })
-                    .unwrap_or(clipped + 3)
-                    .min(head);
-                (snapped, clipped > requested_start)
-            } else {
-                (requested_start, false)
-            };
-            let cap_end = req_start.saturating_add(req.max_bytes as u64).min(head);
-            let window_start = req_start
-                .saturating_sub(limits.lookbehind_bytes as u64)
-                .max(tail);
-            let window_end = cap_end
-                .saturating_add(limits.lookahead_bytes as u64)
-                .min(head);
-            let scan_start = head
-                .saturating_sub(limits.partial_secret_scan_bytes as u64)
-                .max(tail);
-            // The unvouched scan's own lookbehind (GH #195). It reaches
-            // `UNVOUCHED_CARRY_BYTES` rather than `lookbehind_bytes`
-            // because a read that begins inside a region a previous read
-            // masked has to see the anchor that produced the mask, and
-            // that anchor can be the whole carry behind `req_start`.
-            // Never later than `window_start`, so the region contains the
-            // window and one slice answers for both.
-            let carry_region_start = req_start
-                .saturating_sub(crate::output::UNVOUCHED_CARRY_BYTES as u64)
-                .max(tail)
-                .min(window_start);
-            (
-                buffer.slice(window_start, window_end),
-                window_start,
-                buffer.slice(carry_region_start, window_end),
-                carry_region_start,
-                buffer.slice(scan_start, head),
-                scan_start,
-                req_start,
-                head,
-                tail,
-                cap_end,
-                front_clipped,
-            )
-        };
-
-        let truncated_at_tail = matches!(req.start, ReadStart::Cursor(c) if c < tail);
-        let snapshot = WindowSnapshot {
-            window: &window,
-            window_start,
-            carry_region: &carry_region,
-            carry_region_start,
-            tail_region: &tail_region,
-            tail_region_start: scan_start,
-            req_start,
-            head,
-            cap_end,
-            child_alive,
-            bypass_holdback: req.holdback == Holdback::BypassedByCallerOptIn,
-            front_clipped,
-            truncated_at_tail,
-        };
+        // The guard is a temporary of this statement, so the lock is
+        // released as soon as `for_read` has copied the regions.
+        let taken =
+            WindowSnapshot::for_read(&self.buffer.lock(), req, processor.limits, child_alive);
+        let snapshot = taken.snapshot();
         // The width is the session's now: GH #247's collapse drops a
         // redraw only when the line in front of it cannot have wrapped.
         let read = processor.process_at_width(&snapshot, &req.options, Some(self.size().0));
@@ -2689,16 +2614,15 @@ impl Session {
 
         // Both of these are audit obligations of the *read*, so they live
         // here rather than in each transport that calls it (§9.2, §9.4).
-        if !req.options.redact {
-            processor
-                .audit
-                .record_redaction_disabled(Some(&self.id), req.tool, req.client_kind);
-        }
-        if truncated_at_tail {
+        self.account_read(req, &read, snapshot.head, processor);
+        if snapshot.truncated_at_tail {
             if let ReadStart::Cursor(c) = req.start {
-                processor
-                    .audit
-                    .record_truncated_at_tail(&self.id, req.tool, c, tail);
+                processor.audit.record_truncated_at_tail(
+                    &self.id,
+                    req.tool,
+                    c,
+                    taken.buffer_tail(),
+                );
             }
         }
         read
@@ -3762,7 +3686,7 @@ mod tests {
     // Re-importing any of them is `error[E0252]`.
     use crate::audit::AuditLog;
     use crate::output::rules::RuleSet;
-    use crate::output::{ProcessingLimits, ReadRequest, ReadStart};
+    use crate::output::{Holdback, ProcessingLimits, ReadRequest, ReadStart};
 
     const GITHUB: &str = "ghp_0123456789abcdefghijABCDEFGHIJ012345";
 
@@ -3864,11 +3788,12 @@ mod tests {
     /// the previous chunk is fully redacted again in the next chunk, with
     /// no leak"*).
     ///
-    /// The unit test in `output` pins the same invariant against a
-    /// hand-built snapshot; the geometry that actually decides whether a
-    /// continuation read can still see `-----BEGIN` is *this* function's
-    /// (`window_start = req_start − lookbehind_bytes`), so it is pinned
-    /// here as well. A 1.6 KB key is three times the 512-byte lookbehind:
+    /// The unit test in `output` pins the same invariant through
+    /// `WindowSnapshot::for_read` over a ring of its own; this row pins it
+    /// on the session's ring, through `read_processed`, where the geometry
+    /// that decides whether a continuation read can still see
+    /// `-----BEGIN` (`window_start = req_start − lookbehind_bytes`) is
+    /// applied. A 1.6 KB key is three times the 512-byte lookbehind:
     /// a cursor left inside it can never be recovered from, and the leak
     /// carries `redactions: {}` and no audit entry, so nothing downstream
     /// can tell it happened.
@@ -3984,15 +3909,15 @@ mod tests {
     /// **GH #195 on the real read path: a continuation read that begins
     /// inside a region a previous read masked must mask it too.**
     ///
-    /// The unit test in `output` pins the same invariant against a
-    /// hand-built snapshot, and it cannot pin *this*: the geometry that
-    /// decides whether the continuation can still see `-----BEGIN` is
-    /// `read_processed`'s `carry_region_start`, which that helper
-    /// supplies for itself. Replacing it with `window_start` — the
-    /// obvious simplification, since the window already has a lookbehind
-    /// — survives every row in `output` and puts a private key body on
-    /// the wire, because `lookbehind_bytes` is 512 and a believed
-    /// candidate reaches `UNVOUCHED_CARRY_BYTES` back.
+    /// The unit test in `output` pins the same invariant through
+    /// `WindowSnapshot::for_read` over a ring of its own; this row pins it
+    /// on the session's own ring, through `read_processed`. The geometry
+    /// that decides whether the continuation can still see `-----BEGIN`
+    /// is `for_read`'s `carry_region_start`. Replacing it with
+    /// `window_start` — the obvious simplification, since the window
+    /// already has a lookbehind — puts a private key body on the wire,
+    /// because `lookbehind_bytes` is 512 and a believed candidate reaches
+    /// `UNVOUCHED_CARRY_BYTES` back.
     ///
     /// The key is **unterminated**, which is the whole subject: a
     /// terminated one matches `private-key-block` as soon as the window
@@ -4340,10 +4265,10 @@ mod tests {
 
     /// REQ-O-008's liveness input comes from the backend, and
     /// `read_processed` is the only place that samples it. Every
-    /// processor unit test builds its own snapshot and passes
-    /// `child_alive` by hand, so hardcoding it here leaves all of them
-    /// green while a real exited session withholds its last bytes for
-    /// ever.
+    /// processor unit test supplies `child_alive` by hand, to
+    /// `WindowSnapshot::for_read` or to a boundary snapshot it builds, so
+    /// hardcoding it here leaves all of them green while a real exited
+    /// session withholds its last bytes for ever.
     #[test]
     fn the_liveness_the_escape_rule_needs_comes_from_the_backend() {
         let (s, pty) = mock_session();
@@ -5023,6 +4948,9 @@ mod tests {
                 // detection knobs, and a usize beside two usizes above is
                 // named rather than defaulted for the same reason.
                 output_broadcast_capacity: OUTPUT_BROADCAST_FRAMES,
+                // No `session_stats` line: this row has no trail to read.
+                audit: None,
+                history_policy: crate::audit::HistoryPolicy::Discard,
             },
         );
         pty.queue_output(&bytes);

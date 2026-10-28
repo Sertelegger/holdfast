@@ -241,20 +241,87 @@ impl AuditLog {
     /// the read path may branch on it to decide whether to redact
     /// (§9.4, REQ-SEC-018); §7.5's `Attach.role` is the only field that
     /// selects raw versus redacted output.
-    pub fn record_redaction_disabled(
-        &self,
-        session_id: Option<&str>,
-        tool: &'static str,
-        client_kind: &'static str,
-    ) {
-        let count = self.redact_false_count.fetch_add(1, Ordering::Relaxed) + 1;
+    ///
+    /// **The other four fields say what the read was** (plan §3.4's
+    /// "Audit." bullet): which escape it used (`mode`), where it began
+    /// (`start`), how much it handed over (`bytes_returned`), and whether
+    /// the session's previous masked read had shown an
+    /// `[REDACTED:unresolved]` (`prior_unresolved`) — the one fact that
+    /// says whether a marker is what sent the caller here. See
+    /// [`RawRead`] for each.
+    ///
+    /// `redact_false_count_so_far` stays what its name says: the
+    /// daemon-wide count of `mode: "false"` entries. A `complete_only`
+    /// entry carries the count as it stands and does not move it; the
+    /// per-session split is `session_stats.raw_reads`.
+    pub fn record_redaction_disabled(&self, session_id: Option<&str>, read: &RawRead) {
+        let count = match read.mode {
+            RedactionMode::False => self.redact_false_count.fetch_add(1, Ordering::Relaxed) + 1,
+        };
         self.record(
             "redaction_disabled",
             session_id,
             serde_json::json!({
-                "tool": tool,
-                "client_kind": client_kind,
+                "tool": read.tool,
+                "client_kind": read.client_kind,
                 "redact_false_count_so_far": count,
+                "mode": read.mode.as_str(),
+                "start": read.start.as_str(),
+                "bytes_returned": read.bytes_returned,
+                "prior_unresolved": read.prior_unresolved,
+            }),
+        );
+    }
+
+    /// `session_stats` (plan §4.9): one line per session, written once
+    /// when it stops being live. **Counts and closed-vocabulary names
+    /// only** — no command, no argument, no byte of output — so the line
+    /// is safe on a host whose redaction rules miss something.
+    ///
+    /// The writer is `Session::record_stats`, which owns the
+    /// once-per-session rule; this method only lays the line out, so the
+    /// shape lives beside every other kind's. Every key is present on
+    /// every line, a zero rather than an absence, because an omitted
+    /// count cannot be told from one a writer forgot.
+    pub fn record_session_stats(&self, session_id: &str, stats: &SessionStatsRecord) {
+        // `unresolved` is the one kind every line carries, at zero when
+        // no read showed one: a key that comes and goes is one every
+        // reader has to default by hand.
+        let mut redactions = stats.redactions.clone();
+        redactions
+            .entry(crate::output::redact::UNRESOLVED_KIND.to_string())
+            .or_insert(0);
+        self.record(
+            "session_stats",
+            Some(session_id),
+            serde_json::json!({
+                "shell": stats.shell,
+                "duration_ms": stats.duration_ms,
+                "history_policy": stats.history_policy.as_str(),
+                "known_values_registered": stats.known_values_registered,
+                "bytes_produced": stats.bytes_produced,
+                "bytes_returned": stats.bytes_returned,
+                "reads": {
+                    "cursor": stats.reads.cursor,
+                    "tail": stats.reads.tail,
+                    "resource": stats.reads.resource,
+                    "screen": stats.reads.screen,
+                },
+                "reads_held_back": stats.reads_held_back,
+                "max_bytes_withheld": stats.max_bytes_withheld,
+                "reads_unresolved": stats.reads_unresolved,
+                "operator_reads": stats.operator_reads,
+                "redactions": redactions,
+                "raw_reads": {
+                    "false": stats.raw_reads.redact_false,
+                    "complete_only": stats.raw_reads.complete_only,
+                },
+                "waits": {
+                    "matched": stats.waits.matched,
+                    "timeout": stats.waits.timeout,
+                    "idle": stats.waits.idle,
+                    "session_died": stats.waits.session_died,
+                },
             }),
         );
     }
@@ -410,6 +477,250 @@ fn now_rfc3339() -> String {
     chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Millis, true)
 }
 
+/// The redaction a read ran under when it was not the default — §9.4's
+/// `redaction_disabled.mode`, and the key of `session_stats.raw_reads`.
+///
+/// **Closed, and one variant short of its design.** The `complete_only`
+/// escape hatch (plan §3.4, the C PR) adds `CompleteOnly`, spelled
+/// `"complete_only"`. Every writer matches on this enum without a
+/// wildcard, so that variant cannot arrive without each of them deciding
+/// what it means.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RedactionMode {
+    /// `redact: false`: every mask and the holdback off. Spelled as the
+    /// string `"false"` rather than a JSON boolean, so the column keeps
+    /// one type when `complete_only` joins it.
+    False,
+}
+
+impl RedactionMode {
+    /// Every variant, so a test walks the enum rather than a list beside
+    /// it.
+    pub const ALL: [Self; 1] = [Self::False];
+
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::False => "false",
+        }
+    }
+}
+
+/// Where a read began — §9.4's `redaction_disabled.start`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ReadAnchor {
+    /// An absolute offset: `read_output`'s `since_cursor`, and every
+    /// `resources/read` — its `since_cursor`, or the buffer's oldest byte
+    /// when it names none. The row's `tool` already says which.
+    Cursor,
+    /// `read_output`'s `tail_lines` or `tail_bytes`: the newest bytes.
+    Tail,
+    /// `get_screen_state`: the rendered grid, which has no byte offset.
+    Screen,
+}
+
+impl ReadAnchor {
+    pub const ALL: [Self; 3] = [Self::Cursor, Self::Tail, Self::Screen];
+
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Cursor => "cursor",
+            Self::Tail => "tail",
+            Self::Screen => "screen",
+        }
+    }
+}
+
+/// One read that was not fully masked, as [`AuditLog::record_redaction_disabled`]
+/// records it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RawRead {
+    /// The mechanism: `read_output`, `resource_read` or
+    /// `get_screen_state`. A `&'static str` because it names a handler in
+    /// this binary and so can only come from a literal at the call site.
+    pub tool: &'static str,
+    /// The accountable party — `shim`, `cli`, `ui-bridge`, `in_process`
+    /// — derived from the uid-checked handshake (`mcp::caller`), never
+    /// from the request.
+    pub client_kind: &'static str,
+    pub mode: RedactionMode,
+    pub start: ReadAnchor,
+    /// What the read handed over. For a byte-stream read, the raw bytes
+    /// it consumed — `read_output`'s own `bytes_returned`. For
+    /// `get_screen_state`, the UTF-8 length of the rows and title it
+    /// returned, or of the diff, because a grid is not a byte range.
+    pub bytes_returned: u64,
+    /// Whether this session's most recent **masked** read by the same
+    /// party — any read, screen or wait whose text went through the
+    /// redactor — returned an `[REDACTED:unresolved]` marker. `false` when
+    /// there was none. The party is the agent (`shim`, `in_process`) or a
+    /// human (`cli`, `ui-bridge`), so an operator's `holdfast logs` does
+    /// not answer for what the agent saw.
+    pub prior_unresolved: bool,
+}
+
+/// Where a session's base environment came from — §9.4's
+/// `session_start.env_base` (plan §3.1, E4), decided by
+/// `session::launch::Host::env_base`.
+///
+/// The known-values PR (#253) adds `known_env_names` beside this field
+/// on the same row: names only, never values.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum EnvBase {
+    /// The calling client's own environment, which its shim sent under
+    /// `@client`: a `command` session in a daemon.
+    Client,
+    /// The daemon's own environment, less the variables that name the
+    /// client that spawned it: a `profile` session, or a request whose
+    /// shim sent no environment.
+    Daemon,
+    /// This process's environment, inherited whole: `holdfast mcp
+    /// --no-daemon` and Windows, where this process is the client's.
+    InProcess,
+}
+
+impl EnvBase {
+    pub const ALL: [Self; 3] = [Self::Client, Self::Daemon, Self::InProcess];
+
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Client => "client",
+            Self::Daemon => "daemon",
+            Self::InProcess => "in_process",
+        }
+    }
+}
+
+/// Where a session's shell keeps its command history (GH #252) —
+/// `session_stats.history_policy`. Decided once, at `start_session`, by
+/// `session::stats::history_policy`.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum HistoryPolicy {
+    /// `"none"`: `[terminal] shell_history_file = "none"`, the default.
+    /// `HISTFILE=/dev/null` and its siblings, which the integration
+    /// snippet re-applies after the rc files when it is typed.
+    #[default]
+    Discard,
+    /// `"per_session"`: a `0600` history file of the session's own under
+    /// the state directory.
+    PerSession,
+    /// `"caller"`: the call's own `env`, or the profile's, set a variable
+    /// the policy yields to and the session's shell reads — `HISTFILE` or
+    /// `HOLDFAST_HISTFILE` for bash and zsh, a non-empty `fish_history`
+    /// for fish, any of those for a command that is not a shell — so the
+    /// shell keeps its history where that said, whichever mode is
+    /// configured (`session::stats::history_policy`).
+    Caller,
+}
+
+impl HistoryPolicy {
+    pub const ALL: [Self; 3] = [Self::Discard, Self::PerSession, Self::Caller];
+
+    /// `"none"` and `"per_session"` are `[terminal] shell_history_file`'s
+    /// own spellings, so the trail and the config read alike.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Discard => "none",
+            Self::PerSession => "per_session",
+            Self::Caller => "caller",
+        }
+    }
+}
+
+/// `session_stats.reads`: how many reads each surface served.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct ReadCounts {
+    /// `read_output` from `since_cursor`.
+    pub cursor: u64,
+    /// `read_output` with `tail_lines` or `tail_bytes`.
+    pub tail: u64,
+    /// `resources/read` of the session's buffer.
+    pub resource: u64,
+    /// `get_screen_state`.
+    pub screen: u64,
+}
+
+/// `session_stats.raw_reads`: the reads that were not fully masked, by
+/// [`RedactionMode`]. A subset of [`ReadCounts`], not an addition to it.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct RawReadCounts {
+    /// `"false"`.
+    pub redact_false: u64,
+    /// `"complete_only"`. **Zero until the `complete_only` PR (C)**, which
+    /// adds [`RedactionMode`]'s second variant and counts it here. The
+    /// key is on every line before then, so the field week's reader does
+    /// not change shape when C lands.
+    pub complete_only: u64,
+}
+
+/// `session_stats.waits`: how each `wait_for_pattern` and
+/// `send_input(wait_for:)` ended.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct WaitCounts {
+    /// A pattern wait whose match was returned.
+    pub matched: u64,
+    /// Any wait whose deadline elapsed, including a match still withheld
+    /// at it.
+    pub timeout: u64,
+    /// A pattern-less wait that saw the session stop executing.
+    pub idle: u64,
+    /// Any wait that ended because the child had exited. Not one of plan
+    /// §4.9's three: without it the three would not sum to the waits made.
+    pub session_died: u64,
+}
+
+/// One `session_stats` line, as plain data. Built by
+/// `Session::stats_record` from the session's counters.
+///
+/// **`reads`, `raw_reads`, `waits`, the held-back figures,
+/// `bytes_returned` and `reads_unresolved` are the agent's**: calls whose
+/// `client_kind` is `shim` or `in_process`. A human's reads (`cli`,
+/// `ui-bridge`) are counted once, in `operator_reads`.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct SessionStatsRecord {
+    /// The interactive shell the session runs, when Holdfast recognises
+    /// one (`bash`, `zsh`, `fish`), whether or not it was integrated;
+    /// `None` for anything else, `bash -c` included.
+    pub shell: Option<&'static str>,
+    /// From the spawn to the first observation of the child's exit, on
+    /// the session's clock; to the record itself for a session still
+    /// running when it was written (daemon shutdown). The session's
+    /// reader thread observes the exit when the pty closes, so the end
+    /// does not wait for a call to ask.
+    pub duration_ms: u64,
+    pub history_policy: HistoryPolicy,
+    /// How many values the session's known-value matcher holds. **Zero
+    /// until the known-values PR (K, #253)**, which registers them at
+    /// spawn and sets this through `SessionStats::set_known_values_registered`.
+    pub known_values_registered: u64,
+    /// Every byte the child wrote: the ring buffer's head.
+    pub bytes_produced: u64,
+    /// The raw bytes the byte-stream reads (`reads.cursor`, `.tail` and
+    /// `.resource`) handed over. Overlapping reads count each time, so it
+    /// can exceed `bytes_produced`; the grid and wait text are not in it.
+    pub bytes_returned: u64,
+    pub reads: ReadCounts,
+    /// Reads whose response said `held_back: true`, the grid's included.
+    pub reads_held_back: u64,
+    /// The most a held-back byte-stream read left between where it
+    /// stopped and the buffer's head at that read.
+    pub max_bytes_withheld: u64,
+    /// Reads in `reads`, every surface, whose response showed at least
+    /// one `[REDACTED:unresolved]`. **The numerator for "how often does
+    /// the agent meet a marker"**, over the same reads as its
+    /// denominator, which `redactions.unresolved` is not.
+    pub reads_unresolved: u64,
+    /// Reads by a human (`holdfast logs`, the web UI), every surface.
+    pub operator_reads: u64,
+    /// The session's `status.redaction_stats` tally, by kind: every
+    /// region masked by every pass through the read pipeline, which
+    /// includes each wait's text (twice for a matched pattern wait) and
+    /// the operator's reads, and excludes the grid. The line always
+    /// carries `unresolved`, at zero if no read showed one.
+    pub redactions: std::collections::BTreeMap<String, u64>,
+    pub raw_reads: RawReadCounts,
+    pub waits: WaitCounts,
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -420,6 +731,19 @@ mod tests {
     fn log_in(dir: &Path) -> AuditLog {
         let rules = Arc::new(RuleSet::builtin().unwrap());
         AuditLog::to_path(dir.join("audit.log"), rules).unwrap()
+    }
+
+    /// A `redact: false` cursor read by `tool` for `client_kind`, with no
+    /// size and no marker before it.
+    fn raw_read(tool: &'static str, client_kind: &'static str) -> RawRead {
+        RawRead {
+            tool,
+            client_kind,
+            mode: RedactionMode::False,
+            start: ReadAnchor::Cursor,
+            bytes_returned: 0,
+            prior_unresolved: false,
+        }
     }
 
     fn lines(log: &AuditLog) -> Vec<Value> {
@@ -606,8 +930,8 @@ mod tests {
     fn redaction_disabled_entries_name_the_tool_and_the_caller_and_count_up() {
         let dir = tempfile::tempdir().unwrap();
         let log = log_in(dir.path());
-        log.record_redaction_disabled(Some("sess_a"), "read_output", "shim");
-        log.record_redaction_disabled(Some("sess_a"), "read_output", "cli");
+        log.record_redaction_disabled(Some("sess_a"), &raw_read("read_output", "shim"));
+        log.record_redaction_disabled(Some("sess_a"), &raw_read("read_output", "cli"));
         let entries = lines(&log);
         assert_eq!(entries[0]["kind"], "redaction_disabled");
         assert_eq!(entries[0]["session_id"], "sess_a");
@@ -620,6 +944,273 @@ mod tests {
         assert_eq!(entries[1]["client_kind"], "cli");
         assert_eq!(entries[1]["redact_false_count_so_far"], 2);
         assert_eq!(log.redact_false_count(), 2);
+    }
+
+    /// Plan §3.4's four additions, each carrying what the read was.
+    ///
+    /// **Two rows that differ in every new field**, so a writer that
+    /// emitted a constant, or swapped two same-typed fields, fails one of
+    /// them: `bytes_returned` is a number on both, `prior_unresolved` a
+    /// bool on both, and `start` takes a different value on each.
+    #[test]
+    fn redaction_disabled_records_the_mode_the_start_the_size_and_what_came_before() {
+        let dir = tempfile::tempdir().unwrap();
+        let log = log_in(dir.path());
+        log.record_redaction_disabled(
+            Some("sess_a"),
+            &RawRead {
+                start: ReadAnchor::Tail,
+                bytes_returned: 4096,
+                prior_unresolved: true,
+                ..raw_read("read_output", "shim")
+            },
+        );
+        log.record_redaction_disabled(
+            Some("sess_a"),
+            &RawRead {
+                start: ReadAnchor::Screen,
+                bytes_returned: 77,
+                prior_unresolved: false,
+                ..raw_read("get_screen_state", "cli")
+            },
+        );
+        let entries = lines(&log);
+        assert_eq!(entries[0]["mode"], "false", "a string, not a JSON boolean");
+        assert_eq!(entries[0]["start"], "tail");
+        assert_eq!(entries[0]["bytes_returned"], 4096);
+        assert_eq!(entries[0]["prior_unresolved"], true);
+        assert_eq!(entries[1]["mode"], "false");
+        assert_eq!(entries[1]["start"], "screen");
+        assert_eq!(entries[1]["bytes_returned"], 77);
+        assert_eq!(entries[1]["prior_unresolved"], false);
+
+        // Every existing field is still on the row, and nothing else is.
+        let keys: Vec<&str> = entries[0]
+            .as_object()
+            .unwrap()
+            .keys()
+            .map(String::as_str)
+            .collect();
+        let mut keys = keys;
+        keys.sort_unstable();
+        assert_eq!(
+            keys,
+            [
+                "bytes_returned",
+                "client_kind",
+                "kind",
+                "mode",
+                "prior_unresolved",
+                "redact_false_count_so_far",
+                "session_id",
+                "start",
+                "tool",
+                "ts",
+            ]
+        );
+        assert_eq!(entries[1]["redact_false_count_so_far"], 2);
+    }
+
+    /// Each closed enum the new fields draw from: one spelling per
+    /// variant, all distinct, and the exact ones the plan and the config
+    /// use. A walk over `ALL`, so a variant added without a spelling, or
+    /// with a duplicate one, fails here.
+    #[test]
+    fn every_new_audit_vocabulary_is_closed_and_spelled_once() {
+        fn spellings<T: Copy>(all: &[T], as_str: fn(T) -> &'static str) -> Vec<&'static str> {
+            let out: Vec<&str> = all.iter().map(|v| as_str(*v)).collect();
+            let mut unique = out.clone();
+            unique.sort_unstable();
+            unique.dedup();
+            assert_eq!(
+                unique.len(),
+                out.len(),
+                "two variants share a spelling: {out:?}"
+            );
+            out
+        }
+        assert_eq!(
+            spellings(&RedactionMode::ALL, RedactionMode::as_str),
+            ["false"]
+        );
+        assert_eq!(
+            spellings(&ReadAnchor::ALL, ReadAnchor::as_str),
+            ["cursor", "tail", "screen"]
+        );
+        assert_eq!(
+            spellings(&EnvBase::ALL, EnvBase::as_str),
+            ["client", "daemon", "in_process"]
+        );
+        assert_eq!(
+            spellings(&HistoryPolicy::ALL, HistoryPolicy::as_str),
+            ["none", "per_session", "caller"]
+        );
+        // The two config-backed spellings are the config's own, so the
+        // trail and `[terminal] shell_history_file` read alike.
+        for mode in crate::config::SHELL_HISTORY_FILE_MODES {
+            assert!(
+                HistoryPolicy::ALL.iter().any(|p| p.as_str() == mode),
+                "`{mode}` is a configurable history mode the record cannot name"
+            );
+        }
+        assert_eq!(HistoryPolicy::default(), HistoryPolicy::Discard);
+    }
+
+    /// A record whose every count is a different number, so a field that
+    /// reads its neighbour's counter shows up as the wrong value.
+    fn distinct_stats() -> SessionStatsRecord {
+        SessionStatsRecord {
+            shell: Some("bash"),
+            duration_ms: 1001,
+            history_policy: HistoryPolicy::PerSession,
+            known_values_registered: 2,
+            bytes_produced: 3003,
+            bytes_returned: 404,
+            reads: ReadCounts {
+                cursor: 5,
+                tail: 6,
+                resource: 7,
+                screen: 8,
+            },
+            reads_held_back: 9,
+            max_bytes_withheld: 10,
+            reads_unresolved: 18,
+            operator_reads: 19,
+            redactions: [("github".to_string(), 11)].into_iter().collect(),
+            raw_reads: RawReadCounts {
+                redact_false: 12,
+                complete_only: 13,
+            },
+            waits: WaitCounts {
+                matched: 14,
+                timeout: 15,
+                idle: 16,
+                session_died: 17,
+            },
+        }
+    }
+
+    /// Plan §4.9's table, field by field, with the three counts beside
+    /// it (`waits.session_died`, `reads_unresolved`, `operator_reads`),
+    /// and nothing else.
+    #[test]
+    fn session_stats_lays_out_every_field_of_the_table() {
+        let dir = tempfile::tempdir().unwrap();
+        let log = log_in(dir.path());
+        log.record_session_stats("sess_a", &distinct_stats());
+        let entries = lines(&log);
+        assert_eq!(entries.len(), 1);
+        let e = &entries[0];
+        assert_eq!(e["kind"], "session_stats");
+        assert_eq!(e["session_id"], "sess_a");
+        assert_eq!(e["shell"], "bash");
+        assert_eq!(e["duration_ms"], 1001);
+        assert_eq!(e["history_policy"], "per_session");
+        assert_eq!(e["known_values_registered"], 2);
+        assert_eq!(e["bytes_produced"], 3003);
+        assert_eq!(e["bytes_returned"], 404);
+        assert_eq!(
+            e["reads"],
+            json!({"cursor": 5, "tail": 6, "resource": 7, "screen": 8})
+        );
+        assert_eq!(e["reads_held_back"], 9);
+        assert_eq!(e["max_bytes_withheld"], 10);
+        assert_eq!(e["reads_unresolved"], 18);
+        assert_eq!(e["operator_reads"], 19);
+        assert_eq!(e["raw_reads"], json!({"false": 12, "complete_only": 13}));
+        assert_eq!(
+            e["waits"],
+            json!({"matched": 14, "timeout": 15, "idle": 16, "session_died": 17})
+        );
+        // `unresolved` is on every line, at zero when no read showed one.
+        assert_eq!(e["redactions"], json!({"github": 11, "unresolved": 0}));
+
+        let mut keys: Vec<&str> = e.as_object().unwrap().keys().map(String::as_str).collect();
+        keys.sort_unstable();
+        assert_eq!(
+            keys,
+            [
+                "bytes_produced",
+                "bytes_returned",
+                "duration_ms",
+                "history_policy",
+                "kind",
+                "known_values_registered",
+                "max_bytes_withheld",
+                "operator_reads",
+                "raw_reads",
+                "reads",
+                "reads_held_back",
+                "reads_unresolved",
+                "redactions",
+                "session_id",
+                "shell",
+                "ts",
+                "waits",
+            ],
+            "the line is counts and closed names; a new key is a decision, not an accident"
+        );
+    }
+
+    /// The zero record — a session nobody read — is still every field, a
+    /// zero rather than an absence, and `shell` an explicit `null`.
+    #[test]
+    fn a_session_nobody_read_still_writes_every_count_as_zero() {
+        let dir = tempfile::tempdir().unwrap();
+        let log = log_in(dir.path());
+        log.record_session_stats("sess_a", &SessionStatsRecord::default());
+        let e = &lines(&log)[0];
+        assert!(e["shell"].is_null() && e.get("shell").is_some());
+        assert_eq!(e["history_policy"], "none");
+        assert_eq!(e["known_values_registered"], 0);
+        assert_eq!(e["raw_reads"]["complete_only"], 0);
+        assert_eq!(e["reads_unresolved"], 0);
+        assert_eq!(e["operator_reads"], 0);
+        assert_eq!(e["redactions"], json!({"unresolved": 0}));
+    }
+
+    /// The audit log's first guarantee holds for the new kind: every
+    /// string on it goes through the redactor, keys included. The only
+    /// strings `session_stats` carries are rule kinds and closed names,
+    /// so this drives the walk with a secret where a kind would be.
+    #[test]
+    fn a_session_stats_line_is_redacted_like_every_other_kind() {
+        let dir = tempfile::tempdir().unwrap();
+        let log = log_in(dir.path());
+        let mut stats = distinct_stats();
+        stats.redactions.insert(SECRET.to_string(), 1);
+        log.record_session_stats(SECRET, &stats);
+        let raw = std::fs::read_to_string(log.path().unwrap()).unwrap();
+        assert!(!raw.contains(SECRET), "the secret reached the audit log");
+        let e = &lines(&log)[0];
+        assert_eq!(e["session_id"], "[REDACTED:github]");
+        assert_eq!(e["redactions"]["[REDACTED:github]"], 1);
+        assert_eq!(
+            e["redactions"]["github"], 11,
+            "the rest of the map survived"
+        );
+    }
+
+    /// And its second and third: the line lands in the owner-only file,
+    /// and after §19.1 renames that file away, in the one `reopen` makes.
+    #[cfg(unix)]
+    #[test]
+    fn a_session_stats_line_follows_the_trail_through_a_rotation() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let _umask = crate::daemon::paths::ForcedUmask::loose();
+        let path = dir.path().join("logs").join("audit.log");
+        let log = AuditLog::to_path(&path, Arc::new(RuleSet::builtin().unwrap())).unwrap();
+        log.record_session_stats("sess_before", &SessionStatsRecord::default());
+        std::fs::rename(&path, dir.path().join("logs").join("audit.log.1")).unwrap();
+        log.reopen().unwrap();
+        log.record_session_stats("sess_after", &SessionStatsRecord::default());
+        let text = std::fs::read_to_string(&path).unwrap();
+        assert!(text.contains("sess_after") && !text.contains("sess_before"));
+        assert_eq!(
+            std::fs::metadata(&path).unwrap().permissions().mode() & 0o777,
+            0o600
+        );
     }
 
     #[test]
