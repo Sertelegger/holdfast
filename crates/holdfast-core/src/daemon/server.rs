@@ -738,6 +738,11 @@ impl Daemon {
                 terminated += 1;
             }
         }
+        // Plan §4.9's retire path for a stopping daemon: no sweep will
+        // come, so every session without a `session_stats` line gets it
+        // now. Repeat calls — this runs from the SIGTERM handler and again
+        // at the end of `run` — write nothing more.
+        self.server.registry.record_remaining_stats();
         let _ = self.shutdown_tx.send(true);
         terminated
     }
@@ -821,6 +826,9 @@ impl Daemon {
             }
         }
 
+        // As in [`Daemon::shutdown`], after the grace, so a session that
+        // ended inside it is counted to its end.
+        self.server.registry.record_remaining_stats();
         let _ = self.shutdown_tx.send(true);
         live.len() as u64
     }
@@ -3609,6 +3617,76 @@ mod tests {
              state this replaces"
         );
         assert!(!s.is_alive());
+    }
+
+    /// **Plan §4.9's retire path for a stopping daemon**, both forms.
+    ///
+    /// A daemon that stops leaves no eviction behind it, so the stop
+    /// writes the `session_stats` line of every session that has none:
+    /// the live one it is killing, and the one an earlier tick retired,
+    /// whose record was still readable and so had no line. `shutdown`
+    /// runs twice on the real path — the SIGTERM handler, then the end of
+    /// `run` — and the second writes nothing.
+    #[tokio::test]
+    async fn a_daemon_stop_writes_each_sessions_line_once_whichever_way_it_ended() {
+        for graceful in [false, true] {
+            let paths = scratch(if graceful { "statsgrace" } else { "statsforce" });
+            let _s = Scratch(paths.clone());
+            paths.ensure_dir().unwrap();
+            let daemon = Daemon::new(paths.clone());
+            let audited = |id: &str, pty: &Arc<crate::pty::MockPty>| {
+                crate::session::Session::new(
+                    id.into(),
+                    None,
+                    "bash".into(),
+                    vec![],
+                    Arc::clone(pty) as Arc<dyn crate::pty::PtyBackend>,
+                    crate::session::SessionConfig {
+                        audit: Some(Arc::clone(&daemon.server.processor.audit)),
+                        ..crate::session::SessionConfig::default()
+                    },
+                )
+            };
+            let live_pty = Arc::new(crate::pty::MockPty::new());
+            let done_pty = Arc::new(crate::pty::MockPty::new());
+            let live = audited("sess_live", &live_pty);
+            let done = audited("sess_done", &done_pty);
+            daemon.server.registry.insert(Arc::clone(&live)).unwrap();
+            daemon.server.registry.insert(Arc::clone(&done)).unwrap();
+            done_pty.exit(0);
+            assert_eq!(daemon.server.registry.retire_exited(), 1);
+
+            let stats_ids = || {
+                let text = std::fs::read_to_string(paths.audit_log()).unwrap_or_default();
+                let mut ids: Vec<String> = text
+                    .lines()
+                    .map(|l| serde_json::from_str::<serde_json::Value>(l).unwrap())
+                    .filter(|e| e["kind"] == "session_stats")
+                    .map(|e| e["session_id"].as_str().unwrap().to_string())
+                    .collect();
+                ids.sort();
+                ids
+            };
+            assert!(stats_ids().is_empty(), "graceful={graceful}");
+            if graceful {
+                daemon.shutdown_graceful(Duration::from_secs(10)).await;
+            } else {
+                daemon.shutdown();
+            }
+            assert_eq!(
+                stats_ids(),
+                ["sess_done", "sess_live"],
+                "graceful={graceful}"
+            );
+            daemon.shutdown();
+            assert_eq!(
+                stats_ids(),
+                ["sess_done", "sess_live"],
+                "the second stop wrote again, graceful={graceful}"
+            );
+            drop(live);
+            drop(done);
+        }
     }
 
     #[tokio::test]

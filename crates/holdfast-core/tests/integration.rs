@@ -3149,6 +3149,11 @@ async fn session_start_records_the_field_set_9_4_names() {
             "args",
             "command",
             "cwd",
+            // Where the child's environment started from (plan §3.1,
+            // E4): `in_process` on this server, which is the client's own
+            // process. `env_keys` names only the call's keys, so without
+            // it the row cannot say whose environment the rest came from.
+            "env_base",
             "env_keys",
             "idle_timeout_secs",
             "kind",
@@ -3179,6 +3184,7 @@ async fn session_start_records_the_field_set_9_4_names() {
     // Values, not just names: a record that reported another session's
     // command, or a constant, would pass the key-set assertion alone.
     assert_eq!(entries[0]["command"], "bash");
+    assert_eq!(entries[0]["env_base"], "in_process");
     assert_eq!(entries[0]["args"], json!(["--norc", "--noprofile"]));
     assert_eq!(
         entries[0]["cwd"],

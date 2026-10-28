@@ -97,7 +97,11 @@ fn round3(x: f32) -> f64 {
 /// response exists. These decide what is *reported* and never what is
 /// *decided* — the property `suppressing_the_report_does_not_move_the_
 /// pattern_score` asserts directly.
-fn safe_last_line(processor: &OutputProcessor, session: &Session, d: &Detection) -> String {
+///
+/// `pub` and hidden from the docs so a test outside the crate can judge
+/// this field directly; [`with_detection`] is its only product caller.
+#[doc(hidden)]
+pub fn safe_last_line(processor: &OutputProcessor, session: &Session, d: &Detection) -> String {
     // Case 3 first, and case 2 before any per-line work: both answer for
     // the whole line, so there is nothing for the clip to improve on.
     if d.last_line_truncated {
