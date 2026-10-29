@@ -1284,8 +1284,17 @@ async fn a_client_that_stops_reading_is_detached_in_bounded_time() {
         clients_reach(&d, 2, 5).await.is_some(),
         "both clients never registered"
     );
-    let fast_reader =
-        tokio::spawn(async move { drain_until(&mut fast, b"LAST", 30, Duration::ZERO).await });
+    // **The draining client's connection is handed back, not dropped**
+    // (GH #307). Closing it is a `client_detach`, and nothing orders that
+    // after the stalled client's detach: a machine that drains the burst
+    // inside the stall bound would let it leave first, and (a) would then
+    // count the wrong client out and read its audit row. Held open until
+    // the end of the row, the stalled client is the only one that can
+    // leave before (a).
+    let fast_reader = tokio::spawn(async move {
+        let seen = drain_until(&mut fast, b"LAST", 30, Duration::ZERO).await;
+        (seen, fast)
+    });
 
     // Far more than any socket buffer plus the per-connection budget.
     let head_before = s.buffer_head();
@@ -1308,7 +1317,7 @@ async fn a_client_that_stops_reading_is_detached_in_bounded_time() {
     assert_eq!(rows[0]["reason"].as_str(), Some("slow_consumer"));
 
     // (b) the draining client still receives every byte.
-    let seen = fast_reader.await.expect("reader task");
+    let (seen, fast) = fast_reader.await.expect("reader task");
     assert!(
         contains(&seen.bytes, b"LAST"),
         "the draining client stopped receiving when the stalled one was detached \
@@ -1329,6 +1338,7 @@ async fn a_client_that_stops_reading_is_detached_in_bounded_time() {
         s.buffer_head()
     );
     drop(slow);
+    drop(fast);
 }
 
 /// **A stalled client that comes back inside the grace is told why, once**
