@@ -156,7 +156,7 @@ jobs:
       # §8.7 PyREPL row never runs: ubuntu-24.04's own python3 is 3.12.3,
       # whose readline REPL drives no bracketed paste. See ci.yml's probe
       # job for the full reason and for why the pin is a minor series.
-      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+      - uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7.1.0
         with:
           python-version: "3.13"
       - name: Install the toolchain rust-toolchain.toml pins
@@ -165,7 +165,7 @@ jobs:
       # exists and never write over it — a scheduled job that writes the
       # shared cache is a scheduled job that can slow every push, and cache
       # space is a 10 GB shared budget.
-      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
         with:
           key: nightly
           save-if: false
