@@ -87,7 +87,7 @@ jobs:
       # tag (§12.4), and a rehearsal runs on every pull request, where the
       # cache is the difference between a gate people keep and one they turn
       # off. The cache changes how fast the build is, not what it produces.
-      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
         with:
           key: rehearse-${{ matrix.asset }}
           save-if: ${{ github.ref == 'refs/heads/main' }}
