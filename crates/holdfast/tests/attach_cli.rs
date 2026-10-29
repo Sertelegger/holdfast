@@ -181,9 +181,14 @@ impl Term {
         let seen = Arc::new(Mutex::new(Vec::new()));
         let sink = Arc::clone(&seen);
         let mut reader = pair.master.try_clone_reader().expect("clone reader");
-        // Returns only at EOF — `Ok(0)`, or Linux's `EIO` once the slave
-        // side has closed — so the thread finishing means every byte the
-        // client wrote is in `seen`. An interrupted read is not that.
+        // The barrier is the `Ok(0)` arm. portable-pty reports the master's
+        // EOF as `Ok(0)` on every unix, folding into it the `EIO` Linux
+        // returns once the slave side has closed, so the thread finishing
+        // there means every byte the client wrote is in `seen`. An
+        // interrupted read is retried. Any other error also ends the
+        // thread, and `seen` may then be short: none occurs on a blocking
+        // master, and a row asserting on the client's last line would fail
+        // on it rather than hang.
         let reader = std::thread::spawn(move || {
             let mut buf = [0u8; 4096];
             loop {
