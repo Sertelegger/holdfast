@@ -87,7 +87,7 @@ jobs:
       # tag (§12.4), and a rehearsal runs on every pull request, where the
       # cache is the difference between a gate people keep and one they turn
       # off. The cache changes how fast the build is, not what it produces.
-      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
         with:
           key: rehearse-${{ matrix.asset }}
           save-if: ${{ github.ref == 'refs/heads/main' }}
@@ -136,7 +136,7 @@ jobs:
               echo "the asset reports '$out', not build ${GITHUB_SHA} — HOLDFAST_BUILD_SHA did not reach the build" >&2
               exit 1 ;;
           esac
-      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: rehearsal-${{ matrix.asset }}
           path: dist/
@@ -175,7 +175,7 @@ jobs:
           done
       - name: What the release would carry
         run: ls -l dist && cat dist/SHA256SUMS.txt
-      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: rehearsal-release-set
           path: dist/
