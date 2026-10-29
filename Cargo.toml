@@ -60,7 +60,7 @@ tokio = { version = "1.53.1", features = ["rt-multi-thread", "macros", "io-std",
 toml = "1.1.4"
 unicode-width = "0.2.2"
 uuid = { version = "1", features = ["v4"] }
-vt100 = "0.16.2"
+vt100 = "0.18.1"
 
 # **The two crates that build GH #142's liveness automata, optimized even in
 # a debug build.** `PrefixIndex::build` runs once per `OutputProcessor` and a
