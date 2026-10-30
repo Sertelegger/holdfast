@@ -148,6 +148,9 @@ struct Term {
     child: Box<dyn portable_pty::Child + Send + Sync>,
     writer: Box<dyn Write + Send>,
     seen: Arc<Mutex<Vec<u8>>>,
+    /// The thread copying the pty into `seen`. It returns at the master's
+    /// EOF, and [`wait_exit`](Self::wait_exit) waits for that.
+    reader: Option<std::thread::JoinHandle<()>>,
 }
 
 impl Term {
@@ -178,13 +181,23 @@ impl Term {
         let seen = Arc::new(Mutex::new(Vec::new()));
         let sink = Arc::clone(&seen);
         let mut reader = pair.master.try_clone_reader().expect("clone reader");
-        std::thread::spawn(move || {
+        // The barrier is the `Ok(0)` arm. portable-pty reports the master's
+        // EOF as `Ok(0)` on every unix, folding into it the `EIO` Linux
+        // returns once the slave side has closed, so the thread finishing
+        // there means every byte the client wrote is in `seen`. An
+        // interrupted read is retried. Any other error also ends the
+        // thread, and `seen` may then be short: none occurs on a blocking
+        // master, and a row asserting on the client's last line would fail
+        // on it rather than hang.
+        let reader = std::thread::spawn(move || {
             let mut buf = [0u8; 4096];
-            while let Ok(n) = reader.read(&mut buf) {
-                if n == 0 {
-                    return;
+            loop {
+                match reader.read(&mut buf) {
+                    Ok(0) => return,
+                    Ok(n) => sink.lock().unwrap().extend_from_slice(&buf[..n]),
+                    Err(e) if e.kind() == std::io::ErrorKind::Interrupted => {}
+                    Err(_) => return,
                 }
-                sink.lock().unwrap().extend_from_slice(&buf[..n]);
             }
         });
         let writer = pair.master.take_writer().expect("take writer");
@@ -193,6 +206,7 @@ impl Term {
             child,
             writer,
             seen,
+            reader: Some(reader),
         }
     }
 
@@ -285,20 +299,50 @@ impl Term {
         }
     }
 
+    /// The client's exit code, **once everything it wrote has been read**
+    /// (GH #287).
+    ///
+    /// The child exiting and `seen` holding its last line are two events.
+    /// The reader thread copies the pty on its own schedule, and on a
+    /// loaded runner it can have copied nothing yet when the child is
+    /// reaped — so a row asserting on the ending the client prints on its
+    /// way out reads an empty transcript. The reader returning is the
+    /// barrier: the master reaches EOF only once the slave side is closed
+    /// and drained.
     fn wait_exit(&mut self, secs: u64) -> u32 {
         let deadline = Instant::now() + Duration::from_secs(secs);
-        while Instant::now() < deadline {
+        let code = loop {
             match self.child.try_wait() {
-                Ok(Some(status)) => return status.exit_code(),
-                Ok(None) => std::thread::sleep(Duration::from_millis(20)),
+                Ok(Some(status)) => break status.exit_code(),
+                Ok(None) if Instant::now() < deadline => {
+                    std::thread::sleep(Duration::from_millis(20));
+                }
+                Ok(None) => {
+                    let _ = self.child.kill();
+                    panic!(
+                        "the client never exited within {secs}s. Seen:\n{}",
+                        String::from_utf8_lossy(&self.snapshot())
+                    );
+                }
                 Err(e) => panic!("try_wait: {e}"),
             }
+        };
+        if let Some(reader) = self.reader.take() {
+            // At least five seconds for the drain, so a client that exits
+            // just inside `secs` is not failed for the reader's turn.
+            let eof_by = deadline.max(Instant::now() + Duration::from_secs(5));
+            while !reader.is_finished() {
+                assert!(
+                    Instant::now() < eof_by,
+                    "the client exited ({code}) and its terminal never reached EOF, so \
+                     what it printed last may not have been read. Seen:\n{}",
+                    String::from_utf8_lossy(&self.snapshot())
+                );
+                std::thread::sleep(Duration::from_millis(5));
+            }
+            reader.join().expect("the pty reader thread panicked");
         }
-        let _ = self.child.kill();
-        panic!(
-            "the client never exited within {secs}s. Seen:\n{}",
-            String::from_utf8_lossy(&self.snapshot())
-        );
+        code
     }
 
     /// The client's own pid, for the rows that signal it.
